@@ -140,6 +140,7 @@ fn parse_token(body: &str) -> Result<TokenSet, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -170,8 +171,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x-tokens.json");
         write_private_file(&path, r#"{"access_token":"secret","refresh_token":null}"#).unwrap();
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("secret"));
     }
