@@ -12,6 +12,7 @@
 use gpui_kit::{AppContext, Bounds, WindowBounds, WindowKind, WindowOptions, px, size};
 
 struct PreviewArgs {
+    bench_tabs: bool,
     splash: bool,
     mock: bool,
     width: f32,
@@ -22,6 +23,7 @@ fn preview_args() -> PreviewArgs {
     let mut args = PreviewArgs {
         splash: false,
         mock: false,
+        bench_tabs: false,
         width: std::env::var("TERMY_X_PREVIEW_WIDTH")
             .ok()
             .and_then(|value| value.parse::<f32>().ok())
@@ -36,6 +38,7 @@ fn preview_args() -> PreviewArgs {
         match arg.as_str() {
             "--splash" | "splash" => args.splash = true,
             "--mock" | "mock" => args.mock = true,
+            "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
             "--width" => {
                 if let Some(value) = raw.next().and_then(|text| text.parse().ok()) {
                     args.width = value;
@@ -73,6 +76,7 @@ fn main() {
     };
     let width = args.width;
     let height = args.height;
+    let bench_tabs = args.bench_tabs;
 
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
@@ -97,7 +101,13 @@ fn main() {
             },
             move |window, cx| {
                 window.set_window_title("Termy X Preview");
-                cx.new(move |cx| termy::x_panel::XPanel::preview(&scene, cx))
+                cx.new(move |cx| {
+                    let mut panel = termy::x_panel::XPanel::preview(&scene, cx);
+                    if bench_tabs {
+                        panel.bench_tabs(cx);
+                    }
+                    panel
+                })
             },
         );
     });

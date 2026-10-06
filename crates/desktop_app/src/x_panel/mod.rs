@@ -4,6 +4,7 @@
 pub mod art;
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{
     div, img, px, rgb, rgba, Context, FocusHandle, Image, ImageSource, InteractiveElement,
@@ -28,7 +29,7 @@ macro_rules! x_button {
 }
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
-use termy_x::providers::{sample_posts, MockProvider, XProvider};
+use termy_x::providers::{MockProvider, XProvider};
 use termy_x::text::{split_thread, weighted_len};
 use termy_x::XConfig;
 
@@ -90,6 +91,58 @@ pub struct XPanel {
     live: bool,
     art: Option<Arc<Image>>,
     notice: Option<String>,
+    /// Per-section last successful fetch. Tab switches reuse data younger than 30s.
+    fetched_at: SectionTimes,
+    /// Monotonic id so a slow OpenCLI reply cannot overwrite a newer tab's data.
+    fetch_seq: u64,
+    inflight: [u64; 5],
+    loading: bool,
+}
+
+const FRESH_FOR: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Default)]
+struct SectionTimes {
+    timeline: Option<Instant>,
+    search: Option<Instant>,
+    trends: Option<Instant>,
+    lookup: Option<Instant>,
+    research: Option<Instant>,
+}
+
+#[derive(Clone)]
+enum FetchPayload {
+    Timeline { posts: Vec<Post>, status: String },
+    Search { posts: Vec<Post>, status: String },
+    Trends { trends: Vec<Trend>, status: String },
+    Lookup { profile: Option<Profile>, status: String },
+    Research { hits: Vec<ResearchHit>, status: String },
+}
+
+fn section_slot(section: XSection) -> Option<usize> {
+    match section {
+        XSection::Timeline => Some(0),
+        XSection::Search => Some(1),
+        XSection::Trends => Some(2),
+        XSection::Lookup => Some(3),
+        XSection::Research => Some(4),
+        XSection::Compose => None,
+    }
+}
+
+fn log_switch(section: XSection, started: Instant, kind: &str) {
+    let us = started.elapsed().as_micros();
+    let line = format!("termy-x tab: {kind} {} in {us} us", section.label());
+    eprintln!("{line}");
+    let path = std::env::temp_dir().join("termy-x-tab-timing.txt");
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 impl XPanel {
@@ -112,7 +165,7 @@ impl XPanel {
             compose: "Termy X counts this URL as 23: https://termy.sh".into(),
             variants: Vec::new(),
             drafts: Vec::new(),
-            status: "mock · fixture data · no X API credits".into(),
+            status: "ready · free providers · no X API credits".into(),
             confirm: false,
             intent_urls: Vec::new(),
             intent_index: 0,
@@ -123,47 +176,84 @@ impl XPanel {
             live: !fill_window,
             art: None,
             notice: None,
+            fetched_at: SectionTimes::default(),
+            fetch_seq: 0,
+            inflight: [0; 5],
+            loading: false,
         };
-        panel.load_timeline();
+        // Instant first paint: fixtures on screen, live fetch in the background.
+        if fill_window {
+            // Preview path fills via load_scene / open_section.
+        } else {
+            panel.seed_fixtures();
+            panel.prewarm_art(cx);
+            panel.schedule_fetch(XSection::Timeline, cx);
+        }
         panel
     }
 
     pub fn preview(scene: &str, cx: &mut Context<Self>) -> Self {
         let mut panel = Self::new(cx, true);
         panel.background_art = true;
-        panel.load_scene(scene);
+        panel.load_scene(scene, cx);
         panel
     }
 
-    pub fn open_section(&mut self, section: XSection) {
+    /// Tab / command open. Must return in microseconds: swap local state only,
+    /// never call OpenCLI / twitter-cli on the UI thread.
+    pub fn open_section(&mut self, section: XSection, cx: &mut Context<Self>) {
+        let started = Instant::now();
         self.section = section;
         self.confirm = false;
         self.splash = false;
-        if self.fill_window {
+
+        if self.fill_window || !self.live {
             self.ensure_mock_lists();
-            self.section = section;
+            if section == XSection::Compose && self.variants.is_empty() {
+                self.suggest();
+            }
+            if section == XSection::Search && self.search_posts.is_empty() {
+                self.search_posts = MockProvider
+                    .search(&self.query, false, 10)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+            }
+            log_switch(section, started, "local");
             return;
         }
-        match section {
-            XSection::Timeline => self.load_timeline(),
-            XSection::Search => self.load_search(),
-            XSection::Trends => self.load_trends(),
-            XSection::Lookup => self.load_lookup(),
-            XSection::Research => self.load_research(),
-            XSection::Compose => {
-                if self.variants.is_empty() {
-                    self.suggest();
-                }
+
+        if section == XSection::Compose {
+            if self.variants.is_empty() {
+                self.suggest();
             }
+            self.status = "compose · confirm before publish · no X API credits".into();
+            log_switch(section, started, "compose");
+            return;
         }
+
+        if self.is_fresh(section) {
+            self.loading = false;
+            self.status = format!("{} · cached (<30s) · no X API credits", section.label());
+            log_switch(section, started, "cache");
+            return;
+        }
+
+        if self.section_has_data(section) {
+            self.status = format!("{} · refreshing…", section.label());
+        } else {
+            self.status = format!("loading {}…", section.label());
+        }
+        self.loading = true;
+        log_switch(section, started, "async");
+        self.schedule_fetch(section, cx);
     }
 
-    fn load_scene(&mut self, scene: &str) {
+    fn load_scene(&mut self, scene: &str, cx: &mut Context<Self>) {
         match scene {
-            "search" => self.open_section(XSection::Search),
-            "compose" => self.open_section(XSection::Compose),
+            "search" => self.open_section(XSection::Search, cx),
+            "compose" => self.open_section(XSection::Compose, cx),
             "confirm" => {
-                self.open_section(XSection::Compose);
+                self.open_section(XSection::Compose, cx);
                 self.arm_confirm();
             }
             "splash" => {
@@ -178,8 +268,8 @@ impl XPanel {
                 self.status = "splash · background art at full strength".into();
             }
             "mock" => self.load_mock_dashboard(),
-            "trends" => self.open_section(XSection::Trends),
-            _ => self.open_section(XSection::Timeline),
+            "trends" => self.open_section(XSection::Trends, cx),
+            _ => self.open_section(XSection::Timeline, cx),
         }
     }
 
@@ -190,6 +280,44 @@ impl XPanel {
         self.ensure_mock_lists();
         self.suggest();
         self.status = "mock · search, timeline, trends · no network · no X API credits".into();
+    }
+
+    /// Seed fixture lists without turning off live mode.
+    fn seed_fixtures(&mut self) {
+        if self.posts.is_empty() {
+            self.posts = MockProvider
+                .timeline(8)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.search_posts.is_empty() {
+            self.search_posts = MockProvider
+                .search(&self.query, false, 4)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.trends.is_empty() {
+            self.trends = MockProvider
+                .trends(Some("worldwide"), 6)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.research.is_empty() {
+            self.research = vec![ResearchHit {
+                source: "fixture".into(),
+                title: "GPUI terminals people actually use".into(),
+                url: "https://example.com/gpui".into(),
+                excerpt: "Fixture research for drafts. Live fetch runs in the background.".into(),
+                session: None,
+            }];
+        }
+        if self.profile.is_none() {
+            self.profile = MockProvider
+                .lookup(&self.lookup)
+                .ok()
+                .map(|served| served.value);
+        }
+        self.status = "fixtures · refreshing free providers in background".into();
     }
 
     fn ensure_mock_lists(&mut self) {
@@ -223,87 +351,140 @@ impl XPanel {
         }
     }
 
-    fn service(&self) -> termy_x::providers::Service {
+    fn is_fresh(&self, section: XSection) -> bool {
+        let at = match section {
+            XSection::Timeline => self.fetched_at.timeline,
+            XSection::Search => self.fetched_at.search,
+            XSection::Trends => self.fetched_at.trends,
+            XSection::Lookup => self.fetched_at.lookup,
+            XSection::Research => self.fetched_at.research,
+            XSection::Compose => return true,
+        };
+        match at {
+            Some(instant) if instant.elapsed() < FRESH_FOR && self.section_has_data(section) => true,
+            _ => false,
+        }
+    }
+
+    fn section_has_data(&self, section: XSection) -> bool {
+        match section {
+            XSection::Timeline => !self.posts.is_empty(),
+            XSection::Search => !self.search_posts.is_empty(),
+            XSection::Trends => !self.trends.is_empty(),
+            XSection::Lookup => self.profile.is_some(),
+            XSection::Research => !self.research.is_empty(),
+            XSection::Compose => true,
+        }
+    }
+
+
+    /// Cycle every tab once. Used by `x_panel_preview --bench-tabs` to log switch times.
+    pub fn bench_tabs(&mut self, cx: &mut Context<Self>) {
+        for section in [
+            XSection::Timeline,
+            XSection::Search,
+            XSection::Trends,
+            XSection::Lookup,
+            XSection::Compose,
+            XSection::Research,
+            XSection::Timeline,
+        ] {
+            self.open_section(section, cx);
+        }
+    }
+
+    fn prewarm_art(&mut self, cx: &mut Context<Self>) {
+        if !self.background_art || self.art.is_some() {
+            return;
+        }
+        // Never rasterize on the UI hot path. Decode once in the background.
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { art::load().map(|art| art.image) })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.art.is_none() {
+                    panel.art = image;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn schedule_fetch(&mut self, section: XSection, cx: &mut Context<Self>) {
+        let Some(slot) = section_slot(section) else {
+            return;
+        };
+        self.fetch_seq = self.fetch_seq.wrapping_add(1);
+        let seq = self.fetch_seq;
+        self.inflight[slot] = seq;
+
+        let query = self.query.clone();
+        let lookup = self.lookup.clone();
+        let live = self.live;
+
+        cx.spawn(async move |this, cx| {
+            let payload = cx
+                .background_executor()
+                .spawn(async move { fetch_section(section, query, lookup, live) })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.inflight[slot] != seq {
+                    return;
+                }
+                panel.loading = false;
+                panel.apply_fetch(section, payload);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_fetch(&mut self, section: XSection, payload: FetchPayload) {
+        let now = Instant::now();
+        match payload {
+            FetchPayload::Timeline { posts, status } => {
+                self.posts = posts;
+                self.status = status;
+                self.fetched_at.timeline = Some(now);
+            }
+            FetchPayload::Search { posts, status } => {
+                self.search_posts = posts;
+                self.status = status;
+                self.fetched_at.search = Some(now);
+            }
+            FetchPayload::Trends { trends, status } => {
+                self.trends = trends;
+                self.status = status;
+                self.fetched_at.trends = Some(now);
+            }
+            FetchPayload::Lookup { profile, status } => {
+                self.profile = profile;
+                self.status = status;
+                self.fetched_at.lookup = Some(now);
+            }
+            FetchPayload::Research { hits, status } => {
+                self.research = hits;
+                self.status = status;
+                self.fetched_at.research = Some(now);
+            }
+        }
+        // Keep status accurate if the user already left this tab.
+        if self.section != section && !self.loading {
+            // leave current tab's status alone if it has its own message
+        }
+        let _ = section;
+    }
+
+    fn service_free() -> termy_x::providers::Service {
         let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
         termy_x::providers::Service::free(
             &config,
             Arc::new(termy_x::io::SystemRunner),
             Arc::new(termy_x::io::UreqHttp::default()),
         )
-    }
-
-    fn load_timeline(&mut self) {
-        if self.live {
-            if let Ok(served) = self.service().timeline(10) {
-                self.posts = served.value;
-                self.status = served.status.render();
-                return;
-            }
-        }
-        self.posts = MockProvider.timeline(10).map(|served| served.value).unwrap_or_default();
-        self.status = "mock · fixture data · no X API credits".into();
-    }
-
-    fn load_search(&mut self) {
-        if self.live {
-            if let Ok(served) = self.service().search(&self.query, false, 10) {
-                self.posts = served.value;
-                self.status = served.status.render();
-                return;
-            }
-        }
-        self.posts = MockProvider
-            .search(&self.query, false, 10)
-            .map(|served| served.value)
-            .unwrap_or_default();
-        self.status = format!("mock · search “{}” · no X API credits", self.query);
-    }
-
-    fn load_trends(&mut self) {
-        if self.live {
-            if let Ok(served) = self.service().trends(Some("worldwide"), 8) {
-                self.status = served.status.render();
-                self.trends = served.value;
-                self.posts.clear();
-                return;
-            }
-        }
-        self.trends = MockProvider
-            .trends(Some("worldwide"), 8)
-            .map(|served| served.value)
-            .unwrap_or_default();
-        self.posts = sample_posts();
-        self.status = "mock · trends · no X API credits".into();
-    }
-
-    fn load_lookup(&mut self) {
-        if self.live {
-            if let Ok(served) = self.service().lookup(&self.lookup) {
-                self.status = served.status.render();
-                self.profile = Some(served.value);
-                return;
-            }
-        }
-        self.profile = MockProvider.lookup(&self.lookup).ok().map(|served| served.value);
-        self.status = format!("mock · lookup @{} · no X API credits", self.lookup.trim_start_matches('@'));
-    }
-
-    fn load_research(&mut self) {
-        if self.live {
-            let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
-            let runner = termy_x::io::SystemRunner;
-            self.research = self.service().research("gpui terminal", &runner, &config);
-            self.status = "research · no X API credits".into();
-            return;
-        }
-        self.research = vec![ResearchHit {
-            source: "fixture".into(),
-            title: "GPUI terminals people actually use".into(),
-            url: "https://example.com/gpui".into(),
-            excerpt: "Fixture research for drafts. Install OpenCLI, yt-dlp, or curl to pull Reddit, YouTube, and the web.".into(),
-            session: None,
-        }];
-        self.status = "research · fixture · no X API credits".into();
     }
 
     fn suggest(&mut self) {
@@ -362,6 +543,109 @@ impl XPanel {
             return;
         }
         cx.notify();
+    }
+}
+
+fn fetch_section(
+    section: XSection,
+    query: String,
+    lookup: String,
+    live: bool,
+) -> FetchPayload {
+    if live {
+        let service = XPanel::service_free();
+        match section {
+            XSection::Timeline => {
+                if let Ok(served) = service.timeline(10) {
+                    return FetchPayload::Timeline {
+                        posts: served.value,
+                        status: served.status.render(),
+                    };
+                }
+            }
+            XSection::Search => {
+                if let Ok(served) = service.search(&query, false, 10) {
+                    return FetchPayload::Search {
+                        posts: served.value,
+                        status: served.status.render(),
+                    };
+                }
+            }
+            XSection::Trends => {
+                if let Ok(served) = service.trends(Some("worldwide"), 8) {
+                    return FetchPayload::Trends {
+                        trends: served.value,
+                        status: served.status.render(),
+                    };
+                }
+            }
+            XSection::Lookup => {
+                if let Ok(served) = service.lookup(&lookup) {
+                    return FetchPayload::Lookup {
+                        profile: Some(served.value),
+                        status: served.status.render(),
+                    };
+                }
+            }
+            XSection::Research => {
+                let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                let runner = termy_x::io::SystemRunner;
+                let hits = service.research("gpui terminal", &runner, &config);
+                return FetchPayload::Research {
+                    hits,
+                    status: "research · no X API credits".into(),
+                };
+            }
+            XSection::Compose => {}
+        }
+    }
+
+    match section {
+        XSection::Timeline => FetchPayload::Timeline {
+            posts: MockProvider
+                .timeline(10)
+                .map(|served| served.value)
+                .unwrap_or_default(),
+            status: "mock · fixture data · no X API credits".into(),
+        },
+        XSection::Search => FetchPayload::Search {
+            posts: MockProvider
+                .search(&query, false, 10)
+                .map(|served| served.value)
+                .unwrap_or_default(),
+            status: format!("mock · search “{query}” · no X API credits"),
+        },
+        XSection::Trends => FetchPayload::Trends {
+            trends: MockProvider
+                .trends(Some("worldwide"), 8)
+                .map(|served| served.value)
+                .unwrap_or_default(),
+            status: "mock · trends · no X API credits".into(),
+        },
+        XSection::Lookup => FetchPayload::Lookup {
+            profile: MockProvider
+                .lookup(&lookup)
+                .ok()
+                .map(|served| served.value),
+            status: format!(
+                "mock · lookup @{} · no X API credits",
+                lookup.trim_start_matches('@')
+            ),
+        },
+        XSection::Research => FetchPayload::Research {
+            hits: vec![ResearchHit {
+                source: "fixture".into(),
+                title: "GPUI terminals people actually use".into(),
+                url: "https://example.com/gpui".into(),
+                excerpt: "Fixture research for drafts. Install OpenCLI, yt-dlp, or curl to pull Reddit, YouTube, and the web.".into(),
+                session: None,
+            }],
+            status: "research · fixture · no X API credits".into(),
+        },
+        XSection::Compose => FetchPayload::Timeline {
+            posts: Vec::new(),
+            status: "compose".into(),
+        },
     }
 }
 
@@ -562,7 +846,7 @@ impl XPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.open_section(section);
+                            this.open_section(section, cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -572,10 +856,15 @@ impl XPanel {
     }
 
     fn status_line(&self) -> impl IntoElement {
+        let label = if self.loading {
+            format!("⏳ {}", self.status)
+        } else {
+            self.status.clone()
+        };
         div()
             .text_size(px(11.0))
             .text_color(rgb(0x93a4c3))
-            .child(self.status.clone())
+            .child(label)
     }
 
     fn dashboard(
@@ -698,11 +987,23 @@ impl XPanel {
             rows.push(hint(notice.clone()));
         }
         match self.section {
-            XSection::Timeline | XSection::Search => {
+            XSection::Timeline => {
                 if self.posts.is_empty() {
                     rows.push(self.splash_copy());
+                } else if self.loading && self.section == XSection::Timeline {
+                    rows.push(hint("Refreshing timeline…".into()));
                 }
                 for post in &self.posts {
+                    rows.push(post_card(post));
+                }
+            }
+            XSection::Search => {
+                if self.search_posts.is_empty() {
+                    rows.push(self.splash_copy());
+                } else if self.loading {
+                    rows.push(hint("Refreshing search…".into()));
+                }
+                for post in &self.search_posts {
                     rows.push(post_card(post));
                 }
             }

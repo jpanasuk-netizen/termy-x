@@ -13,7 +13,7 @@ impl TerminalView {
         self.x_panel_open = true;
         if let Some(panel) = &self.x_panel {
             panel.update(cx, |panel, cx| {
-                panel.open_section(section);
+                panel.open_section(section, cx);
                 cx.notify();
             });
         }
