@@ -3,6 +3,7 @@
 
 pub mod art;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -96,6 +97,7 @@ impl XSection {
 enum UiFocus {
     Compose,
     Clear,
+    Attach,
     Suggest,
     Publish,
     Art,
@@ -115,6 +117,8 @@ pub struct XPanel {
     query: String,
     lookup: String,
     compose: String,
+    /// Local image paths attached to the next publish (max 4).
+    media: Vec<PathBuf>,
     variants: Vec<Draft>,
     drafts: Vec<Draft>,
     status: String,
@@ -217,6 +221,7 @@ impl XPanel {
             profile: None,
             query: "gpui terminal".into(),
             lookup: "termy".into(),
+            media: Vec::new(),
             compose: if fill_window {
                 "Termy X counts this URL as 23: https://termy.sh".into()
             } else {
@@ -622,6 +627,25 @@ impl XPanel {
         }
         self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         self.intent_index = 0;
+        if self.media.is_empty() {
+            self.notice = Some("Confirm exact text before anything posts.".into());
+        } else {
+            let names: Vec<String> = self
+                .media
+                .iter()
+                .map(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("image")
+                        .to_string()
+                })
+                .collect();
+            self.notice = Some(format!(
+                "Confirm text + {} image(s): {}",
+                self.media.len(),
+                names.join(", ")
+            ));
+        }
         self.confirm = true;
         self.compose_focused = false;
         self.ui_focus = UiFocus::ConfirmNext;
@@ -703,6 +727,9 @@ impl XPanel {
         // Activate focused chrome button with Enter.
         if key == "enter" && !mods.modified() && self.ui_focus != UiFocus::Compose {
             match self.ui_focus {
+                UiFocus::Attach => {
+                    self.attach_images(cx);
+                }
                 UiFocus::Clear => {
                     self.compose.clear();
                     self.caret = 0;
@@ -1022,6 +1049,7 @@ impl XPanel {
             [
                 UiFocus::Compose,
                 UiFocus::Clear,
+                UiFocus::Attach,
                 UiFocus::Suggest,
                 UiFocus::Publish,
                 UiFocus::Art,
@@ -1723,6 +1751,34 @@ impl XPanel {
             .into_any_element()
     }
 
+    
+    fn attach_images(&mut self, cx: &mut Context<Self>) {
+        let remaining = 4usize.saturating_sub(self.media.len());
+        if remaining == 0 {
+            self.notice = Some("Max 4 images per post.".into());
+            cx.notify();
+            return;
+        }
+        let paths = rfd::FileDialog::new()
+            .set_title("Attach images to Termy X")
+            .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp"])
+            .pick_files()
+            .unwrap_or_default();
+        for path in paths.into_iter().take(remaining) {
+            if path.is_file() {
+                self.media.push(path);
+            }
+        }
+        self.notice = Some(format!("Attached {} image(s).", self.media.len()));
+        cx.notify();
+    }
+
+    fn clear_media(&mut self, cx: &mut Context<Self>) {
+        self.media.clear();
+        self.notice = Some("Cleared attachments.".into());
+        cx.notify();
+    }
+
     fn compose_block(&self, weighted: usize, limit: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let counter = if limit >= 25_000 {
             format!("{weighted} / {limit} Premium")
@@ -1735,6 +1791,7 @@ impl XPanel {
             "Suggest variants"
         };
         let clear_active = self.ui_focus == UiFocus::Clear;
+        let attach_active = self.ui_focus == UiFocus::Attach;
         let suggest_active = self.ui_focus == UiFocus::Suggest;
         let publish_active = self.ui_focus == UiFocus::Publish;
         let editor_focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
@@ -1742,6 +1799,52 @@ impl XPanel {
             .flex()
             .flex_col()
             .gap(px(8.0))
+            // Attachments strip
+            .child({
+                let mut row = div().flex().flex_col().gap(px(6.0));
+                row = row.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .child(x_button!("x-attach", "Attach image", attach_active, cx.listener(|this, _, _, cx| {
+                            this.attach_images(cx);
+                        })))
+                        .child(x_button!("x-media-clear", "Clear images", false, cx.listener(|this, _, _, cx| {
+                            this.clear_media(cx);
+                        }))),
+                );
+                if self.media.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x93a4c3))
+                            .child("No images attached. JPG/PNG/GIF/WEBP. Max 4."),
+                    );
+                } else {
+                    for (index, path) in self.media.iter().enumerate() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image")
+                            .to_string();
+                        let label = format!("[{}] {}", index + 1, name);
+                        row = row.child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x2f7bff))
+                                .bg(tint(0x12203a, 0xcc))
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7af6ff))
+                                .child(label),
+                        );
+                    }
+                }
+                row
+            })
             // Sticky actions FIRST so Publish is never below the fold.
             .child(
                 div()
@@ -2021,7 +2124,41 @@ impl XPanel {
             .get(current)
             .cloned()
             .unwrap_or_default();
-        let part_rows = parts.iter().enumerate().map(|(index, part)| {
+        
+        let media_lines: Vec<String> = self
+            .media
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string()
+            })
+            .collect();
+        let media_block = if media_lines.is_empty() {
+            div().into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x7af6ff))
+                        .child(format!("Attached media ({}):", media_lines.len())),
+                )
+                .children(media_lines.into_iter().map(|name| {
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xc5d2ea))
+                        .child(format!("- {name}"))
+                        .into_any_element()
+                }))
+                .into_any_element()
+        };
+
+let part_rows = parts.iter().enumerate().map(|(index, part)| {
             let active = index == current;
             let part_count = weighted_len_limited(part, limit).weighted;
             div()
@@ -2078,6 +2215,7 @@ impl XPanel {
                             .text_color(rgb(0xffd0ea))
                             .child("Confirm - nothing posts until you say yes"),
                     )
+                    .child(media_block)
                     .child(
                         div()
                             .text_size(px(12.0))

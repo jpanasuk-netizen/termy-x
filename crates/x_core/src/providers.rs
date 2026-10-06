@@ -10,6 +10,7 @@ use crate::model::{
     Post, Profile, ProviderId, ResearchHit, Served, StatusLine, Thread, Trend, SESSION_OWN,
 };
 use crate::publish::{session_label, Publisher};
+use std::path::PathBuf;
 
 pub trait XProvider: Send + Sync {
     fn id(&self) -> ProviderId;
@@ -613,20 +614,41 @@ impl Publisher for OpenCliPublisher {
     fn session_note(&self) -> Option<String> {
         session_label(ProviderId::OpenCli)
     }
-    fn publish(&self, parts: &[String], reply_to: Option<&str>) -> Result<String, String> {
+    fn supports_media(&self) -> bool {
+        true
+    }
+
+    fn publish(
+        &self,
+        parts: &[String],
+        reply_to: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
+        validate_media(media)?;
         let mut previous = reply_to.map(status_url);
         let mut last = String::new();
-        for part in parts {
-            let args = if let Some(target) = &previous {
-                opencli_json(&[
+        for (index, part) in parts.iter().enumerate() {
+            let mut args = if let Some(target) = &previous {
+                vec![
                     "twitter".into(),
                     "reply".into(),
                     target.clone(),
                     part.clone(),
-                ])
+                ]
             } else {
-                opencli_json(&["twitter".into(), "post".into(), part.clone()])
+                vec!["twitter".into(), "post".into(), part.clone()]
             };
+            // OpenCLI --images only on the first part (max 4).
+            if index == 0 && !media.is_empty() {
+                let joined = media
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                args.push("--images".into());
+                args.push(joined);
+            }
+            let args = opencli_json(&args);
             let output = self.runner.run(&self.bin, &args)?;
             if output.status != 0 {
                 return Err(if output.stderr.is_empty() {
@@ -640,7 +662,12 @@ impl Publisher for OpenCliPublisher {
                 previous = Some(next);
             }
         }
-        Ok(format!("opencli posted {} part(s): {last}", parts.len()))
+        let media_note = if media.is_empty() {
+            String::new()
+        } else {
+            format!(" with {} image(s)", media.len())
+        };
+        Ok(format!("opencli posted {} part(s){media_note}: {last}", parts.len()))
     }
 }
 
@@ -670,7 +697,12 @@ impl Publisher for TwitterCliPublisher {
     fn session_note(&self) -> Option<String> {
         session_label(ProviderId::TwitterCli)
     }
-    fn publish(&self, parts: &[String], reply_to: Option<&str>) -> Result<String, String> {
+    fn publish(&self, parts: &[String], reply_to: Option<&str>, media: &[PathBuf]) -> Result<String, String> {
+        if !media.is_empty() {
+            return Err(
+                "twitter-cli path cannot upload images here; use OpenCLI or the web intent fallback".into(),
+            );
+        }
         let mut previous = reply_to.map(crate::model::post_id_from_input);
         for part in parts {
             let mut args = vec!["post".into(), part.clone()];
@@ -732,6 +764,30 @@ pub fn help_lists_command(text: &str, command: &str) -> bool {
         }
     }
     false
+}
+
+
+fn validate_media(media: &[PathBuf]) -> Result<(), String> {
+    if media.len() > 4 {
+        return Err("X allows at most 4 images per post".into());
+    }
+    for path in media {
+        if !path.is_file() {
+            return Err(format!("media not found: {}", path.display()));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+            return Err(format!(
+                "unsupported media type for {}: use jpg/png/gif/webp",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn opencli_read(args: &[String]) -> Vec<String> {
@@ -918,7 +974,12 @@ impl Publisher for OfficialPublisher {
             self.inner.config.post_write_usd
         ))
     }
-    fn publish(&self, parts: &[String], reply_to: Option<&str>) -> Result<String, String> {
+    fn publish(&self, parts: &[String], reply_to: Option<&str>, media: &[PathBuf]) -> Result<String, String> {
+        if !media.is_empty() {
+            return Err(
+                "official API media upload is not wired in Termy X yet; use OpenCLI --images or attach in the browser".into(),
+            );
+        }
         let token = self.inner.token()?;
         let mut ids = Vec::new();
         for (index, part) in parts.iter().enumerate() {

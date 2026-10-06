@@ -44,11 +44,14 @@ enum Cmd {
     /// Publish text after you type yes. `--dry-run` prints the plan and never posts.
     Post {
         text: String,
-        /// Print the exact parts, counts, and intent URLs. Never posts.
+        /// Print the exact parts, counts, media, and intent URLs. Never posts.
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
         reply_to: Option<String>,
+        /// Image paths to attach (jpg/png/gif/webp). Repeatable. Max 4.
+        #[arg(long = "media", value_name = "PATH")]
+        media: Vec<PathBuf>,
     },
     /// Unicode bird
     Splash,
@@ -243,8 +246,8 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             print!("{}", render_splash(true));
             0
         }
-        Cmd::Post { text, dry_run, reply_to } => {
-            publish_text(&text, dry_run, reply_to, json, io, interactive)
+        Cmd::Post { text, dry_run, reply_to, media } => {
+            publish_text(&text, dry_run, reply_to, media, json, io, interactive)
         }
         Cmd::Search { query, recent, top: _, limit } => {
             let limit = clamp_limit(limit, io.config.default_limit);
@@ -377,13 +380,14 @@ fn publish_draft(
         return 1;
     };
     let reply = reply_to.or_else(|| draft.reply_to.clone());
-    publish_text(&draft.text, dry_run, reply, json, io, interactive)
+    publish_text(&draft.text, dry_run, reply, Vec::new(), json, io, interactive)
 }
 
 fn publish_text(
     text: &str,
     dry_run: bool,
     reply_to: Option<String>,
+    media: Vec<PathBuf>,
     json: bool,
     io: &mut CliIo,
     interactive: bool,
@@ -398,13 +402,18 @@ fn publish_text(
         eprintln!("no publish path");
         return 1;
     };
+    if let Err(error) = validate_media_paths(&media) {
+        eprintln!("{error}");
+        return 1;
+    }
     let resolved = crate::premium::resolve_char_limit(&io.config, io.runner.as_ref());
-    let plan = crate::publish::build_plan_limited(
+    let plan = crate::publish::build_plan_with_media(
         text,
         reply_to.as_deref(),
         publisher,
         dry_run,
         resolved.limit,
+        &media,
     );
     print_plan(&plan);
     if dry_run {
@@ -465,7 +474,18 @@ fn print_plan(plan: &crate::publish::PublishPlan) {
         plan.parts.len(),
         plan.count.limit
     );
-    for (index, part) in plan.parts.iter().enumerate() {
+
+    if !plan.media.is_empty() {
+        println!("media · {} file(s):", plan.media.len());
+        for path in &plan.media {
+            println!("  - {}", path.display());
+        }
+        if plan.provider == crate::model::ProviderId::OpenCli {
+            println!("OpenCLI will upload via --images");
+        } else {
+            println!("this provider cannot upload files; browser attach required if you continue");
+        }
+    }    for (index, part) in plan.parts.iter().enumerate() {
         let count = crate::text::weighted_len_limited(part, plan.count.limit);
         println!(
             "--- part {}/{} · {} weighted ---",
@@ -537,6 +557,7 @@ fn plan_json(plan: &crate::publish::PublishPlan, dry_run: bool) -> String {
         "weighted": plan.count.weighted,
         "parts": plan.parts,
         "intent_urls": plan.intent_urls,
+        "media": plan.media.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
     })
     .to_string()
 }
@@ -611,6 +632,29 @@ fn io_stdout() -> io::Stdout {
 
 fn io_stderr() -> io::Stderr {
     io::stderr()
+}
+
+fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
+    if media.len() > 4 {
+        return Err("at most 4 images per post".into());
+    }
+    for path in media {
+        if !path.is_file() {
+            return Err(format!("media not found: {}", path.display()));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+            return Err(format!(
+                "unsupported media {}: use jpg/png/gif/webp",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

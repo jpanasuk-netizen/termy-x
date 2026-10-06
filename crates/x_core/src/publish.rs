@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use crate::model::{ProviderId, SESSION_OWN};
 use crate::text::{intent_url, WeightedCount};
 
@@ -16,6 +17,8 @@ pub struct PublishPlan {
     pub session: Option<String>,
     pub intent_urls: Vec<String>,
     pub dry_run: bool,
+    /// Local image paths to attach (jpg/png/gif/webp). Max 4 for OpenCLI.
+    pub media: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,7 +32,16 @@ pub trait Publisher: Send + Sync {
     fn id(&self) -> ProviderId;
     fn available(&self) -> bool;
     fn session_note(&self) -> Option<String>;
-    fn publish(&self, parts: &[String], reply_to: Option<&str>) -> Result<String, String>;
+    fn publish(
+        &self,
+        parts: &[String],
+        reply_to: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String>;
+    /// True when this publisher can upload the given media paths itself.
+    fn supports_media(&self) -> bool {
+        false
+    }
 }
 
 pub struct IntentPublisher {
@@ -50,14 +62,31 @@ impl Publisher for IntentPublisher {
         Some("you click Post in the browser".to_string())
     }
 
-    fn publish(&self, parts: &[String], reply_to: Option<&str>) -> Result<String, String> {
+    fn publish(
+        &self,
+        parts: &[String],
+        reply_to: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
         let urls = intent_urls(parts, reply_to);
         if self.open_browser {
             if let Some(url) = urls.first() {
                 self.opener.open(url)?;
             }
         }
-        Ok(format!("opened web intent for {} part(s)", parts.len()))
+        if media.is_empty() {
+            Ok(format!("opened web intent for {} part(s)", parts.len()))
+        } else {
+            let list = media
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Ok(format!(
+                "opened web intent for {} part(s). Attach these images in the browser compose UI (web intent cannot upload files): {list}",
+                parts.len()
+            ))
+        }
     }
 }
 
@@ -88,11 +117,33 @@ pub fn build_plan_limited(
     dry_run: bool,
     char_limit: usize,
 ) -> PublishPlan {
+    build_plan_with_media(text, reply_to, publisher, dry_run, char_limit, &[])
+}
+
+pub fn build_plan_with_media(
+    text: &str,
+    reply_to: Option<&str>,
+    publisher: &dyn Publisher,
+    dry_run: bool,
+    char_limit: usize,
+    media: &[PathBuf],
+) -> PublishPlan {
     let parts = crate::text::split_thread_limited(text, char_limit);
     let parts = if parts.is_empty() {
         vec![String::new()]
     } else {
         parts
+    };
+    let media = media.to_vec();
+    let session = match (publisher.session_note(), media.is_empty(), publisher.supports_media()) {
+        (Some(note), false, false) => Some(format!(
+            "{note}. Media will need a manual attach in the browser if this path cannot upload files."
+        )),
+        (Some(note), _, _) => Some(note),
+        (None, false, false) => Some(
+            "media listed below; provider may require manual attach in the browser".into(),
+        ),
+        _ => None,
     };
     PublishPlan {
         count: crate::text::weighted_len_limited(text.trim(), char_limit),
@@ -100,8 +151,9 @@ pub fn build_plan_limited(
         text: text.trim().to_string(),
         parts,
         provider: publisher.id(),
-        session: publisher.session_note(),
+        session,
         dry_run,
+        media,
     }
 }
 
@@ -131,14 +183,26 @@ pub fn confirm_and_publish_limited(
     publisher: &dyn Publisher,
     char_limit: usize,
 ) -> GateOutcome {
-    let plan = build_plan_limited(text, reply_to, publisher, dry_run, char_limit);
+    confirm_and_publish_with_media(text, reply_to, decision, dry_run, publisher, char_limit, &[])
+}
+
+pub fn confirm_and_publish_with_media(
+    text: &str,
+    reply_to: Option<&str>,
+    decision: ConfirmDecision,
+    dry_run: bool,
+    publisher: &dyn Publisher,
+    char_limit: usize,
+    media: &[PathBuf],
+) -> GateOutcome {
+    let plan = build_plan_with_media(text, reply_to, publisher, dry_run, char_limit, media);
     if decision != ConfirmDecision::Yes {
         return GateOutcome::Rejected { plan };
     }
     if dry_run {
         return GateOutcome::DryRun { plan };
     }
-    match publisher.publish(&plan.parts, reply_to) {
+    match publisher.publish(&plan.parts, reply_to, &plan.media) {
         Ok(receipt) => GateOutcome::Sent { plan, receipt },
         Err(error) => GateOutcome::Rejected {
             plan: PublishPlan {
