@@ -180,6 +180,7 @@ Other free OpenAI-compatible servers: llama.cpp's `llama-server` and any local s
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `background_art` | `true` | Geometric swift behind the panel, and the CLI splash |
+| `background_opacity` | `0.18` | Bird strength behind lists. The splash stays at full strength |
 | `provider` | `auto` | `auto`, `opencli`, `twitter`, `mock`, or `official` |
 | `default_limit` | `10` | Page size, clamped to 20 on the CLI |
 | `official_api.enabled` | `false` | Turn on the paid API |
@@ -188,15 +189,17 @@ Other free OpenAI-compatible servers: llama.cpp's `llama-server` and any local s
 
 ### Desktop panel
 
-Open it with `Ctrl+Shift+X` (`Cmd+Shift+X` on macOS) or the command palette entries under X: Timeline, Search, Trends, Lookup, Compose, Research. Compose shows a live preview, the weighted counter, thread splits, and "Suggest variants". Publish opens a confirm dialog with the exact text.
+Open it with `Ctrl+Shift+X` (`Cmd+Shift+X` on macOS) or the command palette entries under X: Timeline, Search, Trends, Lookup, Compose, Research. Compose shows a live preview, the weighted counter, thread splits, and "Suggest variants". Publish opens a confirm dialog with the exact text of each part. "Next post" opens one web intent at a time. "Copy" copies that part. Nothing is posted automatically.
 
-The background is an original low-poly swift (electric blue and cyan, magenta heart with a `+1`) in `assets/x/termy-x-bird.svg`, drawn for a 3440×1440 frame and scaled with object-fit cover. Behind lists it sits under a dark veil so the art reads at about 20% strength. The empty splash shows it at full strength. "Art on/off" writes `background_art` into `x.toml`. The CLI prints a small ANSI bird when that flag is on.
+The background is an original low-poly swift (electric blue and cyan, magenta heart with a `+1`) in `assets/x/termy-x-bird.svg`, drawn for a 1600×1000 frame and scaled with object-fit cover. Behind lists it is drawn at `background_opacity` (default 0.18). The empty splash shows it at full strength. "Art on/off" writes `background_art` into `x.toml`. Turning art off skips rasterization. The CLI prints a small ANSI bird when that flag is on.
 
-Preview the panel on fixture data:
+On a wide preview the panel is three columns (compose, results, trends). It drops to two columns, then one, as the window gets narrower.
+
+Preview the panel on fixture data (no network):
 
 ```bash
-cargo run -p termy --bin x_panel_preview -- timeline
-TERMY_X_PREVIEW_WIDTH=3440 TERMY_X_PREVIEW_HEIGHT=900 cargo run -p termy --bin x_panel_preview -- splash
+cargo run -p termy --bin x_panel_preview -- --mock --width 1600 --height 1000
+cargo run -p termy --bin x_panel_preview -- --splash
 ```
 
 ## Roadmap and contributing
