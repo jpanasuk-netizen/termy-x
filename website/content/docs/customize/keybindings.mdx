@@ -1,0 +1,32 @@
+---
+title: Keybindings
+description: Customize shortcuts in Settings or config.txt.
+---
+
+In **Settings → Keyboard shortcuts**, **Switch tabs** is the main shortcut for
+cycling through tabs. It defaults to `Ctrl+Tab` and wraps from the last tab to
+the first. Click its shortcut box to record a replacement; press Escape to
+cancel or Backspace to clear it.
+
+Open **More tab shortcuts** to configure previous/next-tab and numbered-tab
+shortcuts individually. Existing custom bindings stay active when this group
+is collapsed and are preserved when you change **Switch tabs**.
+
+Repeated `keybind` lines in `~/.config/termy/config.txt`:
+
+```txt
+keybind = clear
+keybind = secondary-p=toggle_command_palette
+keybind = secondary-t=new_tab
+keybind = secondary-w=unbind
+keybind = secondary-g=plugin:git-tools/status
+```
+
+- Lines apply in order; later lines win for the same trigger.
+- `clear` removes all defaults before later lines apply.
+- `unbind` removes a mapping.
+- `secondary` → `cmd` on macOS, `ctrl` elsewhere.
+- `plugin:<plugin-id>/<command-id>` runs a plugin command. Commands with inputs open their input form.
+- Termy refreshes plugins before a plugin shortcut runs, so changed manifests and source are picked up.
+
+Defaults: [Keybinding defaults](/docs/reference/keybinding-defaults). Actions: [Actions](/docs/reference/actions).

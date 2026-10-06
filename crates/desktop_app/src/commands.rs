@@ -1,0 +1,1272 @@
+use gpui_kit::{FocusHandle, KeyBinding, MenuItem, OsAction, Window, actions};
+use termy_core::command_core::{CommandAvailability, CommandCapabilities, CommandId};
+
+const GLOBAL_CONTEXT: Option<&str> = None;
+const TERMINAL_CONTEXT: Option<&str> = Some("Terminal");
+const INLINE_INPUT_CONTEXT: Option<&str> = Some("InlineInput");
+
+#[derive(Clone, Debug, PartialEq, Eq, gpui_kit::Action)]
+#[action(namespace = termy, no_json)]
+pub struct RunNamedTask {
+    pub task_name: String,
+}
+
+impl RunNamedTask {
+    pub fn into_key_binding(self, trigger: &str) -> KeyBinding {
+        KeyBinding::new(trigger, self, TERMINAL_CONTEXT)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, gpui_kit::Action)]
+#[action(namespace = termy, no_json)]
+pub struct RunPluginCommand {
+    pub plugin_id: String,
+    pub command_id: String,
+}
+
+impl RunPluginCommand {
+    pub fn into_key_binding(self, trigger: &str) -> KeyBinding {
+        KeyBinding::new(trigger, self, TERMINAL_CONTEXT)
+    }
+
+    pub fn keybinding_label(&self, window: &Window, focus_handle: &FocusHandle) -> Option<String> {
+        window
+            .bindings_for_action_in(self, focus_handle)
+            .into_iter()
+            .next()
+            .map(|binding| {
+                binding
+                    .keystrokes()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+    }
+}
+
+pub type MenuSection = u8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandPaletteVisibility {
+    Always,
+    MacOsOnly,
+    /// The tmux/pane command group is hidden on Windows until tmux is active.
+    NotWindows,
+}
+
+impl CommandPaletteVisibility {
+    pub fn is_visible(self) -> bool {
+        self.is_visible_on_platform(cfg!(target_os = "macos"), cfg!(target_os = "windows"))
+    }
+
+    pub fn is_visible_for_runtime(self, tmux_runtime_active: bool) -> bool {
+        self.is_visible()
+            || (cfg!(target_os = "windows") && tmux_runtime_active && self == Self::NotWindows)
+    }
+
+    pub const fn is_visible_on_platform(self, is_macos: bool, is_windows: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::MacOsOnly => is_macos,
+            Self::NotWindows => !is_windows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MenuRoot {
+    App,
+    File,
+    Edit,
+    View,
+    Window,
+    Help,
+}
+
+impl MenuRoot {
+    pub const fn title(self) -> &'static str {
+        match self {
+            Self::App => "Termy",
+            Self::File => "File",
+            Self::Edit => "Edit",
+            Self::View => "View",
+            Self::Window => "Window",
+            Self::Help => "Help",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MenuVisibility {
+    Always,
+    MacOsOnly,
+    /// The tmux/pane command group is hidden on Windows until tmux is active.
+    NotWindows,
+}
+
+impl MenuVisibility {
+    pub fn is_visible(self) -> bool {
+        self.is_visible_on_platform(cfg!(target_os = "macos"), cfg!(target_os = "windows"))
+    }
+
+    pub fn is_visible_for_runtime(self, tmux_runtime_active: bool) -> bool {
+        self.is_visible()
+            || (cfg!(target_os = "windows") && tmux_runtime_active && self == Self::NotWindows)
+    }
+
+    pub const fn is_visible_on_platform(self, is_macos: bool, is_windows: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::MacOsOnly => is_macos,
+            Self::NotWindows => !is_windows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MenuActionRole {
+    Normal,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandPaletteSpec {
+    pub title: &'static str,
+    pub keywords: &'static str,
+    pub visibility: CommandPaletteVisibility,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandPaletteEntry {
+    pub action: CommandAction,
+    pub title: &'static str,
+    pub keywords: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandMenuSpec {
+    pub root: MenuRoot,
+    pub section: MenuSection,
+    pub title: &'static str,
+    pub visibility: MenuVisibility,
+    pub role: MenuActionRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandMenuEntry {
+    pub action: CommandAction,
+    pub root: MenuRoot,
+    pub section: MenuSection,
+    pub title: &'static str,
+    pub role: MenuActionRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSpec {
+    pub action: CommandAction,
+    pub context: Option<&'static str>,
+    pub palette: Option<CommandPaletteSpec>,
+    pub menu: Option<CommandMenuSpec>,
+}
+
+const MENU_ROOTS: [MenuRoot; 6] = [
+    MenuRoot::App,
+    MenuRoot::File,
+    MenuRoot::Edit,
+    MenuRoot::View,
+    MenuRoot::Window,
+    MenuRoot::Help,
+];
+
+const fn palette(
+    title: &'static str,
+    keywords: &'static str,
+    visibility: CommandPaletteVisibility,
+) -> CommandPaletteSpec {
+    CommandPaletteSpec {
+        title,
+        keywords,
+        visibility,
+    }
+}
+
+const fn menu(
+    root: MenuRoot,
+    section: MenuSection,
+    title: &'static str,
+    visibility: MenuVisibility,
+    role: MenuActionRole,
+) -> CommandMenuSpec {
+    CommandMenuSpec {
+        root,
+        section,
+        title,
+        visibility,
+        role,
+    }
+}
+
+const fn command(
+    action: CommandAction,
+    context: Option<&'static str>,
+    palette: Option<CommandPaletteSpec>,
+    menu: Option<CommandMenuSpec>,
+) -> CommandSpec {
+    CommandSpec {
+        action,
+        context,
+        palette,
+        menu,
+    }
+}
+
+macro_rules! define_commands {
+    ($(($variant:ident, $context:expr, $palette:expr, $menu:expr)),+ $(,)?) => {
+        actions!(
+            termy,
+            [$( $variant, )+]
+        );
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum CommandAction {
+            $( $variant, )+
+        }
+
+        const COMMAND_SPECS: &[CommandSpec] = &[
+            $(command(CommandAction::$variant, $context, $palette, $menu),)+
+        ];
+
+        impl CommandAction {
+            #[cfg(test)]
+            pub fn specs() -> &'static [CommandSpec] {
+                COMMAND_SPECS
+            }
+
+            #[cfg(test)]
+            pub fn all() -> impl std::iter::ExactSizeIterator<Item = Self> + Clone {
+                COMMAND_SPECS.iter().map(|spec| spec.action)
+            }
+
+            #[allow(dead_code)]
+            pub fn from_config_name(name: &str) -> Option<Self> {
+                CommandId::from_config_name(name).map(Self::from_command_id)
+            }
+
+            #[allow(dead_code)]
+            pub fn all_config_names() -> impl std::iter::ExactSizeIterator<Item = &'static str> {
+                CommandId::all_config_names()
+            }
+
+            #[cfg(test)]
+            pub fn palette_entries() -> Vec<CommandPaletteEntry> {
+                Self::palette_entries_for_runtime(false)
+            }
+
+            pub fn palette_entries_for_runtime(tmux_runtime_active: bool) -> Vec<CommandPaletteEntry> {
+                COMMAND_SPECS
+                    .iter()
+                    .filter_map(|spec| {
+                        let palette = spec.palette?;
+                        if !palette.visibility.is_visible_for_runtime(tmux_runtime_active) {
+                            return None;
+                        }
+
+                        Some(CommandPaletteEntry {
+                            action: spec.action,
+                            title: palette.title,
+                            keywords: palette.keywords,
+                        })
+                    })
+                    .collect()
+            }
+
+            pub fn menu_roots() -> &'static [MenuRoot] {
+                &MENU_ROOTS
+            }
+
+            #[cfg(test)]
+            pub fn menu_entries_for_root(root: MenuRoot) -> Vec<CommandMenuEntry> {
+                Self::menu_entries_for_root_for_runtime(root, false)
+            }
+
+            pub fn menu_entries_for_root_for_runtime(
+                root: MenuRoot,
+                tmux_runtime_active: bool,
+            ) -> Vec<CommandMenuEntry> {
+                let mut entries = COMMAND_SPECS
+                    .iter()
+                    .filter_map(|spec| {
+                        let menu = spec.menu?;
+                        if menu.root != root || !menu.visibility.is_visible_for_runtime(tmux_runtime_active) {
+                            return None;
+                        }
+
+                        Some(CommandMenuEntry {
+                            action: spec.action,
+                            root: menu.root,
+                            section: menu.section,
+                            title: menu.title,
+                            role: menu.role,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+
+                // App info is intentionally surfaced from both the app menu and Help.
+                if root == MenuRoot::Help {
+                    entries.push(CommandMenuEntry {
+                        action: CommandAction::AppInfo,
+                        root: MenuRoot::Help,
+                        section: 0,
+                        title: "App Info",
+                        role: MenuActionRole::Normal,
+                    });
+                }
+
+                // Keep menu section ordering deterministic even when command specs are grouped
+                // by action families instead of menu layout.
+                entries.sort_by_key(|entry| entry.section);
+
+                entries
+            }
+
+            pub fn availability(self, caps: CommandCapabilities) -> CommandAvailability {
+                self.to_command_id().availability(caps)
+            }
+
+            pub fn to_menu_item(self, title: &'static str, role: MenuActionRole) -> MenuItem {
+                let os_action = match role {
+                    MenuActionRole::Normal => None,
+                    MenuActionRole::Copy => Some(OsAction::Copy),
+                    MenuActionRole::Paste => Some(OsAction::Paste),
+                    MenuActionRole::SelectAll => Some(OsAction::SelectAll),
+                };
+
+                match self {
+                    $(
+                        Self::$variant => match os_action {
+                            Some(os_action) => MenuItem::os_action(title, $variant, os_action),
+                            None => MenuItem::action(title, $variant),
+                        },
+                    )+
+                }
+            }
+
+            pub fn to_key_binding(self, trigger: &str) -> KeyBinding {
+                match self {
+                    $(Self::$variant => KeyBinding::new(trigger, $variant, $context),)+
+                }
+            }
+
+            pub fn keybinding_label(
+                self,
+                window: &Window,
+                focus_handle: &FocusHandle,
+            ) -> Option<String> {
+                let binding = match self {
+                    $(Self::$variant => window.bindings_for_action_in(&$variant, focus_handle).into_iter().next(),)+
+                };
+
+                binding.map(|binding| {
+                    binding
+                        .keystrokes()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+            }
+        }
+    };
+}
+
+macro_rules! impl_command_action_id_mapping {
+    ($(($variant:ident, $_config_name:literal),)+) => {
+        impl CommandAction {
+            pub fn from_command_id(id: CommandId) -> Self {
+                match id {
+                    $(CommandId::$variant => Self::$variant,)+
+                }
+            }
+
+            #[allow(dead_code)]
+            pub fn to_command_id(self) -> CommandId {
+                match self {
+                    $(Self::$variant => CommandId::$variant,)+
+                }
+            }
+        }
+    };
+}
+
+define_commands!(
+    (
+        NewTab,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "New Tab",
+            "create tab",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::File,
+            0,
+            "New Tab",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (CloseTab, TERMINAL_CONTEXT, None, None),
+    (
+        ClosePaneOrTab,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Close Pane or Tab",
+            "close pane tab remove",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::File,
+            1,
+            "Close Pane or Tab",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        MoveTabLeft,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Move Tab Left",
+            "reorder tab left",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Window,
+            1,
+            "Move Tab Left",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        MoveTabRight,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Move Tab Right",
+            "reorder tab right",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Window,
+            1,
+            "Move Tab Right",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        SwitchTabLeft,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Switch Tab Left",
+            "change active tab left",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Window,
+            1,
+            "Switch Tab Left",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        SwitchTabRight,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Switch Tab Right",
+            "change active tab right",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Window,
+            1,
+            "Switch Tab Right",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        CycleTabs,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Cycle Tabs",
+            "cycle next tab wrap",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Window,
+            1,
+            "Cycle Tabs",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (SwitchToTab1, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab2, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab3, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab4, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab5, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab6, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab7, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab8, TERMINAL_CONTEXT, None, None),
+    (SwitchToTab9, TERMINAL_CONTEXT, None, None),
+    (
+        ManageTmuxSessions,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Tmux Sessions",
+            "tmux sessions attach switch create manage",
+            CommandPaletteVisibility::NotWindows
+        )),
+        Some(menu(
+            MenuRoot::File,
+            1,
+            "Tmux Sessions",
+            MenuVisibility::NotWindows,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ManageSavedLayouts,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Saved Layouts",
+            "saved layouts split panes tabs restore snapshot",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        RunTask,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Run Task",
+            "task run command layout session",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        SplitPaneVertical,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Split Pane Vertical",
+            "split pane vertical right",
+            CommandPaletteVisibility::NotWindows
+        )),
+        Some(menu(
+            MenuRoot::File,
+            1,
+            "Split Pane Vertical",
+            MenuVisibility::NotWindows,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        SplitPaneHorizontal,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Split Pane Horizontal",
+            "split pane horizontal down",
+            CommandPaletteVisibility::NotWindows
+        )),
+        Some(menu(
+            MenuRoot::File,
+            1,
+            "Split Pane Horizontal",
+            MenuVisibility::NotWindows,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ClosePane,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Close Pane",
+            "kill close pane",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        FocusPaneLeft,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Pane Left",
+            "focus pane left",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        FocusPaneRight,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Pane Right",
+            "focus pane right",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        FocusPaneUp,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Pane Up",
+            "focus pane up",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        FocusPaneDown,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Pane Down",
+            "focus pane down",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        FocusPaneNext,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Next Pane",
+            "focus pane next cycle",
+            CommandPaletteVisibility::NotWindows
+        )),
+        Some(menu(
+            MenuRoot::File,
+            1,
+            "Focus Next Pane",
+            MenuVisibility::NotWindows,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        FocusPanePrevious,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Focus Previous Pane",
+            "focus pane previous cycle",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (FocusPane1, TERMINAL_CONTEXT, None, None),
+    (FocusPane2, TERMINAL_CONTEXT, None, None),
+    (FocusPane3, TERMINAL_CONTEXT, None, None),
+    (FocusPane4, TERMINAL_CONTEXT, None, None),
+    (FocusPane5, TERMINAL_CONTEXT, None, None),
+    (FocusPane6, TERMINAL_CONTEXT, None, None),
+    (FocusPane7, TERMINAL_CONTEXT, None, None),
+    (FocusPane8, TERMINAL_CONTEXT, None, None),
+    (FocusPane9, TERMINAL_CONTEXT, None, None),
+    (
+        ResizePaneLeft,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Resize Pane Left",
+            "resize pane left",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        ResizePaneRight,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Resize Pane Right",
+            "resize pane right",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        ResizePaneUp,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Resize Pane Up",
+            "resize pane up",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        ResizePaneDown,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Resize Pane Down",
+            "resize pane down",
+            CommandPaletteVisibility::NotWindows
+        )),
+        None
+    ),
+    (
+        TogglePaneZoom,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Toggle Pane Zoom",
+            "zoom pane maximize",
+            CommandPaletteVisibility::NotWindows
+        )),
+        Some(menu(
+            MenuRoot::View,
+            1,
+            "Toggle Pane Zoom",
+            MenuVisibility::NotWindows,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        MinimizeWindow,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Window,
+            0,
+            "Minimize",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        RenameTab,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Rename Tab",
+            "title name",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::File,
+            0,
+            "Rename Tab",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        AppInfo,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "App Info",
+            "information version about build",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::App,
+            0,
+            "App Info",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        RestartApp,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Restart App",
+            "relaunch reopen restart",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenSettings,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "Settings",
+            "settings preferences options",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::App,
+            1,
+            "Settings...",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        OpenConfig,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "Open Settings File",
+            "settings file config edit",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::App,
+            1,
+            "Open Config File...",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        PrettifyConfig,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "Prettify Settings File",
+            "prettify format config settings file tidy sort",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        ImportColors,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Import Colors",
+            "theme palette json",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            2,
+            "Import Colors",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        SwitchTheme,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Switch Theme",
+            "theme palette colors appearance",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            2,
+            "Switch Theme",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ZoomIn,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Zoom In",
+            "font increase",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            1,
+            "Zoom In",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ZoomOut,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Zoom Out",
+            "font decrease",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            1,
+            "Zoom Out",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ZoomReset,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Reset Zoom",
+            "font default",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            1,
+            "Reset Zoom",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        OpenSearch,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Find",
+            "search lookup text",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Edit,
+            1,
+            "Find",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        CheckForUpdates,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Check for Updates",
+            "release version updater",
+            CommandPaletteVisibility::MacOsOnly
+        )),
+        Some(menu(
+            MenuRoot::App,
+            0,
+            "Check for Updates",
+            MenuVisibility::MacOsOnly,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ViewReleaseNotes,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "View Release Notes",
+            "changelog what's new github release notes this version installed",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Help,
+            0,
+            "Release Notes",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        BrowseReleaseNotes,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Browse Release Notes",
+            "past releases latest changelog what's new github history versions",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Help,
+            0,
+            "Browse Release Notes",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        Quit,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "Quit Termy",
+            "quit exit close",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::App,
+            2,
+            "Quit Termy",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ToggleCommandPalette,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "Command Palette",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        Copy,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Edit,
+            0,
+            "Copy",
+            MenuVisibility::Always,
+            MenuActionRole::Copy
+        ))
+    ),
+    (
+        Paste,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Edit,
+            0,
+            "Paste",
+            MenuVisibility::Always,
+            MenuActionRole::Paste
+        ))
+    ),
+    (
+        SelectAll,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Edit,
+            0,
+            "Select All",
+            MenuVisibility::Always,
+            MenuActionRole::SelectAll
+        ))
+    ),
+    (
+        ClearScreen,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Clear Screen",
+            "clear terminal viewport",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (CloseSearch, TERMINAL_CONTEXT, None, None),
+    (
+        SearchNext,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Edit,
+            1,
+            "Find Next",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        SearchPrevious,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Edit,
+            1,
+            "Find Previous",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (ToggleSearchCaseSensitive, TERMINAL_CONTEXT, None, None),
+    (ToggleSearchRegex, TERMINAL_CONTEXT, None, None),
+    (
+        InstallCli,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Install CLI",
+            "install command line interface terminal shell path",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::Help,
+            0,
+            "Install CLI",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ToggleTabBarVisibility,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Toggle Tab Bar Visibility",
+            "tab bar tabs strip show hide visibility",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "Tab Bar",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ToggleWorkspaceSidebar,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Toggle Workspace Sidebar",
+            "workspace sidebar show hide fade edge peek",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "Workspace Sidebar",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ToggleInspector,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Toggle Inspector",
+            "open show close hide inspector developer debug devtools terminal state keyboard render",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "Inspector",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        ToggleXPanel,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Toggle Panel",
+            "x twitter timeline social panel",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "X Panel",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        OpenXTimeline,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Timeline",
+            "x twitter home timeline posts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXSearch,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Search",
+            "x twitter search posts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXTrends,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Trends",
+            "x twitter trends popular",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXLookup,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Lookup",
+            "x twitter user profile lookup",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXCompose,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Compose",
+            "x twitter draft post compose publish",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXResearch,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Research",
+            "x reddit youtube web research drafts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+);
+
+termy_core::termy_command_catalog!(impl_command_action_id_mapping);
+
+actions!(
+    termy_inline_input,
+    [
+        InlineBackspace,
+        InlineDelete,
+        InlineMoveLeft,
+        InlineMoveRight,
+        InlineSelectLeft,
+        InlineSelectRight,
+        InlineSelectAll,
+        InlineMoveToStart,
+        InlineMoveToEnd,
+        InlineDeleteWordBackward,
+        InlineDeleteWordForward,
+        InlineDeleteToStart,
+        InlineDeleteToEnd,
+    ]
+);
+
+pub fn inline_input_keybindings() -> Vec<KeyBinding> {
+    vec![
+        KeyBinding::new("secondary-c", Copy, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("secondary-v", Paste, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("backspace", InlineBackspace, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("delete", InlineDelete, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("left", InlineMoveLeft, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("right", InlineMoveRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-left", InlineSelectLeft, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-right", InlineSelectRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("secondary-a", InlineSelectAll, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("home", InlineMoveToStart, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("end", InlineMoveToEnd, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("secondary-left", InlineMoveToStart, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("secondary-right", InlineMoveToEnd, INLINE_INPUT_CONTEXT),
+        KeyBinding::new(
+            "alt-backspace",
+            InlineDeleteWordBackward,
+            INLINE_INPUT_CONTEXT,
+        ),
+        KeyBinding::new("alt-delete", InlineDeleteWordForward, INLINE_INPUT_CONTEXT),
+        KeyBinding::new(
+            "secondary-backspace",
+            InlineDeleteToStart,
+            INLINE_INPUT_CONTEXT,
+        ),
+        KeyBinding::new("secondary-delete", InlineDeleteToEnd, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("ctrl-backspace", InlineDeleteToStart, INLINE_INPUT_CONTEXT),
+    ]
+}
+
+#[cfg(test)]
+mod tests;

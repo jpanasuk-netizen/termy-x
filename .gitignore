@@ -1,0 +1,43 @@
+﻿/target
+.codex/
+.DS_Store
+.env
+.env.*
+!.env.example
+./docs/examples/plugins/hello-rust/target
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.build
+
+# DMG / dist
+/dist
+
+# Secrets & local credentials (never commit)
+.xai-key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+**/credentials.json
+**/cookies.json
+**/x-tokens.json
+**/*-tokens.json
+**/secrets.toml
+**/wallet.json
+.npmrc
+.pypirc
+
+# Local agent / scratch
+_*.py
+_*.txt
+post.txt
+preview-post.cmd
+send-post.cmd
+screenshots/*.png
+!screenshots/.gitkeep
+
+# Editor / OS
+*.swp
+*~
+Thumbs.db

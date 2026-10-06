@@ -1,0 +1,74 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/desktop_app",
+    "crates/cli",
+    "crates/x_core",
+    "crates/x_cli",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+flume = "0.11"
+# Keep Termy's own controls and assets; Kit supplies GPUI and the native platforms.
+gpui-kit = { version = "=0.7.0", default-features = false }
+keyring = "4.1.1"
+log = "0.4"
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+polling = "3.11"
+rand_core = { version = "0.6", features = ["getrandom"] }
+semver = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
+unicode-width = "0.2"
+ureq = { version = "2", features = ["json"] }
+url = "2.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+  'cfg(macos_sdk_26)',
+  'cfg(feature, values("cargo-clippy"))',
+] }
+
+[workspace.lints.clippy]
+# ── Correctness & performance ────────────────────────────────────
+redundant_clone = "warn"
+inefficient_to_string = "warn"
+large_types_passed_by_value = "warn"
+unnecessary_wraps = "warn"
+unnested_or_patterns = "warn"
+manual_let_else = "warn"
+semicolon_if_nothing_returned = "warn"
+
+# ── Code quality ─────────────────────────────────────────────────
+cloned_instead_of_copied = "warn"
+flat_map_option = "warn"
+implicit_clone = "warn"
+inconsistent_struct_constructor = "warn"
+macro_use_imports = "warn"
+map_unwrap_or = "warn"
+needless_continue = "warn"
+trivially_copy_pass_by_ref = "warn"
+uninlined_format_args = "warn"
+explicit_iter_loop = "warn"
+ref_as_ptr = "warn"
+single_match_else = "warn"
+
+# ── Safety nets ──────────────────────────────────────────────────
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+[profile.release]
+strip = "symbols"
+
+# Release-equivalent build with symbols retained for Instruments/xctrace.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"

@@ -1,0 +1,18 @@
+[package]
+name = "termy_x_cli"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Termy X command line"
+readme = "README.md"
+default-run = "x"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "x"
+path = "src/main.rs"
+
+[dependencies]
+termy_x = { path = "../x_core" }

@@ -1,0 +1,27 @@
+---
+title: SSH hosts
+description: Save remote hosts and open them in native Termy tabs.
+---
+
+Open **Settings → SSH** to add, edit, or delete a host. Each host keeps a
+display name, hostname, port, username, and either an SSH key path or password
+authentication.
+
+After saving a host, open the new-tab menu and choose it under **SSH Hosts**.
+Termy launches your system OpenSSH client in a normal terminal tab, so
+connection and authentication messages remain visible there.
+
+## Credentials
+
+Leave the password or private-key passphrase blank to enter it interactively
+when OpenSSH asks. If you enter one in Settings, Termy stores it in the system
+Keychain and never in `ssh_hosts.json`, process arguments, logs, or the shell
+command line.
+
+Termy stores only an identity-file path, not a copy of your private key.
+
+## Host verification
+
+OpenSSH still manages host fingerprints and `known_hosts`. Termy does not
+disable strict host-key checks. Review the fingerprint before accepting a new
+host, and treat a changed-host-key warning as a security error.
