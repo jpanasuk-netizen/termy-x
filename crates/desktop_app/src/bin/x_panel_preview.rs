@@ -15,6 +15,7 @@ struct PreviewArgs {
     bench_tabs: bool,
     splash: bool,
     mock: bool,
+    compose: bool,
     width: f32,
     height: f32,
 }
@@ -23,6 +24,7 @@ fn preview_args() -> PreviewArgs {
     let mut args = PreviewArgs {
         splash: false,
         mock: false,
+        compose: false,
         bench_tabs: false,
         width: std::env::var("TERMY_X_PREVIEW_WIDTH")
             .ok()
@@ -38,6 +40,7 @@ fn preview_args() -> PreviewArgs {
         match arg.as_str() {
             "--splash" | "splash" => args.splash = true,
             "--mock" | "mock" => args.mock = true,
+            "--compose" | "compose" => args.compose = true,
             "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
             "--width" => {
                 if let Some(value) = raw.next().and_then(|text| text.parse().ok()) {
@@ -70,9 +73,10 @@ fn preview_args() -> PreviewArgs {
 fn main() {
     let args = preview_args();
     // `--splash` is the empty full-strength bird. `--mock` and the default stay on fixtures.
-    let scene = match (args.splash, args.mock) {
-        (true, _) => "splash",
-        (false, _) => "mock",
+    let scene = match (args.splash, args.compose, args.mock) {
+        (true, _, _) => "splash",
+        (_, true, _) => "compose",
+        _ => "mock",
     };
     let width = args.width;
     let height = args.height;

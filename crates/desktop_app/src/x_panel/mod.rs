@@ -14,18 +14,42 @@ use gpui_kit::{
 
 macro_rules! x_button {
     ($id:expr, $label:expr, $handler:expr) => {
+        x_button!($id, $label, false, $handler)
+    };
+    ($id:expr, $label:expr, $active:expr, $handler:expr) => {{
+        let active = $active;
         div()
             .id($id)
             .px(px(10.0))
             .py(px(6.0))
             .rounded(px(8.0))
-            .bg(rgb(0x1636c9))
+            .border_1()
+            .border_color(if active {
+                rgb(0xff4fa3)
+            } else {
+                tint(0x7af6ff, 55)
+            })
+            .bg(if active {
+                rgb(0x2a0f3a)
+            } else {
+                rgb(0x1636c9)
+            })
             .text_size(px(12.0))
-            .text_color(rgb(0xf8fbff))
+            .text_color(if active {
+                rgb(0xffd0ea)
+            } else {
+                rgb(0xf8fbff)
+            })
             .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x1f4fff))
+                    .border_color(rgb(0x7af6ff))
+                    .text_color(rgb(0xe9fdff))
+            })
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
-    };
+    }};
 }
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
@@ -67,6 +91,19 @@ impl XSection {
     }
 }
 
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiFocus {
+    Compose,
+    Clear,
+    Suggest,
+    Publish,
+    Art,
+    ConfirmCancel,
+    ConfirmCopy,
+    ConfirmNext,
+}
+
 pub struct XPanel {
     focus: FocusHandle,
     section: XSection,
@@ -101,6 +138,18 @@ pub struct XPanel {
     pending_focus: bool,
     /// Suggest variants is running in the background.
     suggesting: bool,
+    /// Compose box owns keyboard input and shows a real caret.
+    compose_focused: bool,
+    /// UTF-8 byte caret inside `compose`.
+    caret: usize,
+    /// Selection anchor; range is between anchor and caret when set.
+    sel_anchor: Option<usize>,
+    /// Blinking caret phase.
+    blink_visible: bool,
+    /// Keyboard / Tab focus target for neon chrome.
+    ui_focus: UiFocus,
+    /// Blink loop started once per panel.
+    blink_running: bool,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -190,6 +239,12 @@ impl XPanel {
             loading: false,
             pending_focus: false,
             suggesting: false,
+            compose_focused: false,
+            caret: 0,
+            sel_anchor: None,
+            blink_visible: true,
+            ui_focus: UiFocus::Compose,
+            blink_running: false,
         };
         // Instant first paint: fixtures on screen, live fetch in the background.
         if fill_window {
@@ -199,6 +254,8 @@ impl XPanel {
             panel.prewarm_art(cx);
             panel.schedule_fetch(XSection::Timeline, cx);
         }
+        panel.caret = panel.compose.len();
+        panel.start_caret_blink(cx);
         panel
     }
 
@@ -222,9 +279,11 @@ impl XPanel {
             if section == XSection::Compose {
                 self.loading = false;
                 self.pending_focus = true;
+                self.focus_compose_editor();
                 // Preview keeps a demo draft; do not auto-run AI.
                 if self.compose.is_empty() {
                     self.compose = "Termy X counts this URL as 23: https://termy.sh".into();
+                    self.caret = self.compose.len();
                 }
             }
             if section == XSection::Search && self.search_posts.is_empty() {
@@ -241,7 +300,8 @@ impl XPanel {
             // Never block: no AI / OpenCLI on the open path. Suggest is a button.
             self.loading = false;
             self.pending_focus = true;
-            self.status = "compose Â· click the box and type Â· Publish opens confirm instantly".into();
+            self.focus_compose_editor();
+            self.status = "compose · click the box · caret blinks · Publish opens confirm instantly".into();
             log_switch(section, started, "compose");
             return;
         }
@@ -559,12 +619,16 @@ impl XPanel {
         self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         self.intent_index = 0;
         self.confirm = true;
+        self.compose_focused = false;
+        self.ui_focus = UiFocus::ConfirmNext;
         self.pending_focus = true;
     }
 
     fn accept_variant(&mut self, index: usize) {
         if let Some(draft) = self.variants.get(index) {
             self.compose = draft.text.clone();
+            self.caret = self.compose.len();
+            self.sel_anchor = None;
             self.drafts.push(Draft {
                 id: new_id(),
                 text: draft.text.clone(),
@@ -586,38 +650,334 @@ impl XPanel {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.section != XSection::Compose || self.confirm {
-            return;
-        }
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
-        // Ctrl/Cmd+V paste â€” common path when focus finally lands on the panel.
+
+        if key == "escape" {
+            if self.confirm {
+                self.confirm = false;
+                self.focus_compose_editor();
+                self.pending_focus = true;
+                cx.notify();
+            }
+            return;
+        }
+
+        if key == "tab" && !mods.control && !mods.platform && !mods.alt {
+            self.cycle_ui_focus(mods.shift);
+            self.pending_focus = true;
+            cx.notify();
+            return;
+        }
+
+        if self.confirm {
+            if key == "enter" && !mods.modified() {
+                match self.ui_focus {
+                    UiFocus::ConfirmCancel => {
+                        self.confirm = false;
+                        self.focus_compose_editor();
+                    }
+                    UiFocus::ConfirmCopy => self.copy_current_part(cx),
+                    UiFocus::ConfirmNext => self.open_current_intent(),
+                    _ => self.open_current_intent(),
+                }
+                self.pending_focus = true;
+                cx.notify();
+            }
+            return;
+        }
+
+        if self.section != XSection::Compose {
+            return;
+        }
+
+        // Activate focused chrome button with Enter.
+        if key == "enter" && !mods.modified() && self.ui_focus != UiFocus::Compose {
+            match self.ui_focus {
+                UiFocus::Clear => {
+                    self.compose.clear();
+                    self.caret = 0;
+                    self.sel_anchor = None;
+                    self.variants.clear();
+                    self.notice = Some("Draft cleared.".into());
+                    self.focus_compose_editor();
+                }
+                UiFocus::Suggest => {
+                    self.suggest_async(cx);
+                    self.focus_compose_editor();
+                }
+                UiFocus::Publish => self.arm_confirm(),
+                UiFocus::Art => self.toggle_art(),
+                _ => {}
+            }
+            self.pending_focus = true;
+            cx.notify();
+            return;
+        }
+
+        // Typing goes to the compose editor.
+        if self.ui_focus != UiFocus::Compose {
+            self.focus_compose_editor();
+        }
+        self.compose_focused = true;
+        self.blink_visible = true;
+
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
             if let Some(item) = cx.read_from_clipboard() {
                 if let Some(clip) = item.text() {
-                    self.compose.push_str(&clip);
+                    self.insert_text(&clip);
                     cx.notify();
                 }
             }
             return;
         }
-        if mods.modified() {
+        if (mods.control || mods.platform) && key.eq_ignore_ascii_case("a") {
+            self.sel_anchor = Some(0);
+            self.caret = self.compose.len();
+            cx.notify();
+            return;
+        }
+        if (mods.control || mods.platform) && key.eq_ignore_ascii_case("c") {
+            if let Some((a, b)) = self.selection_range() {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                    self.compose[a..b].to_string(),
+                ));
+            }
+            return;
+        }
+
+        if key == "left" {
+            self.move_caret(CaretMove::Left, mods.shift);
+            cx.notify();
+            return;
+        }
+        if key == "right" {
+            self.move_caret(CaretMove::Right, mods.shift);
+            cx.notify();
+            return;
+        }
+        if key == "up" || key == "home" {
+            self.move_caret(CaretMove::LineStart, mods.shift);
+            cx.notify();
+            return;
+        }
+        if key == "down" || key == "end" {
+            self.move_caret(CaretMove::LineEnd, mods.shift);
+            cx.notify();
+            return;
+        }
+
+        if mods.modified() && key != "backspace" && key != "delete" {
             return;
         }
         if key == "backspace" {
-            self.compose.pop();
+            self.backspace();
+        } else if key == "delete" {
+            self.delete_forward();
         } else if key == "space" {
-            self.compose.push(' ');
+            self.insert_text(" ");
         } else if key == "enter" {
-            self.compose.push('\n');
+            self.insert_text("\n");
         } else if key.chars().count() == 1 {
-            self.compose.push_str(key);
+            self.insert_text(key);
         } else {
             return;
         }
         cx.notify();
     }
+
+    fn focus_compose_editor(&mut self) {
+        self.compose_focused = true;
+        self.ui_focus = UiFocus::Compose;
+        self.blink_visible = true;
+        self.caret = self.caret.min(self.compose.len());
+    }
+
+    fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_running {
+            return;
+        }
+        self.blink_running = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(530))
+                    .await;
+                let keep = this
+                    .update(cx, |panel, cx| {
+                        if panel.compose_focused && !panel.confirm && panel.section == XSection::Compose
+                        {
+                            panel.blink_visible = !panel.blink_visible;
+                            cx.notify();
+                        } else {
+                            panel.blink_visible = true;
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.sel_anchor?;
+        let a = anchor.min(self.caret);
+        let b = anchor.max(self.caret);
+        if a == b {
+            None
+        } else {
+            Some((a, b))
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        if let Some((a, b)) = self.selection_range() {
+            self.compose.replace_range(a..b, text);
+            self.caret = a + text.len();
+        } else {
+            let at = self.caret.min(self.compose.len());
+            self.compose.insert_str(at, text);
+            self.caret = at + text.len();
+        }
+        self.clear_selection();
+        self.blink_visible = true;
+    }
+
+    fn backspace(&mut self) {
+        if let Some((a, b)) = self.selection_range() {
+            self.compose.replace_range(a..b, "");
+            self.caret = a;
+            self.clear_selection();
+            self.blink_visible = true;
+            return;
+        }
+        if self.caret == 0 {
+            return;
+        }
+        let prev = prev_boundary(&self.compose, self.caret);
+        self.compose.replace_range(prev..self.caret, "");
+        self.caret = prev;
+        self.blink_visible = true;
+    }
+
+    fn delete_forward(&mut self) {
+        if let Some((a, b)) = self.selection_range() {
+            self.compose.replace_range(a..b, "");
+            self.caret = a;
+            self.clear_selection();
+            self.blink_visible = true;
+            return;
+        }
+        if self.caret >= self.compose.len() {
+            return;
+        }
+        let next = next_boundary(&self.compose, self.caret);
+        self.compose.replace_range(self.caret..next, "");
+        self.blink_visible = true;
+    }
+
+    fn move_caret(&mut self, motion: CaretMove, extend: bool) {
+        if extend && self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.caret);
+        } else if !extend {
+            self.clear_selection();
+        }
+        match motion {
+            CaretMove::Left => self.caret = prev_boundary(&self.compose, self.caret),
+            CaretMove::Right => self.caret = next_boundary(&self.compose, self.caret),
+            CaretMove::LineStart => {
+                let head = self.compose[..self.caret]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                self.caret = head;
+            }
+            CaretMove::LineEnd => {
+                let tail = self.compose[self.caret..]
+                    .find('\n')
+                    .map(|i| self.caret + i)
+                    .unwrap_or(self.compose.len());
+                self.caret = tail;
+            }
+        }
+        self.blink_visible = true;
+    }
+
+    fn cycle_ui_focus(&mut self, reverse: bool) {
+        let order = if self.confirm {
+            [
+                UiFocus::ConfirmCancel,
+                UiFocus::ConfirmCopy,
+                UiFocus::ConfirmNext,
+            ]
+            .as_slice()
+        } else if self.section == XSection::Compose {
+            [
+                UiFocus::Compose,
+                UiFocus::Clear,
+                UiFocus::Suggest,
+                UiFocus::Publish,
+                UiFocus::Art,
+            ]
+            .as_slice()
+        } else {
+            [UiFocus::Art].as_slice()
+        };
+        let idx = order.iter().position(|f| *f == self.ui_focus).unwrap_or(0);
+        let next = if reverse {
+            if idx == 0 {
+                order.len() - 1
+            } else {
+                idx - 1
+            }
+        } else {
+            (idx + 1) % order.len()
+        };
+        self.ui_focus = order[next];
+        self.compose_focused = self.ui_focus == UiFocus::Compose && !self.confirm;
+        self.blink_visible = true;
+    }
 }
+
+#[derive(Clone, Copy)]
+enum CaretMove {
+    Left,
+    Right,
+    LineStart,
+    LineEnd,
+}
+
+fn prev_boundary(text: &str, offset: usize) -> usize {
+    if offset == 0 {
+        return 0;
+    }
+    let offset = offset.min(text.len());
+    text[..offset]
+        .char_indices()
+        .next_back()
+        .map(|(i, _)| i)
+        .unwrap_or(0)
+}
+
+fn next_boundary(text: &str, offset: usize) -> usize {
+    if offset >= text.len() {
+        return text.len();
+    }
+    text[offset..]
+        .chars()
+        .next()
+        .map(|c| offset + c.len_utf8())
+        .unwrap_or(text.len())
+}
+
 
 fn fetch_section(
     section: XSection,
@@ -867,15 +1227,39 @@ impl XPanel {
                         .child("Termy X"),
                 ),
             )
-            .child(
+            .child({
+                let art_focus = self.ui_focus == UiFocus::Art;
                 div()
                     .id("x-art-toggle")
                     .px(px(10.0))
                     .py(px(4.0))
                     .rounded(px(999.0))
-                    .bg(tint(0x102033, 180))
+                    .border_1()
+                    .border_color(if art_focus {
+                        rgb(0xff4fa3)
+                    } else if self.background_art {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 40)
+                    })
+                    .bg(if art_focus {
+                        rgb(0x2a0f3a)
+                    } else {
+                        tint(0x102033, 180)
+                    })
                     .text_size(px(12.0))
+                    .text_color(if art_focus {
+                        rgb(0xffd0ea)
+                    } else {
+                        rgb(0xe7eefc)
+                    })
                     .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0x1a3050))
+                            .border_color(rgb(0x7af6ff))
+                            .text_color(rgb(0x7af6ff))
+                    })
                     .child(if self.background_art {
                         "Art on"
                     } else {
@@ -884,12 +1268,13 @@ impl XPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.ui_focus = UiFocus::Art;
                             this.toggle_art();
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    ),
-            )
+                    )
+            })
     }
 
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -908,17 +1293,33 @@ impl XPanel {
                 let active = section == current;
                 div()
                     .id(SharedString::from(format!("x-tab-{}", section.label())))
-                    .px(px(8.0))
-                    .py(px(4.0))
+                    .px(px(10.0))
+                    .py(px(5.0))
                     .rounded(px(8.0))
                     .text_size(px(12.0))
                     .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 25)
+                    })
                     .bg(if active {
-                        tint(0x1d4ed8, 210)
+                        rgb(0x122a55)
                     } else {
                         tint(0x101826, 170)
                     })
-                    .text_color(if active { rgb(0xf8fbff) } else { rgb(0xb7c3dc) })
+                    .text_color(if active {
+                        rgb(0x7af6ff)
+                    } else {
+                        rgb(0xb7c3dc)
+                    })
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0x1a3050))
+                            .border_color(rgb(0xff4fa3))
+                            .text_color(rgb(0xffd0ea))
+                    })
                     .child(section.label())
                     .on_mouse_down(
                         MouseButton::Left,
@@ -1153,20 +1554,14 @@ impl XPanel {
     fn compose_block(&self, weighted: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let counter = format!("{weighted} / 280");
         let suggest_label = if self.suggesting {
-            "Suggestingâ€¦"
+            "Suggesting…"
         } else {
             "Suggest variants"
         };
-        let editor_body = if self.compose.is_empty() {
-            "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.".to_string()
-        } else {
-            self.compose.clone()
-        };
-        let editor_color = if self.compose.is_empty() {
-            rgb(0x93a4c3)
-        } else {
-            rgb(0xf8fbff)
-        };
+        let clear_active = self.ui_focus == UiFocus::Clear;
+        let suggest_active = self.ui_focus == UiFocus::Suggest;
+        let publish_active = self.ui_focus == UiFocus::Publish;
+        let editor_focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
         div()
             .flex()
             .flex_col()
@@ -1177,21 +1572,26 @@ impl XPanel {
                     .flex()
                     .gap(px(8.0))
                     .flex_wrap()
-                    .child(x_button!("x-clear", "Clear", cx.listener(|this, _, _, cx| {
+                    .child(x_button!("x-clear", "Clear", clear_active, cx.listener(|this, _, _, cx| {
                         this.compose.clear();
+                        this.caret = 0;
+                        this.sel_anchor = None;
                         this.variants.clear();
                         this.notice = Some("Draft cleared.".into());
+                        this.focus_compose_editor();
                         this.pending_focus = true;
                         cx.stop_propagation();
                         cx.notify();
                     })))
-                    .child(x_button!("x-suggest", suggest_label, cx.listener(|this, _, _, cx| {
+                    .child(x_button!("x-suggest", suggest_label, suggest_active, cx.listener(|this, _, _, cx| {
                         this.suggest_async(cx);
+                        this.focus_compose_editor();
                         this.pending_focus = true;
                         cx.stop_propagation();
                         cx.notify();
                     })))
-                    .child(x_button!("x-publish", "Publish", cx.listener(|this, _, _, cx| {
+                    .child(x_button!("x-publish", "Publish", publish_active, cx.listener(|this, _, _, cx| {
+                        this.ui_focus = UiFocus::ConfirmNext;
                         this.arm_confirm();
                         cx.stop_propagation();
                         cx.notify();
@@ -1201,29 +1601,56 @@ impl XPanel {
                 div()
                     .id("x-compose-editor")
                     .p(px(12.0))
-                    .min_h(px(120.0))
+                    .min_h(px(132.0))
                     .rounded(px(12.0))
-                    .bg(tint(0x0c1422, 235))
+                    .bg(if editor_focused {
+                        tint(0x0f1c33, 245)
+                    } else {
+                        tint(0x0c1422, 235)
+                    })
                     .border_1()
-                    .border_color(rgb(0x7af6ff))
+                    .border_color(if editor_focused {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 70)
+                    })
                     .cursor_pointer()
+                    .hover(|style| style.border_color(rgb(0xff4fa3)))
                     .child(
                         div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0x9ad7ff))
-                            .child("Compose"),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(if editor_focused {
+                                        rgb(0x7af6ff)
+                                    } else {
+                                        rgb(0x9ad7ff)
+                                    })
+                                    .child(if editor_focused {
+                                        "Compose · focused"
+                                    } else {
+                                        "Compose · click to focus"
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(0xf0a8d0))
+                                    .child("Tab cycles · Esc cancels confirm"),
+                            ),
                     )
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .text_size(px(14.0))
-                            .text_color(editor_color)
-                            .child(editor_body),
-                    )
+                    .child(self.render_compose_editor())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.focus.focus(window, cx);
+                            this.focus_compose_editor();
+                            // Click jumps caret to end; arrows refine position.
+                            this.caret = this.compose.len();
+                            this.sel_anchor = None;
                             this.pending_focus = false;
                             cx.stop_propagation();
                             cx.notify();
@@ -1250,30 +1677,147 @@ impl XPanel {
             }))
             .children(self.drafts.iter().map(|draft| {
                 card(
-                    format!("Draft Â· {}", draft.tone.as_deref().unwrap_or("note")),
+                    format!("Draft · {}", draft.tone.as_deref().unwrap_or("note")),
                     draft.text.clone(),
                 )
             }))
             .children(self.variants.iter().enumerate().map(|(index, draft)| {
-                let label = format!("Variant {} Â· {}", index + 1, draft.source);
+                let label = format!("Variant {} · {}", index + 1, draft.source);
                 div()
                     .id(SharedString::from(format!("x-variant-{index}")))
                     .p(px(10.0))
                     .rounded(px(10.0))
                     .bg(tint(0x10192b, 220))
+                    .border_1()
+                    .border_color(tint(0xff4fa3, 55))
                     .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0x1a1030))
+                            .border_color(rgb(0xff4fa3))
+                    })
                     .child(div().text_size(px(11.0)).text_color(rgb(0xf0a8d0)).child(label))
                     .child(div().mt(px(4.0)).text_size(px(13.0)).child(draft.text.clone()))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             this.accept_variant(index);
+                            this.focus_compose_editor();
                             this.pending_focus = true;
                             cx.stop_propagation();
                             cx.notify();
                         }),
                     )
             }))
+            .into_any_element()
+    }
+
+    fn render_compose_editor(&self) -> gpui_kit::AnyElement {
+        let focused =
+            self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
+        let show_caret = focused && self.blink_visible;
+        let caret = self.caret.min(self.compose.len());
+        let sel = self.selection_range();
+
+        if self.compose.is_empty() {
+            return div()
+                .mt(px(8.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0x93a4c3))
+                        .child(
+                            "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.",
+                        ),
+                )
+                .children(show_caret.then(|| self.caret_bar()))
+                .into_any_element();
+        }
+
+        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
+        let text = self.compose.as_str();
+        let mut offset = 0usize;
+        let parts: Vec<&str> = text.split('\n').collect();
+        for (idx, line) in parts.iter().enumerate() {
+            let line_start = offset;
+            let line_end = line_start + line.len();
+            let caret_on_line = caret >= line_start && caret <= line_end;
+            let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
+
+            // Build character runs: [start, end, selected]
+            let mut marks = vec![0usize, line.len()];
+            if caret_on_line {
+                marks.push((caret - line_start).min(line.len()));
+            }
+            if let Some((sa, sb)) = sel {
+                marks.push(sa.saturating_sub(line_start).min(line.len()));
+                marks.push(sb.saturating_sub(line_start).min(line.len()));
+            }
+            marks.sort_unstable();
+            marks.dedup();
+
+            let mut caret_drawn = false;
+            for window in marks.windows(2) {
+                let (s, e) = (window[0], window[1]);
+                if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == s {
+                    row = row.child(self.caret_bar());
+                    caret_drawn = true;
+                }
+                if s < e {
+                    let abs_s = line_start + s;
+                    let abs_e = line_start + e;
+                    let selected = sel
+                        .map(|(sa, sb)| abs_s >= sa && abs_e <= sb)
+                        .unwrap_or(false);
+                    let chunk = &line[s..e];
+                    let mut el = div().text_size(px(14.0));
+                    if selected {
+                        el = el
+                            .px(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(tint(0xff4fa3, 130))
+                            .text_color(rgb(0xffe8f5));
+                    } else {
+                        el = el.text_color(rgb(0xf8fbff));
+                    }
+                    row = row.child(el.child(chunk.to_string()));
+                }
+                if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == e {
+                    row = row.child(self.caret_bar());
+                    caret_drawn = true;
+                }
+            }
+            if show_caret && caret_on_line && !caret_drawn {
+                row = row.child(self.caret_bar());
+            }
+            if line.is_empty() && !(show_caret && caret_on_line) {
+                row = row.child(div().text_size(px(14.0)).text_color(rgb(0xf8fbff)).child(" "));
+            }
+
+            rows.push(row.into_any_element());
+            offset = line_end + if idx + 1 < parts.len() { 1 } else { 0 };
+        }
+
+        div()
+            .mt(px(8.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn caret_bar(&self) -> gpui_kit::AnyElement {
+        div()
+            .w(px(2.0))
+            .h(px(16.0))
+            .rounded(px(1.0))
+            .bg(rgb(0x7af6ff))
+            .flex_none()
             .into_any_element()
     }
 
@@ -1372,29 +1916,35 @@ impl XPanel {
                             .text_color(rgb(0x9ad7ff))
                             .child(url),
                     )
-                    .child(
+                    .child({
+                        let cancel_active = self.ui_focus == UiFocus::ConfirmCancel;
+                        let copy_active = self.ui_focus == UiFocus::ConfirmCopy;
+                        let next_active = self.ui_focus == UiFocus::ConfirmNext;
                         div()
                             .flex()
                             .gap(px(8.0))
                             .flex_wrap()
-                            .child(x_button!("x-cancel", "Cancel", cx.listener(|this, _, _, cx| {
+                            .child(x_button!("x-cancel", "Cancel", cancel_active, cx.listener(|this, _, _, cx| {
                                 this.confirm = false;
+                                this.focus_compose_editor();
                                 this.pending_focus = true;
                                 cx.stop_propagation();
                                 cx.notify();
                             })))
-                            .child(x_button!("x-copy", "Copy", cx.listener(|this, _, _, cx| {
+                            .child(x_button!("x-copy", "Copy", copy_active, cx.listener(|this, _, _, cx| {
+                                this.ui_focus = UiFocus::ConfirmCopy;
                                 this.copy_current_part(cx);
                                 cx.stop_propagation();
                                 cx.notify();
                             })))
-                            .child(x_button!("x-next-post", "Next post", cx.listener(|this, _, _, cx| {
+                            .child(x_button!("x-next-post", "Next post", next_active, cx.listener(|this, _, _, cx| {
+                                this.ui_focus = UiFocus::ConfirmNext;
                                 // Open browser after confirm; spawn is non-blocking.
                                 this.open_current_intent();
                                 cx.stop_propagation();
                                 cx.notify();
-                            }))),
-                    ),
+                            })))
+                    }),
             )
     }
 
@@ -1461,6 +2011,11 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
         .bg(tint(0x0c1422, 225))
         .border_1()
         .border_color(tint(0x7af6ff, 40))
+        .hover(|style| {
+            style
+                .bg(tint(0x122038, 245))
+                .border_color(rgb(0x7af6ff))
+        })
         .child(
             div()
                 .text_size(px(13.0))
