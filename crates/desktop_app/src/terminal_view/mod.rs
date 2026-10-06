@@ -71,6 +71,7 @@ mod command_palette;
 mod constants;
 mod inline_input;
 mod inspector;
+mod x_host;
 mod interaction;
 mod kitty_images;
 #[cfg(target_os = "macos")]
@@ -1364,6 +1365,8 @@ pub struct TerminalView {
     benchmark_exit_scheduled: bool,
     show_debug_overlay: bool,
     inspector: inspector::InspectorState,
+    x_panel: Option<gpui_kit::Entity<termy::x_panel::XPanel>>,
+    x_panel_open: bool,
     debug_overlay_stats: DebugOverlayStats,
     install_cli_available: bool,
     tab_strip: TabStripState,
@@ -3325,6 +3328,8 @@ impl TerminalView {
             benchmark_exit_scheduled: false,
             show_debug_overlay: config.show_debug_overlay,
             inspector: inspector::InspectorState::new(config.inspector_height),
+            x_panel: None,
+            x_panel_open: false,
             debug_overlay_stats: DebugOverlayStats::new(),
             install_cli_available: Self::install_cli_available_from_system(),
             tab_strip: TabStripState::new(config.tab_switch_modifier_hints),

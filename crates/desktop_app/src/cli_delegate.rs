@@ -43,6 +43,7 @@ fn is_cli_entrypoint(arg: &str) -> bool {
             | "-version"
             | "plugin"
             | "mux"
+            | "x"
             | "-list-fonts"
             | "-list-keybinds"
             | "-list-themes"
@@ -141,6 +142,7 @@ mod tests {
         for command in [
             "plugin",
             "mux",
+            "x",
             "-list-fonts",
             "-list-keybinds",
             "-list-themes",

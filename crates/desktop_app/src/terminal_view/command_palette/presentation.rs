@@ -61,6 +61,10 @@ pub(super) fn command_icon_path(id: CommandId) -> &'static str {
         ToggleTabBarVisibility => "icons/settings/tabs.svg",
         ToggleWorkspaceSidebar => "icons/command_palette/sidebar.svg",
         ToggleInspector => "icons/settings/advanced.svg",
+        ToggleXPanel | OpenXTimeline | OpenXCompose => "icons/command_palette/sidebar.svg",
+        OpenXSearch => "icons/settings/search.svg",
+        OpenXTrends | OpenXResearch => "icons/command_palette/link.svg",
+        OpenXLookup => "icons/command_palette/info.svg",
     }
 }
 
@@ -146,6 +150,8 @@ pub(super) fn command_category(id: CommandId) -> &'static str {
         OpenConfig | PrettifyConfig | OpenSettings | InstallCli => "Settings",
         AppInfo | RestartApp | CheckForUpdates | ViewReleaseNotes | BrowseReleaseNotes | Quit
         | ToggleCommandPalette | ToggleInspector => "App",
+        ToggleXPanel | OpenXTimeline | OpenXSearch | OpenXTrends | OpenXLookup | OpenXCompose
+        | OpenXResearch => "X",
     }
 }
 

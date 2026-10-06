@@ -88,6 +88,100 @@ Termy is supported by companies and people who care about fast, native developer
   </a>
 </p>
 
+## Termy X
+
+Termy X is a fork layer on [Termy](https://github.com/lassejlv/termy) (MIT, © Lasse Jørgensen). The terminal itself is unchanged. X reads, drafts, and publishing live in `crates/x_core` so upstream merges stay small. The desktop app gains a side panel; the CLI gains `termy x` and a standalone `x` binary.
+
+No X API credits are required. The official API is off unless you set `official_api.enabled = true`.
+
+### Commands
+
+```bash
+x doctor
+x timeline
+x search "gpui" --recent --limit 10
+x lookup @termy
+x post 1001
+x trends --place worldwide
+x popular gpui
+x draft "ship the panel" --n 3 --tone punchy
+x compose --text "hello from the terminal"
+x publish <draft-id>          # asks [y/N], prints the exact text first
+x publish <draft-id> --dry-run
+x research "gpui terminals"
+termy x doctor                # same commands through the Termy CLI
+```
+
+`--json` prints machine-readable output. `--provider mock` forces fixtures (what the tests use). Tones for `x draft` are `punchy`, `informative`, `thread`, and `reply`.
+
+`x publish` never posts until you answer `y`. It prints the exact text, the weighted character count (URLs count as 23, limit 280), and the web-intent URLs. `--dry-run` stops after that.
+
+### Free providers
+
+Reads try, in order:
+
+1. [OpenCLI](https://github.com/jackwener/opencli) `twitter` adapter (`profile`, `thread`, `search`, `timeline`, `trending`). Uses your logged-in Chrome session and the Browser Bridge extension. Termy X does not automate login or store passwords.
+2. [twitter-cli](https://github.com/public-clis/twitter-cli), the X path used by [Agent Reach](https://github.com/Panniantong/Agent-Reach). Auth is your own cookie (`TWITTER_AUTH_TOKEN` and `TWITTER_CT0`, or the browser cookie jar). Trends are derived from search results ranked by engagement when a trends endpoint is missing.
+3. Built-in mock fixtures, so the app and tests run with nothing installed.
+
+Publishing tries, in order, and still requires the confirm step:
+
+1. `opencli twitter post` / `opencli twitter reply`
+2. `twitter post` / `twitter post --reply-to`
+3. An X web intent: `https://x.com/intent/post?text=...` (and `in_reply_to` on the first post of a thread). Termy X opens it in the browser; you click Post. The panel's "Next post" button copies the next intent URL.
+
+`x doctor` reports which of these are installed and states that no X API credits are needed. Cookie and browser-session providers are labeled "uses your own logged-in session".
+
+### Optional official API
+
+Create an app at the X developer portal, set `official_api.enabled = true`, and export the client id:
+
+```bash
+export TERMY_X_CLIENT_ID=...
+x auth
+```
+
+`x auth` prints an OAuth 2.0 PKCE authorize URL (scopes include `tweet.read` and `tweet.write`) and can exchange a code into the OS keychain (service `termy-x`) or a `0600` file. The localhost callback listener is not started for you; paste the redirect yourself only if you finish the exchange out of band. Cost figures in the status line are labeled estimates (post read $0.005, user read $0.010, post write $0.010) and are not a bill.
+
+### AI drafts
+
+Drafts stay drafts. Nothing is auto-posted.
+
+```bash
+export TERMY_X_AI_BASE_URL=http://127.0.0.1:11434/v1   # Ollama
+export TERMY_X_AI_MODEL=llama3.2
+# export TERMY_X_AI_API_KEY=...   # Groq or OpenRouter, when the server requires one
+x draft "ship the panel" --tone informative
+```
+
+Other free OpenAI-compatible servers: Groq (`https://api.groq.com/openai/v1`) and OpenRouter free models (`https://openrouter.ai/api/v1`). If those variables are unset, `x draft` uses local templates and labels them `template`, not a model. Prompt text lives in `crates/x_core/prompts/default.toml`.
+
+### Config
+
+`x config` prints an example. The file is `~/.config/termy/x.toml`.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `background_art` | `true` | Geometric swift behind the panel, and the CLI splash |
+| `provider` | `auto` | `auto`, `opencli`, `twitter`, `mock`, or `official` |
+| `default_limit` | `10` | Page size, clamped to 20 on the CLI |
+| `official_api.enabled` | `false` | Turn on the paid API |
+| `ai.base_url_env` | `TERMY_X_AI_BASE_URL` | Env var that holds the chat endpoint |
+| `shell.min_interval_ms` | `1500` | Pause between shell-outs |
+
+### Desktop panel
+
+Open it with `Ctrl+Shift+X` (`Cmd+Shift+X` on macOS) or the command palette entries under X: Timeline, Search, Trends, Lookup, Compose, Research. Compose shows a live preview, the weighted counter, thread splits, and "Suggest variants". Publish opens a confirm dialog with the exact text.
+
+The background is an original low-poly swift (electric blue and cyan, magenta heart with a `+1`) in `assets/x/termy-x-bird.svg`, drawn for a 3440×1440 frame and scaled with object-fit cover. Behind lists it sits under a dark veil so the art reads at about 20% strength. The empty splash shows it at full strength. "Art on/off" writes `background_art` into `x.toml`. The CLI prints a small ANSI bird when that flag is on.
+
+Preview the panel on fixture data:
+
+```bash
+cargo run -p termy --bin x_panel_preview -- timeline
+TERMY_X_PREVIEW_WIDTH=3440 TERMY_X_PREVIEW_HEIGHT=900 cargo run -p termy --bin x_panel_preview -- splash
+```
+
 ## Roadmap and contributing
 
 - [Engineering quality roadmap](./docs/engineering/roadmap.md)

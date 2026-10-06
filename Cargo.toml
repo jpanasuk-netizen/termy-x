@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/core", "crates/desktop_app", "crates/cli"]
+members = [
+    "crates/core",
+    "crates/desktop_app",
+    "crates/cli",
+    "crates/x_core",
+    "crates/x_cli",
+]
 resolver = "2"
 
 [workspace.dependencies]

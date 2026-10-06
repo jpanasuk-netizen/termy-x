@@ -43,6 +43,7 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 sha2 = { workspace = true }
 unicode-width = { workspace = true }
 termy_core = { path = "../core" }
+termy_x = { path = "../x_core" }
 
 
 [target."cfg(not(target_os = \"windows\"))".dependencies]

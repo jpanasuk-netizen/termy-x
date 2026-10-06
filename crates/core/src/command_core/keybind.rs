@@ -228,6 +228,10 @@ pub fn default_keybinds_for_platform(platform: KeybindPlatform) -> Vec<DefaultKe
             trigger: "secondary-alt-i",
             action: CommandId::ToggleInspector,
         },
+        DefaultKeybind {
+            trigger: "secondary-shift-x",
+            action: CommandId::ToggleXPanel,
+        },
     ];
 
     if matches!(platform, KeybindPlatform::MacOs) {

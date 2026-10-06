@@ -76,6 +76,13 @@ macro_rules! termy_command_catalog {
             (ToggleTabBarVisibility, "toggle_tab_bar_visibility"),
             (ToggleWorkspaceSidebar, "toggle_workspace_sidebar"),
             (ToggleInspector, "toggle_inspector"),
+            (ToggleXPanel, "toggle_x_panel"),
+            (OpenXTimeline, "open_x_timeline"),
+            (OpenXSearch, "open_x_search"),
+            (OpenXTrends, "open_x_trends"),
+            (OpenXLookup, "open_x_lookup"),
+            (OpenXCompose, "open_x_compose"),
+            (OpenXResearch, "open_x_research"),
         }
     };
 }

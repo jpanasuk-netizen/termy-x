@@ -118,6 +118,13 @@ enum Action {
         force: bool,
     },
 
+    /// Termy X commands. Free paths by default; no X API credits required.
+    X {
+        /// Arguments forwarded to the `x` command set
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Validate a Termy themes repo checkout
     #[command(name = "-validate-theme-repo")]
     ValidateThemeRepo {
@@ -257,6 +264,10 @@ fn main() {
             force,
         }) => commands::theme_repo::export_theme(repo, slug, name, version, description, force),
         Some(Action::ValidateThemeRepo { repo }) => commands::theme_repo::validate_theme_repo(repo),
+        Some(Action::X { args }) => {
+            let code = termy_x::cli::execute(&args, &mut termy_x::cli::CliIo::live(), true);
+            std::process::exit(code);
+        }
         None => {
             // No subcommand: show help
             commands::help::run();

@@ -192,6 +192,27 @@ impl TerminalView {
             CommandAction::ToggleInspector => {
                 self.toggle_inspector(cx);
             }
+            CommandAction::ToggleXPanel => {
+                self.toggle_x_panel(cx);
+            }
+            CommandAction::OpenXTimeline => {
+                self.open_x_section(termy::x_panel::XSection::Timeline, cx);
+            }
+            CommandAction::OpenXSearch => {
+                self.open_x_section(termy::x_panel::XSection::Search, cx);
+            }
+            CommandAction::OpenXTrends => {
+                self.open_x_section(termy::x_panel::XSection::Trends, cx);
+            }
+            CommandAction::OpenXLookup => {
+                self.open_x_section(termy::x_panel::XSection::Lookup, cx);
+            }
+            CommandAction::OpenXCompose => {
+                self.open_x_section(termy::x_panel::XSection::Compose, cx);
+            }
+            CommandAction::OpenXResearch => {
+                self.open_x_section(termy::x_panel::XSection::Research, cx);
+            }
             _ if shortcuts_suspended => {}
             CommandAction::OpenConfig
             | CommandAction::PrettifyConfig
@@ -393,6 +414,69 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.execute_command_action(CommandAction::ToggleInspector, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_toggle_x_panel_action(
+        &mut self,
+        _: &commands::ToggleXPanel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::ToggleXPanel, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_timeline_action(
+        &mut self,
+        _: &commands::OpenXTimeline,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXTimeline, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_search_action(
+        &mut self,
+        _: &commands::OpenXSearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXSearch, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_trends_action(
+        &mut self,
+        _: &commands::OpenXTrends,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXTrends, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_lookup_action(
+        &mut self,
+        _: &commands::OpenXLookup,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXLookup, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_compose_action(
+        &mut self,
+        _: &commands::OpenXCompose,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXCompose, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_x_research_action(
+        &mut self,
+        _: &commands::OpenXResearch,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenXResearch, true, window, cx);
     }
 
     pub(in super::super) fn handle_new_tab_action(

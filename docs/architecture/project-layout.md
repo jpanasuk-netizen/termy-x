@@ -1,7 +1,11 @@
 # Project Layout
 
-The workspace has three packages: desktop, CLI, and core. Add modules within the
+The workspace has three Termy packages: desktop, CLI, and core. Add modules within the
 appropriate package instead of creating a crate for each helper.
+
+Termy X adds two more crates so the terminal stays easy to merge from upstream:
+`crates/x_core` (`termy_x`, headless) and `crates/x_cli` (the `x` binary). The
+desktop panel lives in `crates/desktop_app/src/x_panel` and only calls `termy_x`.
 
 ## Desktop: `crates/desktop_app` (`termy`)
 
@@ -39,7 +43,15 @@ C exports and header contracts are unchanged.
 - `src/xtask/`: repository automation, generated documentation, dependency checks, and performance tooling.
 
 The default binary is `termy-cli`. Run repository tooling with
-`cargo run -p termy_cli --bin xtask -- <command>`.
+`cargo run -p termy_cli --bin xtask -- <command>`. `termy x` delegates to the
+same command set as the standalone `x` binary.
+
+## Termy X: `crates/x_core` (`termy_x`) and `crates/x_cli`
+
+- `crates/x_core`: provider trait, free-path fallback, mock fixtures, weighted length, publish confirmation, drafts, and AI requests. No GPUI.
+- `crates/x_cli`: the `x` executable. Behavior stays in `termy_x`.
+- `crates/desktop_app/src/x_panel`: the side panel. Background art is `assets/x/termy-x-bird.svg`.
+- `crates/desktop_app/src/bin/x_panel_preview.rs`: opens the panel on fixture data for review.
 
 ## Repository support
 

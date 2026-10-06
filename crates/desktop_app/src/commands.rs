@@ -1138,6 +1138,82 @@ define_commands!(
             MenuActionRole::Normal
         ))
     ),
+    (
+        ToggleXPanel,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Toggle Panel",
+            "x twitter timeline social panel",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "X Panel",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        OpenXTimeline,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Timeline",
+            "x twitter home timeline posts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXSearch,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Search",
+            "x twitter search posts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXTrends,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Trends",
+            "x twitter trends popular",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXLookup,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Lookup",
+            "x twitter user profile lookup",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXCompose,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Compose",
+            "x twitter draft post compose publish",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
+    (
+        OpenXResearch,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "X: Research",
+            "x reddit youtube web research drafts",
+            CommandPaletteVisibility::Always
+        )),
+        None
+    ),
 );
 
 termy_core::termy_command_catalog!(impl_command_action_id_mapping);

@@ -3902,6 +3902,13 @@ impl Render for TerminalView {
                     })
                     .on_action(cx.listener(Self::handle_toggle_tab_bar_visibility_action))
                     .on_action(cx.listener(Self::handle_toggle_inspector_action))
+                    .on_action(cx.listener(Self::handle_toggle_x_panel_action))
+                    .on_action(cx.listener(Self::handle_open_x_timeline_action))
+                    .on_action(cx.listener(Self::handle_open_x_search_action))
+                    .on_action(cx.listener(Self::handle_open_x_trends_action))
+                    .on_action(cx.listener(Self::handle_open_x_lookup_action))
+                    .on_action(cx.listener(Self::handle_open_x_compose_action))
+                    .on_action(cx.listener(Self::handle_open_x_research_action))
                     .on_action(cx.listener(Self::handle_inline_backspace_action))
                     .on_action(cx.listener(Self::handle_inline_delete_action))
                     .on_action(cx.listener(Self::handle_inline_move_left_action))
@@ -4004,6 +4011,7 @@ impl Render for TerminalView {
                                     )
                                     .children(inspector_panel),
                             )
+                            .children(self.x_panel_open.then(|| self.x_panel.clone()).flatten())
                             .children(tab_sidebar),
                     ),
             )
