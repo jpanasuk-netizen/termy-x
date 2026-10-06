@@ -211,3 +211,7 @@ set-version version:
     perl -i -pe '$done ||= s/^version = ".*"/version = "$ENV{NEW}"/' crates/cli/Cargo.toml
     cargo update --workspace --offline
     echo "Set $CURRENT -> $NEW"
+
+# Re-apply OpenCLI media-attach patch after Hermes/opencli upgrades (Windows)
+reapply-opencli-media:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}/scripts/reapply-opencli-media-patch.ps1"
