@@ -1,13 +1,14 @@
-//! Termy X side panel. The geometric swift is an original SVG, dimmed behind
-//! lists and shown at full strength on the empty splash.
+//! Termy X side panel. The geometric swift is an original SVG, drawn at
+//! `background_opacity` behind lists and at full strength on the empty splash.
+
+pub mod art;
 
 use std::sync::Arc;
 
-use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
-    div, img, px, rgb, rgba, Context, FocusHandle, Image, ImageFormat, ImageSource,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
+    div, img, px, rgb, rgba, Context, FocusHandle, Image, ImageSource, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
 };
 
 macro_rules! x_button {
@@ -28,7 +29,6 @@ macro_rules! x_button {
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{sample_posts, MockProvider, XProvider};
-use termy_x::splash::BIRD_SVG;
 use termy_x::text::{split_thread, weighted_len};
 use termy_x::XConfig;
 
@@ -70,6 +70,7 @@ pub struct XPanel {
     focus: FocusHandle,
     section: XSection,
     posts: Vec<Post>,
+    search_posts: Vec<Post>,
     trends: Vec<Trend>,
     research: Vec<ResearchHit>,
     profile: Option<Profile>,
@@ -83,10 +84,11 @@ pub struct XPanel {
     intent_urls: Vec<String>,
     intent_index: usize,
     background_art: bool,
+    background_opacity: f32,
     splash: bool,
     fill_window: bool,
     live: bool,
-    art: Arc<Image>,
+    art: Option<Arc<Image>>,
     notice: Option<String>,
 }
 
@@ -101,6 +103,7 @@ impl XPanel {
             focus: cx.focus_handle(),
             section: XSection::Timeline,
             posts: Vec::new(),
+            search_posts: Vec::new(),
             trends: Vec::new(),
             research: Vec::new(),
             profile: None,
@@ -114,10 +117,11 @@ impl XPanel {
             intent_urls: Vec::new(),
             intent_index: 0,
             background_art: config.background_art,
+            background_opacity: config.background_opacity,
             splash: false,
             fill_window,
             live: !fill_window,
-            art: bird_image(),
+            art: None,
             notice: None,
         };
         panel.load_timeline();
@@ -135,6 +139,11 @@ impl XPanel {
         self.section = section;
         self.confirm = false;
         self.splash = false;
+        if self.fill_window {
+            self.ensure_mock_lists();
+            self.section = section;
+            return;
+        }
         match section {
             XSection::Timeline => self.load_timeline(),
             XSection::Search => self.load_search(),
@@ -160,11 +169,57 @@ impl XPanel {
             "splash" => {
                 self.section = XSection::Timeline;
                 self.posts.clear();
+                self.search_posts.clear();
+                self.trends.clear();
+                self.research.clear();
+                self.profile = None;
+                self.variants.clear();
                 self.splash = true;
                 self.status = "splash · background art at full strength".into();
             }
+            "mock" => self.load_mock_dashboard(),
             "trends" => self.open_section(XSection::Trends),
             _ => self.open_section(XSection::Timeline),
+        }
+    }
+
+    fn load_mock_dashboard(&mut self) {
+        self.splash = false;
+        self.live = false;
+        self.section = XSection::Timeline;
+        self.ensure_mock_lists();
+        self.suggest();
+        self.status = "mock · search, timeline, trends · no network · no X API credits".into();
+    }
+
+    fn ensure_mock_lists(&mut self) {
+        self.live = false;
+        if self.posts.is_empty() {
+            self.posts = MockProvider
+                .timeline(8)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.search_posts.is_empty() {
+            self.search_posts = MockProvider
+                .search(&self.query, false, 4)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.trends.is_empty() {
+            self.trends = MockProvider
+                .trends(Some("worldwide"), 6)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.research.is_empty() {
+            self.research = vec![ResearchHit {
+                source: "fixture".into(),
+                title: "GPUI terminals people actually use".into(),
+                url: "https://example.com/gpui".into(),
+                excerpt: "Fixture research for drafts. No network call in the mock preview.".into(),
+                session: None,
+            }];
         }
     }
 
@@ -173,7 +228,7 @@ impl XPanel {
         termy_x::providers::Service::free(
             &config,
             Arc::new(termy_x::io::SystemRunner),
-            Arc::new(termy_x::io::UreqHttp),
+            Arc::new(termy_x::io::UreqHttp::default()),
         )
     }
 
@@ -314,10 +369,9 @@ impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let count = weighted_len(&self.compose);
         let parts = split_thread(&self.compose);
-        let dim = self.confirm
-            || self.section != XSection::Timeline
-            || (!self.splash && !self.posts.is_empty());
-        let art_opacity_overlay = if self.splash { 0.0 } else { 0.80 };
+        let columns = self.column_count(window);
+        let art_opacity = self.bird_opacity();
+        let dialog_width = if self.fill_window { 600.0 } else { 432.0 };
 
         let mut root = div()
             .id("termy-x-panel")
@@ -342,7 +396,7 @@ impl Render for XPanel {
             root = root.w(px(480.0)).flex_none();
         }
 
-        root.child(self.backdrop(dim, art_opacity_overlay))
+        root.child(self.backdrop(art_opacity))
             .child(
                 div()
                     .relative()
@@ -354,7 +408,7 @@ impl Render for XPanel {
                     .child(self.header(cx))
                     .child(self.tabs(cx))
                     .child(self.status_line())
-                    .child(
+                    .child(if columns == 1 {
                         div()
                             .id("x-scroll")
                             .flex_1()
@@ -363,40 +417,79 @@ impl Render for XPanel {
                             .flex()
                             .flex_col()
                             .gap(px(8.0))
-                            .children(self.body(count.weighted, &parts, cx)),
-                    ),
+                            .children(self.body(count.weighted, &parts, cx))
+                            .into_any_element()
+                    } else {
+                        self.dashboard(columns, count.weighted, &parts, cx)
+                    }),
             )
-            .children(self.confirm.then(|| self.confirm_dialog(count.weighted, &parts, window, cx)))
+            .children(
+                self.confirm
+                    .then(|| self.confirm_dialog(count.weighted, &parts, dialog_width, cx)),
+            )
     }
 }
 
 impl XPanel {
-    fn backdrop(&self, dim: bool, overlay: f32) -> impl IntoElement {
-        let source: ImageSource = self.art.clone().into();
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .child(if self.background_art {
-                img(source)
-                    .id("termy-x-bird")
-                    .size_full()
-                    .object_fit(ObjectFit::Cover)
-                    .into_any_element()
-            } else {
-                div().size_full().bg(rgb(0x070b14)).into_any_element()
-            })
-            .when(self.background_art && dim, |layer| {
-                layer.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .size_full()
-                        .bg(tint(0x070b14, (overlay * 255.0) as u8)),
-                )
-            })
+    fn column_count(&self, window: &Window) -> usize {
+        if self.splash || !self.fill_window {
+            return 1;
+        }
+        let width: f32 = window.viewport_size().width.into();
+        if width >= 1480.0 {
+            3
+        } else if width >= 1100.0 {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Full strength on the empty splash. Lists use the configured opacity.
+    /// Art off returns 0 so the raster is never requested.
+    fn bird_opacity(&self) -> f32 {
+        if !self.background_art {
+            return 0.0;
+        }
+        if self.splash || self.looks_empty() {
+            1.0
+        } else {
+            self.background_opacity.clamp(0.0, 1.0)
+        }
+    }
+
+    fn looks_empty(&self) -> bool {
+        self.posts.is_empty()
+            && self.search_posts.is_empty()
+            && self.trends.is_empty()
+            && self.research.is_empty()
+            && self.profile.is_none()
+            && self.variants.is_empty()
+            && self.section != XSection::Compose
+            && !self.confirm
+    }
+
+    fn backdrop(&mut self, opacity: f32) -> gpui_kit::AnyElement {
+        let mut layer = div().absolute().top_0().left_0().size_full();
+        if self.background_art && opacity > 0.0 {
+            if self.art.is_none() {
+                self.art = art::cached_image();
+            }
+            if let Some(image) = self.art.clone() {
+                let source: ImageSource = image.into();
+                layer = layer.child(
+                    div().size_full().opacity(opacity).child(
+                        img(source)
+                            .id("termy-x-bird")
+                            .size_full()
+                            .object_fit(ObjectFit::Cover),
+                    ),
+                );
+            }
+        } else {
+            layer = layer.child(div().size_full().bg(rgb(0x070b14)));
+        }
+        layer.into_any_element()
     }
 
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -483,6 +576,115 @@ impl XPanel {
             .text_size(px(11.0))
             .text_color(rgb(0x93a4c3))
             .child(self.status.clone())
+    }
+
+    fn dashboard(
+        &self,
+        columns: usize,
+        weighted: usize,
+        parts: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let mut row = div()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .gap(px(12.0))
+            .overflow_hidden();
+        row = row.child(self.compose_column(weighted, parts, cx));
+        row = row.child(self.results_column(columns == 2));
+        if columns >= 3 {
+            row = row.child(self.trends_column());
+        }
+        row.into_any_element()
+    }
+
+    fn column_shell(&self, title: &str, body: impl IntoIterator<Item = gpui_kit::AnyElement>) -> gpui_kit::AnyElement {
+        div()
+            .id(SharedString::from(format!("x-col-{title}")))
+            .flex_1()
+            .min_w(px(0.0))
+            .h_full()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child(title.to_string()),
+            )
+            .children(body)
+            .into_any_element()
+    }
+
+    fn compose_column(
+        &self,
+        weighted: usize,
+        parts: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        self.column_shell("Compose", vec![self.compose_block(weighted, parts, cx)])
+    }
+
+    fn results_column(&self, include_side: bool) -> gpui_kit::AnyElement {
+        let mut rows = Vec::new();
+        rows.push(hint(format!("Search · {}", self.query)));
+        let search = if self.search_posts.is_empty() {
+            &self.posts
+        } else {
+            &self.search_posts
+        };
+        for post in search.iter().take(3) {
+            rows.push(post_card(post));
+        }
+        rows.push(hint("Timeline".into()));
+        for post in &self.posts {
+            rows.push(post_card(post));
+        }
+        if let Some(root) = self.posts.first() {
+            let replies = self.posts.iter().skip(1).take(2).count();
+            rows.push(card(
+                format!("Thread · @{}", root.author_handle),
+                format!("{}\n{replies} repl{}", root.text, if replies == 1 { "y" } else { "ies" }),
+            ));
+        }
+        if include_side {
+            rows.extend(self.side_rows());
+        }
+        self.column_shell("Results", rows)
+    }
+
+    fn trends_column(&self) -> gpui_kit::AnyElement {
+        self.column_shell("Trends", self.side_rows())
+    }
+
+    fn side_rows(&self) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        for trend in &self.trends {
+            rows.push(card(
+                trend.name.clone(),
+                format!(
+                    "{} · volume {}",
+                    trend.place.as_deref().unwrap_or("worldwide"),
+                    trend.volume.unwrap_or(0)
+                ),
+            ));
+        }
+        if let Some(post) = self.posts.iter().max_by_key(|post| post.engagement()) {
+            rows.push(card(
+                format!("Popular · @{} · {} likes", post.author_handle, post.likes),
+                post.text.clone(),
+            ));
+        }
+        for hit in &self.research {
+            rows.push(card(
+                format!("[{}] {}", hit.source, hit.title),
+                format!("{}\n{}", hit.url, hit.excerpt),
+            ));
+        }
+        rows
     }
 
     fn body(
@@ -592,6 +794,15 @@ impl XPanel {
                     .text_color(rgb(0xb7c3dc))
                     .child(format!("{} thread part(s). URLs count as 23.", parts.len())),
             )
+            .children(parts.iter().enumerate().map(|(index, part)| {
+                card(format!("Part {}", index + 1), part.clone())
+            }))
+            .children(self.drafts.iter().map(|draft| {
+                card(
+                    format!("Draft · {}", draft.tone.as_deref().unwrap_or("note")),
+                    draft.text.clone(),
+                )
+            }))
             .child(
                 div()
                     .flex()
@@ -630,14 +841,46 @@ impl XPanel {
         &self,
         weighted: usize,
         parts: &[String],
-        _window: &mut Window,
+        dialog_width: f32,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let current = if parts.is_empty() {
+            0
+        } else {
+            self.intent_index.min(parts.len() - 1)
+        };
         let url = self
             .intent_urls
-            .get(self.intent_index)
+            .get(current)
             .cloned()
             .unwrap_or_default();
+        let part_rows = parts.iter().enumerate().map(|(index, part)| {
+            let active = index == current;
+            let part_count = weighted_len(part).weighted;
+            div()
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .bg(rgb(0x070b14))
+                .border_1()
+                .border_color(if active {
+                    rgb(0xff4fa3)
+                } else {
+                    tint(0x7af6ff, 40)
+                })
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(if active { rgb(0xffd0ea) } else { rgb(0x93a4c3) })
+                        .child(format!("Part {} of {} · {part_count} weighted", index + 1, parts.len())),
+                )
+                .child(
+                    div()
+                        .mt(px(4.0))
+                        .text_size(px(14.0))
+                        .text_color(rgb(0xf8fbff))
+                        .child(part.clone()),
+                )
+        });
         div()
             .absolute()
             .top_0()
@@ -650,8 +893,9 @@ impl XPanel {
             .child(
                 div()
                     .id("x-confirm")
-                    .w(px(460.0))
+                    .w(px(dialog_width))
                     .max_w(px(640.0))
+                    .max_h(px(720.0))
                     .p(px(16.0))
                     .rounded(px(14.0))
                     .bg(rgb(0x101624))
@@ -660,6 +904,7 @@ impl XPanel {
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
+                    .overflow_y_scroll()
                     .child(
                         div()
                             .text_size(px(16.0))
@@ -670,20 +915,16 @@ impl XPanel {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("mock · no X API credits · you still confirm"),
+                            .child("Nothing is posted automatically. Next post opens one part."),
                     )
-                    .child(
-                        div()
-                            .p(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(rgb(0x070b14))
-                            .text_size(px(14.0))
-                            .child(self.compose.clone()),
-                    )
+                    .children(part_rows)
                     .child(
                         div()
                             .text_size(px(13.0))
-                            .child(format!("{weighted} weighted characters · {} part(s)", parts.len())),
+                            .child(format!(
+                                "{weighted} weighted characters · {} part(s)",
+                                parts.len()
+                            )),
                     )
                     .child(
                         div()
@@ -695,80 +936,71 @@ impl XPanel {
                         div()
                             .flex()
                             .gap(px(8.0))
+                            .flex_wrap()
                             .child(x_button!("x-cancel", "Cancel", cx.listener(|this, _, _, cx| {
                                 this.confirm = false;
                                 cx.notify();
                             })))
-                            .child(x_button!(
-                                "x-confirm-publish",
-                                "Publish",
-                                cx.listener(|this, _, _, cx| {
-                                    this.publish_confirmed();
-                                    cx.notify();
-                                })
-                            ))
-                            .child(x_button!("x-next-post", "Next post", cx.listener(|this, _, window, cx| {
-                                if this.intent_urls.is_empty() {
-                                    return;
-                                }
-                                let next = (this.intent_index + 1) % this.intent_urls.len();
-                                this.intent_index = next;
-                                if let Some(url) = this.intent_urls.get(next) {
-                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(url.clone()));
-                                }
-                                let _ = window;
+                            .child(x_button!("x-copy", "Copy", cx.listener(|this, _, _, cx| {
+                                this.copy_current_part(cx);
+                                cx.notify();
+                            })))
+                            .child(x_button!("x-next-post", "Next post", cx.listener(|this, _, _, cx| {
+                                this.open_current_intent();
                                 cx.notify();
                             }))),
                     ),
             )
     }
 
-    fn publish_confirmed(&mut self) {
-        self.confirm = false;
-        if !self.live {
-            self.notice = Some(
-                "Dry run in this preview. The exact text was not posted.".into(),
-            );
+    fn copy_current_part(&mut self, cx: &mut Context<Self>) {
+        let parts = split_thread(&self.compose);
+        let text = if parts.is_empty() {
+            self.compose.clone()
+        } else {
+            let index = self.intent_index.min(parts.len() - 1);
+            parts[index].clone()
+        };
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(text));
+        self.notice = Some("Copied this part.".into());
+    }
+
+    /// Opens only the highlighted part. Preview and mock never open a browser.
+    fn open_current_intent(&mut self) {
+        let parts = split_thread(&self.compose);
+        if parts.is_empty() {
+            self.notice = Some("Nothing to post.".into());
             return;
         }
-        let mut service = self.service();
-        service
-            .publishers
-            .push(Box::new(termy_x::publish::IntentPublisher {
-                open_browser: true,
-                opener: Arc::new(termy_x::io::SystemOpener),
-            }));
-        let Some(publisher) = termy_x::publish::first_available(&service.publishers) else {
-            self.notice = Some("No publisher is available.".into());
-            return;
-        };
-        let outcome = termy_x::publish::confirm_and_publish(
-            &self.compose,
-            None,
-            termy_x::ConfirmDecision::Yes,
-            false,
-            publisher,
-        );
-        self.notice = Some(match outcome {
-            termy_x::GateOutcome::Sent { plan, receipt } => {
-                format!("{} · {receipt}", plan.provider.label())
+        let index = self.intent_index.min(parts.len() - 1);
+        if self.intent_urls.len() != parts.len() {
+            self.intent_urls = termy_x::publish::intent_urls(&parts, None);
+        }
+        let url = self.intent_urls.get(index).cloned().unwrap_or_default();
+        if self.live {
+            match termy_x::io::Opener::open(&termy_x::io::SystemOpener, &url) {
+                Ok(()) => {
+                    self.notice = Some(format!(
+                        "Opened part {} of {} in the browser. You still click Post there.",
+                        index + 1,
+                        parts.len()
+                    ));
+                }
+                Err(error) => {
+                    self.notice = Some(format!("Could not open the intent: {error}"));
+                }
             }
-            termy_x::GateOutcome::DryRun { plan } => {
-                format!("dry run · {} weighted", plan.count.weighted)
-            }
-            termy_x::GateOutcome::Rejected { plan } => format!(
-                "not posted · {}",
-                plan.session.unwrap_or_else(|| "cancelled".into())
-            ),
-        });
+        } else {
+            self.notice = Some(format!(
+                "Held part {} of {}. Preview does not open a browser.",
+                index + 1,
+                parts.len()
+            ));
+        }
+        if index + 1 < parts.len() {
+            self.intent_index = index + 1;
+        }
     }
-}
-
-fn bird_image() -> Arc<Image> {
-    Arc::new(Image::from_bytes(
-        ImageFormat::Svg,
-        BIRD_SVG.as_bytes().to_vec(),
-    ))
 }
 
 fn card(title: String, body: String) -> gpui_kit::AnyElement {
