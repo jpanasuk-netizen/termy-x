@@ -5,6 +5,11 @@ use crate::model::{Draft, Tone};
 
 const PROMPTS: &str = include_str!("../prompts/default.toml");
 
+/// Draft `n` variants. Never posts anything.
+///
+/// Uses the configured OpenAI-compatible endpoint. With nothing configured it
+/// tries the free local default (Ollama) and, if that is not running, returns
+/// offline template drafts labelled `template`.
 pub fn draft_variants(
     config: &XConfig,
     http: &dyn Http,
@@ -13,38 +18,50 @@ pub fn draft_variants(
     n: usize,
 ) -> Result<Vec<Draft>, String> {
     let n = n.clamp(1, 6);
-    if config.ai_configured() {
-        let (system, user) = prompts_for(tone, idea, n);
-        let body = serde_json::json!({
-            "model": config.ai_model,
-            "temperature": 0.7,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user}
-            ]
-        })
-        .to_string();
-        let mut url = config.ai_base_url.trim_end_matches('/').to_string();
-        url.push_str("/chat/completions");
-        let response = http.request(HttpRequest {
-            method: "POST",
-            url,
-            body: Some(body),
-            bearer: config.api_key(),
-            content_type: Some("application/json".into()),
-        })?;
-        let text = completion_text(&response)?;
-        let variants = split_variants(&text);
-        if variants.is_empty() {
-            return Err("the model returned an empty draft".into());
-        }
-        return Ok(variants
-            .into_iter()
-            .take(n)
-            .map(|text| draft(text, tone, "model"))
-            .collect());
+    match model_variants(config, http, idea, tone, n) {
+        Ok(variants) => Ok(variants),
+        Err(error) if config.ai_configured() => Err(error),
+        Err(_) => Ok(template_variants(idea, tone, n)),
     }
-    Ok(template_variants(idea, tone, n))
+}
+
+fn model_variants(
+    config: &XConfig,
+    http: &dyn Http,
+    idea: &str,
+    tone: Tone,
+    n: usize,
+) -> Result<Vec<Draft>, String> {
+    let (base, model) = config.ai_endpoint();
+    let (system, user) = prompts_for(tone, idea, n);
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.7,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+    })
+    .to_string();
+    let mut url = base.trim_end_matches('/').to_string();
+    url.push_str("/chat/completions");
+    let response = http.request(HttpRequest {
+        method: "POST",
+        url,
+        body: Some(body),
+        bearer: config.api_key(),
+        content_type: Some("application/json".into()),
+    })?;
+    let text = completion_text(&response)?;
+    let variants = split_variants(&text);
+    if variants.is_empty() {
+        return Err("the model returned an empty draft".into());
+    }
+    Ok(variants
+        .into_iter()
+        .take(n)
+        .map(|text| draft(text, tone, "model"))
+        .collect())
 }
 
 fn draft(text: String, tone: Tone, source: &str) -> Draft {
@@ -58,19 +75,32 @@ fn draft(text: String, tone: Tone, source: &str) -> Draft {
     }
 }
 
+/// Offline drafts used when no model is reachable. Clearly labelled.
 pub fn template_variants(idea: &str, tone: Tone, n: usize) -> Vec<Draft> {
+    let idea = idea.trim().trim_end_matches('.');
+    let options: Vec<String> = match tone {
+        Tone::Punchy => vec![
+            format!("{idea}."),
+            format!("Hot take: {idea}."),
+            format!("{idea}. That's it. That's the post."),
+            format!("Nobody talks about this enough: {idea}."),
+        ],
+        Tone::Informative => vec![
+            format!("Quick note on {idea}: here's what changed and why it matters."),
+            format!("{idea}, in three points:\n1.\n2.\n3."),
+            format!("What I learned about {idea} this week."),
+        ],
+        Tone::Thread => vec![
+            format!("A thread on {idea} 🧵\n\n1/"),
+            format!("{idea}.\n\nHere's how it works, step by step 👇"),
+        ],
+        Tone::Reply => vec![
+            format!("Agree on {idea}. One thing I'd add:"),
+            format!("Interesting take on {idea}. Have you tried the opposite?"),
+        ],
+    };
     (0..n)
-        .map(|index| {
-            let text = match tone {
-                Tone::Punchy => format!("Unpopular draft {index}: {idea}. Still a draft."),
-                Tone::Informative => {
-                    format!("Notes on {idea}. Variant {index}. Nothing here has been posted.")
-                }
-                Tone::Thread => format!("{idea}\n\nPart {index} stays under the limit until you edit it."),
-                Tone::Reply => format!("Replying on {idea} — variant {index}. Confirm before it goes anywhere."),
-            };
-            draft(text, tone, "template")
-        })
+        .map(|index| draft(options[index % options.len()].clone(), tone, "template"))
         .collect()
 }
 
@@ -134,14 +164,25 @@ mod tests {
     use super::*;
     use crate::io::MapHttp;
     #[test]
-    fn unconfigured_ai_returns_labeled_templates_and_does_not_post() {
+    fn unconfigured_ai_tries_free_local_default_then_templates() {
         let config = XConfig::default();
         let http = MapHttp::default();
         let drafts = draft_variants(&config, &http, "ship the panel", Tone::Punchy, 3).unwrap();
         assert_eq!(drafts.len(), 3);
         assert!(drafts.iter().all(|draft| draft.source == "template"));
         assert!(drafts.iter().all(|draft| draft.text.contains("ship the panel")));
-        assert!(http.calls.lock().unwrap().is_empty());
+        let calls = http.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one probe of the free local endpoint");
+        assert!(calls[0].contains("127.0.0.1:11434/v1/chat/completions"));
+    }
+
+    #[test]
+    fn configured_ai_errors_are_reported_not_hidden() {
+        let mut config = XConfig::default();
+        config.ai_base_url = "http://127.0.0.1:9/v1".into();
+        config.ai_model = "m".into();
+        let http = MapHttp::default();
+        assert!(draft_variants(&config, &http, "idea", Tone::Punchy, 2).is_err());
     }
 
     #[test]

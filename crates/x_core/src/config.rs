@@ -3,9 +3,18 @@ use std::path::{Path, PathBuf};
 
 use crate::model::ProviderId;
 
+/// Bird opacity behind content: dimmed into the 15-25% band by default.
+pub const DEFAULT_BACKGROUND_OPACITY: f32 = 0.20;
+/// Free default for AI drafts: a local Ollama server (no key, no cost).
+pub const DEFAULT_AI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+pub const DEFAULT_AI_MODEL: &str = "llama3.2";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct XConfig {
     pub background_art: bool,
+    /// Opacity of the bird behind lists (0.0-1.0). The empty/splash state
+    /// always shows it at full strength.
+    pub background_opacity: f32,
     pub default_limit: usize,
     pub provider: Option<ProviderId>,
     pub official_enabled: bool,
@@ -32,6 +41,7 @@ impl Default for XConfig {
     fn default() -> Self {
         Self {
             background_art: true,
+            background_opacity: DEFAULT_BACKGROUND_OPACITY,
             default_limit: 10,
             provider: None,
             official_enabled: false,
@@ -98,6 +108,11 @@ impl XConfig {
     pub fn set_key(&mut self, key: &str, value: &str) {
         match key {
             "background_art" => self.background_art = parse_bool(value),
+            "background_opacity" => {
+                if let Ok(opacity) = value.parse::<f32>() {
+                    self.background_opacity = opacity.clamp(0.0, 1.0);
+                }
+            }
             "default_limit" => {
                 if let Ok(limit) = value.parse::<usize>() {
                     self.default_limit = limit.clamp(1, 100);
@@ -160,8 +175,25 @@ impl XConfig {
         }
     }
 
+    /// True when the user pointed drafting at an endpoint explicitly.
     pub fn ai_configured(&self) -> bool {
         !self.ai_base_url.trim().is_empty() && !self.ai_model.trim().is_empty()
+    }
+
+    /// Endpoint used for AI drafts: the configured one, else the free local
+    /// default (Ollama's OpenAI-compatible API on 127.0.0.1:11434).
+    pub fn ai_endpoint(&self) -> (String, String) {
+        let base = if self.ai_base_url.trim().is_empty() {
+            DEFAULT_AI_BASE_URL.to_string()
+        } else {
+            self.ai_base_url.trim().to_string()
+        };
+        let model = if self.ai_model.trim().is_empty() {
+            DEFAULT_AI_MODEL.to_string()
+        } else {
+            self.ai_model.trim().to_string()
+        };
+        (base, model)
     }
 
     pub fn api_key(&self) -> Option<String> {
@@ -239,7 +271,8 @@ fn unquote(value: &str) -> String {
 
 pub fn example_config() -> &'static str {
     r#"# Termy X. Free paths are the default. No X API credits are required.
-background_art = true
+background_art = true       # set false to hide the bird entirely
+background_opacity = 0.20   # bird strength behind lists (splash is always 1.0)
 default_limit = 10
 provider = "auto"
 
@@ -253,10 +286,11 @@ user_read_usd = 0.010
 post_write_usd = 0.010
 
 [ai]
-# Leave empty and set the env vars, or fill a free OpenAI-compatible server.
-# Ollama:  base_url = "http://127.0.0.1:11434/v1"  model = "llama3.2"
-# Groq:     base_url = "https://api.groq.com/openai/v1"
-# OpenRouter free models: base_url = "https://openrouter.ai/api/v1"
+# Any OpenAI-compatible /chat/completions endpoint. Env vars win over these.
+# Free default when nothing is set: local Ollama at http://127.0.0.1:11434/v1
+# (model llama3.2). If it is not running, drafts fall back to offline templates.
+# Other free options (see README): Groq free tier, OpenRouter ":free" models,
+# Google Gemini's OpenAI-compatible endpoint, LM Studio, llama.cpp server.
 base_url_env = "TERMY_X_AI_BASE_URL"
 model_env = "TERMY_X_AI_MODEL"
 api_key_env = "TERMY_X_AI_API_KEY"
@@ -281,6 +315,17 @@ mod tests {
         assert_eq!(config.default_limit, 10);
         assert!(config.provider.is_none());
         assert!(!config.ai_configured());
+        assert!((config.background_opacity - 0.20).abs() < f32::EPSILON);
+        assert_eq!(config.ai_endpoint().0, DEFAULT_AI_BASE_URL);
+    }
+
+    #[test]
+    fn background_opacity_is_parsed_and_clamped() {
+        let mut config = XConfig::default();
+        config.apply_text("background_opacity = 0.15");
+        assert!((config.background_opacity - 0.15).abs() < 1e-6);
+        config.apply_text("background_opacity = 4");
+        assert!((config.background_opacity - 1.0).abs() < 1e-6);
     }
 
     #[test]

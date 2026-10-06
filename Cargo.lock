@@ -7772,6 +7772,7 @@ dependencies = [
  "sysinfo 0.37.2",
  "tempfile",
  "termy_core",
+ "termy_x",
  "tokio",
  "unicode-width 0.2.0",
  "ureq",
@@ -7804,6 +7805,7 @@ dependencies = [
  "shlex 2.0.1",
  "tempfile",
  "termy_core",
+ "termy_x",
  "ureq",
  "url",
 ]
@@ -7843,6 +7845,31 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "winreg",
+]
+
+[[package]]
+name = "termy_x"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "clap",
+ "dirs 6.0.0",
+ "keyring",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "ureq",
+ "uuid",
+]
+
+[[package]]
+name = "termy_x_cli"
+version = "0.1.0"
+dependencies = [
+ "termy_x",
 ]
 
 [[package]]
