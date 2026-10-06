@@ -12,7 +12,7 @@ use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-const COMMAND_TIMEOUT: Duration = Duration::from_secs(25);
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandOutput {
