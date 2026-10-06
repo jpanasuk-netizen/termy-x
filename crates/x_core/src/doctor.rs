@@ -91,6 +91,10 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
             if config.background_art { "on" } else { "off" },
             config.background_opacity
         ),
+        format!(
+            "Post length: {} weighted (Premium long-form is 25000; free tier 280). Override with char_limit or TERMY_X_CHAR_LIMIT.",
+            config.char_limit_or_fallback()
+        ),
         format!("Config directory: {}", config.config_dir.display()),
     ];
     if opencli.0 == Probe::Missing && twitter.0 == Probe::Missing {
@@ -186,7 +190,8 @@ mod tests {
         assert!(text.contains("Background art: on"));
         assert!(!config.official_enabled);
         assert!(runner.calls.lock().unwrap().is_empty());
-    }
+            assert!(text.contains("Post length:"), "{text}");
+}
 
     #[test]
     fn doctor_probes_are_read_only() {

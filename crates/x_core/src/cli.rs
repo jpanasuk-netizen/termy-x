@@ -398,7 +398,14 @@ fn publish_text(
         eprintln!("no publish path");
         return 1;
     };
-    let plan = crate::publish::build_plan(text, reply_to.as_deref(), publisher, dry_run);
+    let resolved = crate::premium::resolve_char_limit(&io.config, io.runner.as_ref());
+    let plan = crate::publish::build_plan_limited(
+        text,
+        reply_to.as_deref(),
+        publisher,
+        dry_run,
+        resolved.limit,
+    );
     print_plan(&plan);
     if dry_run {
         if json {
@@ -459,7 +466,7 @@ fn print_plan(plan: &crate::publish::PublishPlan) {
         plan.count.limit
     );
     for (index, part) in plan.parts.iter().enumerate() {
-        let count = crate::text::weighted_len(part);
+        let count = crate::text::weighted_len_limited(part, plan.count.limit);
         println!(
             "--- part {}/{} · {} weighted ---",
             index + 1,

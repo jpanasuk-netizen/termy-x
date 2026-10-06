@@ -54,7 +54,7 @@ macro_rules! x_button {
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{MockProvider, XProvider};
-use termy_x::text::{split_thread, weighted_len};
+use termy_x::text::{split_thread_limited, weighted_len_limited};
 use termy_x::XConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -608,7 +608,8 @@ impl XPanel {
     }
 
     fn arm_confirm(&mut self) {
-        let parts = split_thread(&self.compose);
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+        let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             vec![self.compose.trim().to_string()]
         } else {
@@ -1186,8 +1187,10 @@ impl Render for XPanel {
             self.focus.focus(window, cx);
             self.pending_focus = false;
         }
-        let count = weighted_len(&self.compose);
-        let parts = split_thread(&self.compose);
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            .char_limit_or_fallback();
+        let count = weighted_len_limited(&self.compose, char_limit);
+        let parts = split_thread_limited(&self.compose, char_limit);
         let columns = self.column_count(window);
         let art_opacity = self.bird_opacity();
         let dialog_width = if self.fill_window { 600.0 } else { 432.0 };
@@ -1236,15 +1239,15 @@ impl Render for XPanel {
                             .flex()
                             .flex_col()
                             .gap(px(8.0))
-                            .children(self.body(count.weighted, &parts, cx))
+                            .children(self.body(count.weighted, count.limit, &parts, cx))
                             .into_any_element()
                     } else {
-                        self.dashboard(columns, count.weighted, &parts, cx)
+                        self.dashboard(columns, count.weighted, count.limit, &parts, cx)
                     }),
             )
             .children(
                 self.confirm
-                    .then(|| self.confirm_dialog(count.weighted, &parts, dialog_width, cx)),
+                    .then(|| self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)),
             )
     }
 }
@@ -1447,6 +1450,7 @@ impl XPanel {
         &self,
         columns: usize,
         weighted: usize,
+        limit: usize,
         parts: &[String],
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
@@ -1456,7 +1460,7 @@ impl XPanel {
             .min_h(px(0.0))
             .gap(px(12.0))
             .overflow_hidden();
-        row = row.child(self.compose_column(weighted, parts, cx));
+        row = row.child(self.compose_column(weighted, limit, parts, cx));
         row = row.child(self.results_column(columns == 2));
         if columns >= 3 {
             row = row.child(self.trends_column());
@@ -1487,10 +1491,11 @@ impl XPanel {
     fn compose_column(
         &self,
         weighted: usize,
+        limit: usize,
         parts: &[String],
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        self.column_shell("Compose", vec![self.compose_block(weighted, parts, cx)])
+        self.column_shell("Compose", vec![self.compose_block(weighted, limit, parts, cx)])
     }
 
     fn results_column(&self, include_side: bool) -> gpui_kit::AnyElement {
@@ -1555,6 +1560,7 @@ impl XPanel {
     fn body(
         &self,
         weighted: usize,
+        limit: usize,
         parts: &[String],
         cx: &mut Context<Self>,
     ) -> Vec<gpui_kit::AnyElement> {
@@ -1565,9 +1571,19 @@ impl XPanel {
         match self.section {
             XSection::Timeline => {
                 if self.posts.is_empty() {
-                    rows.push(self.splash_copy());
-                } else if self.loading && self.section == XSection::Timeline {
-                    rows.push(hint("Refreshing timelineâ€¦".into()));
+                    if self.loading {
+                        rows.push(empty_state(
+                            "Loading timeline...",
+                            "Using your free OpenCLI session. Nothing burns X API credits.",
+                        ));
+                    } else {
+                        rows.push(empty_state(
+                            "Timeline is quiet",
+                            "OpenCLI / twitter-cli / fixtures fill this lane. Press Timeline to retry.",
+                        ));
+                    }
+                } else if self.loading {
+                    rows.push(hint("Refreshing timeline...".into()));
                 }
                 for post in &self.posts {
                     rows.push(post_card(post));
@@ -1575,20 +1591,45 @@ impl XPanel {
             }
             XSection::Search => {
                 if self.search_posts.is_empty() {
-                    rows.push(self.splash_copy());
+                    if self.loading {
+                        rows.push(empty_state(
+                            "Searching...",
+                            format!("Query: {}. Free session · no credits.", self.query),
+                        ));
+                    } else {
+                        rows.push(empty_state(
+                            "No matches yet",
+                            "Type a query and hit Search. Mock fixtures appear when the free path is offline.",
+                        ));
+                    }
                 } else if self.loading {
-                    rows.push(hint("Refreshing searchâ€¦".into()));
+                    rows.push(hint("Refreshing search...".into()));
                 }
                 for post in &self.search_posts {
                     rows.push(post_card(post));
                 }
             }
             XSection::Trends => {
+                if self.trends.is_empty() {
+                    if self.loading {
+                        rows.push(empty_state(
+                            "Scanning trends...",
+                            "Free session path · no X API credits. Hang tight.",
+                        ));
+                    } else {
+                        rows.push(empty_state(
+                            "No trends yet",
+                            "Hit Trends again, or check OpenCLI with x doctor. Mock fixtures fill in when offline.",
+                        ));
+                    }
+                } else if self.loading {
+                    rows.push(hint("Refreshing trends...".into()));
+                }
                 for trend in &self.trends {
                     rows.push(card(
                         trend.name.clone(),
                         format!(
-                            "{} Â· volume {}",
+                            "{} · volume {}",
                             trend.place.as_deref().unwrap_or("worldwide"),
                             trend.volume.unwrap_or(0)
                         ),
@@ -1601,18 +1642,43 @@ impl XPanel {
             XSection::Lookup => {
                 if let Some(profile) = &self.profile {
                     rows.push(card(
-                        format!("@{} Â· {}", profile.handle, profile.name),
+                        format!("@{} · {}", profile.handle, profile.name),
                         format!(
-                            "{}\n{} followers Â· {} following",
+                            "{}\n{} followers · {} following",
                             profile.bio, profile.followers, profile.following
                         ),
                     ));
                     for post in &profile.posts {
                         rows.push(post_card(post));
                     }
+                } else if self.loading {
+                    rows.push(empty_state(
+                        "Looking up...",
+                        "Free session profile fetch. No X API credits.",
+                    ));
+                } else {
+                    rows.push(empty_state(
+                        "Lookup a handle",
+                        "Enter @someone and hit Lookup. Verified / Premium shows in doctor post length.",
+                    ));
                 }
             }
             XSection::Research => {
+                if self.research.is_empty() {
+                    if self.loading {
+                        rows.push(empty_state(
+                            "Researching...",
+                            "RSS + free sources. No X API credits.",
+                        ));
+                    } else {
+                        rows.push(empty_state(
+                            "Research is empty",
+                            "Kick Research to pull free sources for your draft.",
+                        ));
+                    }
+                } else if self.loading {
+                    rows.push(hint("Refreshing research...".into()));
+                }
                 for hit in &self.research {
                     rows.push(card(
                         format!("[{}] {}", hit.source, hit.title),
@@ -1621,7 +1687,7 @@ impl XPanel {
                 }
             }
             XSection::Compose => {
-                rows.push(self.compose_block(weighted, parts, cx));
+                rows.push(self.compose_block(weighted, limit, parts, cx));
             }
         }
         rows
@@ -1629,28 +1695,40 @@ impl XPanel {
 
     fn splash_copy(&self) -> gpui_kit::AnyElement {
         div()
-            .mt(px(80.0))
+            .mt(px(96.0))
+            .px(px(24.0))
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(10.0))
             .child(
                 div()
                     .text_size(px(28.0))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .text_color(rgb(0xe9fdff))
-                    .child("Look it up from the terminal."),
+                    .child("Termy X - free session. Zero credits."),
             )
             .child(
                 div()
                     .text_size(px(14.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child("Timeline / Search / Trends / Compose / Research"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
                     .text_color(rgb(0xc5d2ea))
-                    .child("No X API credits. Your session, or the browser intent."),
+                    .child("Your confirm before anything posts. Premium long-form up to 25,000."),
             )
             .into_any_element()
     }
 
-    fn compose_block(&self, weighted: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let counter = format!("{weighted} / 280");
+    fn compose_block(&self, weighted: usize, limit: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let counter = if limit >= 25_000 {
+            format!("{weighted} / {limit} Premium")
+        } else {
+            format!("{weighted} / {limit}")
+        };
         let suggest_label = if self.suggesting {
             "Suggesting…"
         } else {
@@ -1762,7 +1840,7 @@ impl XPanel {
             .child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(if weighted > 280 { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
+                    .text_color(if weighted > limit { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
                     .child(counter),
             )
             .child(
@@ -1836,7 +1914,7 @@ impl XPanel {
                         .text_size(px(14.0))
                         .text_color(rgb(0x93a4c3))
                         .child(
-                            "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.",
+                            "Click here - caret blinks, hint vanishes. Ctrl+V pastes. Premium counts to 25,000.",
                         )
                 }))
                 .into_any_element();
@@ -1928,6 +2006,7 @@ impl XPanel {
     fn confirm_dialog(
         &self,
         weighted: usize,
+        limit: usize,
         parts: &[String],
         dialog_width: f32,
         cx: &mut Context<Self>,
@@ -1944,7 +2023,7 @@ impl XPanel {
             .unwrap_or_default();
         let part_rows = parts.iter().enumerate().map(|(index, part)| {
             let active = index == current;
-            let part_count = weighted_len(part).weighted;
+            let part_count = weighted_len_limited(part, limit).weighted;
             div()
                 .p(px(10.0))
                 .rounded(px(8.0))
@@ -1997,7 +2076,7 @@ impl XPanel {
                         div()
                             .text_size(px(16.0))
                             .text_color(rgb(0xffd0ea))
-                            .child("Publish this exact text?"),
+                            .child("Confirm - nothing posts until you say yes"),
                     )
                     .child(
                         div()
@@ -2053,7 +2132,8 @@ impl XPanel {
     }
 
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
-        let parts = split_thread(&self.compose);
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+        let parts = split_thread_limited(&self.compose, char_limit);
         let text = if parts.is_empty() {
             self.compose.clone()
         } else {
@@ -2067,7 +2147,8 @@ impl XPanel {
     /// Opens only the highlighted part. Preview and mock never open a browser.
     /// Browser launch is fire-and-forget so the confirm UI never freezes.
     fn open_current_intent(&mut self) {
-        let parts = split_thread(&self.compose);
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+        let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             let trimmed = self.compose.trim().to_string();
             if trimmed.is_empty() {
@@ -2148,6 +2229,32 @@ fn hint(text: String) -> gpui_kit::AnyElement {
         .text_size(px(12.0))
         .text_color(rgb(0xf0a8d0))
         .child(text)
+        .into_any_element()
+}
+
+fn empty_state(title: &str, detail: impl Into<String>) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .p(px(16.0))
+        .rounded_xl()
+        .border_1()
+        .border_color(rgb(0x2f7bff))
+        .bg(tint(0x0b1220, 0xcc))
+        .child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(rgb(0x7af6ff))
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0xc5d2ea))
+                .child(detail.into()),
+        )
         .into_any_element()
 }
 

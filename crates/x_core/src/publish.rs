@@ -1,5 +1,5 @@
 use crate::model::{ProviderId, SESSION_OWN};
-use crate::text::{intent_url, split_thread, weighted_len, WeightedCount};
+use crate::text::{intent_url, WeightedCount};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmDecision {
@@ -78,14 +78,24 @@ pub fn build_plan(
     publisher: &dyn Publisher,
     dry_run: bool,
 ) -> PublishPlan {
-    let parts = split_thread(text);
+    build_plan_limited(text, reply_to, publisher, dry_run, crate::text::STANDARD_CHAR_LIMIT)
+}
+
+pub fn build_plan_limited(
+    text: &str,
+    reply_to: Option<&str>,
+    publisher: &dyn Publisher,
+    dry_run: bool,
+    char_limit: usize,
+) -> PublishPlan {
+    let parts = crate::text::split_thread_limited(text, char_limit);
     let parts = if parts.is_empty() {
         vec![String::new()]
     } else {
         parts
     };
     PublishPlan {
-        count: weighted_len(text.trim()),
+        count: crate::text::weighted_len_limited(text.trim(), char_limit),
         intent_urls: intent_urls(&parts, reply_to),
         text: text.trim().to_string(),
         parts,
@@ -103,7 +113,25 @@ pub fn confirm_and_publish(
     dry_run: bool,
     publisher: &dyn Publisher,
 ) -> GateOutcome {
-    let plan = build_plan(text, reply_to, publisher, dry_run);
+    confirm_and_publish_limited(
+        text,
+        reply_to,
+        decision,
+        dry_run,
+        publisher,
+        crate::text::STANDARD_CHAR_LIMIT,
+    )
+}
+
+pub fn confirm_and_publish_limited(
+    text: &str,
+    reply_to: Option<&str>,
+    decision: ConfirmDecision,
+    dry_run: bool,
+    publisher: &dyn Publisher,
+    char_limit: usize,
+) -> GateOutcome {
+    let plan = build_plan_limited(text, reply_to, publisher, dry_run, char_limit);
     if decision != ConfirmDecision::Yes {
         return GateOutcome::Rejected { plan };
     }
