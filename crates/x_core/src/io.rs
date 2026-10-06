@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-/// `CREATE_NO_WINDOW`. Child processes must not flash a console.
-#[cfg(windows)]
 #[cfg(windows)]
 use std::io::Write;
+
+/// `CREATE_NO_WINDOW`. Child processes must not flash a console.
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(180);
