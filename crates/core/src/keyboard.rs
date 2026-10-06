@@ -958,7 +958,7 @@ mod tests {
     use super::pure_text_event_text;
     use super::{
         Keystroke, Modifiers, TerminalKeyEventKind, TerminalKeyboardMode, associated_text,
-        keystroke_to_input,
+        keystroke_to_input, keystroke_to_input_with_options,
     };
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
