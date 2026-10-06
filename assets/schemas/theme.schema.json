@@ -1,0 +1,108 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Termy Theme Colors",
+  "description": "Color scheme for Termy terminal emulator",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference"
+    },
+    "foreground": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "Default text color"
+    },
+    "background": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "Terminal background color"
+    },
+    "cursor": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "Cursor color"
+    },
+    "black": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 0 (black)"
+    },
+    "red": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 1 (red)"
+    },
+    "green": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 2 (green)"
+    },
+    "yellow": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 3 (yellow)"
+    },
+    "blue": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 4 (blue)"
+    },
+    "magenta": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 5 (magenta)"
+    },
+    "cyan": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 6 (cyan)"
+    },
+    "white": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 7 (white)"
+    },
+    "bright_black": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 8 (bright black / gray)"
+    },
+    "bright_red": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 9 (bright red)"
+    },
+    "bright_green": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 10 (bright green)"
+    },
+    "bright_yellow": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 11 (bright yellow)"
+    },
+    "bright_blue": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 12 (bright blue)"
+    },
+    "bright_magenta": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 13 (bright magenta)"
+    },
+    "bright_cyan": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 14 (bright cyan)"
+    },
+    "bright_white": {
+      "type": "string",
+      "pattern": "^#[0-9a-fA-F]{6}$",
+      "description": "ANSI color 15 (bright white)"
+    }
+  },
+  "additionalProperties": false
+}

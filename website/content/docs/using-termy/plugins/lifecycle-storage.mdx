@@ -1,0 +1,89 @@
+---
+title: Lifecycle and storage
+description: React to terminal activity and persist plugin-specific data.
+---
+
+Plugins can explicitly subscribe to active-terminal lifecycle events beside
+`commands`. Use `commands: []` for an event-only plugin.
+
+```ts title="plugin.ts"
+export default definePlugin({
+  commands: [],
+  events: {
+    "terminal.ready"({ context }) {
+      context.toasts.info("Terminal ready");
+    },
+    "tab.activated"({ event, context }) {
+      console.log(event.previousTabId, context.activeTab?.id);
+    },
+    "pane.activated"({ event, context }) {
+      console.log(event.previousPaneId, context.activePane?.id);
+    },
+    "tab.created"({ event }) {
+      console.log("created", event.tabId);
+    },
+    "terminal.bell"() {
+      console.log("bell");
+    },
+    "workingDirectory.changed"({ event }) {
+      console.log(event.previousWorkingDirectory, event.workingDirectory);
+    },
+    "command.finished"({ event }) {
+      console.log(event.command, event.exitCode, event.durationMs);
+    },
+  },
+} satisfies TermyPlugin);
+```
+
+Handlers receive the same read-only [context](/docs/using-termy/plugins/commands-context#read-the-active-context)
+as commands. They can emit toasts or return the same actions.
+
+`terminal.ready` runs once after the plugin catalog is ready. Other subscriptions
+are `tab.activated`, `pane.activated`, `tab.created`, `tab.closed`,
+`terminal.bell`, `workingDirectory.changed`, `command.started`, and
+`command.finished`. Native shell integration provides command exit codes, measured
+durations, and bell events. Tmux completion is inferred and its bell state is not
+available, so unavailable fields/events are omitted instead of guessed.
+
+Events remain ordered within one plugin. Separate plugins may handle them
+concurrently under the normal execution timeout.
+
+## Store JSON values
+
+Declare the storage capability in `plugin.json`:
+
+```json title="plugin.json"
+{
+  "$schema": "https://termy.sh/schemas/plugin.schema.json",
+  "apiVersion": 1,
+  "id": "todos",
+  "name": "Todos",
+  "capabilities": ["storage"]
+}
+```
+
+Then use the asynchronous storage API for small persistent values:
+
+```ts
+const todos = await context.storage.get<Todo[]>("todos") ?? [];
+await context.storage.set("todos", todos);
+await context.storage.delete("todos");
+await context.storage.clear();
+```
+
+Each plugin can store up to 512 JSON values totaling 1 MiB. Storage is plain local
+JSON; use a declared `secret` setting for credentials.
+
+## Store larger files
+
+`context.paths.dataDirectory` is for larger persistent files, while
+`context.paths.cacheDirectory` is for disposable data. Plugins may use Bun or
+Node-compatible file APIs to read and write these paths.
+
+Both locations are isolated per plugin, live outside the content-hashed source
+tree, and survive reloads and updates. Uninstalling a plugin removes its storage,
+data, and cache. Disabling it keeps them.
+
+Use [Native UI](/docs/using-termy/plugins/native-ui) to turn stored data into a
+small native tool, or review the [security model](/docs/using-termy/plugins/security-limits)
+before handling sensitive data.

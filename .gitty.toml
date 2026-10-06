@@ -1,0 +1,6 @@
+provider = "codex"
+style = "conventional"
+candidates = 1
+max_diff_bytes = 120000
+language = "English"
+allowed_types = ["feat", "fix", "docs", "refactor", "test", "chore"]

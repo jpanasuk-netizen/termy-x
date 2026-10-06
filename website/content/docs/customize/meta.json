@@ -1,0 +1,14 @@
+{
+  "title": "Customize",
+  "pages": [
+    "index",
+    "appearance",
+    "terminal-behavior",
+    "tabs-titlebar",
+    "colors",
+    "themes",
+    "keybindings",
+    "advanced"
+  ],
+  "defaultOpen": false
+}

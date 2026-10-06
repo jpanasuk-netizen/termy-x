@@ -1,0 +1,127 @@
+---
+title: Getting started
+description: Create, install, and develop a Termy plugin.
+---
+
+Install [Bun](https://bun.sh/), then scaffold a plugin:
+
+```sh
+termy plugin init my-plugin
+termy plugin dev ./my-plugin
+```
+
+`dev` installs or updates Termy's managed copy and watches the development folder.
+Open the command palette after saving to load the latest valid version.
+
+## Plugin files
+
+A minimal plugin has a manifest and a TypeScript entrypoint:
+
+```text
+my-plugin/plugin.json
+my-plugin/plugin.ts
+```
+
+`plugin.json` owns identity and API metadata:
+
+```json title="plugin.json"
+{
+  "$schema": "https://termy.sh/schemas/plugin.schema.json",
+  "apiVersion": 1,
+  "id": "hello",
+  "name": "Hello",
+  "version": "1.0.0",
+  "capabilities": []
+}
+```
+
+`version` is optional metadata shown in Settings. Set `main` to a relative `.ts` or
+`.tsx` path when the entrypoint is not `plugin.ts`; it must stay inside the plugin
+directory and cannot be a symlink.
+
+`$schema` gives compatible editors validation and autocomplete from Termy's public
+[plugin manifest schema](/schemas/plugin.schema.json). `termy plugin init` adds it
+automatically.
+
+`capabilities` declares the Termy host APIs a plugin uses. Supported values are
+`storage` for `context.storage` and `context.paths`, and `native-ui` for views and
+`view.open`. Omitting the field means no capabilities; unknown and duplicate values
+are rejected.
+
+<Callout type="info">
+  Capabilities gate Termy APIs. They are not operating-system permissions: plugins
+  are still trusted Bun code with normal file, network, and process access.
+</Callout>
+
+The entrypoint exports a plugin definition without repeating manifest metadata:
+
+```ts title="plugin.ts"
+export default definePlugin({
+  commands: [
+    {
+      id: "greet",
+      title: "Hello: Greet me",
+      keywords: ["hello", "example"],
+      icon: "info",
+      run({ context }) {
+        context.toasts.success(`Welcome to Termy ${context.appVersion}`);
+      },
+    },
+  ],
+} satisfies TermyPlugin);
+```
+
+Termy manages `plugins/termy.d.ts`, which supplies the global `definePlugin`,
+`TermyPlugin`, `TermyPluginContext`, and JSX types. Do not import an SDK or run a
+build step.
+
+## Install and manage plugins
+
+Use **Settings → Plugins → Install from folder** to select a plugin directory.
+Termy validates it and copies it into the managed plugins directory. The same screen
+shows Bun status and lets you refresh, open the folder, enable, disable, or uninstall
+plugins.
+
+The CLI supports local folders and trusted GitHub sources:
+
+```sh
+termy plugin add ./my-plugin
+termy plugin add https://github.com/example/termy-plugins --path my-plugin
+termy plugin status my-plugin
+termy plugin disable my-plugin
+termy plugin enable my-plugin
+termy plugin update my-plugin
+termy plugin uninstall my-plugin
+```
+
+`add` also accepts the `install` alias, while `remove` accepts `uninstall`. Local
+installs copy the source into Termy's managed directory and leave the development
+folder untouched.
+
+GitHub repository URLs, `/tree/<ref>/<path>` URLs, `--ref`, and `--path` are
+supported. Termy resolves refs to full commits and stores source metadata for
+predictable status and updates. A repository with multiple valid plugins requires
+`--path` instead of guessing.
+
+The installer downloads regular files as data. It does not clone the repository,
+run scripts, evaluate plugin code, or install dependencies while installing. The
+plugin becomes trusted Bun code when Termy loads it, so interactive CLI installs
+require confirmation and automation must pass `--yes`.
+
+## Develop safely
+
+`termy plugin dev ./my-plugin` validates the source tree and atomically swaps each
+valid update into place. A validation or copy failure leaves the managed copy
+untouched; Bun load errors appear when the command palette refreshes. `Ctrl C` stops
+the watcher without uninstalling the plugin.
+
+Dev mode preserves enabled state and storage. It refuses to replace a GitHub-tracked
+installation with a local source, so uninstall that copy first when intentionally
+changing its origin.
+
+The managed plugin directory is `$XDG_CONFIG_HOME/termy/plugins` when
+`XDG_CONFIG_HOME` is set, `~/.config/termy/plugins` otherwise on macOS and Linux,
+and `%APPDATA%\termy\plugins` on Windows.
+
+Next, define richer [commands and context](/docs/using-termy/plugins/commands-context)
+or switch the entrypoint to `.tsx` for [native UI](/docs/using-termy/plugins/native-ui).

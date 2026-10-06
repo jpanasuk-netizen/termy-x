@@ -1,0 +1,35 @@
+---
+title: Plugins
+description: Add commands, automations, and safe native tools to Termy.
+---
+
+Plugins extend Termy with TypeScript running in Bun. A plugin can add command-palette
+commands, react to terminal lifecycle events, store local data, and open small native
+tools rendered by Termy.
+
+<Callout type="warn">
+  Plugins are trusted local code. They run with your user account's file, network,
+  and process access, so read the source before installing one.
+</Callout>
+
+<Cards>
+  <Card title="Getting started" description="Create, install, and develop your first plugin." href="/docs/using-termy/plugins/getting-started" />
+  <Card title="Commands and context" description="Add palette commands, inputs, settings, actions, and shortcuts." href="/docs/using-termy/plugins/commands-context" />
+  <Card title="Native UI" description="Build safe JSX tools that Termy renders with GPUI." href="/docs/using-termy/plugins/native-ui" />
+  <Card title="Lifecycle and storage" description="React to terminal events and keep plugin data between reloads." href="/docs/using-termy/plugins/lifecycle-storage" />
+  <Card title="Security and limits" description="Understand trust, isolation, imports, reloads, and runtime limits." href="/docs/using-termy/plugins/security-limits" />
+</Cards>
+
+## What plugins can do
+
+| Feature | Use it for |
+| --- | --- |
+| Commands | Add actions to the command palette, context menus, and keybindings. |
+| Context | Read the active terminal, selection, working directory, shell, tab, and pane. |
+| Native UI | Return allowlisted JSX that Termy validates and renders with GPUI. |
+| Lifecycle events | Respond when the terminal is ready, a tab changes, the directory changes, or a command finishes. |
+| Settings and storage | Expose typed settings and persist plugin-specific JSON or files. |
+
+Install [Bun](https://bun.sh/) before loading plugins. Then open **Settings →
+Plugins** to install, enable, disable, refresh, or uninstall them. Developers can
+start with [Getting started](/docs/using-termy/plugins/getting-started).

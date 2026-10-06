@@ -1,0 +1,101 @@
+---
+title: Security and limits
+description: Understand plugin trust, import rules, isolation, reloads, and boundaries.
+---
+
+Plugins are trusted Bun code, not sandboxed extensions. A handler can use async
+functions, `fetch`, `Bun.*`, Node-compatible standard-library APIs, files,
+subprocesses, network requests, and local relative TypeScript imports.
+
+<Callout type="warn">
+  Worker isolation protects Termy from many crashes and timeouts, but it does not
+  protect your account from a malicious plugin. Read the source before installing.
+</Callout>
+
+Manifest capabilities gate Termy-owned APIs, not operating-system access. A plugin
+needs `storage` for `context.storage` and `context.paths`, and `native-ui` for views
+and `view.open`, but those declarations do not restrict Bun, Node built-ins,
+subprocesses, files, or the network.
+
+## Imports and source validation
+
+V1 supports local relative imports that remain inside the plugin directory, plus
+Bun and Node built-ins such as `bun` and `node:fs`. Package imports, out-of-root
+paths, and symlinks are rejected. Termy never installs packages automatically or
+runs plugin build hooks.
+
+GitHub installation downloads regular files without cloning the repository,
+running scripts, evaluating code, or installing dependencies. Code executes only
+when the plugin is loaded.
+
+## Workers, timeouts, and processes
+
+Termy uses one external Bun host and isolates each plugin in its own Worker.
+Lifecycle subscribers keep the host warm; eventless plugins restart it on demand
+after idle suspension. Commands, events, and native views use execution timeouts;
+a crash or timeout is contained to the failed Worker.
+
+Subprocesses started by plugin code can outlive that Worker, so the plugin must stop
+its own child processes when cancellation matters. If the shared host transport
+exits, Termy rebuilds it and reloads Workers on the next refresh without taking down
+the app.
+
+User cancellation aborts `context.signal`; long-running handlers should observe it
+and can report a bounded status message and percentage through `context.progress`.
+
+Persist durable state through `context.storage` or managed files. Module globals
+may reset when an eventless host sleeps.
+
+The default handler timeout is 10 seconds. A command or view may set `timeoutMs`
+from 100 to 30,000 milliseconds.
+
+## Runtime limits
+
+| Area | Limit |
+| --- | --- |
+| Installed plugins | 32 |
+| Source tree | 4,096 files and 16 MiB total |
+| Definitions | 512 commands, 64 settings, and 32 views per plugin |
+| Command input | 16 inputs per command and 128 options per select or pick result |
+| Returned actions | 32 per invocation |
+| View params | 64 KiB JSON object |
+| Structured launch | 128 args and 4,096 characters per program/arg |
+
+Small persistent storage has separate limits documented under
+[Lifecycle and storage](/docs/using-termy/plugins/lifecycle-storage#store-json-values).
+
+## Native UI boundaries
+
+JSX is data, not renderer access. Termy accepts only the documented
+[native components](/docs/using-termy/plugins/native-ui#component-allowlist),
+semantic props, and string or boolean control values. It rejects unknown nodes and
+props before GPUI renders anything.
+
+A plugin may declare at most 32 views. Each rendered document is limited to 256
+nodes, 16 levels of nesting, 64 children per node, and 64 value-bearing controls.
+Text input values are limited to 4,096 characters. View params must be a JSON object
+and are limited to 64 KiB.
+
+## Bundles and reloads
+
+Termy checks plugin content whenever the command palette opens. It fingerprints the
+manifest and source tree, then bundles each changed plugin once with
+`Bun.build({ target: "bun" })` into
+`plugins/.termy-cache/bundles/<id>/<content-hash>.mjs`. Local relative imports are
+included in both the content hash and bundle; unchanged plugins reuse their cached
+module.
+
+Saving a manifest or source file replaces the changed Worker and refreshes its
+commands without restarting Termy. Disabling a plugin keeps its managed files and
+storage but removes its commands on the next refresh. Uninstalling removes the
+managed copy, storage, and cache while leaving the original source folder untouched.
+Actions and native-view updates from requests already running when a plugin
+changes, is disabled, or is removed are rejected.
+
+Termy resolves Bun from `TERMY_BUN_PATH`, beside the Termy executable, `PATH`,
+Bun's default user install, Homebrew, and `/usr/local/bin`. Set `TERMY_BUN_PATH` to
+an absolute executable path when automatic resolution misses it.
+
+V1 supports command-palette commands, lifecycle events, plugin keybindings, and
+allowlisted native JSX views. It does not support arbitrary React, HTML, or GPUI,
+build hooks, package imports, or automatic package installation.

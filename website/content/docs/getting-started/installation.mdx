@@ -1,0 +1,61 @@
+---
+title: Install
+description: Download Termy for macOS, Linux, or Windows.
+---
+
+The fastest path is the [Termy download page](/download). It detects your platform and links to the current GitHub release.
+
+<Cards>
+  <Card title="macOS" description="Install the DMG on Apple silicon or Intel." href="#macos" />
+  <Card title="Linux" description="Run the AppImage or unpack the archive." href="#linux" />
+  <Card title="Windows" description="Install Termy with the MSI package." href="#windows" />
+  <Card title="Build from source" description="Compile the Rust workspace locally." href="#from-source" />
+</Cards>
+
+## macOS
+
+1. On the [download page](/download), choose **Apple silicon** for M-series Macs or **Intel** for older Macs.
+2. Open the `.dmg` and drag Termy to `/Applications`.
+3. Open Termy from Applications.
+
+macOS DMGs from v0.2.75 onward are signed and notarized. If Termy does not open,
+[see the troubleshooting guide](/docs/getting-started/troubleshooting).
+
+## Linux
+
+Download the AppImage or `.tar.gz` from [GitHub Releases](https://github.com/lassejlv/termy/releases).
+
+- **AppImage:** mark it executable, then run it.
+- **Archive:** unpack it and run the included Termy binary.
+
+Linux release launchers prefer X11/XWayland when it is available so the desktop
+window manager can provide the native title bar and window controls. To run the
+Wayland backend instead, launch Termy with `TERMY_LINUX_BACKEND=wayland`.
+Both terminal and Settings windows request system-managed decorations, including
+KDE's title bar, window controls, and resize borders. The window manager controls
+the titlebar theme independently of Termy's terminal color theme.
+
+## Windows
+
+Download and run the `.msi` installer from [GitHub Releases](https://github.com/lassejlv/termy/releases).
+
+## From source
+
+```bash
+git clone https://github.com/lassejlv/termy
+cd termy
+cargo run --release -p termy
+```
+
+This route requires Rust and the platform dependencies used by the desktop app. Prefer a release binary unless you are developing Termy itself.
+
+## First launch
+
+| | |
+| --- | --- |
+| Theme | `termy` |
+| Shell | your login shell (`$SHELL`) |
+| Font | system monospace (Menlo on macOS, Consolas on Windows), 14px |
+| Settings | `Cmd ,` (macOS) · `Ctrl ,` (Linux / Windows) |
+| Command palette | `Cmd P` · `Ctrl P` |
+| Open a folder | file manager **Open new Termy tab here**, or `termy /path` |

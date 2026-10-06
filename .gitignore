@@ -1,0 +1,11 @@
+/target
+.codex/
+.DS_Store
+.env
+./docs/examples/plugins/hello-rust/target
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
+.build
+
+# DMG build output
+/dist

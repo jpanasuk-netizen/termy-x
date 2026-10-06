@@ -1,0 +1,22 @@
+---
+title: Tasks and layouts
+description: Named commands launched from the palette.
+---
+
+Pattern: `task.<name>.<field>`
+
+| Field | Required | Description |
+| ----- | -------- | ----------- |
+| `command` | yes | Shell command for a new tab |
+| `layout` | no | Only show when this saved layout is active |
+| `working_dir` | no | Working directory |
+
+```txt
+task.build.command     = cargo build
+task.build.working_dir = crates/cli
+
+task.dev_server.layout  = dashboard
+task.dev_server.command = cargo run
+```
+
+Run from the palette (**Run Task**) or bind `run_task` to a key.

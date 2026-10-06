@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://termy.sh/schemas/plugin.schema.json",
+  "title": "Termy Plugin Manifest",
+  "description": "Manifest for a Termy plugin.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "id", "name"],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri-reference",
+      "description": "JSON Schema used by editors to validate this manifest."
+    },
+    "apiVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Termy plugin API version."
+    },
+    "id": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
+      "description": "Stable plugin ID used as the managed plugin directory name."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "\\S",
+      "description": "Human-readable plugin name shown by Termy."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "pattern": "\\S",
+      "description": "Plugin version shown in Settings."
+    },
+    "main": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "\\S",
+      "default": "plugin.ts",
+      "description": "Entrypoint relative to the plugin directory. It must remain inside that directory and point to a regular file.",
+      "allOf": [
+        {
+          "not": {
+            "pattern": "^(?:[\\\\/]|[A-Za-z]:[\\\\/])"
+          }
+        },
+        {
+          "not": {
+            "pattern": "(?:^|[\\\\/])\\.\\.(?:[\\\\/]|$)"
+          }
+        }
+      ]
+    },
+    "capabilities": {
+      "type": "array",
+      "default": [],
+      "maxItems": 2,
+      "uniqueItems": true,
+      "description": "Termy host APIs used by the plugin. These are not operating-system permissions.",
+      "items": {
+        "type": "string",
+        "enum": ["storage", "native-ui"]
+      }
+    }
+  }
+}

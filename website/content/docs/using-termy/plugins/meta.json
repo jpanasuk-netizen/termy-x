@@ -1,0 +1,12 @@
+{
+  "title": "Plugins",
+  "pages": [
+    "index",
+    "getting-started",
+    "commands-context",
+    "native-ui",
+    "lifecycle-storage",
+    "security-limits"
+  ],
+  "defaultOpen": false
+}

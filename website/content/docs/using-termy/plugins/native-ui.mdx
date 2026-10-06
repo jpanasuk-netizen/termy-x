@@ -1,0 +1,163 @@
+---
+title: Native UI
+description: Build safe JSX tools that Termy validates and renders with GPUI.
+---
+
+Plugins can open small native tools from `.tsx` entrypoints. JSX is compiled into a
+strictly validated Termy document and rendered with GPUI; it is not HTML or React,
+and plugins never receive native renderer access.
+
+Declare `native-ui` in `plugin.json`; add `storage` too when the view persists data.
+
+## Open a view
+
+Point the manifest at a `.tsx` entrypoint:
+
+```json title="plugin.json"
+{
+  "$schema": "https://termy.sh/schemas/plugin.schema.json",
+  "apiVersion": 1,
+  "id": "todos",
+  "name": "Todos",
+  "main": "plugin.tsx",
+  "capabilities": ["storage", "native-ui"]
+}
+```
+
+Add the Termy JSX pragmas, declare the view, and return `view.open` from a command:
+
+```tsx title="plugin.tsx"
+/** @jsxRuntime classic */
+/** @jsx TermyUI.createElement */
+/** @jsxFrag TermyUI.Fragment */
+
+export default definePlugin({
+  commands: [{
+    id: "open",
+    title: "Todos: Open",
+    run() {
+      return { type: "view.open", view: "todos" };
+    },
+  }],
+  views: {
+    todos: {
+      title: "Todos",
+      async render({ params, context }) {
+        const todos = await context.storage.get<Array<{
+          id: string;
+          title: string;
+          done: boolean;
+        }>>("todos") ?? [];
+        return (
+          <TermyUI.Column gap="medium">
+            <TermyUI.Row gap="small" align="center">
+              <TermyUI.TextInput id="title" placeholder="Add a task…" submit="add" />
+              <TermyUI.Button id="add-button" action="add" variant="primary">
+                Add
+              </TermyUI.Button>
+            </TermyUI.Row>
+            <TermyUI.Divider />
+            {todos.slice(0, 24).map((todo) => (
+              <TermyUI.Checkbox
+                id={`todo-${todo.id}`}
+                action="toggle"
+                payload={todo.id}
+                checked={todo.done}
+              >
+                {todo.title}
+              </TermyUI.Checkbox>
+            ))}
+          </TermyUI.Column>
+        );
+      },
+      async onAction({ action, values, context }) {
+        // Persist changes using action.id, action.payload, and the form values.
+        // Termy rerenders the view after this handler finishes.
+      },
+    },
+  },
+} satisfies TermyPlugin);
+```
+
+The view key (`todos`) must match the `view` in the `view.open` action. The managed
+`termy.d.ts` file supplies `TermyUI`, JSX, view, and action types globally.
+
+`view.open` accepts a bounded JSON `params` object. Termy freezes it and passes the
+same values to `render` and `onAction`. Return `view.replace` to navigate to another
+declared view in place, or `view.close` to dismiss the current view.
+
+Views use a centered modal by default. Add `target: "commandPalette"` to render
+the same bounded native document inside the palette results area while keeping
+the palette search and footer:
+
+```ts
+return { type: "view.open", view: "todos", target: "commandPalette" };
+```
+
+## Handle interactions
+
+Interactive controls use named actions instead of JavaScript callbacks. Any view
+that renders an interactive control must define `onAction`; passive views may omit
+it.
+
+- `Button`, `Checkbox`, `Select`, `List`, and `ListItem` use named actions; `payload` carries optional item data.
+- `TextInput` and `TextArea` require an `id`; `submit` names an optional submit action.
+- Every control ID in one rendered document must be unique.
+
+Termy supplies Tab/Shift-Tab focus traversal, arrow-key selection for selects and
+lists, and Enter/Space activation for controls. A filtering list also accepts text
+while focused and filters its items locally.
+
+`onAction` receives `action.id`, `action.controlId`, optional `action.payload` and
+`action.value`, plus a `values` snapshot keyed by control ID. It can update storage,
+emit toasts, or return any normal [plugin action](/docs/using-termy/plugins/commands-context#return-actions).
+After it finishes, Termy calls `render` again and replaces the document.
+
+```tsx
+type Todo = { id: string; title: string; done: boolean };
+
+async onAction({ action, values, context }) {
+  if (action.id === "add") {
+    const title = String(values.title ?? "").trim();
+    if (!title) {
+      context.toasts.info("Give the todo a title first");
+      return;
+    }
+
+    const todos = await context.storage.get<Todo[]>("todos") ?? [];
+    await context.storage.set("todos", [
+      ...todos,
+      { id: crypto.randomUUID(), title, done: false },
+    ]);
+  }
+}
+```
+
+## Component allowlist
+
+| Component | Supported props |
+| --- | --- |
+| `Column`, `Row` | `gap`, `align`, and children |
+| `Text` | `variant`, `tone`, and text children |
+| `TextInput` | `id`, `label`, `placeholder`, `value`, `maxLength`, `submit`, `disabled` |
+| `TextArea` | TextInput props plus `rows` |
+| `Select` | `id`, `label`, `placeholder`, `value`, `options`, `action`, `disabled` |
+| `List` | `id`, `action`, `selectedId`, `searchPlaceholder`, `filtering`, `isLoading`, and `ListItem` children |
+| `ListItem` | `id`, `title`, `subtitle`, `keywords`, `status`, `payload`, `action`, `disabled` |
+| `EmptyState` | `title`, `description` |
+| `Progress` | `label`, `value` from 0 through 100 |
+| `Button` | `id`, `action`, `payload`, `variant`, `disabled`, and text children |
+| `Checkbox` | `id`, `action`, `payload`, `checked`, `disabled`, and text children |
+| `Divider` | No props |
+| `Spacer` | `size` |
+
+Gaps and spacer sizes use `none`, `small`, `medium`, or `large`. Alignment uses
+`start`, `center`, `end`, or `stretch`. Text variants are `heading`, `body`,
+`caption`, and `code`; tones are `default`, `muted`, `success`, and `danger`.
+Button variants are `secondary`, `primary`, and `danger`.
+
+Styling is semantic and theme-aware. Arbitrary CSS, GPUI properties, assets,
+callbacks, and colors are rejected. Read
+[Security and limits](/docs/using-termy/plugins/security-limits) for document and
+runtime boundaries. Paginate dynamic lists so large saved collections stay inside
+the node, child, and value-control limits.
