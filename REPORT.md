@@ -88,3 +88,13 @@ The release `x_panel_preview` uses `windows_subsystem = "windows"`, so no consol
 **Not pushed.** One non-interactive `git push origin main` was attempted (GIT_TERMINAL_PROMPT=0, GCM_INTERACTIVE=never, 60 s timeout). It failed with `fatal: could not read Username for 'https://origin.cursor.com': terminal prompts disabled` (exit 128). Git Credential Manager has no stored credential for origin.cursor.com, so the commits stay local. No token was created or pasted.
 Remotes: `origin` = https://origin.cursor.com/jeremy-panasuk/termy-x.git, `upstream` = https://github.com/lassejlv/termy.git.
 To publish, run `git push origin main` once from an interactive terminal in the repo and complete the Google sign-in when Git Credential Manager prompts for it.
+
+## Compose caret / first-letter fix (2026-10-06, commit 07d9251d)
+
+**Symptoms:** Empty compose showed the caret on the right; the first typed letter (often a capital) disappeared.
+
+**Root cause:**
+1. Empty-state render placed the placeholder *before* the caret, so the blink sat at the end of the hint line instead of index 0 on the left.
+2. `on_key` bailed on `mods.modified()`, which includes Shift — so Shift+letter (sentence capitals) never reached `insert_text`. Prefer `key_char` now; only ctrl/alt/platform/function block plain text.
+
+**Fix:** Caret-first empty layout; Shift-safe insert via `key_char`; `stop_propagation` on compose editing keys. Release `termy.exe` rebuilt. Not pushed.
