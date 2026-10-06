@@ -1,0 +1,36 @@
+---
+title: Command Boundary
+description: Ownership boundaries between the command engine and adapters.
+---
+
+## Ownership
+
+`termy_core::command_core` owns:
+
+- Command IDs and config-facing command names
+- Command config-name parsing and normalization
+- Keybind defaults
+- Keybind directive parsing (`clear`, bind, unbind)
+- Deterministic keybind resolution order
+
+App/CLI adapters own:
+
+- UI labels, keywords, and command-palette presentation
+- Platform-specific visibility policy for palette entries
+- UI trigger canonicalization and validation (e.g. GPUI keystroke parsing)
+
+## Dependency Rule
+
+`termy_core::command_core` must remain a pure domain crate. It must **not** depend on:
+
+- `termy_core::config_core`
+- `gpui`
+- Other UI or presentation crates
+
+## Integration Pattern
+
+- Adapters convert parsed config keybind lines into `termy_core::command_core::KeybindLineRef`.
+- Adapters call `parse_keybind_directives_from_iter`; trigger canonicalization happens in `termy_core::command_core`.
+- Adapters call `resolve_keybinds` over `default_resolved_keybinds`.
+
+One canonical command/keybind engine; thin, readable adapter code.

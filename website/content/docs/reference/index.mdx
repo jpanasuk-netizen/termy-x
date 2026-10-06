@@ -1,0 +1,35 @@
+---
+title: Reference
+description: Exact configuration keys, default shortcuts, and action names.
+---
+
+Reference pages are for lookup. If you are deciding what to change, start in
+[Customize Termy](/docs/customize) instead.
+
+<Cards>
+  <Card
+    title="Configuration reference"
+    description="Every documented config key, accepted value, and default."
+    href="/docs/reference/configuration-reference"
+  />
+  <Card
+    title="Default keybindings"
+    description="The shortcuts Termy ships on macOS, Linux, and Windows."
+    href="/docs/reference/keybinding-defaults"
+  />
+  <Card
+    title="Actions"
+    description="Action names available to keybindings and the command palette."
+    href="/docs/reference/actions"
+  />
+</Cards>
+
+## How the pieces connect
+
+```txt
+key press → keybinding → action → Termy behavior
+config key → parsed setting → runtime or appearance change
+```
+
+When creating a shortcut, find the behavior in [Actions](/docs/reference/actions),
+then map that action using [Keybindings](/docs/customize/keybindings).

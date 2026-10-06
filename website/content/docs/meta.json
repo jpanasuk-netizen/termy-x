@@ -1,0 +1,17 @@
+{
+  "title": "Termy",
+  "pages": [
+    "index",
+    "---Install & setup---",
+    "getting-started",
+    "---Daily workflows---",
+    "using-termy",
+    "---Settings & themes---",
+    "customize",
+    "---Exact reference---",
+    "reference",
+    "---AI agent tools---",
+    "---Develop & embed---",
+    "developer"
+  ]
+}

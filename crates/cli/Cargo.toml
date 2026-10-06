@@ -1,0 +1,41 @@
+[package]
+name = "termy_cli"
+version = "0.2.81"
+edition = "2024"
+default-run = "termy-cli"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "termy-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "xtask"
+path = "src/xtask/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+notify = "8"
+ratatui = "0.29"
+crossterm = "0.28"
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+shlex = "2.0"
+tempfile = { workspace = true }
+ureq = { workspace = true }
+url = { workspace = true }
+percent-encoding = "2.3"
+roxmltree = "0.20"
+base64 = "0.22"
+termy_core = { path = "../core" }
+termy_x = { path = "../x_core" }
+
+
+[target."cfg(target_os = \"macos\")".dependencies]
+core-text = "=21.0.0"
+core-foundation = "0.10"

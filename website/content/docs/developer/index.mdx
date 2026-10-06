@@ -1,0 +1,39 @@
+---
+title: Develop and embed
+description: Understand Termy's boundaries, measure rendering, or build with libtermy.
+---
+
+Choose the path that matches what you are building.
+
+<Cards>
+  <Card
+    title="Embed libtermy"
+    description="Use the beta terminal engine from Rust, C, Swift, or another native host."
+    href="/docs/developer/libtermy"
+  />
+  <Card
+    title="Understand command boundaries"
+    description="See which commands are safe, external, or controlled by the host."
+    href="/docs/developer/command-boundary"
+  />
+  <Card
+    title="Measure rendering"
+    description="Inspect paint, shaping, caching, and damage-scoped performance metrics."
+    href="/docs/developer/render-metrics"
+  />
+  <Card
+    title="Repository architecture"
+    description="Map crates, native hosts, packaging, and ownership boundaries."
+    href="https://github.com/lassejlv/termy/blob/main/docs/architecture/project-layout.md"
+    external
+  />
+</Cards>
+
+## Pick the correct layer
+
+| Change | Owning layer |
+| --- | --- |
+| Terminal parsing, PTY, frames, input, search | `termy_core` |
+| C, Swift, or Objective-C integration | `termy_core::ffi` |
+| Shared tabs, panes, and terminal UI behavior | `termy::terminal_ui` |
+| GPUI desktop application | `termy` |

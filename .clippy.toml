@@ -1,0 +1,8 @@
+# Clippy threshold configuration for the Termy workspace
+# Tuned for GPUI patterns and terminal emulator rendering code
+
+# GPUI callbacks and render functions often pass many parameters
+too-many-arguments-threshold = 8
+
+# Rendering and state management functions can be legitimately complex
+cognitive-complexity-threshold = 30

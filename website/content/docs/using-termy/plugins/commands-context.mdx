@@ -1,0 +1,183 @@
+---
+title: Commands and context
+description: Define palette commands, inputs, settings, actions, and keybindings.
+---
+
+Commands are searchable actions that run inside the plugin's Bun Worker. They can
+collect native inputs, inspect a read-only Termy context, emit notifications, and
+return typed actions to the app.
+
+```ts title="plugin.ts"
+export default definePlugin({
+  settings: {
+    greeting: {
+      type: "text",
+      title: "Greeting",
+      defaultValue: "Hello from Termy",
+    },
+    token: {
+      type: "secret",
+      title: "API token",
+    },
+  },
+  commands: [
+    {
+      id: "greet",
+      title: "Hello: Greet me",
+      placements: ["commandPalette", "terminalContextMenu"],
+      keywords: ["hello", "example"],
+      icon: "info",
+      inputs: [
+        {
+          id: "style",
+          type: "select",
+          label: "Greeting style",
+          options: [
+            { value: "short", label: "Short" },
+            { value: "friendly", label: "Friendly" },
+          ],
+        },
+        {
+          id: "confirmed",
+          type: "confirm",
+          label: "Show greeting?",
+          defaultValue: true,
+        },
+      ],
+      async run({ inputs, context }) {
+        if (inputs.confirmed !== true) return;
+
+        const message =
+          inputs.style === "friendly"
+            ? `Welcome to Termy ${context.appVersion}`
+            : context.settings.get("greeting") ?? "Hello from Termy";
+
+        context.toasts.success(message);
+      },
+    },
+  ],
+} satisfies TermyPlugin);
+```
+
+## Command fields and inputs
+
+Commands require `id`, `title`, and `run`. They may also declare search `keywords`,
+`status`, `enabled`, `disabledReason`, `timeoutMs`, and one of Termy's built-in
+`icon` names.
+
+`placements` controls where a command is listed. It accepts `commandPalette`,
+`terminalContextMenu`, and `tabContextMenu`, and defaults to
+`["commandPalette"]`. Context-menu placements are currently available on Linux
+and Windows. Commands with inputs use the same palette input flow from every
+surface. Use `placements: []` for a keybinding-only command.
+
+Use `when` to make a command available only in matching context. Supported filters
+are `hasSelection`, `hasWorkingDirectory`, `runtimes`, and `platforms`. Termy
+checks the condition when listing the command and again immediately before running
+it.
+
+Inputs appear sequentially before the handler runs:
+
+- `text` returns a string and supports a placeholder, default, required flag, and maximum length.
+- `select` returns the value of one fixed option.
+- `pick` calls `loadOptions({ query, context })` as the user types and returns the selected option value.
+- `confirm` returns a boolean.
+
+Commands without inputs run immediately. Inputs are delivered as
+`inputs.<input-id>` to `run`.
+
+Pick loaders may be async and return the same `{ value, label, keywords?, status? }`
+shape as select options. Termy debounces requests and ignores stale results. Keep
+loaders side-effect free; they cannot return actions.
+
+## Read the active context
+
+Every handler receives a read-only snapshot with `platform`, `appVersion`, the
+resolved session launch `shell`, and the active `runtime` (`native` or `tmux`). It
+may also include `workingDirectory`, `activeCommand`, `selectedText`, `activeTab`,
+and `activePane`.
+
+`context.origin` contains stable `windowId`, `tabId`, and `paneId` values captured
+when the request starts. Use it to keep an async action aimed at its original
+terminal even if the user changes tabs. Active tab and pane snapshots include the
+same stable IDs.
+
+Tab and pane indexes are zero-based. Selected text is capped at 64 KiB on a UTF-8
+boundary; `selectedTextTruncated` reports whether Termy shortened it.
+
+```ts
+run({ context }) {
+  if (!context.selectedText) {
+    context.toasts.info("Select terminal text first");
+    return;
+  }
+  return { type: "clipboard.write", text: context.selectedText };
+}
+```
+
+The context also exposes `context.toasts.info(message)`, `success(message)`,
+`warning(message)`, and `error(message)`. These emit notifications directly and do
+not require an SDK import or returned action.
+
+Long-running handlers should stop when `context.signal` aborts. They can update the
+cancellable loading toast with
+`context.progress.report({ message?, percentage? })`; percentages range from 0 to
+100.
+
+## Plugin settings
+
+Declare typed `toggle`, `text`, `select`, and `secret` settings beside `commands`.
+Termy renders them under **Settings → Plugins**, and handlers read the resolved
+values with `context.settings.get("settingName")`.
+
+Ordinary overrides live in the plugin data directory. Secrets are masked and stored
+through the operating-system credential store instead of `settings.json`. Changes
+apply to the next invocation without restarting the Worker.
+
+## Return actions
+
+A command, lifecycle handler, or native-view action handler can return one action,
+an action array, `{ actions: [...] }`, or nothing. Handlers may be async.
+
+| Type | Purpose |
+| --- | --- |
+| `terminal.run` | Legacy action that opens a tab and runs a shell command. |
+| `terminal.sendText` | Send text, optionally followed by Enter, to `origin`, `active`, or an exact terminal target. |
+| `terminal.open` | Open a tab, right/down split, or window with an optional working directory and launch. |
+| `termy.command` | Invoke a built-in Termy command. |
+| `clipboard.write` | Copy text to the system clipboard. |
+| `url.open` | Open an `http` or `https` URL. |
+| `view.open` | Open a native view with optional JSON `params`. Add `target: "commandPalette"` to use the palette surface; the default is a modal. Requires `native-ui`. |
+| `view.replace` | Replace the current plugin view and params in place. |
+| `view.close` | Close the current plugin view. |
+| `toast` | Show an info, success, warning, or error notification. |
+
+Exact terminal targets are scoped to the Termy window that delivered the
+invocation. `focus: false` restores the previous pane after opening a tab or
+split; a newly created OS window necessarily becomes focused.
+
+`terminal.open.launch` accepts `{ type: "shell", command }` or
+`{ type: "program", program, args? }`. Prefer structured programs when exact argv
+boundaries matter. Structured program launches require the native runtime; tmux
+rejects them because preserving argv would otherwise require shell parsing.
+
+Never interpolate free-form text directly into `terminal.run` or a shell launch.
+Map selected values to fixed commands or quote values correctly for the target
+shell.
+
+## Bind a plugin command
+
+Use the manifest and command IDs in `~/.config/termy/config.txt`:
+
+```txt
+keybind = secondary-g=plugin:git-tools/status
+```
+
+Commands with inputs open their input form. Termy refreshes the plugin catalog
+before invoking a shortcut, so saved plugin changes are picked up. Normal keybinding
+ordering applies: later lines win, `unbind` removes the shortcut, and a task
+keybinding takes priority on conflicts.
+
+See [Native UI](/docs/using-termy/plugins/native-ui) for `view.open` and
+[Lifecycle and storage](/docs/using-termy/plugins/lifecycle-storage) for events and
+persistence.

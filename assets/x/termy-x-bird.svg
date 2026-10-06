@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1000" width="1600" height="1000" preserveAspectRatio="xMidYMid slice" role="img" aria-labelledby="title desc">
+  <title id="title">Termy X geometric swift</title>
+  <desc id="desc">Original low-poly swift in electric blue and cyan on a navy starfield, with a magenta heart badge marked +1. An independent geometric drawing for a 1600 by 1000 desktop frame.</desc>
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#05070d"/>
+      <stop offset="0.55" stop-color="#07111c"/>
+      <stop offset="1" stop-color="#03050a"/>
+    </linearGradient>
+    <linearGradient id="wing" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7af6ff"/>
+      <stop offset="0.55" stop-color="#2f7bff"/>
+      <stop offset="1" stop-color="#1236c9"/>
+    </linearGradient>
+    <linearGradient id="wing-low" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#19d7ff"/>
+      <stop offset="1" stop-color="#0a3ea8"/>
+    </linearGradient>
+    <linearGradient id="body" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d9fbff"/>
+      <stop offset="0.35" stop-color="#4cc8ff"/>
+      <stop offset="1" stop-color="#1a4dff"/>
+    </linearGradient>
+    <radialGradient id="bloom" cx="50%" cy="50%" r="50%">
+      <stop offset="0" stop-color="#2aa7ff" stop-opacity="0.42"/>
+      <stop offset="0.55" stop-color="#124bff" stop-opacity="0.12"/>
+      <stop offset="1" stop-color="#124bff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect width="1600" height="1000" fill="url(#sky)"/>
+  <path fill="none" stroke="#16324a" stroke-width="1" opacity="0.55" d="M0 100 H1600 M0 200 H1600 M0 300 H1600 M0 400 H1600 M0 500 H1600 M0 600 H1600 M0 700 H1600 M0 800 H1600 M0 900 H1600 M100 0 V1000 M200 0 V1000 M300 0 V1000 M400 0 V1000 M500 0 V1000 M600 0 V1000 M700 0 V1000 M800 0 V1000 M900 0 V1000 M1000 0 V1000 M1100 0 V1000 M1200 0 V1000 M1300 0 V1000 M1400 0 V1000 M1500 0 V1000"/>
+
+  <g fill="#d7f7ff">
+    <circle cx="90" cy="70" r="1.6" opacity="0.8"/>
+    <circle cx="240" cy="140" r="1.2" opacity="0.5"/>
+    <circle cx="420" cy="60" r="1.7" opacity="0.7"/>
+    <circle cx="980" cy="80" r="1.4" opacity="0.55"/>
+    <circle cx="1180" cy="150" r="1.2" opacity="0.45"/>
+    <circle cx="1380" cy="70" r="1.6" opacity="0.65"/>
+    <circle cx="1520" cy="180" r="1.3" opacity="0.5"/>
+    <circle cx="80" cy="520" r="1.2" opacity="0.35"/>
+    <circle cx="140" cy="860" r="1.3" opacity="0.4"/>
+    <circle cx="360" cy="920" r="1.2" opacity="0.32"/>
+    <circle cx="1480" cy="860" r="1.4" opacity="0.4"/>
+    <circle cx="1540" cy="480" r="1.2" opacity="0.35"/>
+    <polygon points="70,240 74,250 84,254 74,258 70,268 66,258 56,254 66,250" opacity="0.45"/>
+    <polygon points="1460,300 1464,310 1474,314 1464,318 1460,328 1456,318 1446,314 1456,310" opacity="0.4"/>
+    <polygon points="900,930 904,940 914,944 904,948 900,958 896,948 886,944 896,940" opacity="0.35"/>
+  </g>
+
+  <ellipse cx="760" cy="490" rx="420" ry="250" fill="url(#bloom)"/>
+
+  <!-- Faceted swift facing left. Knife wings, diamond head, forked tail. Opaque facets, no blur. -->
+  <g>
+    <polygon points="820,440 1240,300 1080,470 860,485" fill="#163cff"/>
+    <polygon points="840,530 1180,640 1020,555 860,560" fill="#0a3ea8"/>
+    <polygon points="560,545 860,530 700,690" fill="url(#wing-low)"/>
+    <polygon points="560,545 700,690 420,770" fill="#19d7ff"/>
+    <polygon points="700,690 880,575 760,745" fill="#0c2f9a"/>
+    <polygon points="470,445 820,400 860,515 530,540" fill="url(#body)"/>
+    <polygon points="530,540 860,515 890,600 590,610" fill="#1a4dff"/>
+    <polygon points="230,205 530,275 440,375 300,330" fill="#e9fdff"/>
+    <polygon points="530,275 790,395 700,485 440,375" fill="url(#wing)"/>
+    <polygon points="545,310 700,335 655,405 500,375" fill="#bff7ff"/>
+    <polygon points="300,452 395,395 475,458 395,535 300,508" fill="#d9fbff"/>
+    <polygon points="395,395 475,458 395,455" fill="#7af6ff"/>
+    <polygon points="168,478 300,450 300,508" fill="#e9fdff"/>
+    <circle cx="368" cy="462" r="11" fill="#071018"/>
+    <circle cx="364" cy="458" r="3.2" fill="#e9fdff"/>
+  </g>
+
+  <g transform="translate(1188 655)">
+    <circle cx="78" cy="78" r="78" fill="#1a0614" stroke="#ff4fa3" stroke-width="3"/>
+    <path d="M78 108 C78 94 60 82 42 96 C20 112 24 142 46 160 C60 172 78 186 78 186 C78 186 96 172 110 160 C132 142 136 112 114 96 C96 82 78 94 78 108 Z" fill="#ff3d9a"/>
+    <path d="M58 118 C48 106 34 108 34 120" fill="none" stroke="#ffd0ea" stroke-width="4" stroke-linecap="round"/>
+    <g fill="#ffd0ea">
+      <rect x="18" y="196" width="26" height="6"/>
+      <rect x="28" y="186" width="6" height="26"/>
+      <polygon points="62,186 70,186 70,212 62,212 62,196 54,192 62,186"/>
+    </g>
+  </g>
+</svg>

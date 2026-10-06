@@ -1,0 +1,253 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.id }}
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ github.event.release.tag_name }}
+  INNOSETUP_VERSION: 6.7.1
+  APPIMAGETOOL_VERSION: 1.9.1
+  APPIMAGETOOL_X86_64_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+
+jobs:
+  build-dmg:
+    name: Build ${{ matrix.arch }} DMG
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            target: aarch64-apple-darwin
+            runner: macos-26
+          - arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-26
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+      TERMY_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      TERMY_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Import Developer ID and notarization credentials
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        run: ./scripts/setup-macos-signing.sh
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Build, sign, and notarize DMG
+        run: ./scripts/build-dmg-signed.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --no-layout
+
+      - name: Remove signing credentials
+        if: always()
+        run: |
+          if [[ -n "${TERMY_SIGNING_DIR:-}" && -d "$TERMY_SIGNING_DIR" ]]; then
+            security delete-keychain "$TERMY_SIGNING_DIR/signing.keychain-db" || true
+            rm -rf "$TERMY_SIGNING_DIR"
+          fi
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-dmg-${{ matrix.arch }}
+          path: dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}-signed.dmg
+          if-no-files-found: error
+
+  build-windows-setup:
+    name: Build Windows x64 Setup
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install Inno Setup
+        run: choco install innosetup --version="$env:INNOSETUP_VERSION" --no-progress -y
+
+      - name: Build Setup.exe
+        shell: pwsh
+        run: .\scripts\build-setup.ps1 -Version "${env:VERSION}" -Arch x64 -Target x86_64-pc-windows-msvc
+
+      - name: Upload Setup artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-setup-x64
+          path: target/dist/Termy-${{ env.VERSION }}-windows-x64-Setup.exe
+          if-no-files-found: error
+
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+    env:
+      VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            clang \
+            pkg-config \
+            libfontconfig-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libasound2-dev \
+            libvulkan1 \
+            rpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build Linux tarball
+        run: ./scripts/build-linux.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}"
+
+      - name: Install appimagetool
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64) expected_sha256="$APPIMAGETOOL_X86_64_SHA256" ;;
+            *) echo "Unsupported appimagetool architecture: ${{ matrix.arch }}" >&2; exit 1 ;;
+          esac
+          curl -fsSL -o /tmp/appimagetool.AppImage \
+            "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-${{ matrix.arch }}.AppImage"
+          echo "${expected_sha256}  /tmp/appimagetool.AppImage" | sha256sum -c -
+          chmod +x /tmp/appimagetool.AppImage
+          echo "APPIMAGETOOL=/tmp/appimagetool.AppImage" >> "$GITHUB_ENV"
+
+      - name: Build Linux AppImage
+        run: APPIMAGETOOL="$APPIMAGETOOL" ./scripts/build-linux.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --format appimage
+
+      - name: Build Linux deb
+        run: ./scripts/build-linux.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --format deb
+
+      - name: Build Linux rpm
+        run: ./scripts/build-linux.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --format rpm
+
+      - name: Upload Linux tarball artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-linux-tarball-${{ matrix.arch }}
+          path: target/dist/Termy-${{ env.VERSION }}-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+      - name: Upload Linux AppImage artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-linux-appimage-${{ matrix.arch }}
+          path: target/dist/Termy-${{ env.VERSION }}-linux-${{ matrix.arch }}.AppImage
+          if-no-files-found: error
+
+      - name: Upload Linux deb artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-linux-deb-${{ matrix.arch }}
+          path: target/dist/Termy-${{ env.VERSION }}-linux-${{ matrix.arch }}.deb
+          if-no-files-found: error
+
+      - name: Upload Linux rpm artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-linux-rpm-${{ matrix.arch }}
+          path: target/dist/Termy-${{ env.VERSION }}-linux-${{ matrix.arch }}.rpm
+          if-no-files-found: error
+
+  attach-and-finalize-release:
+    name: Attach release artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - build-dmg
+      - build-windows-setup
+      - build-linux
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          cd dist
+          find . -maxdepth 1 -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.tar.gz' -o -name '*.AppImage' -o -name '*.deb' -o -name '*.rpm' \) -print0 \
+            | sort -z \
+            | xargs -0 sha256sum > checksums.txt
+
+      - name: Attach artifacts to release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          tag_name: ${{ github.event.release.tag_name }}
+          prerelease: ${{ github.event.release.prerelease }}
+          files: |
+            dist/*.dmg
+            dist/*.exe
+            dist/*.tar.gz
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.rpm
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+          overwrite_files: true

@@ -1,0 +1,31 @@
+---
+title: Troubleshooting
+description: Common install and launch issues.
+---
+
+## macOS: app won't open
+
+macOS DMGs from v0.2.75 onward are signed and notarized. If macOS prevents Termy
+from opening, first check that you downloaded the current release and dragged
+`Termy.app` from the `.dmg` into **Applications**.
+
+### Termy is still blocked
+
+1. Remove any older copy of Termy from Applications.
+2. Download the newest `.dmg` from the [Termy download page](/download).
+3. Drag Termy into Applications and try opening it again.
+4. If macOS still blocks it, [report the exact message](https://github.com/lassejlv/termy/issues/new).
+
+Releases before v0.2.75 used unsigned macOS DMGs. Upgrade to a current release
+instead of removing the download's quarantine attribute.
+
+## Report an issue
+
+If the problem continues, [open a GitHub issue](https://github.com/lassejlv/termy/issues/new) with:
+
+- your operating system and architecture;
+- the Termy release you downloaded;
+- the exact error message;
+- what you expected to happen.
+
+Do not include tokens, shell history, or other secrets in screenshots or logs.

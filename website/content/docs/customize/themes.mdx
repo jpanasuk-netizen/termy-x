@@ -1,0 +1,33 @@
+---
+title: Themes
+description: Built-in and custom JSON themes.
+---
+
+Drop `.json` files in `~/.config/termy/themes/` (Windows: `%APPDATA%\termy\themes\`). The filename (without `.json`) is the theme slug:
+
+```txt
+theme = my-theme
+```
+
+Or pick one from **Switch Theme** in the command palette.
+
+## Format
+
+```json
+{
+  "background": "#0b1020",
+  "foreground": "#e7ebf5",
+  "cursor": "#a7e9a3",
+  "black": "#0b1020",
+  "red": "#f1b8c5",
+  "green": "#a7e9a3"
+}
+```
+
+All keys are 6-digit hex. See [Colors](/docs/customize/colors) for the full list.
+
+## Import without switching theme
+
+**Import Colors** in the command palette writes values into `[colors]` while keeping your current `theme` — useful for one-off tweaks.
+
+Delete `[colors]` to fall back to the pure theme file.

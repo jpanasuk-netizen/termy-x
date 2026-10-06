@@ -1,0 +1,80 @@
+---
+title: Tabs
+description: Open, switch, rename, and organize tabs.
+---
+
+| Action | Default |
+| ------ | ------- |
+| `new_tab` | `secondary-t` |
+| `close_pane_or_tab` | `secondary-w` |
+| `switch_to_tab_1` … `switch_to_tab_9` | `secondary-1` … `secondary-9` |
+| `switch_tab_left` / `switch_tab_right` | bind manually |
+| `move_tab_left` / `move_tab_right` | bind manually |
+| `rename_tab` | bind manually |
+
+New tabs inherit the active pane's working directory, including while an app
+such as lazygit is running. Native tabs use the shell-reported directory or a
+fresh lookup of the shell process; tmux tabs query the selected pane directly.
+An explicitly requested directory takes precedence.
+
+Tab titles: [Tabs and titlebar](/docs/customize/tabs-titlebar).
+
+## Open a tab from your file manager
+
+On macOS, go to **Settings → General → System integration → Default terminal**
+and click **Set as default**. This sets Termy as the system's terminal handler.
+Run the installed `Termy.app` to use this option. Apps with their own external
+terminal preference must be configured separately. Finder's **Open new Termy tab
+here** service remains available; opening a file in Termy opens its containing
+folder without running the file.
+
+After Termy is installed, file managers expose **Open new Termy tab here**:
+
+On macOS, launch Termy once after updating to refresh the Finder service.
+The action finds the installed app by its identifier, so it continues to work
+after the app bundle is replaced or moved.
+
+| Platform | Where it appears |
+| --- | --- |
+| Windows | Explorer folder, folder background, and drive context menus |
+| macOS | Finder Services, and Open With on a folder |
+| Linux | Nautilus/Caja Scripts, Nemo actions, KDE/Dolphin folder menus, and Open With |
+
+If Termy is already running, the action adds a tab in that folder. You can also request a tab from a shell:
+
+```bash
+termy --new-tab --working-directory /path/to/project
+```
+
+## Open another window
+
+On Linux, each launch of `termy` opens a separate window. This also applies to
+`termy /path/to/project` and `termy --working-directory /path/to/project`. Your
+window manager can tile and move each window independently. Set your Hyprland
+terminal command to `termy`; no wrapper is needed.
+
+Use `--new-window` to explicitly open a window on any platform:
+
+```bash
+termy --new-window
+termy --new-window --working-directory /path/to/project
+```
+
+Closing a window or exiting its last shell leaves the other windows running.
+Additional windows start fresh. The first window owns the saved native session;
+extra windows do not overwrite it. With tmux enabled, extra windows use separate,
+temporary managed sessions. Explicitly attaching to a named tmux session still
+shares that session.
+
+On macOS and Windows, launches without either flag keep their existing behavior.
+
+## Move tabs between windows
+
+Drag a tab outside its window and release to open it in a new window. Drop it
+onto another Termy terminal window to move it there. The tab keeps its running
+shells, split panes, and scrollback. Moving the last tab closes the empty window.
+Press Escape before releasing to cancel a drag. If the tab bar is hidden for a
+single tab, turn off `auto_hide_tabbar` to make that tab available to drag.
+
+Windows must use the same terminal runtime. With tmux, they must also use the
+same server and different sessions.
