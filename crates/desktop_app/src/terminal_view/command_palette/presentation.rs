@@ -317,6 +317,7 @@ mod tests {
                 "Settings",
                 "Tabs",
                 "Window",
+                "X",
             ]
         );
     }
@@ -356,6 +357,7 @@ mod tests {
                         | "Settings"
                         | "Tabs"
                         | "Window"
+                        | "X"
                 ),
                 "unexpected tint category {category} for {}",
                 id.config_name()

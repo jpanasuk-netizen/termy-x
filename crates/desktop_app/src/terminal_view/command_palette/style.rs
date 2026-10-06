@@ -52,6 +52,8 @@ pub(super) fn category_tint(colors: &TerminalColors, category: &str) -> gpui_kit
         "Appearance" => colors.ansi[4],
         "Settings" => colors.ansi[1],
         "Tasks" => colors.cursor,
+        // Bright cyan is the neon cyan/blue used for Termy X tiles.
+        "X" => colors.ansi[14],
         _ => colors.ansi[4],
     };
     tint.a = 1.0;
@@ -203,5 +205,10 @@ mod tests {
             category_tint(&colors, "Plugins"),
             category_tint(&colors, "Edit")
         );
+        assert_eq!(category_tint(&colors, "X"), {
+            let mut tint = colors.ansi[14];
+            tint.a = 1.0;
+            tint
+        });
     }
 }
