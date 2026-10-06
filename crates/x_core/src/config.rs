@@ -215,7 +215,12 @@ impl XConfig {
     }
 
     /// `TERMY_X_AI_BASE_URL` wins, then `OPENAI_BASE_URL`.
-    pub fn apply_ai_sources(&mut self, termy_base: Option<&str>, openai_base: Option<&str>, termy_model: Option<&str>) {
+    pub fn apply_ai_sources(
+        &mut self,
+        termy_base: Option<&str>,
+        openai_base: Option<&str>,
+        termy_model: Option<&str>,
+    ) {
         if let Some(value) = nonempty(termy_base).or_else(|| nonempty(openai_base)) {
             self.ai_base_url = value.to_string();
             self.ai_explicit = true;
@@ -269,8 +274,7 @@ impl XConfig {
         if let Some(start) = text.find("background_art") {
             let end = text[start..]
                 .find('\n')
-                .map(|index| start + index)
-                .unwrap_or(text.len());
+                .map_or(text.len(), |index| start + index);
             text.replace_range(start..end, &line);
         } else {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -325,7 +329,10 @@ fn parse_char_limit(value: &str) -> Option<usize> {
     {
         return Some(STANDARD_CHAR_LIMIT);
     }
-    trimmed.parse::<usize>().ok().map(|n| n.clamp(1, PREMIUM_CHAR_LIMIT))
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.clamp(1, PREMIUM_CHAR_LIMIT))
 }
 
 fn parse_bool(value: &str) -> bool {
@@ -442,7 +449,6 @@ mod tests {
         assert_eq!(config.provider, Some(ProviderId::Mock));
         assert!(config.official_enabled);
     }
-
 
     #[test]
     fn char_limit_parses_premium_aliases() {

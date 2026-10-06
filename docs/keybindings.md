@@ -53,6 +53,7 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `secondary-g` -> `search_next`
 - `secondary-shift-g` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
+- `secondary-shift-x` -> `toggle_x_panel`
 - `secondary-k` -> `clear_screen`
 - `secondary-m` -> `minimize_window`
 - `secondary-c` -> `copy`
@@ -106,6 +107,7 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `secondary-g` -> `search_next`
 - `secondary-shift-g` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
+- `secondary-shift-x` -> `toggle_x_panel`
 - `secondary-c` -> `copy`
 - `secondary-v` -> `paste`
 - `secondary-a` -> `select_all`
@@ -157,6 +159,7 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `secondary-g` -> `search_next`
 - `secondary-shift-g` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
+- `secondary-shift-x` -> `toggle_x_panel`
 - `ctrl-shift-c` -> `copy`
 - `ctrl-shift-v` -> `paste`
 - `ctrl-shift-a` -> `select_all`
@@ -208,6 +211,7 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `secondary-g` -> `search_next`
 - `secondary-shift-g` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
+- `secondary-shift-x` -> `toggle_x_panel`
 - `ctrl-shift-c` -> `copy`
 - `ctrl-shift-v` -> `paste`
 - `ctrl-shift-a` -> `select_all`
@@ -314,6 +318,13 @@ Related UI option:
 - `toggle_tab_bar_visibility`
 - `toggle_workspace_sidebar`
 - `toggle_inspector`
+- `toggle_x_panel`
+- `open_x_timeline`
+- `open_x_search`
+- `open_x_trends`
+- `open_x_lookup`
+- `open_x_compose`
+- `open_x_research`
 
 ## Customization Examples
 

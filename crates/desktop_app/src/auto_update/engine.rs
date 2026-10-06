@@ -71,14 +71,16 @@ pub fn cache_installer_path(version: &str, extension: &str) -> PathBuf {
 pub fn cache_installer_path(version: &str, extension: &str) -> PathBuf {
     // Use XDG_CACHE_HOME or ~/.cache
     let cache_dir = std::env::var("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".cache")
-        })
+        .map_or_else(
+            |_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".cache")
+            },
+            PathBuf::from,
+        )
         .join("termy");
     let _ = std::fs::create_dir_all(&cache_dir);
-    cache_dir.join(format!("update-{}.{}", version, extension))
+    cache_dir.join(format!("update-{version}.{extension}"))
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]

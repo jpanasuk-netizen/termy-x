@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use crate::model::{ProviderId, SESSION_OWN};
-use crate::text::{intent_url, WeightedCount};
+use crate::text::{WeightedCount, intent_url};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmDecision {
@@ -69,10 +69,10 @@ impl Publisher for IntentPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         let urls = intent_urls(parts, reply_to);
-        if self.open_browser {
-            if let Some(url) = urls.first() {
-                self.opener.open(url)?;
-            }
+        if self.open_browser
+            && let Some(url) = urls.first()
+        {
+            self.opener.open(url)?;
         }
         if media.is_empty() {
             Ok(format!("opened web intent for {} part(s)", parts.len()))
@@ -107,7 +107,13 @@ pub fn build_plan(
     publisher: &dyn Publisher,
     dry_run: bool,
 ) -> PublishPlan {
-    build_plan_limited(text, reply_to, publisher, dry_run, crate::text::STANDARD_CHAR_LIMIT)
+    build_plan_limited(
+        text,
+        reply_to,
+        publisher,
+        dry_run,
+        crate::text::STANDARD_CHAR_LIMIT,
+    )
 }
 
 pub fn build_plan_limited(
@@ -135,14 +141,18 @@ pub fn build_plan_with_media(
         parts
     };
     let media = media.to_vec();
-    let session = match (publisher.session_note(), media.is_empty(), publisher.supports_media()) {
+    let session = match (
+        publisher.session_note(),
+        media.is_empty(),
+        publisher.supports_media(),
+    ) {
         (Some(note), false, false) => Some(format!(
             "{note}. Media will need a manual attach in the browser if this path cannot upload files."
         )),
         (Some(note), _, _) => Some(note),
-        (None, false, false) => Some(
-            "media listed below; provider may require manual attach in the browser".into(),
-        ),
+        (None, false, false) => {
+            Some("media listed below; provider may require manual attach in the browser".into())
+        }
         _ => None,
     };
     PublishPlan {
@@ -183,7 +193,15 @@ pub fn confirm_and_publish_limited(
     publisher: &dyn Publisher,
     char_limit: usize,
 ) -> GateOutcome {
-    confirm_and_publish_with_media(text, reply_to, decision, dry_run, publisher, char_limit, &[])
+    confirm_and_publish_with_media(
+        text,
+        reply_to,
+        decision,
+        dry_run,
+        publisher,
+        char_limit,
+        &[],
+    )
 }
 
 pub fn confirm_and_publish_with_media(
@@ -248,7 +266,12 @@ mod tests {
         fn session_note(&self) -> Option<String> {
             None
         }
-        fn publish(&self, parts: &[String], _reply_to: Option<&str>) -> Result<String, String> {
+        fn publish(
+            &self,
+            parts: &[String],
+            _reply_to: Option<&str>,
+            _media: &[PathBuf],
+        ) -> Result<String, String> {
             self.calls.lock().expect("calls").push(parts.to_vec());
             Ok("posted".to_string())
         }

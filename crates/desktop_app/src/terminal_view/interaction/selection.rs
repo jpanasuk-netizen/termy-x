@@ -930,14 +930,13 @@ impl TerminalView {
         }
         #[cfg(target_os = "linux")]
         {
-            return Command::new("xdg-open")
+            Command::new("xdg-open")
                 .arg(url)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .map(|_| true)
-                .unwrap_or(false);
+                .is_ok_and(|_| true)
         }
         #[cfg(target_os = "windows")]
         {

@@ -1,4 +1,4 @@
-﻿//! Termy X side panel. The geometric swift is an original SVG, drawn at
+//! Termy X side panel. The geometric swift is an original SVG, drawn at
 //! `background_opacity` behind lists and at full strength on the empty splash.
 
 pub mod art;
@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    div, img, px, rgb, rgba, Context, FocusHandle, Image, ImageFormat, ImageSource, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, Window,
+    Context, FocusHandle, Image, ImageSource, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px, rgb, rgba,
 };
 
 macro_rules! x_button {
@@ -30,17 +30,9 @@ macro_rules! x_button {
             } else {
                 tint(0x7af6ff, 55)
             })
-            .bg(if active {
-                rgb(0x2a0f3a)
-            } else {
-                rgb(0x1636c9)
-            })
+            .bg(if active { rgb(0x2a0f3a) } else { rgb(0x1636c9) })
             .text_size(px(12.0))
-            .text_color(if active {
-                rgb(0xffd0ea)
-            } else {
-                rgb(0xf8fbff)
-            })
+            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xf8fbff) })
             .cursor_pointer()
             .hover(|style| {
                 style
@@ -52,11 +44,11 @@ macro_rules! x_button {
             .on_mouse_down(MouseButton::Left, $handler)
     }};
 }
+use termy_x::XConfig;
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{MockProvider, XProvider};
 use termy_x::text::{split_thread_limited, weighted_len_limited};
-use termy_x::XConfig;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XSection {
@@ -66,7 +58,6 @@ pub enum XSection {
     Lookup,
     Compose,
     Research,
-    Help,
 }
 
 impl XSection {
@@ -78,7 +69,6 @@ impl XSection {
             Self::Lookup => "Lookup",
             Self::Compose => "Compose",
             Self::Research => "Research",
-            Self::Help => "Help",
         }
     }
 
@@ -89,12 +79,10 @@ impl XSection {
             "lookup" => Self::Lookup,
             "compose" => Self::Compose,
             "research" => Self::Research,
-            "help" => Self::Help,
             _ => Self::Timeline,
         }
     }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum UiFocus {
@@ -174,11 +162,26 @@ struct SectionTimes {
 
 #[derive(Clone)]
 enum FetchPayload {
-    Timeline { posts: Vec<Post>, status: String },
-    Search { posts: Vec<Post>, status: String },
-    Trends { trends: Vec<Trend>, status: String },
-    Lookup { profile: Option<Profile>, status: String },
-    Research { hits: Vec<ResearchHit>, status: String },
+    Timeline {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Search {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Trends {
+        trends: Vec<Trend>,
+        status: String,
+    },
+    Lookup {
+        profile: Option<Profile>,
+        status: String,
+    },
+    Research {
+        hits: Vec<ResearchHit>,
+        status: String,
+    },
 }
 
 fn section_slot(section: XSection) -> Option<usize> {
@@ -189,7 +192,6 @@ fn section_slot(section: XSection) -> Option<usize> {
         XSection::Lookup => Some(3),
         XSection::Research => Some(4),
         XSection::Compose => None,
-            XSection::Help => None,
     }
 }
 
@@ -233,7 +235,7 @@ impl XPanel {
             },
             variants: Vec::new(),
             drafts: Vec::new(),
-            status: "ready Ã‚Â· free providers Ã‚Â· no X API credits".into(),
+            status: "ready Â· free providers Â· no X API credits".into(),
             confirm: false,
             intent_urls: Vec::new(),
             intent_index: 0,
@@ -313,22 +315,23 @@ impl XPanel {
             self.loading = false;
             self.pending_focus = true;
             self.focus_compose_editor();
-            self.status = "compose Â· click the box Â· caret blinks Â· Publish opens confirm instantly".into();
+            self.status =
+                "compose · click the box · caret blinks · Publish opens confirm instantly".into();
             log_switch(section, started, "compose");
             return;
         }
 
         if self.is_fresh(section) {
             self.loading = false;
-            self.status = format!("{} Ã‚Â· cached (<30s) Ã‚Â· no X API credits", section.label());
+            self.status = format!("{} Â· cached (<30s) Â· no X API credits", section.label());
             log_switch(section, started, "cache");
             return;
         }
 
         if self.section_has_data(section) {
-            self.status = format!("{} Ã‚Â· refreshingÃ¢â‚¬Â¦", section.label());
+            self.status = format!("{} Â· refreshingâ€¦", section.label());
         } else {
-            self.status = format!("loading {}Ã¢â‚¬Â¦", section.label());
+            self.status = format!("loading {}â€¦", section.label());
         }
         self.loading = true;
         log_switch(section, started, "async");
@@ -352,7 +355,7 @@ impl XPanel {
                 self.profile = None;
                 self.variants.clear();
                 self.splash = true;
-                self.status = "splash Ã‚Â· background art at full strength".into();
+                self.status = "splash Â· background art at full strength".into();
             }
             "mock" => self.load_mock_dashboard(),
             "trends" => self.open_section(XSection::Trends, cx),
@@ -366,7 +369,7 @@ impl XPanel {
         self.section = XSection::Timeline;
         self.ensure_mock_lists();
         self.suggest_templates();
-        self.status = "mock Ã‚Â· search, timeline, trends Ã‚Â· no network Ã‚Â· no X API credits".into();
+        self.status = "mock Â· search, timeline, trends Â· no network Â· no X API credits".into();
     }
 
     /// Seed fixture lists without turning off live mode.
@@ -404,7 +407,7 @@ impl XPanel {
                 .ok()
                 .map(|served| served.value);
         }
-        self.status = "fixtures Ã‚Â· refreshing free providers in background".into();
+        self.status = "fixtures Â· refreshing free providers in background".into();
     }
 
     fn ensure_mock_lists(&mut self) {
@@ -445,10 +448,12 @@ impl XPanel {
             XSection::Trends => self.fetched_at.trends,
             XSection::Lookup => self.fetched_at.lookup,
             XSection::Research => self.fetched_at.research,
-            XSection::Compose | XSection::Help => return true,
+            XSection::Compose => return true,
         };
         match at {
-            Some(instant) if instant.elapsed() < FRESH_FOR && self.section_has_data(section) => true,
+            Some(instant) if instant.elapsed() < FRESH_FOR && self.section_has_data(section) => {
+                true
+            }
             _ => false,
         }
     }
@@ -460,10 +465,9 @@ impl XPanel {
             XSection::Trends => !self.trends.is_empty(),
             XSection::Lookup => self.profile.is_some(),
             XSection::Research => !self.research.is_empty(),
-            XSection::Compose | XSection::Help => true,
+            XSection::Compose => true,
         }
     }
-
 
     /// Cycle every tab once. Used by `x_panel_preview --bench-tabs` to log switch times.
     pub fn bench_tabs(&mut self, cx: &mut Context<Self>) {
@@ -474,7 +478,6 @@ impl XPanel {
             XSection::Lookup,
             XSection::Compose,
             XSection::Research,
-            XSection::Help,
             XSection::Timeline,
         ] {
             self.open_section(section, cx);
@@ -585,7 +588,7 @@ impl XPanel {
     fn suggest_async(&mut self, cx: &mut Context<Self>) {
         self.suggest_templates();
         self.suggesting = true;
-        self.notice = Some("Drafting variantsÃ¢â‚¬Â¦ UI stays live.".into());
+        self.notice = Some("Drafting variantsâ€¦ UI stays live.".into());
         let idea = self.compose.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
@@ -602,8 +605,7 @@ impl XPanel {
                 match result {
                     Ok(variants) => {
                         panel.variants = variants;
-                        panel.notice =
-                            Some("Variants are drafts. Nothing was posted.".into());
+                        panel.notice = Some("Variants are drafts. Nothing was posted.".into());
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
@@ -618,14 +620,15 @@ impl XPanel {
     }
 
     fn arm_confirm(&mut self) {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            .char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             vec![self.compose.trim().to_string()]
         } else {
             parts
         };
-        if parts.first().map(|p| p.is_empty()).unwrap_or(true) {
+        if parts.first().is_none_or(|p| p.is_empty()) {
             self.notice = Some("Type something before Publish.".into());
             self.confirm = false;
             return;
@@ -675,8 +678,10 @@ impl XPanel {
 
     fn toggle_art(&mut self) {
         self.background_art = !self.background_art;
-        let mut config = XConfig::default();
-        config.background_art = self.background_art;
+        let config = XConfig {
+            background_art: self.background_art,
+            ..Default::default()
+        };
         if !self.fill_window {
             let _ = config.save_background_art();
         }
@@ -714,8 +719,8 @@ impl XPanel {
                         self.focus_compose_editor();
                     }
                     UiFocus::ConfirmCopy => self.copy_current_part(cx),
-                    UiFocus::ConfirmNext => self.open_current_intent(cx),
-                    _ => self.open_current_intent(cx),
+                    UiFocus::ConfirmNext => self.open_current_intent(),
+                    _ => self.open_current_intent(),
                 }
                 self.pending_focus = true;
                 cx.notify();
@@ -763,13 +768,13 @@ impl XPanel {
         self.compose_focused = true;
         self.blink_visible = true;
 
-        // Always stop_propagation for edit chords â€” even if clipboard is empty â€”
+        // Always stop_propagation for edit chords — even if clipboard is empty —
         // otherwise TerminalView's Paste/Copy/SelectAll actions still hit the shell.
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
-            if let Some(item) = cx.read_from_clipboard() {
-                if let Some(clip) = item.text() {
-                    self.insert_text(&clip);
-                }
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                self.insert_text(&clip);
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -836,7 +841,7 @@ impl XPanel {
             return;
         }
 
-        // Shift alone is NOT a blocking modifier â€” it produces capitals / symbols.
+        // Shift alone is NOT a blocking modifier — it produces capitals / symbols.
         // Only ctrl/alt/platform/function should suppress plain text insertion.
         // (Old `mods.modified()` included shift and ate the first capital letter.)
         let blocks_text = mods.control || mods.alt || mods.platform || mods.function;
@@ -936,7 +941,9 @@ impl XPanel {
                     .await;
                 let keep = this
                     .update(cx, |panel, cx| {
-                        if panel.compose_focused && !panel.confirm && panel.section == XSection::Compose
+                        if panel.compose_focused
+                            && !panel.confirm
+                            && panel.section == XSection::Compose
                         {
                             panel.blink_visible = !panel.blink_visible;
                             cx.notify();
@@ -958,11 +965,7 @@ impl XPanel {
         let anchor = self.sel_anchor?;
         let a = anchor.min(self.caret);
         let b = anchor.max(self.caret);
-        if a == b {
-            None
-        } else {
-            Some((a, b))
-        }
+        if a == b { None } else { Some((a, b)) }
     }
 
     fn clear_selection(&mut self) {
@@ -1025,17 +1028,13 @@ impl XPanel {
             CaretMove::Left => self.caret = prev_boundary(&self.compose, self.caret),
             CaretMove::Right => self.caret = next_boundary(&self.compose, self.caret),
             CaretMove::LineStart => {
-                let head = self.compose[..self.caret]
-                    .rfind('\n')
-                    .map(|i| i + 1)
-                    .unwrap_or(0);
+                let head = self.compose[..self.caret].rfind('\n').map_or(0, |i| i + 1);
                 self.caret = head;
             }
             CaretMove::LineEnd => {
                 let tail = self.compose[self.caret..]
                     .find('\n')
-                    .map(|i| self.caret + i)
-                    .unwrap_or(self.compose.len());
+                    .map_or(self.compose.len(), |i| self.caret + i);
                 self.caret = tail;
             }
         }
@@ -1065,11 +1064,7 @@ impl XPanel {
         };
         let idx = order.iter().position(|f| *f == self.ui_focus).unwrap_or(0);
         let next = if reverse {
-            if idx == 0 {
-                order.len() - 1
-            } else {
-                idx - 1
-            }
+            if idx == 0 { order.len() - 1 } else { idx - 1 }
         } else {
             (idx + 1) % order.len()
         };
@@ -1095,8 +1090,7 @@ fn prev_boundary(text: &str, offset: usize) -> usize {
     text[..offset]
         .char_indices()
         .next_back()
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+        .map_or(0, |(i, _)| i)
 }
 
 fn next_boundary(text: &str, offset: usize) -> usize {
@@ -1106,17 +1100,10 @@ fn next_boundary(text: &str, offset: usize) -> usize {
     text[offset..]
         .chars()
         .next()
-        .map(|c| offset + c.len_utf8())
-        .unwrap_or(text.len())
+        .map_or(text.len(), |c| offset + c.len_utf8())
 }
 
-
-fn fetch_section(
-    section: XSection,
-    query: String,
-    lookup: String,
-    live: bool,
-) -> FetchPayload {
+fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -> FetchPayload {
     if live {
         let service = XPanel::service_free();
         match section {
@@ -1158,10 +1145,10 @@ fn fetch_section(
                 let hits = service.research("gpui terminal", &runner, &config);
                 return FetchPayload::Research {
                     hits,
-                    status: "research Ã‚Â· no X API credits".into(),
+                    status: "research Â· no X API credits".into(),
                 };
             }
-            XSection::Compose | XSection::Help => {}
+            XSection::Compose => {}
         }
     }
 
@@ -1171,21 +1158,21 @@ fn fetch_section(
                 .timeline(10)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: "mock Ã‚Â· fixture data Ã‚Â· no X API credits".into(),
+            status: "mock Â· fixture data Â· no X API credits".into(),
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
                 .search(&query, false, 10)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: format!("mock Ã‚Â· search Ã¢â‚¬Å“{query}Ã¢â‚¬Â Ã‚Â· no X API credits"),
+            status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
         },
         XSection::Trends => FetchPayload::Trends {
             trends: MockProvider
                 .trends(Some("worldwide"), 8)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: "mock Ã‚Â· trends Ã‚Â· no X API credits".into(),
+            status: "mock Â· trends Â· no X API credits".into(),
         },
         XSection::Lookup => FetchPayload::Lookup {
             profile: MockProvider
@@ -1193,7 +1180,7 @@ fn fetch_section(
                 .ok()
                 .map(|served| served.value),
             status: format!(
-                "mock Ã‚Â· lookup @{} Ã‚Â· no X API credits",
+                "mock Â· lookup @{} Â· no X API credits",
                 lookup.trim_start_matches('@')
             ),
         },
@@ -1205,9 +1192,9 @@ fn fetch_section(
                 excerpt: "Fixture research for drafts. Install OpenCLI, yt-dlp, or curl to pull Reddit, YouTube, and the web.".into(),
                 session: None,
             }],
-            status: "research Ã‚Â· fixture Ã‚Â· no X API credits".into(),
+            status: "research Â· fixture Â· no X API credits".into(),
         },
-        XSection::Compose | XSection::Help => FetchPayload::Timeline {
+        XSection::Compose => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
         },
@@ -1278,10 +1265,9 @@ impl Render for XPanel {
                         self.dashboard(columns, count.weighted, count.limit, &parts, cx)
                     }),
             )
-            .children(
-                self.confirm
-                    .then(|| self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)),
-            )
+            .children(self.confirm.then(|| {
+                self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)
+            }))
     }
 }
 
@@ -1321,7 +1307,6 @@ impl XPanel {
             && self.profile.is_none()
             && self.variants.is_empty()
             && self.section != XSection::Compose
-            && self.section != XSection::Help
             && !self.confirm
     }
 
@@ -1422,7 +1407,6 @@ impl XPanel {
                 XSection::Lookup,
                 XSection::Compose,
                 XSection::Research,
-                XSection::Help,
             ]
             .into_iter()
             .map(move |section| {
@@ -1445,11 +1429,7 @@ impl XPanel {
                     } else {
                         tint(0x101826, 170)
                     })
-                    .text_color(if active {
-                        rgb(0x7af6ff)
-                    } else {
-                        rgb(0xb7c3dc)
-                    })
+                    .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
                     .hover(|style| {
                         style
                             .bg(rgb(0x1a3050))
@@ -1471,7 +1451,7 @@ impl XPanel {
 
     fn status_line(&self) -> impl IntoElement {
         let label = if self.loading {
-            format!("Ã¢ÂÂ³ {}", self.status)
+            format!("â³ {}", self.status)
         } else {
             self.status.clone()
         };
@@ -1503,7 +1483,11 @@ impl XPanel {
         row.into_any_element()
     }
 
-    fn column_shell(&self, title: &str, body: impl IntoIterator<Item = gpui_kit::AnyElement>) -> gpui_kit::AnyElement {
+    fn column_shell(
+        &self,
+        title: &str,
+        body: impl IntoIterator<Item = gpui_kit::AnyElement>,
+    ) -> gpui_kit::AnyElement {
         div()
             .id(SharedString::from(format!("x-col-{title}")))
             .flex_1()
@@ -1530,12 +1514,15 @@ impl XPanel {
         parts: &[String],
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        self.column_shell("Compose", vec![self.compose_block(weighted, limit, parts, cx)])
+        self.column_shell(
+            "Compose",
+            vec![self.compose_block(weighted, limit, parts, cx)],
+        )
     }
 
     fn results_column(&self, include_side: bool) -> gpui_kit::AnyElement {
         let mut rows = Vec::new();
-        rows.push(hint(format!("Search Ã‚Â· {}", self.query)));
+        rows.push(hint(format!("Search Â· {}", self.query)));
         let search = if self.search_posts.is_empty() {
             &self.posts
         } else {
@@ -1551,8 +1538,12 @@ impl XPanel {
         if let Some(root) = self.posts.first() {
             let replies = self.posts.iter().skip(1).take(2).count();
             rows.push(card(
-                format!("Thread Ã‚Â· @{}", root.author_handle),
-                format!("{}\n{replies} repl{}", root.text, if replies == 1 { "y" } else { "ies" }),
+                format!("Thread Â· @{}", root.author_handle),
+                format!(
+                    "{}\n{replies} repl{}",
+                    root.text,
+                    if replies == 1 { "y" } else { "ies" }
+                ),
             ));
         }
         if include_side {
@@ -1571,7 +1562,7 @@ impl XPanel {
             rows.push(card(
                 trend.name.clone(),
                 format!(
-                    "{} Ã‚Â· volume {}",
+                    "{} Â· volume {}",
                     trend.place.as_deref().unwrap_or("worldwide"),
                     trend.volume.unwrap_or(0)
                 ),
@@ -1579,7 +1570,7 @@ impl XPanel {
         }
         if let Some(post) = self.posts.iter().max_by_key(|post| post.engagement()) {
             rows.push(card(
-                format!("Popular Ã‚Â· @{} Ã‚Â· {} likes", post.author_handle, post.likes),
+                format!("Popular Â· @{} Â· {} likes", post.author_handle, post.likes),
                 post.text.clone(),
             ));
         }
@@ -1629,7 +1620,7 @@ impl XPanel {
                     if self.loading {
                         rows.push(empty_state(
                             "Searching...",
-                            format!("Query: {}. Free session Â· no credits.", self.query),
+                            format!("Query: {}. Free session · no credits.", self.query),
                         ));
                     } else {
                         rows.push(empty_state(
@@ -1649,7 +1640,7 @@ impl XPanel {
                     if self.loading {
                         rows.push(empty_state(
                             "Scanning trends...",
-                            "Free session path Â· no X API credits. Hang tight.",
+                            "Free session path · no X API credits. Hang tight.",
                         ));
                     } else {
                         rows.push(empty_state(
@@ -1664,7 +1655,7 @@ impl XPanel {
                     rows.push(card(
                         trend.name.clone(),
                         format!(
-                            "{} Â· volume {}",
+                            "{} · volume {}",
                             trend.place.as_deref().unwrap_or("worldwide"),
                             trend.volume.unwrap_or(0)
                         ),
@@ -1677,9 +1668,9 @@ impl XPanel {
             XSection::Lookup => {
                 if let Some(profile) = &self.profile {
                     rows.push(card(
-                        format!("@{} Â· {}", profile.handle, profile.name),
+                        format!("@{} · {}", profile.handle, profile.name),
                         format!(
-                            "{}\n{} followers Â· {} following",
+                            "{}\n{} followers · {} following",
                             profile.bio, profile.followers, profile.following
                         ),
                     ));
@@ -1721,64 +1712,11 @@ impl XPanel {
                     ));
                 }
             }
-            XSection::Help => {
-                rows.extend(self.help_cards());
-            }
             XSection::Compose => {
                 rows.push(self.compose_block(weighted, limit, parts, cx));
             }
         }
         rows
-    }
-
-
-    fn help_cards(&self) -> Vec<gpui_kit::AnyElement> {
-        let cards = [
-            (
-                "Open the panel",
-                "Ctrl+Shift+X toggles Termy X. Tabs: Timeline, Search, Trends, Lookup, Compose, Research, Help. Art on/off is top-right.",
-            ),
-            (
-                "Compose (GUI)",
-                "Click the cyan box so the caret blinks. Type or Ctrl+V to paste (stays in the box). Clear / Suggest variants / Publish sit above the box. Character counter shows 280 or Premium 25,000.",
-            ),
-            (
-                "Attach image (GUI)",
-                "Under the compose box: Attach image section. Pick up to 4 JPG/PNG/GIF/WEBP. Thumbnails + filenames appear. Remove one or Clear all. Confirm lists every attachment before anything goes out.",
-            ),
-            (
-                "Post now (GUI)",
-                "Publish opens Confirm. Read the exact text and attachments. Post now sends through OpenCLI with images when available; otherwise it opens the browser compose link (attach files there by hand). Cancel / Copy still work. Esc cancels confirm.",
-            ),
-            (
-                "x doctor",
-                "PowerShell: .\\target\\release\\x.exe doctor\nChecks OpenCLI / twitter-cli / mock, session note, and Premium vs 280 limit. Never posts.",
-            ),
-            (
-                "x splash",
-                ".\\target\\release\\x.exe splash\nPrints the Termy X bird. No network.",
-            ),
-            (
-                "x search / timeline / trends / lookup",
-                "x.exe search \"query\" [--recent|--top] [--limit N]\nx.exe timeline [--limit N]\nx.exe trends [--place NAME] [--limit N]\nx.exe lookup handle\nAll use your free session (OpenCLI first). No X API credits.",
-            ),
-            (
-                "x post",
-                "x.exe post \"text\"\nx.exe post --dry-run \"text\"\nx.exe post --media .\\pic.jpg \"text\"\nx.exe post --reply-to STATUS_ID \"text\"\nDry-run prints parts + intent URL and never posts. Real post asks you to type yes. --media accepts up to 4 images (repeat the flag). PowerShell: wrap text in quotes or use (Get-Content -Raw .\\post.txt).",
-            ),
-            (
-                "Compose tips (CLI + GUI)",
-                "Premium auto-detects from your session (25,000). Standard is 280. Long posts split into thread parts. Mentions with @ are fine inside quotes. Confirm always shows the exact text. Nothing posts until you say yes / Post now.",
-            ),
-            (
-                "Shortcuts",
-                "Ctrl+Shift+X panel | Tab cycle controls | Esc cancel confirm | Ctrl+A/C/X/V in Compose when focused | Enter activates focused button (Attach / Clear / Suggest / Publish / Post now).",
-            ),
-        ];
-        cards
-            .into_iter()
-            .map(|(title, body)| card(title.to_string(), body.to_string()))
-            .collect()
     }
 
     fn splash_copy(&self) -> gpui_kit::AnyElement {
@@ -1811,7 +1749,6 @@ impl XPanel {
             .into_any_element()
     }
 
-    
     fn attach_images(&mut self, cx: &mut Context<Self>) {
         let remaining = 4usize.saturating_sub(self.media.len());
         if remaining == 0 {
@@ -1839,193 +1776,79 @@ impl XPanel {
         cx.notify();
     }
 
-    fn remove_media(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.media.len() {
-            let removed = self.media.remove(index);
-            let name = removed
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("image");
-            self.notice = Some(format!("Removed {name}."));
-        }
-        cx.notify();
-    }
-
-
-    fn media_thumb(&self, path: &PathBuf, index: usize) -> gpui_kit::AnyElement {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("image")
-            .to_string();
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let format = match ext.as_str() {
-            "png" => Some(ImageFormat::Png),
-            "jpg" | "jpeg" => Some(ImageFormat::Jpeg),
-            "gif" => Some(ImageFormat::Gif),
-            "webp" => Some(ImageFormat::Webp),
-            _ => None,
-        };
-        let mut row = div()
-            .id(SharedString::from(format!("x-media-{index}")))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded_md()
-            .border_1()
-            .border_color(rgb(0x2f7bff))
-            .bg(tint(0x12203a, 0xcc));
-        if let Some(format) = format {
-            if let Ok(bytes) = std::fs::read(path) {
-                if !bytes.is_empty() && bytes.len() < 12_000_000 {
-                    let image = Arc::new(Image::from_bytes(format, bytes));
-                    let source: ImageSource = image.into();
-                    row = row.child(
-                        div()
-                            .w(px(48.0))
-                            .h(px(48.0))
-                            .rounded(px(6.0))
-                            .overflow_hidden()
-                            .flex_none()
-                            .child(
-                                img(source)
-                                    .id(SharedString::from(format!("x-thumb-{index}")))
-                                    .w(px(48.0))
-                                    .h(px(48.0))
-                                    .object_fit(ObjectFit::Cover),
-                            ),
-                    );
-                }
-            }
-        }
-        row = row.child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(rgb(0x7af6ff))
-                        .child(format!("[{}] {name}", index + 1)),
-                )
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(path.display().to_string()),
-                ),
-        );
-        row.into_any_element()
-    }
-
-    fn attach_section(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let attach_active = self.ui_focus == UiFocus::Attach;
-        let count = self.media.len();
-        let mut section = div()
-            .id("x-attach-section")
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .p(px(12.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(rgb(0x7af6ff))
-            .bg(tint(0x0f1c33, 230))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0x7af6ff))
-                            .child(format!("Attach image ({count}/4)")),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(rgb(0xf0a8d0))
-                            .child("JPG / PNG / GIF / WEBP"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .flex_wrap()
-                    .child(x_button!("x-attach", "Attach image", attach_active, cx.listener(|this, _, _, cx| {
-                        this.attach_images(cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })))
-                    .child(x_button!("x-media-clear", "Clear all", false, cx.listener(|this, _, _, cx| {
-                        this.clear_media(cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    }))),
-            );
-        if self.media.is_empty() {
-            section = section.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x93a4c3))
-                    .child("No images yet. Click Attach image, pick up to 4 files. Confirm lists them before Post now."),
-            );
-        } else {
-            for (index, path) in self.media.iter().enumerate() {
-                let idx = index;
-                section = section.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(self.media_thumb(path, index))
-                        .child(x_button!(
-                            SharedString::from(format!("x-media-rm-{index}")),
-                            "Remove",
-                            false,
-                            cx.listener(move |this, _, _, cx| {
-                                this.remove_media(idx, cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })
-                        )),
-                );
-            }
-        }
-        section.into_any_element()
-    }
-
-    fn compose_block(&self, weighted: usize, limit: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn compose_block(
+        &self,
+        weighted: usize,
+        limit: usize,
+        parts: &[String],
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let counter = if limit >= 25_000 {
             format!("{weighted} / {limit} Premium")
         } else {
             format!("{weighted} / {limit}")
         };
         let suggest_label = if self.suggesting {
-            "Suggestingâ€¦"
+            "Suggesting…"
         } else {
             "Suggest variants"
         };
         let clear_active = self.ui_focus == UiFocus::Clear;
+        let attach_active = self.ui_focus == UiFocus::Attach;
         let suggest_active = self.ui_focus == UiFocus::Suggest;
         let publish_active = self.ui_focus == UiFocus::Publish;
-        let editor_focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
+        let editor_focused =
+            self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
         div()
             .flex()
             .flex_col()
             .gap(px(8.0))
+            // Attachments strip
+            .child({
+                let mut row = div().flex().flex_col().gap(px(6.0));
+                row = row.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .child(x_button!("x-attach", "Attach image", attach_active, cx.listener(|this, _, _, cx| {
+                            this.attach_images(cx);
+                        })))
+                        .child(x_button!("x-media-clear", "Clear images", false, cx.listener(|this, _, _, cx| {
+                            this.clear_media(cx);
+                        }))),
+                );
+                if self.media.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x93a4c3))
+                            .child("No images attached. JPG/PNG/GIF/WEBP. Max 4."),
+                    );
+                } else {
+                    for (index, path) in self.media.iter().enumerate() {
+                        let name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image")
+                            .to_string();
+                        let label = format!("[{}] {}", index + 1, name);
+                        row = row.child(
+                            div()
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x2f7bff))
+                                .bg(tint(0x12203a, 0xcc))
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7af6ff))
+                                .child(label),
+                        );
+                    }
+                }
+                row
+            })
             // Sticky actions FIRST so Publish is never below the fold.
             .child(
                 div()
@@ -2090,16 +1913,16 @@ impl XPanel {
                                         rgb(0x9ad7ff)
                                     })
                                     .child(if editor_focused {
-                                        "Compose Â· focused"
+                                        "Compose · focused"
                                     } else {
-                                        "Compose Â· click to focus"
+                                        "Compose · click to focus"
                                     }),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.0))
                                     .text_color(rgb(0xf0a8d0))
-                                    .child("Tab cycles Â· Esc cancels confirm"),
+                                    .child("Tab cycles · Esc cancels confirm"),
                             ),
                     )
                     .child(self.render_compose_editor())
@@ -2121,15 +1944,12 @@ impl XPanel {
                         }),
                     ),
             )
-            
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(if weighted > limit { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
                     .child(counter),
             )
-            // Visible Attach image section UNDER the compose box.
-            .child(self.attach_section(cx))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -2144,12 +1964,12 @@ impl XPanel {
             }))
             .children(self.drafts.iter().map(|draft| {
                 card(
-                    format!("Draft Â· {}", draft.tone.as_deref().unwrap_or("note")),
+                    format!("Draft · {}", draft.tone.as_deref().unwrap_or("note")),
                     draft.text.clone(),
                 )
             }))
             .children(self.variants.iter().enumerate().map(|(index, draft)| {
-                let label = format!("Variant {} Â· {}", index + 1, draft.source);
+                let label = format!("Variant {} · {}", index + 1, draft.source);
                 div()
                     .id(SharedString::from(format!("x-variant-{index}")))
                     .p(px(10.0))
@@ -2180,14 +2000,13 @@ impl XPanel {
     }
 
     fn render_compose_editor(&self) -> gpui_kit::AnyElement {
-        let focused =
-            self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
+        let focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
         let show_caret = focused && self.blink_visible;
         let caret = self.caret.min(self.compose.len());
         let sel = self.selection_range();
 
         if self.compose.is_empty() {
-            // Caret at LEFT (index 0). Hint only when empty AND unfocused â€”
+            // Caret at LEFT (index 0). Hint only when empty AND unfocused —
             // once the caret blinks, the placeholder must disappear.
             return div()
                 .mt(px(8.0))
@@ -2239,9 +2058,7 @@ impl XPanel {
                 if s < e {
                     let abs_s = line_start + s;
                     let abs_e = line_start + e;
-                    let selected = sel
-                        .map(|(sa, sb)| abs_s >= sa && abs_e <= sb)
-                        .unwrap_or(false);
+                    let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
                     let chunk = &line[s..e];
                     let mut el = div().text_size(px(14.0));
                     if selected {
@@ -2264,7 +2081,12 @@ impl XPanel {
                 row = row.child(self.caret_bar());
             }
             if line.is_empty() && !(show_caret && caret_on_line) {
-                row = row.child(div().text_size(px(14.0)).text_color(rgb(0xf8fbff)).child(" "));
+                row = row.child(
+                    div()
+                        .text_size(px(14.0))
+                        .text_color(rgb(0xf8fbff))
+                        .child(" "),
+                );
             }
 
             rows.push(row.into_any_element());
@@ -2303,12 +2125,8 @@ impl XPanel {
         } else {
             self.intent_index.min(parts.len() - 1)
         };
-        let url = self
-            .intent_urls
-            .get(current)
-            .cloned()
-            .unwrap_or_default();
-        
+        let url = self.intent_urls.get(current).cloned().unwrap_or_default();
+
         let media_lines: Vec<String> = self
             .media
             .iter()
@@ -2342,7 +2160,7 @@ impl XPanel {
                 .into_any_element()
         };
 
-let part_rows = parts.iter().enumerate().map(|(index, part)| {
+        let part_rows = parts.iter().enumerate().map(|(index, part)| {
             let active = index == current;
             let part_count = weighted_len_limited(part, limit).weighted;
             div()
@@ -2359,7 +2177,11 @@ let part_rows = parts.iter().enumerate().map(|(index, part)| {
                     div()
                         .text_size(px(11.0))
                         .text_color(if active { rgb(0xffd0ea) } else { rgb(0x93a4c3) })
-                        .child(format!("Part {} of {} Ã‚Â· {part_count} weighted", index + 1, parts.len())),
+                        .child(format!(
+                            "Part {} of {} Â· {part_count} weighted",
+                            index + 1,
+                            parts.len()
+                        )),
                 )
                 .child(
                     div()
@@ -2404,17 +2226,13 @@ let part_rows = parts.iter().enumerate().map(|(index, part)| {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Nothing is posted automatically. Post now sends via OpenCLI (with images) or opens the browser."),
+                            .child("Nothing is posted automatically. Next post opens one part."),
                     )
                     .children(part_rows)
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .child(format!(
-                                "{weighted} weighted characters Ã‚Â· {} part(s)",
-                                parts.len()
-                            )),
-                    )
+                    .child(div().text_size(px(13.0)).child(format!(
+                        "{weighted} weighted characters Â· {} part(s)",
+                        parts.len()
+                    )))
                     .child(
                         div()
                             .text_size(px(11.0))
@@ -2429,31 +2247,48 @@ let part_rows = parts.iter().enumerate().map(|(index, part)| {
                             .flex()
                             .gap(px(8.0))
                             .flex_wrap()
-                            .child(x_button!("x-cancel", "Cancel", cancel_active, cx.listener(|this, _, _, cx| {
-                                this.confirm = false;
-                                this.focus_compose_editor();
-                                this.pending_focus = true;
-                                cx.stop_propagation();
-                                cx.notify();
-                            })))
-                            .child(x_button!("x-copy", "Copy", copy_active, cx.listener(|this, _, _, cx| {
-                                this.ui_focus = UiFocus::ConfirmCopy;
-                                this.copy_current_part(cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })))
-                            .child(x_button!("x-next-post", "Post now", next_active, cx.listener(|this, _, _, cx| {
-                                this.ui_focus = UiFocus::ConfirmNext;
-                                this.open_current_intent(cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            })))
+                            .child(x_button!(
+                                "x-cancel",
+                                "Cancel",
+                                cancel_active,
+                                cx.listener(|this, _, _, cx| {
+                                    this.confirm = false;
+                                    this.focus_compose_editor();
+                                    this.pending_focus = true;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-copy",
+                                "Copy",
+                                copy_active,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ui_focus = UiFocus::ConfirmCopy;
+                                    this.copy_current_part(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-next-post",
+                                "Next post",
+                                next_active,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ui_focus = UiFocus::ConfirmNext;
+                                    // Open browser after confirm; spawn is non-blocking.
+                                    this.open_current_intent();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
                     }),
             )
     }
 
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            .char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
         let text = if parts.is_empty() {
             self.compose.clone()
@@ -2465,10 +2300,11 @@ let part_rows = parts.iter().enumerate().map(|(index, part)| {
         self.notice = Some("Copied this part.".into());
     }
 
-    /// Post now: OpenCLI with media when available; else browser intent.
-    /// Heavy OpenCLI work runs off the UI thread so Compose stays responsive.
-    fn open_current_intent(&mut self, cx: &mut Context<Self>) {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir()).char_limit_or_fallback();
+    /// Opens only the highlighted part. Preview and mock never open a browser.
+    /// Browser launch is fire-and-forget so the confirm UI never freezes.
+    fn open_current_intent(&mut self) {
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            .char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             let trimmed = self.compose.trim().to_string();
@@ -2485,101 +2321,28 @@ let part_rows = parts.iter().enumerate().map(|(index, part)| {
             self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         }
         let url = self.intent_urls.get(index).cloned().unwrap_or_default();
-        let media_for_part: Vec<PathBuf> = if index == 0 {
-            self.media.clone()
-        } else {
-            Vec::new()
-        };
-        let part_text = parts[index].clone();
-        let total = parts.len();
-        let live = self.live;
-
-        if !live {
-            self.notice = Some(format!(
-                "Held part {} of {} ({} image(s) listed). Preview does not post.",
-                index + 1,
-                total,
-                media_for_part.len()
-            ));
-            if index + 1 < total {
-                self.intent_index = index + 1;
-            }
-            return;
-        }
-
-        self.notice = Some(format!(
-            "Posting part {} of {} via OpenCLI...",
-            index + 1,
-            total
-        ));
-        if index + 1 < total {
-            self.intent_index = index + 1;
-        }
-
-        let clear_media_on_success = index == 0 && !media_for_part.is_empty();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let service = XPanel::service_free();
-                    if let Some(publisher) = termy_x::publish::first_available(&service.publishers) {
-                        if media_for_part.is_empty() || publisher.supports_media() {
-                            return match publisher.publish(&[part_text.clone()], None, &media_for_part) {
-                                Ok(receipt) => Ok(receipt),
-                                Err(error) => Err(error),
-                            };
-                        }
-                    }
-                    Err("no OpenCLI/twitter publisher available".into())
-                })
-                .await;
-
-            let _ = this.update(cx, |panel, cx| {
-                match result {
-                    Ok(receipt) => {
-                        panel.notice = Some(format!(
-                            "Posted part {} of {}. {receipt}",
-                            index + 1,
-                            total
-                        ));
-                        if clear_media_on_success {
-                            panel.media.clear();
-                        }
-                        panel.confirm = false;
-                        panel.focus_compose_editor();
-                        panel.pending_focus = true;
-                    }
-                    Err(error) => {
-                        let names: Vec<String> = panel
-                            .media
-                            .iter()
-                            .map(|p| {
-                                p.file_name()
-                                    .and_then(|n| n.to_str())
-                                    .unwrap_or("image")
-                                    .to_string()
-                            })
-                            .collect();
-                        let media_note = if names.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" Attach in the browser: {}.", names.join(", "))
-                        };
-                        let open_url = url.clone();
-                        std::thread::spawn(move || {
-                            let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &open_url);
-                        });
-                        panel.notice = Some(format!(
-                            "OpenCLI failed ({error}). Browser opened for part {} of {}. You still click Post there.{media_note}",
-                            index + 1,
-                            total
-                        ));
-                    }
-                }
-                cx.notify();
+        if self.live {
+            let open_url = url;
+            std::thread::spawn(move || {
+                let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &open_url);
             });
-        })
-        .detach();
+            self.notice = Some(format!(
+                "Opened part {} of {} in the browser. You still click Post there.",
+                index + 1,
+                parts.len()
+            ));
+        } else {
+            self.notice = Some(format!(
+                "Held part {} of {}. Preview does not open a browser.",
+                index + 1,
+                parts.len()
+            ));
+        }
+        if index + 1 < parts.len() {
+            self.intent_index = index + 1;
+        } else {
+            // Stay on confirm so Jeremy can Cancel after the last part.
+        }
     }
 }
 
@@ -2590,11 +2353,7 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
         .bg(tint(0x0c1422, 225))
         .border_1()
         .border_color(tint(0x7af6ff, 40))
-        .hover(|style| {
-            style
-                .bg(tint(0x122038, 245))
-                .border_color(rgb(0x7af6ff))
-        })
+        .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
         .child(
             div()
                 .text_size(px(13.0))
@@ -2613,7 +2372,7 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
 
 fn post_card(post: &Post) -> gpui_kit::AnyElement {
     card(
-        format!("@{} Ã‚Â· {} likes", post.author_handle, post.likes),
+        format!("@{} Â· {} likes", post.author_handle, post.likes),
         post.text.clone(),
     )
 }

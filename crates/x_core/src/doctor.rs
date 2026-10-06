@@ -53,10 +53,7 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
             "--window".into(),
             "background".into(),
         ],
-        &[
-            "twitter".into(),
-            "--help".into(),
-        ],
+        &["twitter".into(), "--help".into()],
     );
     let twitter = shell_probe(
         runner,
@@ -72,7 +69,11 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
             if config.official_enabled { "on" } else { "off" }
         ),
         String::new(),
-        probe_line("OpenCLI", opencli.0, &format!("{SESSION_OWN} · {}", opencli.1)),
+        probe_line(
+            "OpenCLI",
+            opencli.0,
+            &format!("{SESSION_OWN} · {}", opencli.1),
+        ),
         probe_line(
             "twitter-cli / Agent Reach",
             twitter.0,
@@ -120,7 +121,9 @@ fn shell_probe(
         return (Probe::Missing, "not on PATH".into());
     }
     let posting = match runner.run(bin, help_args) {
-        Ok(output) if help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post") => {
+        Ok(output)
+            if help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post") =>
+        {
             "posting supported"
         }
         _ => "posting not supported",
@@ -190,8 +193,8 @@ mod tests {
         assert!(text.contains("Background art: on"));
         assert!(!config.official_enabled);
         assert!(runner.calls.lock().unwrap().is_empty());
-            assert!(text.contains("Post length:"), "{text}");
-}
+        assert!(text.contains("Post length:"), "{text}");
+    }
 
     #[test]
     fn doctor_probes_are_read_only() {
@@ -227,10 +230,12 @@ mod tests {
 
     #[test]
     fn a_responding_model_server_counts_as_working() {
-        let mut config = XConfig::default();
-        config.ai_base_url = "http://127.0.0.1:9/v1".into();
-        config.ai_model = "local".into();
-        config.ai_explicit = true;
+        let config = XConfig {
+            ai_base_url: "http://127.0.0.1:9/v1".into(),
+            ai_model: "local".into(),
+            ai_explicit: true,
+            ..Default::default()
+        };
         let http = MapHttp::default();
         http.routes.lock().unwrap().insert(
             "http://127.0.0.1:9/v1/models".into(),

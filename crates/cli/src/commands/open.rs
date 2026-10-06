@@ -129,7 +129,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_executable_path, resolve_working_dir, sibling_app_binary_names};
+    use super::{resolve_executable_path, resolve_working_dir};
 
     #[cfg(unix)]
     #[test]

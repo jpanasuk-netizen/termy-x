@@ -2,8 +2,8 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
@@ -77,28 +77,22 @@ pub fn exchange_code(
 
 pub fn store_token(config: &XConfig, token: &TokenSet) -> Result<(), String> {
     let json = serde_json::to_string(token).map_err(|error| error.to_string())?;
-    if config.token_store == "keychain" {
-        match keyring::Entry::new("termy-x", "x-oauth") {
-            Ok(entry) => {
-                if entry.set_password(&json).is_ok() {
-                    return Ok(());
-                }
-            }
-            Err(_) => {}
-        }
+    if config.token_store == "keychain"
+        && let Ok(entry) = keyring::Entry::new("termy-x", "x-oauth")
+        && entry.set_password(&json).is_ok()
+    {
+        return Ok(());
     }
     write_private_file(&config.token_path(), &json)
 }
 
 pub fn load_access_token(config: &XConfig) -> Result<String, String> {
-    if config.token_store == "keychain" {
-        if let Ok(entry) = keyring::Entry::new("termy-x", "x-oauth") {
-            if let Ok(json) = entry.get_password() {
-                if let Ok(token) = serde_json::from_str::<TokenSet>(&json) {
-                    return Ok(token.access_token);
-                }
-            }
-        }
+    if config.token_store == "keychain"
+        && let Ok(entry) = keyring::Entry::new("termy-x", "x-oauth")
+        && let Ok(json) = entry.get_password()
+        && let Ok(token) = serde_json::from_str::<TokenSet>(&json)
+    {
+        return Ok(token.access_token);
     }
     let json = fs::read_to_string(config.token_path()).map_err(|error| error.to_string())?;
     parse_token(&json).map(|token| token.access_token)

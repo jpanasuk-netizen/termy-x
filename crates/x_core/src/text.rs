@@ -69,14 +69,16 @@ pub fn split_thread_limited(text: &str, limit: usize) -> Vec<String> {
         }
         let mut cut = longest_fit(rest, limit);
         if cut == 0 {
-            cut = split_units(rest).first().map(|unit| unit.len()).unwrap_or(rest.len());
+            cut = split_units(rest)
+                .first()
+                .map_or(rest.len(), |unit| unit.len());
         }
         cut = snap_grapheme(rest, cut);
         let mut boundary = cut;
-        if let Some(space) = rest[..cut].rfind(char::is_whitespace) {
-            if space > 0 {
-                boundary = snap_grapheme(rest, space);
-            }
+        if let Some(space) = rest[..cut].rfind(char::is_whitespace)
+            && space > 0
+        {
+            boundary = snap_grapheme(rest, space);
         }
         if boundary == 0 {
             boundary = cut;
@@ -199,7 +201,8 @@ fn split_units(text: &str) -> Vec<&str> {
             }
         } else if is_emoji_pict(ch) {
             loop {
-                if index < chars.len() && (is_variation(chars[index].1) || is_skin(chars[index].1)) {
+                if index < chars.len() && (is_variation(chars[index].1) || is_skin(chars[index].1))
+                {
                     index += 1;
                     continue;
                 }
@@ -331,7 +334,11 @@ mod tests {
             "family zwj"
         );
         assert_eq!(weighted_len("\u{1F1FA}\u{1F1F8}").weighted, 2, "flag");
-        assert_eq!(weighted_len("❤️").weighted, 2, "heart plus variation selector");
+        assert_eq!(
+            weighted_len("❤️").weighted,
+            2,
+            "heart plus variation selector"
+        );
         assert_eq!(weighted_len("a\u{1F44D}\u{1F3FD}b").weighted, 4);
     }
 
@@ -377,7 +384,11 @@ mod tests {
         }
         assert!(parts.iter().any(|part| part.contains("extra")));
 
-        let boundary = format!("{}{}", "a".repeat(279), "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+        let boundary = format!(
+            "{}{}",
+            "a".repeat(279),
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+        );
         assert_eq!(weighted_len(&boundary).weighted, 281);
         let split = split_thread(&boundary);
         assert!(split.len() >= 2);
@@ -385,9 +396,12 @@ mod tests {
             assert!(weighted_len(part).weighted <= WEIGHTED_LIMIT, "{part}");
         }
         assert!(split.iter().any(|part| part.contains('\u{1F468}')));
-        assert!(split
-            .iter()
-            .any(|part| part.contains('\u{200D}') && weighted_len(part).weighted <= WEIGHTED_LIMIT));
+        assert!(
+            split
+                .iter()
+                .any(|part| part.contains('\u{200D}')
+                    && weighted_len(part).weighted <= WEIGHTED_LIMIT)
+        );
     }
 
     #[test]
@@ -426,7 +440,10 @@ mod tests {
         assert_eq!(split_thread_limited(&mid, PREMIUM_CHAR_LIMIT).len(), 1);
         assert!(split_thread_limited(&mid, STANDARD_CHAR_LIMIT).len() > 1);
 
-        assert!(weighted_len_limited(&"a".repeat(PREMIUM_CHAR_LIMIT + 1), PREMIUM_CHAR_LIMIT).over_limit());
+        assert!(
+            weighted_len_limited(&"a".repeat(PREMIUM_CHAR_LIMIT + 1), PREMIUM_CHAR_LIMIT)
+                .over_limit()
+        );
         // Split path at a modest Premium-style cap (avoid O(n^2) on 25k in unit tests).
         let over = "a".repeat(600);
         let parts = split_thread_limited(&over, 500);
@@ -436,12 +453,15 @@ mod tests {
         }
     }
 
+    #[test]
     fn standard_mode_still_splits_at_280() {
         let long = format!("{} extra", "word ".repeat(100));
         let parts = split_thread_limited(&long, STANDARD_CHAR_LIMIT);
         assert!(parts.len() > 1);
         for part in &parts {
-            assert!(weighted_len_limited(part, STANDARD_CHAR_LIMIT).weighted <= STANDARD_CHAR_LIMIT);
+            assert!(
+                weighted_len_limited(part, STANDARD_CHAR_LIMIT).weighted <= STANDARD_CHAR_LIMIT
+            );
         }
     }
 

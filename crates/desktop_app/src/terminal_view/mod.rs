@@ -71,7 +71,6 @@ mod command_palette;
 mod constants;
 mod inline_input;
 mod inspector;
-mod x_host;
 mod interaction;
 mod kitty_images;
 #[cfg(target_os = "macos")]
@@ -94,6 +93,7 @@ mod titles;
 mod update_overlay;
 mod update_toasts;
 mod workspaces;
+mod x_host;
 
 pub(crate) use runtime::tmux_runtime_requested;
 
@@ -1672,7 +1672,7 @@ impl TerminalView {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-            return path.is_dir().then(|| path.to_string_lossy().into_owned());
+            path.is_dir().then(|| path.to_string_lossy().into_owned())
         }
 
         #[cfg(target_os = "macos")]

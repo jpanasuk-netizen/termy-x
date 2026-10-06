@@ -6,10 +6,11 @@ use serde_json::Value;
 use crate::config::XConfig;
 use crate::io::{CommandRunner, Http, HttpRequest};
 use crate::model::{
-    post_url, rank_by_engagement, strip_handle, trends_from_posts, Attempt, AttemptKind, CostEstimate,
-    Post, Profile, ProviderId, ResearchHit, Served, StatusLine, Thread, Trend, SESSION_OWN,
+    Attempt, AttemptKind, CostEstimate, Post, Profile, ProviderId, ResearchHit, SESSION_OWN,
+    Served, StatusLine, Thread, Trend, post_url, rank_by_engagement, strip_handle,
+    trends_from_posts,
 };
-use crate::publish::{session_label, Publisher};
+use crate::publish::{Publisher, session_label};
 use std::path::PathBuf;
 
 pub trait XProvider: Send + Sync {
@@ -38,7 +39,8 @@ impl Service {
             }));
             readers.push(Box::new(official));
         }
-        if config.provider != Some(ProviderId::Mock) && config.provider != Some(ProviderId::OfficialApi)
+        if config.provider != Some(ProviderId::Mock)
+            && config.provider != Some(ProviderId::OfficialApi)
         {
             readers.push(Box::new(OpenCliProvider::new(config, runner.clone())));
             readers.push(Box::new(TwitterCliProvider::new(config, runner.clone())));
@@ -60,7 +62,10 @@ impl Service {
             readers.retain(|reader| reader.id() == ProviderId::OfficialApi);
             publishers.retain(|publisher| publisher.id() == ProviderId::OfficialApi);
         }
-        Self { readers, publishers }
+        Self {
+            readers,
+            publishers,
+        }
     }
 
     pub fn reader_ids(&self) -> Vec<ProviderId> {
@@ -68,7 +73,10 @@ impl Service {
     }
 
     pub fn publisher_ids(&self) -> Vec<ProviderId> {
-        self.publishers.iter().map(|publisher| publisher.id()).collect()
+        self.publishers
+            .iter()
+            .map(|publisher| publisher.id())
+            .collect()
     }
 
     fn read<T>(
@@ -119,7 +127,12 @@ impl Service {
         self.read(|reader| reader.thread(&id))
     }
 
-    pub fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String> {
+    pub fn search(
+        &self,
+        query: &str,
+        recent: bool,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
         self.read(|reader| reader.search(query, recent, limit))
     }
 
@@ -132,7 +145,11 @@ impl Service {
         served.value = rank_by_engagement(served.value);
         served.value.truncate(limit);
         let prior = served.status.note.clone();
-        let label = if prior.is_empty() { "top posts" } else { prior.as_str() };
+        let label = if prior.is_empty() {
+            "top posts"
+        } else {
+            prior.as_str()
+        };
         served.status.note = format!("{label} · ranked by engagement");
         Ok(served)
     }
@@ -164,23 +181,29 @@ impl Service {
             }
         }
         let topic = place.unwrap_or("news");
-        if let Ok(mut posts) = self.search(topic, true, limit) {
-            if posts.status.provider != ProviderId::Mock {
-                let trends = trends_from_posts(&rank_by_engagement(std::mem::take(&mut posts.value)), place);
-                posts.status.note = "derived from search, ranked by engagement".to_string();
-                posts.status.attempts.extend(attempts);
-                return Ok(Served {
-                    value: trends,
-                    status: posts.status,
-                });
-            }
+        if let Ok(mut posts) = self.search(topic, true, limit)
+            && posts.status.provider != ProviderId::Mock
+        {
+            let trends =
+                trends_from_posts(&rank_by_engagement(std::mem::take(&mut posts.value)), place);
+            posts.status.note = "derived from search, ranked by engagement".to_string();
+            posts.status.attempts.extend(attempts);
+            return Ok(Served {
+                value: trends,
+                status: posts.status,
+            });
         }
         let mut fixtures = self.read(|reader| reader.trends(place, limit))?;
         fixtures.status.attempts.extend(attempts);
         Ok(fixtures)
     }
 
-    pub fn research(&self, topic: &str, runner: &dyn CommandRunner, config: &XConfig) -> Vec<ResearchHit> {
+    pub fn research(
+        &self,
+        topic: &str,
+        runner: &dyn CommandRunner,
+        config: &XConfig,
+    ) -> Vec<ResearchHit> {
         research_topic(topic, runner, config)
     }
 }
@@ -235,12 +258,14 @@ impl XProvider for MockProvider {
             .cloned()
             .unwrap_or_else(|| posts[0].clone());
         let replies = posts.into_iter().skip(1).take(2).collect();
-        Ok(served(
-            Thread { root, replies },
-            "fixture thread",
-        ))
+        Ok(served(Thread { root, replies }, "fixture thread"))
     }
-    fn search(&self, query: &str, _recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String> {
+    fn search(
+        &self,
+        query: &str,
+        _recent: bool,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
         let mut posts = sample_posts();
         let needle = query.to_ascii_lowercase();
         posts.retain(|post| {
@@ -457,7 +482,11 @@ impl XProvider for OpenCliProvider {
             "--limit".into(),
             "50".into(),
         ]))?;
-        Ok(session_served(ProviderId::OpenCli, parse_thread(&stdout, id)?, "thread"))
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_thread(&stdout, id)?,
+            "thread",
+        ))
     }
     fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let stdout = self.call(&opencli_read(&[
@@ -469,7 +498,11 @@ impl XProvider for OpenCliProvider {
             "--limit".into(),
             limit.to_string(),
         ]))?;
-        Ok(session_served(ProviderId::OpenCli, parse_posts(&stdout)?, "search"))
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_posts(&stdout)?,
+            "search",
+        ))
     }
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let stdout = self.call(&opencli_read(&[
@@ -478,7 +511,11 @@ impl XProvider for OpenCliProvider {
             "--limit".into(),
             limit.to_string(),
         ]))?;
-        Ok(session_served(ProviderId::OpenCli, parse_posts(&stdout)?, "timeline"))
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_posts(&stdout)?,
+            "timeline",
+        ))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
         let args = opencli_read(&[
@@ -488,9 +525,8 @@ impl XProvider for OpenCliProvider {
             limit.to_string(),
         ]);
         let stdout = self.call(&args)?;
-        let trends = parse_trends(&stdout, place).or_else(|_| {
-            Ok::<_, String>(trends_from_posts(&parse_posts(&stdout)?, place))
-        })?;
+        let trends = parse_trends(&stdout, place)
+            .or_else(|_| Ok::<_, String>(trends_from_posts(&parse_posts(&stdout)?, place)))?;
         if trends.is_empty() {
             return Err("opencli trending returned no rows".into());
         }
@@ -560,7 +596,11 @@ impl XProvider for TwitterCliProvider {
             limit.to_string(),
             "--json".into(),
         ])?;
-        Ok(session_served(ProviderId::TwitterCli, parse_posts(&stdout)?, "search"))
+        Ok(session_served(
+            ProviderId::TwitterCli,
+            parse_posts(&stdout)?,
+            "search",
+        ))
     }
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let stdout = self.call(&[
@@ -569,7 +609,11 @@ impl XProvider for TwitterCliProvider {
             limit.to_string(),
             "--json".into(),
         ])?;
-        Ok(session_served(ProviderId::TwitterCli, parse_posts(&stdout)?, "feed"))
+        Ok(session_served(
+            ProviderId::TwitterCli,
+            parse_posts(&stdout)?,
+            "feed",
+        ))
     }
     fn trends(&self, _place: Option<&str>, _limit: usize) -> Result<Served<Vec<Trend>>, String> {
         Err("twitter-cli has no trends endpoint".into())
@@ -667,7 +711,10 @@ impl Publisher for OpenCliPublisher {
         } else {
             format!(" with {} image(s)", media.len())
         };
-        Ok(format!("opencli posted {} part(s){media_note}: {last}", parts.len()))
+        Ok(format!(
+            "opencli posted {} part(s){media_note}: {last}",
+            parts.len()
+        ))
     }
 }
 
@@ -692,12 +739,22 @@ impl Publisher for TwitterCliPublisher {
         ProviderId::TwitterCli
     }
     fn available(&self) -> bool {
-        posting_supported(&self.post_ok, self.runner.as_ref(), &self.bin, &["--help".into()])
+        posting_supported(
+            &self.post_ok,
+            self.runner.as_ref(),
+            &self.bin,
+            &["--help".into()],
+        )
     }
     fn session_note(&self) -> Option<String> {
         session_label(ProviderId::TwitterCli)
     }
-    fn publish(&self, parts: &[String], reply_to: Option<&str>, media: &[PathBuf]) -> Result<String, String> {
+    fn publish(
+        &self,
+        parts: &[String],
+        reply_to: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
         if !media.is_empty() {
             return Err(
                 "twitter-cli path cannot upload images here; use OpenCLI or the web intent fallback".into(),
@@ -706,11 +763,11 @@ impl Publisher for TwitterCliPublisher {
         let mut previous = reply_to.map(crate::model::post_id_from_input);
         for part in parts {
             let mut args = vec!["post".into(), part.clone()];
-            if let Some(reply) = &previous {
-                if !reply.is_empty() {
-                    args.push("--reply-to".into());
-                    args.push(reply.clone());
-                }
+            if let Some(reply) = &previous
+                && !reply.is_empty()
+            {
+                args.push("--reply-to".into());
+                args.push(reply.clone());
             }
             args.push("--json".into());
             let output = self.runner.run(&self.bin, &args)?;
@@ -753,11 +810,10 @@ fn posting_supported(
 pub fn help_lists_command(text: &str, command: &str) -> bool {
     for line in text.lines() {
         let lower = line.trim().to_ascii_lowercase();
-        if lower.starts_with(command) {
-            let rest = &lower[command.len()..];
-            if rest.is_empty() || rest.starts_with([' ', '\t', '<', '[']) {
-                return true;
-            }
+        if let Some(rest) = lower.strip_prefix(command)
+            && (rest.is_empty() || rest.starts_with([' ', '\t', '<', '[']))
+        {
+            return true;
         }
         if lower.split(',').any(|part| part.trim() == command) {
             return true;
@@ -765,7 +821,6 @@ pub fn help_lists_command(text: &str, command: &str) -> bool {
     }
     false
 }
-
 
 fn validate_media(media: &[PathBuf]) -> Result<(), String> {
     if media.len() > 4 {
@@ -818,11 +873,14 @@ fn status_url(id_or_url: &str) -> String {
 fn status_ref_from_output(stdout: &str) -> Option<String> {
     let value: Value = serde_json::from_str(stdout).ok()?;
     let node = value.get("data").unwrap_or(&value);
-    let node = node.as_array().and_then(|rows| rows.first()).unwrap_or(node);
-    if let Some(url) = first_str(node, &["url"]) {
-        if url.starts_with("http") {
-            return Some(url.to_string());
-        }
+    let node = node
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(node);
+    if let Some(url) = first_str(node, &["url"])
+        && url.starts_with("http")
+    {
+        return Some(url.to_string());
     }
     first_str(node, &["id", "id_str"]).map(status_url)
 }
@@ -830,7 +888,10 @@ fn status_ref_from_output(stdout: &str) -> Option<String> {
 fn tweet_id_from_output(stdout: &str) -> Option<String> {
     let value: Value = serde_json::from_str(stdout).ok()?;
     let node = value.get("data").unwrap_or(&value);
-    let node = node.as_array().and_then(|rows| rows.first()).unwrap_or(node);
+    let node = node
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(node);
     first_str(node, &["id", "id_str"]).map(|id| id.to_string())
 }
 
@@ -899,7 +960,12 @@ impl XProvider for OfficialProvider {
             "https://api.x.com/2/users/by/username/{handle}?user.fields=description,public_metrics"
         ))?;
         let profile = parse_profile(&body, handle)?;
-        Ok(official_served(profile, 1, self.config.user_read_usd, "1 user"))
+        Ok(official_served(
+            profile,
+            1,
+            self.config.user_read_usd,
+            "1 user",
+        ))
     }
     fn thread(&self, id: &str) -> Result<Served<Thread>, String> {
         let share = self.share();
@@ -974,7 +1040,12 @@ impl Publisher for OfficialPublisher {
             self.inner.config.post_write_usd
         ))
     }
-    fn publish(&self, parts: &[String], reply_to: Option<&str>, media: &[PathBuf]) -> Result<String, String> {
+    fn publish(
+        &self,
+        parts: &[String],
+        reply_to: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
         if !media.is_empty() {
             return Err(
                 "official API media upload is not wired in Termy X yet; use OpenCLI --images or attach in the browser".into(),
@@ -1005,10 +1076,7 @@ impl Publisher for OfficialPublisher {
                 ids.push(id);
             }
         }
-        Ok(format!(
-            "official API posted {} part(s)",
-            parts.len()
-        ))
+        Ok(format!("official API posted {} part(s)", parts.len()))
     }
 }
 
@@ -1030,28 +1098,32 @@ fn official_served<T>(value: T, resources: usize, unit: f64, detail: &str) -> Se
     }
 }
 
-pub fn research_topic(topic: &str, runner: &dyn CommandRunner, config: &XConfig) -> Vec<ResearchHit> {
+pub fn research_topic(
+    topic: &str,
+    runner: &dyn CommandRunner,
+    config: &XConfig,
+) -> Vec<ResearchHit> {
     let mut hits = Vec::new();
     if runner.exists(&config.opencli_bin) {
-        if let Ok(output) = runner.run(&config.opencli_bin, &opencli_read(&[
-            "reddit".into(),
-            "search".into(),
-            topic.into(),
-            "--limit".into(),
-            "5".into(),
-        ])) {
-            if output.status == 0 {
-                hits.extend(parse_research("reddit", &output.stdout, Some(SESSION_OWN)));
-            }
+        if let Ok(output) = runner.run(
+            &config.opencli_bin,
+            &opencli_read(&[
+                "reddit".into(),
+                "search".into(),
+                topic.into(),
+                "--limit".into(),
+                "5".into(),
+            ]),
+        ) && output.status == 0
+        {
+            hits.extend(parse_research("reddit", &output.stdout, Some(SESSION_OWN)));
         }
-        if let Ok(output) = runner.run(&config.opencli_bin, &opencli_read(&[
-            "youtube".into(),
-            "search".into(),
-            topic.into(),
-        ])) {
-            if output.status == 0 {
-                hits.extend(parse_research("youtube", &output.stdout, Some(SESSION_OWN)));
-            }
+        if let Ok(output) = runner.run(
+            &config.opencli_bin,
+            &opencli_read(&["youtube".into(), "search".into(), topic.into()]),
+        ) && output.status == 0
+        {
+            hits.extend(parse_research("youtube", &output.stdout, Some(SESSION_OWN)));
         }
     }
     if runner.exists(&config.youtube_bin) {
@@ -1064,23 +1136,22 @@ pub fn research_topic(topic: &str, runner: &dyn CommandRunner, config: &XConfig)
                 "%(title)s\t%(webpage_url)s".into(),
                 query,
             ],
-        ) {
-            if output.status == 0 {
-                for line in output.stdout.lines().take(5) {
-                    let mut parts = line.split('\t');
-                    let title = parts.next().unwrap_or("").trim();
-                    let url = parts.next().unwrap_or("").trim();
-                    if title.is_empty() {
-                        continue;
-                    }
-                    hits.push(ResearchHit {
-                        source: "youtube".into(),
-                        title: title.into(),
-                        url: url.into(),
-                        excerpt: String::new(),
-                        session: None,
-                    });
+        ) && output.status == 0
+        {
+            for line in output.stdout.lines().take(5) {
+                let mut parts = line.split('\t');
+                let title = parts.next().unwrap_or("").trim();
+                let url = parts.next().unwrap_or("").trim();
+                if title.is_empty() {
+                    continue;
                 }
+                hits.push(ResearchHit {
+                    source: "youtube".into(),
+                    title: title.into(),
+                    url: url.into(),
+                    excerpt: String::new(),
+                    session: None,
+                });
             }
         }
     }
@@ -1089,26 +1160,27 @@ pub fn research_topic(topic: &str, runner: &dyn CommandRunner, config: &XConfig)
             "https://r.jina.ai/https://lite.duckduckgo.com/lite/?q={}",
             crate::text::percent_encode(topic)
         );
-        if let Ok(output) = runner.run("curl", &["-fsSL".into(), "--max-time".into(), "15".into(), reader])
+        if let Ok(output) = runner.run(
+            "curl",
+            &["-fsSL".into(), "--max-time".into(), "15".into(), reader],
+        ) && output.status == 0
         {
-            if output.status == 0 {
-                let excerpt = output
-                    .stdout
-                    .chars()
-                    .take(280)
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if !excerpt.is_empty() {
-                    hits.push(ResearchHit {
-                        source: "web".into(),
-                        title: format!("Web notes for {topic}"),
-                        url: format!("https://r.jina.ai/"),
-                        excerpt,
-                        session: None,
-                    });
-                }
+            let excerpt = output
+                .stdout
+                .chars()
+                .take(280)
+                .collect::<String>()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !excerpt.is_empty() {
+                hits.push(ResearchHit {
+                    source: "web".into(),
+                    title: format!("Web notes for {topic}"),
+                    url: "https://r.jina.ai/".to_string(),
+                    excerpt,
+                    session: None,
+                });
             }
         }
     }
@@ -1150,10 +1222,7 @@ fn rss_hits(topic: &str, runner: &dyn CommandRunner) -> Vec<ResearchHit> {
     if output.status != 0 {
         return Vec::new();
     }
-    parse_rss(&output.stdout)
-        .into_iter()
-        .take(5)
-        .collect()
+    parse_rss(&output.stdout).into_iter().take(5).collect()
 }
 
 fn parse_rss(xml: &str) -> Vec<ResearchHit> {
@@ -1185,7 +1254,7 @@ fn xml_text(item: &str, tag: &str) -> String {
     };
     let from = start + content_at + 1;
     let close = format!("</{tag}>");
-    let end = item[from..].find(&close).map(|index| from + index).unwrap_or(from);
+    let end = item[from..].find(&close).map_or(from, |index| from + index);
     item[from..end]
         .replace("<![CDATA[", "")
         .replace("]]>", "")
@@ -1200,17 +1269,18 @@ fn parse_research(source: &str, text: &str, session: Option<&str>) -> Vec<Resear
     };
     array_of(&value)
         .into_iter()
-        .filter_map(|item| {
+        .map(|item| {
             let title = first_str(item, &["title", "name", "text"]).unwrap_or("untitled");
             let url = first_str(item, &["url", "link", "permalink"]).unwrap_or("");
-            let excerpt = first_str(item, &["excerpt", "body", "selftext", "description"]).unwrap_or("");
-            Some(ResearchHit {
+            let excerpt =
+                first_str(item, &["excerpt", "body", "selftext", "description"]).unwrap_or("");
+            ResearchHit {
                 source: source.into(),
                 title: title.to_string(),
                 url: url.to_string(),
                 excerpt: excerpt.chars().take(240).collect(),
                 session: session.map(str::to_string),
-            })
+            }
         })
         .collect()
 }
@@ -1278,7 +1348,9 @@ fn parse_trends(text: &str, place: Option<&str>) -> Result<Vec<Trend>, String> {
         .filter_map(|item| {
             let name = first_str(item, &["name", "title", "topic", "trend", "query"])?.to_string();
             Some(Trend {
-                query: first_str(item, &["query", "name"]).unwrap_or(&name).to_string(),
+                query: first_str(item, &["query", "name"])
+                    .unwrap_or(&name)
+                    .to_string(),
                 volume: item
                     .get("volume")
                     .or_else(|| item.get("tweet_volume"))
@@ -1304,7 +1376,8 @@ fn array_of(value: &Value) -> Vec<&Value> {
             return array.iter().collect();
         }
     }
-    if value.get("text").is_some() || value.get("full_text").is_some() || value.get("id").is_some() {
+    if value.get("text").is_some() || value.get("full_text").is_some() || value.get("id").is_some()
+    {
         return vec![value];
     }
     Vec::new()
@@ -1336,7 +1409,10 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         .to_string();
     let author = item.get("user").or_else(|| item.get("author"));
     let (mut handle, mut name) = match author {
-        Some(Value::String(text)) => (text.trim().trim_start_matches('@').to_string(), String::new()),
+        Some(Value::String(text)) => (
+            text.trim().trim_start_matches('@').to_string(),
+            String::new(),
+        ),
         Some(author) => (
             first_str(author, &["username", "screen_name", "screenName", "handle"])
                 .unwrap_or("")
@@ -1354,18 +1430,20 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
             .trim_start_matches('@')
             .to_string();
     }
-    if handle.is_empty() {
-        if let Some(author_id) = item.get("author_id").and_then(Value::as_str) {
-            if let Some((_, username, display)) = users.iter().find(|(id, _, _)| id == author_id) {
-                handle = username.clone();
-                name = display.clone();
-            }
-        }
+    if handle.is_empty()
+        && let Some(author_id) = item.get("author_id").and_then(Value::as_str)
+        && let Some((_, username, display)) = users.iter().find(|(id, _, _)| id == author_id)
+    {
+        handle = username.clone();
+        name = display.clone();
     }
     if name.is_empty() {
         name = handle.clone();
     }
-    let metrics = item.get("public_metrics").or_else(|| item.get("metrics")).unwrap_or(item);
+    let metrics = item
+        .get("public_metrics")
+        .or_else(|| item.get("metrics"))
+        .unwrap_or(item);
     Some(Post {
         url: post_url(&handle, &id),
         author_handle: handle,
@@ -1382,7 +1460,8 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
 }
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|key| value.get(*key).and_then(Value::as_str))
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
 fn number(value: &Value, keys: &[&str]) -> u64 {
@@ -1412,18 +1491,25 @@ mod tests {
         let service = Service::free(&quiet_config(), runner, http);
         assert_eq!(
             service.reader_ids(),
-            vec![ProviderId::OpenCli, ProviderId::TwitterCli, ProviderId::Mock]
+            vec![
+                ProviderId::OpenCli,
+                ProviderId::TwitterCli,
+                ProviderId::Mock
+            ]
         );
         assert!(!service.reader_ids().contains(&ProviderId::OfficialApi));
         let timeline = service.timeline(2).unwrap();
         assert_eq!(timeline.status.provider, ProviderId::Mock);
         assert!(timeline.status.render().contains("no X API credits"));
         assert_eq!(timeline.value.len(), 2);
-        assert!(timeline
-            .status
-            .attempts
-            .iter()
-            .any(|attempt| attempt.provider == ProviderId::OpenCli && attempt.kind == AttemptKind::Skipped));
+        assert!(
+            timeline
+                .status
+                .attempts
+                .iter()
+                .any(|attempt| attempt.provider == ProviderId::OpenCli
+                    && attempt.kind == AttemptKind::Skipped)
+        );
     }
 
     #[test]
@@ -1439,7 +1525,11 @@ mod tests {
             &["feed"],
             r#"[{"id":"8","text":"from cookie","screen_name":"bea"}]"#,
         );
-        let service = Service::free(&quiet_config(), runner.clone(), Arc::new(crate::io::MapHttp::default()));
+        let service = Service::free(
+            &quiet_config(),
+            runner.clone(),
+            Arc::new(crate::io::MapHttp::default()),
+        );
         let timeline = service.timeline(10).unwrap();
         assert_eq!(timeline.status.provider, ProviderId::OpenCli);
         assert_eq!(timeline.value[0].text, "from chrome");
@@ -1457,15 +1547,22 @@ mod tests {
             &["search"],
             r#"[{"id":"4","text":"cookie hit","screenName":"cy"}]"#,
         );
-        let service = Service::free(&quiet_config(), runner, Arc::new(crate::io::MapHttp::default()));
+        let service = Service::free(
+            &quiet_config(),
+            runner,
+            Arc::new(crate::io::MapHttp::default()),
+        );
         let found = service.search("cookie", true, 5).unwrap();
         assert_eq!(found.status.provider, ProviderId::TwitterCli);
         assert_eq!(found.value[0].author_handle, "cy");
-        assert!(found
-            .status
-            .attempts
-            .iter()
-            .any(|attempt| attempt.provider == ProviderId::OpenCli && attempt.kind == AttemptKind::Failed));
+        assert!(
+            found
+                .status
+                .attempts
+                .iter()
+                .any(|attempt| attempt.provider == ProviderId::OpenCli
+                    && attempt.kind == AttemptKind::Failed)
+        );
     }
 
     #[test]
@@ -1478,13 +1575,23 @@ mod tests {
             &["twitter", "search"],
             r#"[{"id":"1","text":"quiet #gpui","likes":1},{"id":"2","text":"loud #gpui","likes":50,"reposts":4}]"#,
         );
-        let service = Service::free(&quiet_config(), runner, Arc::new(crate::io::MapHttp::default()));
+        let service = Service::free(
+            &quiet_config(),
+            runner,
+            Arc::new(crate::io::MapHttp::default()),
+        );
         let popular = service.popular("gpui", 2).unwrap();
         assert_eq!(popular.value[0].id, "2");
         assert!(popular.status.note.contains("engagement"));
         let trends = service.trends(Some("nyc"), 5).unwrap();
         assert_eq!(trends.status.provider, ProviderId::OpenCli);
-        assert!(trends.status.note.contains("derived") || trends.value.iter().any(|trend| trend.name.contains("gpui") || trend.name.contains("#gpui")));
+        assert!(
+            trends.status.note.contains("derived")
+                || trends
+                    .value
+                    .iter()
+                    .any(|trend| trend.name.contains("gpui") || trend.name.contains("#gpui"))
+        );
     }
 
     #[test]
@@ -1578,12 +1685,18 @@ mod tests {
     fn help_listing_requires_a_command_token() {
         assert!(help_lists_command("post <text> [options]", "post"));
         assert!(help_lists_command("accept, post, profile", "post"));
-        assert!(help_lists_command("  post        Post a new tweet.", "post"));
+        assert!(help_lists_command(
+            "  post        Post a new tweet.",
+            "post"
+        ));
         assert!(help_lists_command(
             "lists, login, mute-word, notifications, post, profile, quote, reply,\n  post <text> [options]               [write] Post a new tweet/thread",
             "post"
         ));
-        assert!(!help_lists_command("This tool does not post tweets.", "post"));
+        assert!(!help_lists_command(
+            "This tool does not post tweets.",
+            "post"
+        ));
         assert!(!help_lists_command("profile, search, timeline", "post"));
     }
 
@@ -1596,6 +1709,9 @@ mod tests {
             "<rss><item><title>GPUI notes</title><link>https://example.com/g</link></item></rss>",
         );
         let hits = research_topic("gpui", &runner, &quiet_config());
-        assert!(hits.iter().any(|hit| hit.source == "rss" && hit.title == "GPUI notes"));
+        assert!(
+            hits.iter()
+                .any(|hit| hit.source == "rss" && hit.title == "GPUI notes")
+        );
     }
 }

@@ -121,16 +121,18 @@ fn prompt_value(section: &str, key: &str) -> Option<String> {
     let mut current = String::new();
     for line in PROMPTS.lines() {
         let line = line.trim();
-        if let Some(name) = line.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        if let Some(name) = line
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
             current = name.to_string();
             continue;
         }
-        if current == section {
-            if let Some((found, value)) = line.split_once('=') {
-                if found.trim() == key {
-                    return Some(unquote(value.trim()));
-                }
-            }
+        if current == section
+            && let Some((found, value)) = line.split_once('=')
+            && found.trim() == key
+        {
+            return Some(unquote(value.trim()));
         }
     }
     None
@@ -170,7 +172,11 @@ mod tests {
         let drafts = draft_variants(&config, &http, "ship the panel", Tone::Punchy, 3).unwrap();
         assert_eq!(drafts.len(), 3);
         assert!(drafts.iter().all(|draft| draft.source == "template"));
-        assert!(drafts.iter().all(|draft| draft.text.contains("ship the panel")));
+        assert!(
+            drafts
+                .iter()
+                .all(|draft| draft.text.contains("ship the panel"))
+        );
         let calls = http.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "one probe of the free local endpoint");
         assert!(calls[0].contains("127.0.0.1:11434/v1/chat/completions"));
@@ -178,18 +184,22 @@ mod tests {
 
     #[test]
     fn configured_ai_errors_are_reported_not_hidden() {
-        let mut config = XConfig::default();
-        config.ai_base_url = "http://127.0.0.1:9/v1".into();
-        config.ai_model = "m".into();
+        let config = XConfig {
+            ai_base_url: "http://127.0.0.1:9/v1".into(),
+            ai_model: "m".into(),
+            ..Default::default()
+        };
         let http = MapHttp::default();
         assert!(draft_variants(&config, &http, "idea", Tone::Punchy, 2).is_err());
     }
 
     #[test]
     fn configured_ai_parses_variants_and_stays_a_draft() {
-        let mut config = XConfig::default();
-        config.ai_base_url = "http://127.0.0.1:9/v1".into();
-        config.ai_model = "local-free".into();
+        let config = XConfig {
+            ai_base_url: "http://127.0.0.1:9/v1".into(),
+            ai_model: "local-free".into(),
+            ..Default::default()
+        };
         let http = MapHttp::default();
         http.routes.lock().unwrap().insert(
             "http://127.0.0.1:9/v1/chat/completions".into(),

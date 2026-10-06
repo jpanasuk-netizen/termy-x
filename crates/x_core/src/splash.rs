@@ -3,10 +3,7 @@ pub fn splash_ansi() -> String {
 }
 
 fn color_enabled() -> bool {
-    match std::env::var_os("NO_COLOR") {
-        Some(value) if !value.is_empty() => false,
-        _ => true,
-    }
+    !matches!(std::env::var_os("NO_COLOR"), Some(value) if !value.is_empty())
 }
 
 pub fn render_splash(color: bool) -> String {
