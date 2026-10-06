@@ -17,7 +17,7 @@ use crate::publish::{confirm_and_publish, first_available, ConfirmDecision, Gate
 use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
-#[command(name = "x", version, about = "Termy X — read and post without X API credits")]
+#[command(name = "x", version, about = "Termy X - read and post without X API credits", disable_help_subcommand = true)]
 struct Cli {
     /// Print JSON for scripting
     #[arg(long, global = true)]
@@ -112,6 +112,8 @@ enum Cmd {
     },
     /// Research a topic from Reddit, YouTube, and the web
     Research { topic: String },
+    /// Full Termy X command guide (GUI + CLI)
+    Help,
     /// Which free providers are installed. No X credits required.
     Doctor,
     /// Print the example config
@@ -155,6 +157,37 @@ pub fn run_env() -> i32 {
     code
 }
 
+
+fn print_help_guide() {
+    println!("Termy X - GUI + CLI guide");
+    println!();
+    println!("GUI");
+    println!("  Ctrl+Shift+X          Open / close the X panel");
+    println!("  Tabs                  Timeline, Search, Trends, Lookup, Compose, Research, Help");
+    println!("  Compose               Click the cyan box (caret blinks). Ctrl+V pastes in-box.");
+    println!("  Attach image          Section under the compose box. Up to 4 JPG/PNG/GIF/WEBP.");
+    println!("                        Thumbnails + filenames. Remove one or Clear all.");
+    println!("  Publish -> Post now   Confirm shows exact text + attachments. Post now uses");
+    println!("                        OpenCLI (with images) when available; else browser intent.");
+    println!("  Tab / Esc / Enter     Cycle controls, cancel confirm, activate focused button");
+    println!();
+    println!("CLI  (from the termy-x folder: .\\target\\release\\x.exe …)");
+    println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
+    println!("  x splash              Print the Termy X bird");
+    println!("  x search \"query\" [--recent|--top] [--limit N]");
+    println!("  x timeline [--limit N]");
+    println!("  x trends [--place NAME] [--limit N]");
+    println!("  x lookup handle");
+    println!("  x post \"text\"");
+    println!("  x post --dry-run \"text\"          Plan only - never posts");
+    println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
+    println!("  x post --reply-to ID \"text\"      Reply to a status");
+    println!("  PowerShell long text:  x post --dry-run (Get-Content -Raw .\\post.txt)");
+    println!();
+    println!("Nothing posts until you type yes (CLI) or hit Post now after Confirm (GUI).");
+    println!("Premium auto-detects (25,000 chars); otherwise 280.");
+}
+
 pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
     let cli = match Cli::try_parse_from(std::iter::once("x".to_string()).chain(args.iter().cloned()))
     {
@@ -191,11 +224,15 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
         None => {
             print!("{}", splash_ansi());
             println!("Termy X. No X API credits are needed.");
-            println!("Try `x doctor`, `x splash`, or `x --help`.");
+            println!("Try `x help`, `x doctor`, `x splash`, or `x --help`.");
             0
         }
         Some(Cmd::Splash) => {
             print!("{}", splash_ansi());
+            0
+        }
+        Some(Cmd::Help) => {
+            print_help_guide();
             0
         }
         Some(Cmd::Doctor) => {
@@ -362,7 +399,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             dry_run,
             reply_to,
         } => publish_draft(&draft_id, dry_run, reply_to, json, io, interactive),
-        Cmd::Doctor | Cmd::Config | Cmd::Auth => 0,
+        Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth => 0,
     }
 }
 
