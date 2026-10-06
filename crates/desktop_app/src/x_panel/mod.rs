@@ -726,6 +726,7 @@ impl XPanel {
             if let Some(item) = cx.read_from_clipboard() {
                 if let Some(clip) = item.text() {
                     self.insert_text(&clip);
+                    cx.stop_propagation();
                     cx.notify();
                 }
             }
@@ -734,6 +735,7 @@ impl XPanel {
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("a") {
             self.sel_anchor = Some(0);
             self.caret = self.compose.len();
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -743,31 +745,40 @@ impl XPanel {
                     self.compose[a..b].to_string(),
                 ));
             }
+            cx.stop_propagation();
             return;
         }
 
         if key == "left" {
             self.move_caret(CaretMove::Left, mods.shift);
+            cx.stop_propagation();
             cx.notify();
             return;
         }
         if key == "right" {
             self.move_caret(CaretMove::Right, mods.shift);
+            cx.stop_propagation();
             cx.notify();
             return;
         }
         if key == "up" || key == "home" {
             self.move_caret(CaretMove::LineStart, mods.shift);
+            cx.stop_propagation();
             cx.notify();
             return;
         }
         if key == "down" || key == "end" {
             self.move_caret(CaretMove::LineEnd, mods.shift);
+            cx.stop_propagation();
             cx.notify();
             return;
         }
 
-        if mods.modified() && key != "backspace" && key != "delete" {
+        // Shift alone is NOT a blocking modifier — it produces capitals / symbols.
+        // Only ctrl/alt/platform/function should suppress plain text insertion.
+        // (Old `mods.modified()` included shift and ate the first capital letter.)
+        let blocks_text = mods.control || mods.alt || mods.platform || mods.function;
+        if blocks_text && key != "backspace" && key != "delete" {
             return;
         }
         if key == "backspace" {
@@ -778,11 +789,18 @@ impl XPanel {
             self.insert_text(" ");
         } else if key == "enter" {
             self.insert_text("\n");
+        } else if let Some(ch) = event.keystroke.key_char.as_deref() {
+            // Prefer key_char so Shift+letter inserts "H" not "h", and Shift+1 inserts "!".
+            if ch.is_empty() {
+                return;
+            }
+            self.insert_text(ch);
         } else if key.chars().count() == 1 {
             self.insert_text(key);
         } else {
             return;
         }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -790,7 +808,13 @@ impl XPanel {
         self.compose_focused = true;
         self.ui_focus = UiFocus::Compose;
         self.blink_visible = true;
-        self.caret = self.caret.min(self.compose.len());
+        if self.compose.is_empty() {
+            // Empty draft: caret at left (index 0), never a phantom selection.
+            self.caret = 0;
+            self.sel_anchor = None;
+        } else {
+            self.caret = self.caret.min(self.compose.len());
+        }
     }
 
     fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
@@ -1648,8 +1672,12 @@ impl XPanel {
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.focus.focus(window, cx);
                             this.focus_compose_editor();
-                            // Click jumps caret to end; arrows refine position.
-                            this.caret = this.compose.len();
+                            // Empty draft: caret at left (0). Non-empty: jump to end.
+                            if this.compose.is_empty() {
+                                this.caret = 0;
+                            } else {
+                                this.caret = this.compose.len();
+                            }
                             this.sel_anchor = None;
                             this.pending_focus = false;
                             cx.stop_propagation();
@@ -1720,12 +1748,15 @@ impl XPanel {
         let sel = self.selection_range();
 
         if self.compose.is_empty() {
+            // Caret must sit at the LEFT of an empty draft (index 0), not after
+            // the placeholder — otherwise it looks like typing starts on the right.
             return div()
                 .mt(px(8.0))
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
+                .children(show_caret.then(|| self.caret_bar()))
                 .child(
                     div()
                         .text_size(px(14.0))
@@ -1734,7 +1765,6 @@ impl XPanel {
                             "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.",
                         ),
                 )
-                .children(show_caret.then(|| self.caret_bar()))
                 .into_any_element();
         }
 
