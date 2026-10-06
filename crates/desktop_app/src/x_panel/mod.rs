@@ -97,6 +97,10 @@ pub struct XPanel {
     fetch_seq: u64,
     inflight: [u64; 5],
     loading: bool,
+    /// Focus the panel on next render (Compose needs keys; terminal steals focus).
+    pending_focus: bool,
+    /// Suggest variants is running in the background.
+    suggesting: bool,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -162,10 +166,14 @@ impl XPanel {
             profile: None,
             query: "gpui terminal".into(),
             lookup: "termy".into(),
-            compose: "Termy X counts this URL as 23: https://termy.sh".into(),
+            compose: if fill_window {
+                "Termy X counts this URL as 23: https://termy.sh".into()
+            } else {
+                String::new()
+            },
             variants: Vec::new(),
             drafts: Vec::new(),
-            status: "ready · free providers · no X API credits".into(),
+            status: "ready Â· free providers Â· no X API credits".into(),
             confirm: false,
             intent_urls: Vec::new(),
             intent_index: 0,
@@ -180,6 +188,8 @@ impl XPanel {
             fetch_seq: 0,
             inflight: [0; 5],
             loading: false,
+            pending_focus: false,
+            suggesting: false,
         };
         // Instant first paint: fixtures on screen, live fetch in the background.
         if fill_window {
@@ -209,8 +219,13 @@ impl XPanel {
 
         if self.fill_window || !self.live {
             self.ensure_mock_lists();
-            if section == XSection::Compose && self.variants.is_empty() {
-                self.suggest();
+            if section == XSection::Compose {
+                self.loading = false;
+                self.pending_focus = true;
+                // Preview keeps a demo draft; do not auto-run AI.
+                if self.compose.is_empty() {
+                    self.compose = "Termy X counts this URL as 23: https://termy.sh".into();
+                }
             }
             if section == XSection::Search && self.search_posts.is_empty() {
                 self.search_posts = MockProvider
@@ -223,25 +238,25 @@ impl XPanel {
         }
 
         if section == XSection::Compose {
-            if self.variants.is_empty() {
-                self.suggest();
-            }
-            self.status = "compose · confirm before publish · no X API credits".into();
+            // Never block: no AI / OpenCLI on the open path. Suggest is a button.
+            self.loading = false;
+            self.pending_focus = true;
+            self.status = "compose Â· click the box and type Â· Publish opens confirm instantly".into();
             log_switch(section, started, "compose");
             return;
         }
 
         if self.is_fresh(section) {
             self.loading = false;
-            self.status = format!("{} · cached (<30s) · no X API credits", section.label());
+            self.status = format!("{} Â· cached (<30s) Â· no X API credits", section.label());
             log_switch(section, started, "cache");
             return;
         }
 
         if self.section_has_data(section) {
-            self.status = format!("{} · refreshing…", section.label());
+            self.status = format!("{} Â· refreshingâ€¦", section.label());
         } else {
-            self.status = format!("loading {}…", section.label());
+            self.status = format!("loading {}â€¦", section.label());
         }
         self.loading = true;
         log_switch(section, started, "async");
@@ -265,7 +280,7 @@ impl XPanel {
                 self.profile = None;
                 self.variants.clear();
                 self.splash = true;
-                self.status = "splash · background art at full strength".into();
+                self.status = "splash Â· background art at full strength".into();
             }
             "mock" => self.load_mock_dashboard(),
             "trends" => self.open_section(XSection::Trends, cx),
@@ -278,8 +293,8 @@ impl XPanel {
         self.live = false;
         self.section = XSection::Timeline;
         self.ensure_mock_lists();
-        self.suggest();
-        self.status = "mock · search, timeline, trends · no network · no X API credits".into();
+        self.suggest_templates();
+        self.status = "mock Â· search, timeline, trends Â· no network Â· no X API credits".into();
     }
 
     /// Seed fixture lists without turning off live mode.
@@ -317,7 +332,7 @@ impl XPanel {
                 .ok()
                 .map(|served| served.value);
         }
-        self.status = "fixtures · refreshing free providers in background".into();
+        self.status = "fixtures Â· refreshing free providers in background".into();
     }
 
     fn ensure_mock_lists(&mut self) {
@@ -487,16 +502,64 @@ impl XPanel {
         )
     }
 
-    fn suggest(&mut self) {
+    fn suggest_templates(&mut self) {
         self.variants = termy_x::ai::template_variants(&self.compose, Tone::Punchy, 3);
-        self.notice = Some("Variants are drafts. Nothing was posted.".into());
+        self.suggesting = false;
+        self.notice = Some("Template drafts. Nothing was posted.".into());
+    }
+
+    /// Instant local templates, then optional AI in the background. Never blocks UI.
+    fn suggest_async(&mut self, cx: &mut Context<Self>) {
+        self.suggest_templates();
+        self.suggesting = true;
+        self.notice = Some("Drafting variantsâ€¦ UI stays live.".into());
+        let idea = self.compose.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let config =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let http = termy_x::io::UreqHttp::default();
+                    termy_x::ai::draft_variants(&config, &http, &idea, Tone::Punchy, 3)
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.suggesting = false;
+                match result {
+                    Ok(variants) => {
+                        panel.variants = variants;
+                        panel.notice =
+                            Some("Variants are drafts. Nothing was posted.".into());
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "AI offline ({error}). Showing templates. UI stayed live."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn arm_confirm(&mut self) {
         let parts = split_thread(&self.compose);
+        let parts = if parts.is_empty() {
+            vec![self.compose.trim().to_string()]
+        } else {
+            parts
+        };
+        if parts.first().map(|p| p.is_empty()).unwrap_or(true) {
+            self.notice = Some("Type something before Publish.".into());
+            self.confirm = false;
+            return;
+        }
         self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         self.intent_index = 0;
         self.confirm = true;
+        self.pending_focus = true;
     }
 
     fn accept_variant(&mut self, index: usize) {
@@ -527,8 +590,18 @@ impl XPanel {
             return;
         }
         let key = event.keystroke.key.as_str();
-        let plain = !event.keystroke.modifiers.modified();
-        if !plain {
+        let mods = &event.keystroke.modifiers;
+        // Ctrl/Cmd+V paste â€” common path when focus finally lands on the panel.
+        if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
+            if let Some(item) = cx.read_from_clipboard() {
+                if let Some(clip) = item.text() {
+                    self.compose.push_str(&clip);
+                    cx.notify();
+                }
+            }
+            return;
+        }
+        if mods.modified() {
             return;
         }
         if key == "backspace" {
@@ -593,7 +666,7 @@ fn fetch_section(
                 let hits = service.research("gpui terminal", &runner, &config);
                 return FetchPayload::Research {
                     hits,
-                    status: "research · no X API credits".into(),
+                    status: "research Â· no X API credits".into(),
                 };
             }
             XSection::Compose => {}
@@ -606,21 +679,21 @@ fn fetch_section(
                 .timeline(10)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: "mock · fixture data · no X API credits".into(),
+            status: "mock Â· fixture data Â· no X API credits".into(),
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
                 .search(&query, false, 10)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: format!("mock · search “{query}” · no X API credits"),
+            status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
         },
         XSection::Trends => FetchPayload::Trends {
             trends: MockProvider
                 .trends(Some("worldwide"), 8)
                 .map(|served| served.value)
                 .unwrap_or_default(),
-            status: "mock · trends · no X API credits".into(),
+            status: "mock Â· trends Â· no X API credits".into(),
         },
         XSection::Lookup => FetchPayload::Lookup {
             profile: MockProvider
@@ -628,7 +701,7 @@ fn fetch_section(
                 .ok()
                 .map(|served| served.value),
             status: format!(
-                "mock · lookup @{} · no X API credits",
+                "mock Â· lookup @{} Â· no X API credits",
                 lookup.trim_start_matches('@')
             ),
         },
@@ -640,7 +713,7 @@ fn fetch_section(
                 excerpt: "Fixture research for drafts. Install OpenCLI, yt-dlp, or curl to pull Reddit, YouTube, and the web.".into(),
                 session: None,
             }],
-            status: "research · fixture · no X API credits".into(),
+            status: "research Â· fixture Â· no X API credits".into(),
         },
         XSection::Compose => FetchPayload::Timeline {
             posts: Vec::new(),
@@ -651,6 +724,10 @@ fn fetch_section(
 
 impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.focus.focus(window, cx);
+            self.pending_focus = false;
+        }
         let count = weighted_len(&self.compose);
         let parts = split_thread(&self.compose);
         let columns = self.column_count(window);
@@ -857,7 +934,7 @@ impl XPanel {
 
     fn status_line(&self) -> impl IntoElement {
         let label = if self.loading {
-            format!("⏳ {}", self.status)
+            format!("â³ {}", self.status)
         } else {
             self.status.clone()
         };
@@ -919,7 +996,7 @@ impl XPanel {
 
     fn results_column(&self, include_side: bool) -> gpui_kit::AnyElement {
         let mut rows = Vec::new();
-        rows.push(hint(format!("Search · {}", self.query)));
+        rows.push(hint(format!("Search Â· {}", self.query)));
         let search = if self.search_posts.is_empty() {
             &self.posts
         } else {
@@ -935,7 +1012,7 @@ impl XPanel {
         if let Some(root) = self.posts.first() {
             let replies = self.posts.iter().skip(1).take(2).count();
             rows.push(card(
-                format!("Thread · @{}", root.author_handle),
+                format!("Thread Â· @{}", root.author_handle),
                 format!("{}\n{replies} repl{}", root.text, if replies == 1 { "y" } else { "ies" }),
             ));
         }
@@ -955,7 +1032,7 @@ impl XPanel {
             rows.push(card(
                 trend.name.clone(),
                 format!(
-                    "{} · volume {}",
+                    "{} Â· volume {}",
                     trend.place.as_deref().unwrap_or("worldwide"),
                     trend.volume.unwrap_or(0)
                 ),
@@ -963,7 +1040,7 @@ impl XPanel {
         }
         if let Some(post) = self.posts.iter().max_by_key(|post| post.engagement()) {
             rows.push(card(
-                format!("Popular · @{} · {} likes", post.author_handle, post.likes),
+                format!("Popular Â· @{} Â· {} likes", post.author_handle, post.likes),
                 post.text.clone(),
             ));
         }
@@ -991,7 +1068,7 @@ impl XPanel {
                 if self.posts.is_empty() {
                     rows.push(self.splash_copy());
                 } else if self.loading && self.section == XSection::Timeline {
-                    rows.push(hint("Refreshing timeline…".into()));
+                    rows.push(hint("Refreshing timelineâ€¦".into()));
                 }
                 for post in &self.posts {
                     rows.push(post_card(post));
@@ -1001,7 +1078,7 @@ impl XPanel {
                 if self.search_posts.is_empty() {
                     rows.push(self.splash_copy());
                 } else if self.loading {
-                    rows.push(hint("Refreshing search…".into()));
+                    rows.push(hint("Refreshing searchâ€¦".into()));
                 }
                 for post in &self.search_posts {
                     rows.push(post_card(post));
@@ -1012,7 +1089,7 @@ impl XPanel {
                     rows.push(card(
                         trend.name.clone(),
                         format!(
-                            "{} · volume {}",
+                            "{} Â· volume {}",
                             trend.place.as_deref().unwrap_or("worldwide"),
                             trend.volume.unwrap_or(0)
                         ),
@@ -1025,9 +1102,9 @@ impl XPanel {
             XSection::Lookup => {
                 if let Some(profile) = &self.profile {
                     rows.push(card(
-                        format!("@{} · {}", profile.handle, profile.name),
+                        format!("@{} Â· {}", profile.handle, profile.name),
                         format!(
-                            "{}\n{} followers · {} following",
+                            "{}\n{} followers Â· {} following",
                             profile.bio, profile.followers, profile.following
                         ),
                     ));
@@ -1075,14 +1152,84 @@ impl XPanel {
 
     fn compose_block(&self, weighted: usize, parts: &[String], cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let counter = format!("{weighted} / 280");
+        let suggest_label = if self.suggesting {
+            "Suggestingâ€¦"
+        } else {
+            "Suggest variants"
+        };
+        let editor_body = if self.compose.is_empty() {
+            "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.".to_string()
+        } else {
+            self.compose.clone()
+        };
+        let editor_color = if self.compose.is_empty() {
+            rgb(0x93a4c3)
+        } else {
+            rgb(0xf8fbff)
+        };
         div()
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(card(
-                "Live preview".into(),
-                self.compose.clone(),
-            ))
+            // Sticky actions FIRST so Publish is never below the fold.
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .flex_wrap()
+                    .child(x_button!("x-clear", "Clear", cx.listener(|this, _, _, cx| {
+                        this.compose.clear();
+                        this.variants.clear();
+                        this.notice = Some("Draft cleared.".into());
+                        this.pending_focus = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    })))
+                    .child(x_button!("x-suggest", suggest_label, cx.listener(|this, _, _, cx| {
+                        this.suggest_async(cx);
+                        this.pending_focus = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    })))
+                    .child(x_button!("x-publish", "Publish", cx.listener(|this, _, _, cx| {
+                        this.arm_confirm();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }))),
+            )
+            .child(
+                div()
+                    .id("x-compose-editor")
+                    .p(px(12.0))
+                    .min_h(px(120.0))
+                    .rounded(px(12.0))
+                    .bg(tint(0x0c1422, 235))
+                    .border_1()
+                    .border_color(rgb(0x7af6ff))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9ad7ff))
+                            .child("Compose"),
+                    )
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .text_size(px(14.0))
+                            .text_color(editor_color)
+                            .child(editor_body),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.focus.focus(window, cx);
+                            this.pending_focus = false;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(
                 div()
                     .text_size(px(12.0))
@@ -1093,32 +1240,22 @@ impl XPanel {
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0xb7c3dc))
-                    .child(format!("{} thread part(s). URLs count as 23.", parts.len())),
+                    .child(format!(
+                        "{} thread part(s). URLs count as 23. Confirm shows exact text before any post.",
+                        parts.len().max(1)
+                    )),
             )
-            .children(parts.iter().enumerate().map(|(index, part)| {
+            .children(parts.iter().enumerate().filter(|(_, part)| !part.is_empty()).map(|(index, part)| {
                 card(format!("Part {}", index + 1), part.clone())
             }))
             .children(self.drafts.iter().map(|draft| {
                 card(
-                    format!("Draft · {}", draft.tone.as_deref().unwrap_or("note")),
+                    format!("Draft Â· {}", draft.tone.as_deref().unwrap_or("note")),
                     draft.text.clone(),
                 )
             }))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(x_button!("x-suggest", "Suggest variants", cx.listener(|this, _, _, cx| {
-                        this.suggest();
-                        cx.notify();
-                    })))
-                    .child(x_button!("x-publish", "Publish", cx.listener(|this, _, _, cx| {
-                        this.arm_confirm();
-                        cx.notify();
-                    }))),
-            )
             .children(self.variants.iter().enumerate().map(|(index, draft)| {
-                let label = format!("Variant {} · {}", index + 1, draft.source);
+                let label = format!("Variant {} Â· {}", index + 1, draft.source);
                 div()
                     .id(SharedString::from(format!("x-variant-{index}")))
                     .p(px(10.0))
@@ -1131,6 +1268,8 @@ impl XPanel {
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                             this.accept_variant(index);
+                            this.pending_focus = true;
+                            cx.stop_propagation();
                             cx.notify();
                         }),
                     )
@@ -1172,7 +1311,7 @@ impl XPanel {
                     div()
                         .text_size(px(11.0))
                         .text_color(if active { rgb(0xffd0ea) } else { rgb(0x93a4c3) })
-                        .child(format!("Part {} of {} · {part_count} weighted", index + 1, parts.len())),
+                        .child(format!("Part {} of {} Â· {part_count} weighted", index + 1, parts.len())),
                 )
                 .child(
                     div()
@@ -1223,7 +1362,7 @@ impl XPanel {
                         div()
                             .text_size(px(13.0))
                             .child(format!(
-                                "{weighted} weighted characters · {} part(s)",
+                                "{weighted} weighted characters Â· {} part(s)",
                                 parts.len()
                             )),
                     )
@@ -1240,14 +1379,19 @@ impl XPanel {
                             .flex_wrap()
                             .child(x_button!("x-cancel", "Cancel", cx.listener(|this, _, _, cx| {
                                 this.confirm = false;
+                                this.pending_focus = true;
+                                cx.stop_propagation();
                                 cx.notify();
                             })))
                             .child(x_button!("x-copy", "Copy", cx.listener(|this, _, _, cx| {
                                 this.copy_current_part(cx);
+                                cx.stop_propagation();
                                 cx.notify();
                             })))
                             .child(x_button!("x-next-post", "Next post", cx.listener(|this, _, _, cx| {
+                                // Open browser after confirm; spawn is non-blocking.
                                 this.open_current_intent();
+                                cx.stop_propagation();
                                 cx.notify();
                             }))),
                     ),
@@ -1267,30 +1411,34 @@ impl XPanel {
     }
 
     /// Opens only the highlighted part. Preview and mock never open a browser.
+    /// Browser launch is fire-and-forget so the confirm UI never freezes.
     fn open_current_intent(&mut self) {
         let parts = split_thread(&self.compose);
-        if parts.is_empty() {
-            self.notice = Some("Nothing to post.".into());
-            return;
-        }
+        let parts = if parts.is_empty() {
+            let trimmed = self.compose.trim().to_string();
+            if trimmed.is_empty() {
+                self.notice = Some("Nothing to post.".into());
+                return;
+            }
+            vec![trimmed]
+        } else {
+            parts
+        };
         let index = self.intent_index.min(parts.len() - 1);
         if self.intent_urls.len() != parts.len() {
             self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         }
         let url = self.intent_urls.get(index).cloned().unwrap_or_default();
         if self.live {
-            match termy_x::io::Opener::open(&termy_x::io::SystemOpener, &url) {
-                Ok(()) => {
-                    self.notice = Some(format!(
-                        "Opened part {} of {} in the browser. You still click Post there.",
-                        index + 1,
-                        parts.len()
-                    ));
-                }
-                Err(error) => {
-                    self.notice = Some(format!("Could not open the intent: {error}"));
-                }
-            }
+            let open_url = url.clone();
+            std::thread::spawn(move || {
+                let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &open_url);
+            });
+            self.notice = Some(format!(
+                "Opened part {} of {} in the browser. You still click Post there.",
+                index + 1,
+                parts.len()
+            ));
         } else {
             self.notice = Some(format!(
                 "Held part {} of {}. Preview does not open a browser.",
@@ -1300,6 +1448,8 @@ impl XPanel {
         }
         if index + 1 < parts.len() {
             self.intent_index = index + 1;
+        } else {
+            // Stay on confirm so Jeremy can Cancel after the last part.
         }
     }
 }
@@ -1329,7 +1479,7 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
 
 fn post_card(post: &Post) -> gpui_kit::AnyElement {
     card(
-        format!("@{} · {} likes", post.author_handle, post.likes),
+        format!("@{} Â· {} likes", post.author_handle, post.likes),
         post.text.clone(),
     )
 }
