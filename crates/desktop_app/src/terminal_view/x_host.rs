@@ -44,9 +44,7 @@ impl TerminalView {
         }
         match action {
             CommandAction::Paste => {
-                let clip = cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text().map(|s| s.to_string()));
+                let clip = cx.read_from_clipboard().and_then(|item| item.text());
                 if let Some(text) = clip {
                     panel.update(cx, |panel, cx| {
                         // Idempotent with KeyDown path: insert once here if the

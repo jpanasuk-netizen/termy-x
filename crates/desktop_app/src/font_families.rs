@@ -151,8 +151,10 @@ fn system_monospace_family() -> String {
         .select_best_match(&[FamilyName::Monospace], &Properties::new())
         .ok()
         .and_then(|handle| handle.load().ok())
-        .map(|font| font.family_name())
-        .unwrap_or_else(|| DEFAULT_FONT_FAMILY.to_string())
+        .map_or_else(
+            || DEFAULT_FONT_FAMILY.to_string(),
+            |font| font.family_name(),
+        )
 }
 
 #[cfg(not(target_os = "linux"))]

@@ -1,4 +1,4 @@
-﻿//! Resolve the post character limit: Premium long-form (25k) or standard (280).
+//! Resolve the post character limit: Premium long-form (25k) or standard (280).
 //!
 //! Order: `TERMY_X_CHAR_LIMIT` env, then `char_limit` in x.toml, then a short
 //! OpenCLI profile probe (`verified` = Premium / Premium+). Detection is
@@ -44,10 +44,22 @@ pub struct ResolvedLimit {
 
 pub fn resolve_char_limit(config: &XConfig, runner: &dyn CommandRunner) -> ResolvedLimit {
     if let Some(limit) = config.env_char_limit() {
-        return remember(config, ResolvedLimit { limit, source: LimitSource::Env });
+        return remember(
+            config,
+            ResolvedLimit {
+                limit,
+                source: LimitSource::Env,
+            },
+        );
     }
     if let Some(limit) = config.explicit_char_limit() {
-        return remember(config, ResolvedLimit { limit, source: LimitSource::Config });
+        return remember(
+            config,
+            ResolvedLimit {
+                limit,
+                source: LimitSource::Config,
+            },
+        );
     }
     if let Some(cached) = read_memory_fresh() {
         return ResolvedLimit {
@@ -93,7 +105,10 @@ pub fn resolve_char_limit(config: &XConfig, runner: &dyn CommandRunner) -> Resol
 
 /// Sync helper for UI / CLI when a runner is available as Arc.
 pub fn resolve_char_limit_simple(config: &XConfig) -> usize {
-    if let Some(limit) = config.env_char_limit().or_else(|| config.explicit_char_limit()) {
+    if let Some(limit) = config
+        .env_char_limit()
+        .or_else(|| config.explicit_char_limit())
+    {
         return limit;
     }
     if let Some(cached) = read_memory_fresh().or_else(|| read_disk_fresh(&config.config_dir)) {
@@ -141,15 +156,26 @@ pub fn profile_looks_premium(text: &str) -> bool {
         return false;
     };
     let node = profile_node(&value);
-    boolish(node, &["verified", "is_blue_verified", "isBlueVerified", "premium", "is_premium"])
-        || string_premium(node, &["subscription", "subscription_type", "verified_type"])
+    boolish(
+        node,
+        &[
+            "verified",
+            "is_blue_verified",
+            "isBlueVerified",
+            "premium",
+            "is_premium",
+        ],
+    ) || string_premium(
+        node,
+        &["subscription", "subscription_type", "verified_type"],
+    )
 }
 
 fn profile_node(value: &Value) -> &Value {
-    if let Some(array) = value.as_array() {
-        if let Some(first) = array.first() {
-            return first;
-        }
+    if let Some(array) = value.as_array()
+        && let Some(first) = array.first()
+    {
+        return first;
     }
     value
         .get("data")
@@ -169,7 +195,8 @@ fn extract_username(text: &str) -> Option<String> {
 }
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter().find_map(|key| value.get(*key).and_then(Value::as_str))
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
 fn boolish(value: &Value, keys: &[&str]) -> bool {
@@ -186,14 +213,10 @@ fn boolish(value: &Value, keys: &[&str]) -> bool {
 
 fn string_premium(value: &Value, keys: &[&str]) -> bool {
     keys.iter().any(|key| {
-        value
-            .get(*key)
-            .and_then(Value::as_str)
-            .map(|s| {
-                let lower = s.to_ascii_lowercase();
-                lower.contains("premium") || lower.contains("blue") || lower == "verified"
-            })
-            .unwrap_or(false)
+        value.get(*key).and_then(Value::as_str).is_some_and(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("premium") || lower.contains("blue") || lower == "verified"
+        })
     })
 }
 
@@ -264,8 +287,7 @@ fn read_disk_fresh(dir: &Path) -> Option<CachedLimit> {
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn age_secs(fetched_unix: u64) -> u64 {

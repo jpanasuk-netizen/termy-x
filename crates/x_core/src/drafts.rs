@@ -26,7 +26,9 @@ pub fn upsert_drafts(path: &Path, new_drafts: Vec<Draft>) -> Result<Vec<Draft>, 
 }
 
 pub fn find_draft<'a>(drafts: &'a [Draft], id: &str) -> Option<&'a Draft> {
-    drafts.iter().find(|draft| draft.id == id || draft.id.starts_with(id))
+    drafts
+        .iter()
+        .find(|draft| draft.id == id || draft.id.starts_with(id))
 }
 
 pub fn new_id() -> String {
@@ -36,7 +38,6 @@ pub fn new_id() -> String {
 pub fn timestamp() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |duration| duration.as_secs());
     format!("{secs}")
 }

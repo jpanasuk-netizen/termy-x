@@ -5,7 +5,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 
 use crate::ai::draft_variants;
-use crate::config::{example_config, XConfig};
+use crate::config::{XConfig, example_config};
 use crate::doctor::doctor;
 use crate::drafts::{find_draft, load_drafts, new_id, timestamp, upsert_drafts};
 use crate::io::{
@@ -13,11 +13,18 @@ use crate::io::{
 };
 use crate::model::{ProviderId, Tone};
 use crate::providers::Service;
-use crate::publish::{confirm_and_publish, first_available, ConfirmDecision, GateOutcome, IntentPublisher};
+use crate::publish::{
+    ConfirmDecision, GateOutcome, IntentPublisher, confirm_and_publish, first_available,
+};
 use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
-#[command(name = "x", version, about = "Termy X - read and post without X API credits", disable_help_subcommand = true)]
+#[command(
+    name = "x",
+    version,
+    about = "Termy X - read and post without X API credits",
+    disable_help_subcommand = true
+)]
 struct Cli {
     /// Print JSON for scripting
     #[arg(long, global = true)]
@@ -153,10 +160,9 @@ pub fn run_env() -> i32 {
     if args.iter().any(|arg| arg == "--dry-run") {
         // The live process still asks on stdin inside execute when confirm is pending.
     }
-    let code = execute(&args, &mut io, true);
-    code
-}
 
+    execute(&args, &mut io, true)
+}
 
 fn print_help_guide() {
     println!("Termy X - GUI + CLI guide");
@@ -189,23 +195,23 @@ fn print_help_guide() {
 }
 
 pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
-    let cli = match Cli::try_parse_from(std::iter::once("x".to_string()).chain(args.iter().cloned()))
-    {
-        Ok(cli) => cli,
-        Err(error) => {
-            if error.kind() == clap::error::ErrorKind::DisplayHelp
-                || error.kind() == clap::error::ErrorKind::DisplayVersion
-            {
-                if io.config.background_art {
-                    let _ = writeln!(io_stdout(), "{}", splash_ansi());
+    let cli =
+        match Cli::try_parse_from(std::iter::once("x".to_string()).chain(args.iter().cloned())) {
+            Ok(cli) => cli,
+            Err(error) => {
+                if error.kind() == clap::error::ErrorKind::DisplayHelp
+                    || error.kind() == clap::error::ErrorKind::DisplayVersion
+                {
+                    if io.config.background_art {
+                        let _ = writeln!(io_stdout(), "{}", splash_ansi());
+                    }
+                    let _ = write!(io_stdout(), "{error}");
+                    return 0;
                 }
-                let _ = write!(io_stdout(), "{error}");
-                return 0;
+                let _ = writeln!(io_stderr(), "{error}");
+                return 2;
             }
-            let _ = writeln!(io_stderr(), "{error}");
-            return 2;
-        }
-    };
+        };
     if let Some(dir) = &cli.config_dir {
         io.config = XConfig::load(dir);
     }
@@ -250,7 +256,9 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
         }
         Some(Cmd::Auth) => {
             if !io.config.official_enabled {
-                eprintln!("The official X API is off. Set official_api.enabled = true before `x auth`.");
+                eprintln!(
+                    "The official X API is off. Set official_api.enabled = true before `x auth`."
+                );
                 return 1;
             }
             match crate::auth::authorize_url(
@@ -259,9 +267,13 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
                 &crate::auth::generate_pkce().challenge,
             ) {
                 Ok(url) => {
-                    println!("Open this URL, approve access, then paste the code into `x auth` later.");
+                    println!(
+                        "Open this URL, approve access, then paste the code into `x auth` later."
+                    );
                     println!("{url}");
-                    println!("Scopes include tweet.read and tweet.write. Tokens go to the OS keychain or a 0600 file.");
+                    println!(
+                        "Scopes include tweet.read and tweet.write. Tokens go to the OS keychain or a 0600 file."
+                    );
                     0
                 }
                 Err(error) => {
@@ -277,23 +289,49 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
-        Cmd::Lookup { handle } => emit(json, service.lookup(&handle).map(|served| (served.status.render(), json_value(served)))),
-        Cmd::Thread { id_or_url } => emit(json, service.thread(&id_or_url).map(|served| (served.status.render(), json_value(served)))),
+        Cmd::Lookup { handle } => emit(
+            json,
+            service
+                .lookup(&handle)
+                .map(|served| (served.status.render(), json_value(served))),
+        ),
+        Cmd::Thread { id_or_url } => emit(
+            json,
+            service
+                .thread(&id_or_url)
+                .map(|served| (served.status.render(), json_value(served))),
+        ),
         Cmd::Splash => {
             print!("{}", render_splash(true));
             0
         }
-        Cmd::Post { text, dry_run, reply_to, media } => {
-            publish_text(&text, dry_run, reply_to, media, json, io, interactive)
-        }
-        Cmd::Search { query, recent, top: _, limit } => {
+        Cmd::Post {
+            text,
+            dry_run,
+            reply_to,
+            media,
+        } => publish_text(&text, dry_run, reply_to, media, json, io, interactive),
+        Cmd::Search {
+            query,
+            recent,
+            top: _,
+            limit,
+        } => {
             let limit = clamp_limit(limit, io.config.default_limit);
-            emit(json, service.search(&query, recent, limit).map(|served| (served.status.render(), json_value(served))))
+            emit(
+                json,
+                service
+                    .search(&query, recent, limit)
+                    .map(|served| (served.status.render(), json_value(served))),
+            )
         }
         Cmd::Trends { place, limit } => emit(
             json,
             service
-                .trends(place.as_deref(), clamp_limit(limit, io.config.default_limit))
+                .trends(
+                    place.as_deref(),
+                    clamp_limit(limit, io.config.default_limit),
+                )
                 .map(|served| (served.status.render(), json_value(served))),
         ),
         Cmd::Popular { topic, limit } => emit(
@@ -311,7 +349,10 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
         Cmd::Research { topic } => {
             let hits = service.research(&topic, io.runner.as_ref(), &io.config);
             if json {
-                println!("{}", serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".into()));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&hits).unwrap_or_else(|_| "[]".into())
+                );
             } else {
                 println!("research · {topic} · no X API credits");
                 for hit in &hits {
@@ -338,15 +379,29 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                         eprintln!("could not save drafts: {error}");
                         return 1;
                     }
-                    if drafts.first().is_some_and(|draft| draft.source == "template") {
+                    if drafts
+                        .first()
+                        .is_some_and(|draft| draft.source == "template")
+                    {
                         let (base, model) = io.config.ai_endpoint();
-                        eprintln!("No reachable model at {base} ({model}). These are offline templates, not a model. Set {} or OPENAI_BASE_URL to a free OpenAI-compatible server (Ollama, LM Studio, Groq, or an OpenRouter :free model). Nothing was posted.", io.config.ai_base_url_env);
+                        eprintln!(
+                            "No reachable model at {base} ({model}). These are offline templates, not a model. Set {} or OPENAI_BASE_URL to a free OpenAI-compatible server (Ollama, LM Studio, Groq, or an OpenRouter :free model). Nothing was posted.",
+                            io.config.ai_base_url_env
+                        );
                     }
                     if json {
-                        println!("{}", serde_json::to_string_pretty(&drafts).unwrap_or_else(|_| "[]".into()));
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&drafts).unwrap_or_else(|_| "[]".into())
+                        );
                     } else {
                         for draft in &drafts {
-                            println!("draft {} · {} · {}", draft.id, draft.source, draft.tone.as_deref().unwrap_or("-"));
+                            println!(
+                                "draft {} · {} · {}",
+                                draft.id,
+                                draft.source,
+                                draft.tone.as_deref().unwrap_or("-")
+                            );
                             println!("{}", draft.text);
                             println!("---");
                         }
@@ -417,7 +472,15 @@ fn publish_draft(
         return 1;
     };
     let reply = reply_to.or_else(|| draft.reply_to.clone());
-    publish_text(&draft.text, dry_run, reply, Vec::new(), json, io, interactive)
+    publish_text(
+        &draft.text,
+        dry_run,
+        reply,
+        Vec::new(),
+        json,
+        io,
+        interactive,
+    )
 }
 
 fn publish_text(
@@ -522,7 +585,8 @@ fn print_plan(plan: &crate::publish::PublishPlan) {
         } else {
             println!("this provider cannot upload files; browser attach required if you continue");
         }
-    }    for (index, part) in plan.parts.iter().enumerate() {
+    }
+    for (index, part) in plan.parts.iter().enumerate() {
         let count = crate::text::weighted_len_limited(part, plan.count.limit);
         println!(
             "--- part {}/{} · {} weighted ---",
@@ -541,7 +605,10 @@ fn deliver_intent(plan: &crate::publish::PublishPlan, io: &CliIo, interactive: b
     for (index, part) in plan.parts.iter().enumerate() {
         match io.clipboard.copy(part) {
             Ok(()) => println!("copied part {} to the clipboard", index + 1),
-            Err(error) => eprintln!("could not copy part {} to the clipboard: {error}", index + 1),
+            Err(error) => eprintln!(
+                "could not copy part {} to the clipboard: {error}",
+                index + 1
+            ),
         }
         let Some(url) = plan.intent_urls.get(index) else {
             continue;
@@ -599,10 +666,7 @@ fn plan_json(plan: &crate::publish::PublishPlan, dry_run: bool) -> String {
     .to_string()
 }
 
-fn emit<T: serde::Serialize>(
-    json: bool,
-    result: Result<(String, T), String>,
-) -> i32 {
+fn emit<T: serde::Serialize>(json: bool, result: Result<(String, T), String>) -> i32 {
     match result {
         Ok((status, value)) => {
             if json {
@@ -617,7 +681,10 @@ fn emit<T: serde::Serialize>(
                 );
             } else {
                 println!("{status}");
-                println!("{}", serde_json::to_string_pretty(&value).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                );
             }
             0
         }
@@ -721,30 +788,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut io = test_io(dir.path());
         assert_eq!(execute(&["doctor".into()], &mut io, false), 0);
-        assert_eq!(execute(&["timeline".into(), "--json".into()], &mut io, false), 0);
         assert_eq!(
-            execute(&["lookup".into(), "@termy".into(), "--json".into()], &mut io, false),
-            0
-        );
-        assert_eq!(execute(&["thread".into(), "1001".into()], &mut io, false), 0);
-        assert_eq!(execute(&["splash".into()], &mut io, false), 0);
-        assert_eq!(
-            execute(&["post".into(), "--dry-run".into(), "hello world".into()], &mut io, false),
+            execute(&["timeline".into(), "--json".into()], &mut io, false),
             0
         );
         assert_eq!(
             execute(
-                &["search".into(), "panel".into(), "--recent".into(), "--limit".into(), "2".into(), "--json".into()],
+                &["lookup".into(), "@termy".into(), "--json".into()],
                 &mut io,
                 false
             ),
             0
         );
-        assert_eq!(execute(&["trends".into(), "--place".into(), "nyc".into()], &mut io, false), 0);
-        assert_eq!(execute(&["popular".into(), "gpui".into()], &mut io, false), 0);
+        assert_eq!(
+            execute(&["thread".into(), "1001".into()], &mut io, false),
+            0
+        );
+        assert_eq!(execute(&["splash".into()], &mut io, false), 0);
         assert_eq!(
             execute(
-                &["draft".into(), "ship the panel".into(), "--n".into(), "2".into(), "--tone".into(), "punchy".into()],
+                &["post".into(), "--dry-run".into(), "hello world".into()],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "search".into(),
+                    "panel".into(),
+                    "--recent".into(),
+                    "--limit".into(),
+                    "2".into(),
+                    "--json".into()
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &["trends".into(), "--place".into(), "nyc".into()],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(&["popular".into(), "gpui".into()], &mut io, false),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "draft".into(),
+                    "ship the panel".into(),
+                    "--n".into(),
+                    "2".into(),
+                    "--tone".into(),
+                    "punchy".into()
+                ],
                 &mut io,
                 false
             ),
@@ -754,7 +859,11 @@ mod tests {
         assert_eq!(drafts.len(), 2);
         io.confirm = ConfirmDecision::No;
         assert_eq!(
-            execute(&["publish".into(), drafts[0].id.clone(), "--dry-run".into()], &mut io, false),
+            execute(
+                &["publish".into(), drafts[0].id.clone(), "--dry-run".into()],
+                &mut io,
+                false
+            ),
             0
         );
         io.confirm = ConfirmDecision::Yes;
@@ -764,14 +873,20 @@ mod tests {
         );
         assert_eq!(
             execute(
-                &["compose".into(), "--text".into(), "hello from compose".into()],
+                &[
+                    "compose".into(),
+                    "--text".into(),
+                    "hello from compose".into()
+                ],
                 &mut io,
                 false
             ),
             0
         );
-        assert!(load_drafts(&io.config.drafts_path())
-            .iter()
-            .any(|draft| draft.text == "hello from compose"));
+        assert!(
+            load_drafts(&io.config.drafts_path())
+                .iter()
+                .any(|draft| draft.text == "hello from compose")
+        );
     }
 }

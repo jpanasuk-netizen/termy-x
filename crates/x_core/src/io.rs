@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -34,7 +34,8 @@ impl CommandRunner for SystemRunner {
     }
 
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
-        let resolved = resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
+        let resolved =
+            resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
         let mut command = command_for(&resolved, args);
         hide_console(&mut command);
         output_with_timeout(command, COMMAND_TIMEOUT)
@@ -131,7 +132,10 @@ fn search_extensions() -> Vec<String> {
             } else {
                 format!(".{ext}")
             };
-            if !exts.iter().any(|have: &String| have.eq_ignore_ascii_case(&ext)) {
+            if !exts
+                .iter()
+                .any(|have: &String| have.eq_ignore_ascii_case(&ext))
+            {
                 exts.push(ext);
             }
         }
@@ -193,7 +197,11 @@ fn cmd_command(path: &Path, args: &[String]) -> Command {
 }
 
 fn powershell_command(path: &Path, args: &[String]) -> Command {
-    let mut command = Command::new(if cfg!(windows) { "powershell.exe" } else { "pwsh" });
+    let mut command = Command::new(if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "pwsh"
+    });
     command.args([
         "-NoProfile",
         "-NonInteractive",
@@ -253,7 +261,10 @@ fn hide_console(command: &mut Command) {
 }
 
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<CommandOutput, String> {
-    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -289,11 +300,13 @@ fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
     buffer
 }
 
+type ScriptedCallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
 #[derive(Clone, Default)]
 pub struct ScriptedRunner {
     bins: Arc<Mutex<Vec<String>>>,
     scripts: Arc<Mutex<Vec<Script>>>,
-    pub calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+    pub calls: ScriptedCallLog,
 }
 
 struct Script {
@@ -311,7 +324,12 @@ impl ScriptedRunner {
         self.bins.lock().expect("bins").push(program.into());
     }
 
-    pub fn script(&self, program: impl Into<String>, args_prefix: &[&str], stdout: impl Into<String>) {
+    pub fn script(
+        &self,
+        program: impl Into<String>,
+        args_prefix: &[&str],
+        stdout: impl Into<String>,
+    ) {
         let program = program.into();
         self.install(program.clone());
         self.scripts.lock().expect("scripts").push(Script {
@@ -334,7 +352,11 @@ impl ScriptedRunner {
 
 impl CommandRunner for ScriptedRunner {
     fn exists(&self, program: &str) -> bool {
-        self.bins.lock().expect("bins").iter().any(|bin| bin == program)
+        self.bins
+            .lock()
+            .expect("bins")
+            .iter()
+            .any(|bin| bin == program)
     }
 
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
@@ -346,7 +368,10 @@ impl CommandRunner for ScriptedRunner {
         let matched = scripts.iter().rev().find(|script| {
             script.program == program
                 && args.len() >= script.args_prefix.len()
-                && args.iter().zip(&script.args_prefix).all(|(got, want)| got == want)
+                && args
+                    .iter()
+                    .zip(&script.args_prefix)
+                    .all(|(got, want)| got == want)
         });
         match matched {
             Some(script) => match &script.result {
@@ -463,7 +488,10 @@ impl Opener for SystemOpener {
             command.arg(url);
         }
         hide_console(&mut command);
-        command.spawn().map(|_| ()).map_err(|error| error.to_string())
+        command
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -515,13 +543,20 @@ fn copy_text(text: &str) -> Result<(), String> {
             "-Command",
             "Set-Clipboard -Value ([Console]::In.ReadToEnd())",
         ]);
-        command.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
         hide_console(&mut command);
         let mut child = command.spawn().map_err(|error| error.to_string())?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|error| error.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|error| error.to_string())?;
         }
-        let output = child.wait_with_output().map_err(|error| error.to_string())?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| error.to_string())?;
         if output.status.success() {
             Ok(())
         } else {
@@ -537,9 +572,11 @@ fn copy_text(text: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn resolver_finds_cmd_and_ps1_shims_on_a_path() {
         let dir = tempfile::tempdir().unwrap();
         let cmd = dir.path().join("shim.cmd");
@@ -549,20 +586,25 @@ mod tests {
         let path = std::ffi::OsString::from(dir.path());
         let resolved_cmd = resolve_with_path("shim", Some(path.as_os_str())).expect("cmd shim");
         assert_eq!(resolved_cmd.kind, ProgramKind::Cmd);
-        assert!(resolved_cmd
-            .path
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&cmd.to_string_lossy()));
+        assert!(
+            resolved_cmd
+                .path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cmd.to_string_lossy())
+        );
         let resolved_ps1 = resolve_with_path("tool", Some(path.as_os_str())).expect("ps1 shim");
         assert_eq!(resolved_ps1.kind, ProgramKind::PowerShell);
-        assert!(resolved_ps1
-            .path
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&ps1.to_string_lossy()));
+        assert!(
+            resolved_ps1
+                .path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&ps1.to_string_lossy())
+        );
         assert!(resolve_with_path("missing-tool", Some(path.as_os_str())).is_none());
     }
 
     #[test]
+    #[cfg(windows)]
     fn windows_shims_run_without_a_console() {
         let dir = tempfile::tempdir().unwrap();
         let cmd = dir.path().join("echo-shim.cmd");
@@ -592,10 +634,12 @@ mod tests {
         let path = std::ffi::OsString::from(dir.path());
         let resolved = resolve_with_path("opencli", Some(path.as_os_str())).expect("cmd shim");
         assert_eq!(resolved.kind, ProgramKind::Cmd);
-        assert!(resolved
-            .path
-            .to_string_lossy()
-            .eq_ignore_ascii_case(&cmd.to_string_lossy()));
+        assert!(
+            resolved
+                .path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&cmd.to_string_lossy())
+        );
     }
 
     #[cfg(windows)]

@@ -136,7 +136,8 @@ pub struct Post {
 
 impl Post {
     pub fn engagement(&self) -> u64 {
-        self.likes.saturating_add(self.reposts.saturating_mul(3))
+        self.likes
+            .saturating_add(self.reposts.saturating_mul(3))
             .saturating_add(self.replies.saturating_mul(2))
             .saturating_add(self.bookmarks.saturating_mul(5))
     }
@@ -223,10 +224,7 @@ pub fn post_id_from_input(input: &str) -> String {
     let trimmed = input.trim();
     if let Some(idx) = trimmed.rfind("/status/") {
         let rest = &trimmed[idx + "/status/".len()..];
-        let id: String = rest
-            .chars()
-            .take_while(|ch| ch.is_ascii_digit())
-            .collect();
+        let id: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
         if !id.is_empty() {
             return id;
         }
@@ -244,7 +242,7 @@ pub fn post_url(handle: &str, id: &str) -> String {
 }
 
 pub fn rank_by_engagement(mut posts: Vec<Post>) -> Vec<Post> {
-    posts.sort_by(|a, b| b.engagement().cmp(&a.engagement()));
+    posts.sort_by_key(|post| std::cmp::Reverse(post.engagement()));
     posts
 }
 
@@ -259,14 +257,16 @@ pub fn trends_from_posts(posts: &[Post], place: Option<&str>) -> Vec<Trend> {
                 .find(|word| word.starts_with('#'))
                 .map(|tag| tag.trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '#'))
                 .filter(|tag| !tag.is_empty())
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let mut title = post.text.chars().take(48).collect::<String>();
-                    if post.text.chars().count() > 48 {
-                        title.push('…');
-                    }
-                    title
-                });
+                .map_or_else(
+                    || {
+                        let mut title = post.text.chars().take(48).collect::<String>();
+                        if post.text.chars().count() > 48 {
+                            title.push('…');
+                        }
+                        title
+                    },
+                    str::to_string,
+                );
             Trend {
                 query: name.clone(),
                 name,

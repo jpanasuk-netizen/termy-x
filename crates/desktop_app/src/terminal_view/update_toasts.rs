@@ -62,10 +62,7 @@ fn installed_update_toast_message(version: &str) -> String {
     }
     #[cfg(target_os = "linux")]
     {
-        format!(
-            "v{} installed to ~/.local/bin \u{2014} restart to apply",
-            version
-        )
+        format!("v{version} installed to ~/.local/bin \u{2014} restart to apply")
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     {

@@ -57,10 +57,10 @@ fn preview_args() -> PreviewArgs {
                     if let Ok(parsed) = value.parse() {
                         args.width = parsed;
                     }
-                } else if let Some(value) = arg.strip_prefix("--height=") {
-                    if let Ok(parsed) = value.parse() {
-                        args.height = parsed;
-                    }
+                } else if let Some(value) = arg.strip_prefix("--height=")
+                    && let Ok(parsed) = value.parse()
+                {
+                    args.height = parsed;
                 }
             }
         }
