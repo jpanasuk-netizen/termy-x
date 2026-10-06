@@ -450,12 +450,10 @@ impl XPanel {
             XSection::Research => self.fetched_at.research,
             XSection::Compose => return true,
         };
-        match at {
-            Some(instant) if instant.elapsed() < FRESH_FOR && self.section_has_data(section) => {
-                true
-            }
-            _ => false,
-        }
+        matches!(
+            at,
+            Some(instant) if instant.elapsed() < FRESH_FOR && self.section_has_data(section)
+        )
     }
 
     fn section_has_data(&self, section: XSection) -> bool {
@@ -1719,6 +1717,8 @@ impl XPanel {
         rows
     }
 
+    // First-launch splash is deferred; keep the view ready until it is wired in.
+    #[allow(dead_code)]
     fn splash_copy(&self) -> gpui_kit::AnyElement {
         div()
             .mt(px(96.0))

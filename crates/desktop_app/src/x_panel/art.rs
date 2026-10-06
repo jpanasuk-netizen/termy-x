@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(bucket_for(1920.0), MAX_ART_WIDTH);
         assert_eq!(bucket_for(6880.0), MAX_ART_WIDTH);
         assert_eq!(height_for(1600), 1000);
-        assert!(MAX_ART_WIDTH <= 1600);
+        const { assert!(MAX_ART_WIDTH <= 1600) };
     }
 
     #[test]
