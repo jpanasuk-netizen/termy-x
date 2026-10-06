@@ -41,6 +41,7 @@ sysinfo = "0.37"
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
 tokio = { version = "1", default-features = false, features = ["rt"] }
 sha2 = { workspace = true }
+resvg = "0.46.0"
 unicode-width = { workspace = true }
 termy_core = { path = "../core" }
 termy_x = { path = "../x_core" }

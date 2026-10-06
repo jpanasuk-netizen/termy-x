@@ -1,38 +1,32 @@
 //! Cached raster of the Termy X bird.
 //!
-//! GPUI can draw the SVG directly, but it rasterises at 2x the intrinsic size
-//! on every new image id, which cost ~6 s in debug builds (and ~30 s when the
-//! intrinsic size was 3440x1440). Instead we rasterise once with resvg at a
-//! capped width bucket (max [`MAX_ART_WIDTH`]), write a PNG to the user cache
-//! dir keyed by size and SVG hash, and keep the encoded PNG in memory. GPUI's
-//! asset system then decodes that PNG once per app (it caches by byte hash).
+//! The SVG is parsed once and rasterized once at [`MAX_ART_WIDTH`]. The GPUI
+//! image is stored in a process-wide [`OnceLock`] and reused every frame.
+//! Resizes do not rasterize again. `background_art = false` must not call
+//! [`load`] at all.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{Image, ImageFormat};
-use sha2::{Digest, Sha256};
+
 use termy_x::splash::BIRD_SVG;
 
-/// Never rasterise wider than this. 1720 is half of a 3440 ultrawide; the art
-/// is soft and dimmed, so upscaling it to full width is visually lossless.
-pub const MAX_ART_WIDTH: u32 = 1720;
-/// Width buckets. Resizing a window only re-uses one of these sizes.
-pub const ART_BUCKETS: [u32; 4] = [430, 860, 1290, 1720];
-const VIEWBOX_W: f32 = 3440.0;
-const VIEWBOX_H: f32 = 1440.0;
+/// Cap the raster at a normal desktop width. Wider windows scale this bitmap.
+pub const MAX_ART_WIDTH: u32 = 1600;
+/// View box of `assets/x/termy-x-bird.svg`. Height follows this ratio.
+const VIEWBOX_W: f32 = 1600.0;
+const VIEWBOX_H: f32 = 1000.0;
 
-/// Where a bird image came from, for logging and the benchmark.
+/// Where a bird image came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtSource {
     Memory,
-    Disk,
     Rendered,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ArtLoad {
     pub image: Arc<Image>,
     pub width: u32,
@@ -41,112 +35,97 @@ pub struct ArtLoad {
     pub elapsed: Duration,
 }
 
-fn memory() -> &'static Mutex<HashMap<u32, Arc<Image>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u32, Arc<Image>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Pick a raster width for a target pixel width (window width times scale).
-pub fn bucket_for(target_px: f32) -> u32 {
-    let target = target_px.max(1.0).ceil() as u32;
-    ART_BUCKETS
-        .iter()
-        .copied()
-        .find(|bucket| *bucket >= target)
-        .unwrap_or(MAX_ART_WIDTH)
-        .min(MAX_ART_WIDTH)
+/// Every window width shares one raster. Scaling is the renderer's job.
+pub fn bucket_for(_target_px: f32) -> u32 {
+    MAX_ART_WIDTH
 }
 
 pub fn height_for(width: u32) -> u32 {
-    ((width as f32) * VIEWBOX_H / VIEWBOX_W).round() as u32
+    ((width as f32) * VIEWBOX_H / VIEWBOX_W).round().max(1.0) as u32
 }
 
-pub fn svg_hash() -> String {
-    let digest = Sha256::digest(BIRD_SVG.as_bytes());
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
-}
-
-pub fn cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("TERMY_X_ART_CACHE") {
-        return PathBuf::from(dir);
+fn parsed_tree() -> Result<&'static resvg::usvg::Tree, String> {
+    static TREE: OnceLock<Result<resvg::usvg::Tree, String>> = OnceLock::new();
+    match TREE.get_or_init(|| {
+        let options = resvg::usvg::Options::default();
+        resvg::usvg::Tree::from_str(BIRD_SVG, &options).map_err(|error| error.to_string())
+    }) {
+        Ok(tree) => Ok(tree),
+        Err(error) => Err(error.clone()),
     }
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("termy-x")
 }
 
-pub fn cache_path(width: u32) -> PathBuf {
-    cache_dir().join(format!(
-        "bird-{width}x{}-{}.png",
-        height_for(width),
-        svg_hash()
-    ))
-}
-
-/// Rasterise the SVG to PNG bytes at `width` (height follows the 21:9 viewBox).
+/// Rasterise the already-parsed SVG. Callers outside the cache should use [`load`].
 pub fn rasterize_png(width: u32) -> anyhow::Result<Vec<u8>> {
-    use resvg::{tiny_skia, usvg};
+    let tree = parsed_tree().map_err(|error| anyhow::anyhow!(error))?;
     let height = height_for(width);
-    let mut options = usvg::Options::default();
-    options.fontdb_mut().load_system_fonts();
-    let tree = usvg::Tree::from_str(BIRD_SVG, &options)?;
-    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| anyhow::anyhow!("bad bird size {width}x{height}"))?;
     let size = tree.size();
-    let transform =
-        tiny_skia::Transform::from_scale(width as f32 / size.width(), height as f32 / size.height());
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        width as f32 / size.width(),
+        height as f32 / size.height(),
+    );
+    resvg::render(tree, transform, &mut pixmap.as_mut());
     Ok(pixmap.encode_png()?)
 }
 
-/// Load the bird at a bucketed width: memory, then disk, then render + store.
-pub fn load(width: u32) -> ArtLoad {
-    let width = bucket_for(width as f32);
-    let height = height_for(width);
+fn write_timing(line: &str) {
+    let path = std::env::temp_dir().join("termy-x-art-timing.txt");
+    let _ = std::fs::write(path, format!("{line}\n"));
+}
+
+fn render_once() -> Option<ArtLoad> {
     let started = Instant::now();
-    if let Some(image) = memory().lock().ok().and_then(|cache| cache.get(&width).cloned()) {
-        return ArtLoad { image, width, height, source: ArtSource::Memory, elapsed: started.elapsed() };
+    let width = bucket_for(MAX_ART_WIDTH as f32);
+    match rasterize_png(width) {
+        Ok(bytes) => {
+            let height = height_for(width);
+            let elapsed = started.elapsed();
+            let ms = elapsed.as_millis();
+            let line = format!("termy-x art: rasterized {width}x{height} in {ms} ms");
+            eprintln!("{line}");
+            write_timing(&line);
+            Some(ArtLoad {
+                image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+                width,
+                height,
+                source: ArtSource::Rendered,
+                elapsed,
+            })
+        }
+        Err(error) => {
+            let line = format!("termy-x art: raster failed: {error}");
+            eprintln!("{line}");
+            write_timing(&line);
+            None
+        }
     }
-    let path = cache_path(width);
-    let (bytes, source) = match std::fs::read(&path) {
-        Ok(bytes) if bytes.starts_with(b"\x89PNG") => (bytes, ArtSource::Disk),
-        _ => match rasterize_png(width) {
-            Ok(bytes) => {
-                store(&path, &bytes);
-                (bytes, ArtSource::Rendered)
-            }
-            Err(error) => {
-                log::warn!("termy-x: bird raster failed ({error}); falling back to SVG");
-                let image = Arc::new(Image::from_bytes(ImageFormat::Svg, BIRD_SVG.as_bytes().to_vec()));
-                return ArtLoad { image, width, height, source: ArtSource::Rendered, elapsed: started.elapsed() };
-            }
-        },
+}
+
+/// Parse, rasterize, and decode once per process. Later calls return the same image.
+pub fn load() -> Option<ArtLoad> {
+    static CACHE: OnceLock<Option<ArtLoad>> = OnceLock::new();
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    let Some(rendered) = CACHE.get_or_init(render_once) else {
+        return None;
     };
-    let image = Arc::new(Image::from_bytes(ImageFormat::Png, bytes));
-    if let Ok(mut cache) = memory().lock() {
-        cache.insert(width, image.clone());
-    }
-    let elapsed = started.elapsed();
-    log::info!("termy-x: bird {width}x{height} from {source:?} in {elapsed:?}");
-    ArtLoad { image, width, height, source, elapsed }
+    let hit = HITS.fetch_add(1, Ordering::Relaxed);
+    Some(ArtLoad {
+        image: Arc::clone(&rendered.image),
+        width: rendered.width,
+        height: rendered.height,
+        source: if hit == 0 {
+            ArtSource::Rendered
+        } else {
+            ArtSource::Memory
+        },
+        elapsed: rendered.elapsed,
+    })
 }
 
-fn store(path: &std::path::Path, bytes: &[u8]) {
-    let Some(dir) = path.parent() else { return };
-    if std::fs::create_dir_all(dir).is_err() {
-        return;
-    }
-    let tmp = path.with_extension(format!("png.{}.tmp", std::process::id()));
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn clear_memory() {
-    if let Ok(mut cache) = memory().lock() {
-        cache.clear();
-    }
+pub fn cached_image() -> Option<Arc<Image>> {
+    load().map(|art| art.image)
 }
 
 #[cfg(test)]
@@ -154,30 +133,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn buckets_are_capped_and_keep_the_ultrawide_ratio() {
-        assert_eq!(bucket_for(300.0), 430);
-        assert_eq!(bucket_for(861.0), 1290);
+    fn one_bucket_keeps_the_desktop_ratio() {
+        assert_eq!(bucket_for(300.0), MAX_ART_WIDTH);
+        assert_eq!(bucket_for(1280.0), MAX_ART_WIDTH);
+        assert_eq!(bucket_for(1920.0), MAX_ART_WIDTH);
         assert_eq!(bucket_for(6880.0), MAX_ART_WIDTH);
-        assert_eq!(height_for(1720), 720);
-        assert!(cache_path(1720).to_string_lossy().contains("bird-1720x720-"));
+        assert_eq!(height_for(1600), 1000);
+        assert!(MAX_ART_WIDTH <= 1600);
     }
 
     #[test]
-    fn render_then_disk_then_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        // SAFETY: tests in this module are the only readers of this variable.
-        unsafe { std::env::set_var("TERMY_X_ART_CACHE", dir.path()) };
-        clear_memory();
-        let first = load(430);
+    fn raster_is_a_png_at_the_capped_size() {
+        let bytes = rasterize_png(MAX_ART_WIDTH).expect("raster");
+        assert!(bytes.starts_with(b"\x89PNG"));
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!((width, height), (1600, 1000));
+    }
+
+    #[test]
+    fn render_once_then_reuse_and_record_timing() {
+        let first = load().expect("art");
         assert_eq!(first.source, ArtSource::Rendered);
-        assert_eq!((first.width, first.height), (430, 180));
-        assert!(cache_path(430).exists());
-        clear_memory();
-        let second = load(430);
-        assert_eq!(second.source, ArtSource::Disk);
-        assert_eq!(second.image.id(), first.image.id());
-        let third = load(400);
-        assert_eq!(third.source, ArtSource::Memory);
-        assert!(Arc::ptr_eq(&third.image, &second.image));
+        assert_eq!((first.width, first.height), (1600, 1000));
+        let second = load().expect("cached");
+        assert_eq!(second.source, ArtSource::Memory);
+        assert!(Arc::ptr_eq(&first.image, &second.image));
+        let timing = std::fs::read_to_string(std::env::temp_dir().join("termy-x-art-timing.txt"))
+            .expect("timing file");
+        assert!(timing.contains("termy-x art: rasterized 1600x1000 in "));
+        assert!(timing.contains(" ms"));
     }
 }

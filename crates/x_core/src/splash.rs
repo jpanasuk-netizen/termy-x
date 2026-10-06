@@ -38,8 +38,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn svg_is_an_original_ultrawide_bird_with_a_heart() {
-        assert!(BIRD_SVG.contains("viewBox=\"0 0 3440 1440\""));
+    fn svg_is_an_original_desktop_bird_with_a_heart() {
+        assert!(BIRD_SVG.contains("viewBox=\"0 0 1600 1000\""));
         assert!(BIRD_SVG.contains("+1"));
         assert!(BIRD_SVG.contains("#ff3d9a"));
         assert!(BIRD_SVG.to_ascii_lowercase().contains("swift"));

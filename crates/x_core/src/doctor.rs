@@ -87,8 +87,9 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
         String::new(),
         ai_line(config, http),
         format!(
-            "Background art: {}",
-            if config.background_art { "on" } else { "off" }
+            "Background art: {} · opacity {:.2}",
+            if config.background_art { "on" } else { "off" },
+            config.background_opacity
         ),
         format!("Config directory: {}", config.config_dir.display()),
     ];

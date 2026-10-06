@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use crate::model::ProviderId;
 
 /// Bird opacity behind content: dimmed into the 15-25% band by default.
-pub const DEFAULT_BACKGROUND_OPACITY: f32 = 0.20;
+pub const DEFAULT_BACKGROUND_OPACITY: f32 = 0.18;
 /// Free default for AI drafts: a local Ollama server (no key, no cost).
 pub const DEFAULT_AI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 pub const DEFAULT_AI_MODEL: &str = "llama3.2";
@@ -296,7 +296,7 @@ fn unquote(value: &str) -> String {
 pub fn example_config() -> &'static str {
     r#"# Termy X. Free paths are the default. No X API credits are required.
 background_art = true       # set false to hide the bird entirely
-background_opacity = 0.20   # bird strength behind lists (splash is always 1.0)
+background_opacity = 0.18   # bird strength behind lists (splash is always 1.0)
 default_limit = 10
 provider = "auto"
 
@@ -341,7 +341,7 @@ mod tests {
         assert!(config.provider.is_none());
         assert!(!config.ai_configured());
         assert!(!config.ai_explicit);
-        assert!((config.background_opacity - 0.20).abs() < f32::EPSILON);
+        assert!((config.background_opacity - 0.18).abs() < f32::EPSILON);
         assert_eq!(config.ai_endpoint().0, DEFAULT_AI_BASE_URL);
         assert_eq!(config.ai_endpoint().1, DEFAULT_AI_MODEL);
     }

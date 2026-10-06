@@ -7763,6 +7763,7 @@ dependencies = [
  "p256",
  "rand_core 0.6.4",
  "raw-window-handle",
+ "resvg 0.46.0",
  "rfd",
  "rustix-openpty",
  "serde",
