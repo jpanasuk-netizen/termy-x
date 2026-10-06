@@ -92,45 +92,52 @@ Termy is supported by companies and people who care about fast, native developer
 
 Termy X is a fork layer on [Termy](https://github.com/lassejlv/termy) (MIT, © Lasse Jørgensen). The terminal itself is unchanged. X reads, drafts, and publishing live in `crates/x_core` so upstream merges stay small. The desktop app gains a side panel; the CLI gains `termy x` and a standalone `x` binary.
 
-No X API credits are required. The official API is off unless you set `official_api.enabled = true`.
+No X API credits are needed. The official API is off unless you set `official_api.enabled = true`.
 
 ### Commands
 
 ```bash
+x
+x splash
 x doctor
 x timeline
 x search "gpui" --recent --limit 10
 x lookup @termy
-x post 1001
+x thread 1001
 x trends --place worldwide
 x popular gpui
 x draft "ship the panel" --n 3 --tone punchy
 x compose --text "hello from the terminal"
-x publish <draft-id>          # asks [y/N], prints the exact text first
+x post --dry-run "hello world"   # prints every part and never posts
+x post "hello world"             # prints every part, then you type yes
 x publish <draft-id> --dry-run
 x research "gpui terminals"
-termy x doctor                # same commands through the Termy CLI
+termy x doctor                   # same commands through the Termy CLI
 ```
 
 `--json` prints machine-readable output. `--provider mock` forces fixtures (what the tests use). Tones for `x draft` are `punchy`, `informative`, `thread`, and `reply`.
 
-`x publish` never posts until you answer `y`. It prints the exact text, the weighted character count (URLs count as 23, limit 280), and the web-intent URLs. `--dry-run` stops after that.
+`x` and `x splash` print an original Unicode bird (blue and cyan, pink heart). `NO_COLOR` turns the ANSI colors off.
+
+`x post` and `x publish` never post until you type `yes`. They print the exact text of every part first, with the weighted count of each part (twitter-text v3, limit 280). `--dry-run` prints the same plan, including which provider would be used, and does not ask and does not post. A thread sent through the web intent opens one intent at a time: each part is copied to the clipboard, then the CLI waits for `next`.
 
 ### Free providers
 
 Reads try, in order:
 
-1. [OpenCLI](https://github.com/jackwener/opencli) `twitter` adapter (`profile`, `thread`, `search`, `timeline`, `trending`). Uses your logged-in Chrome session and the Browser Bridge extension. Termy X does not automate login or store passwords.
-2. [twitter-cli](https://github.com/public-clis/twitter-cli), the X path used by [Agent Reach](https://github.com/Panniantong/Agent-Reach). Auth is your own cookie (`TWITTER_AUTH_TOKEN` and `TWITTER_CT0`, or the browser cookie jar). Trends are derived from search results ranked by engagement when a trends endpoint is missing.
+1. [OpenCLI](https://github.com/jackwener/opencli) `twitter` adapter (`profile`, `thread`, `search`, `timeline`, `trending`, `whoami`). Uses your logged-in Chrome session and the Browser Bridge extension. Reads pass `--window background`. Termy X does not automate login or store passwords.
+2. [twitter-cli](https://github.com/public-clis/twitter-cli), the X path used by [Agent Reach](https://github.com/Panniantong/Agent-Reach) (`user`, `tweet`, `search`, `feed`, `status`). Auth is your own cookie (`TWITTER_AUTH_TOKEN` and `TWITTER_CT0`, or the browser cookie jar). "Popular" is search ranked by engagement. Trends fall back to that ranking when a trends endpoint is missing.
 3. Built-in mock fixtures, so the app and tests run with nothing installed.
 
-Publishing tries, in order, and still requires the confirm step:
+Research (not an X credit) uses OpenCLI Reddit and YouTube search, `yt-dlp`, a web reader, and RSS.
 
-1. `opencli twitter post` / `opencli twitter reply`
-2. `twitter post` / `twitter post --reply-to`
-3. An X web intent: `https://x.com/intent/post?text=...` (and `in_reply_to` on the first post of a thread). Termy X opens it in the browser; you click Post. The panel's "Next post" button copies the next intent URL.
+Publishing tries, in order, and still requires you to type `yes`:
 
-`x doctor` reports which of these are installed and states that no X API credits are needed. Cookie and browser-session providers are labeled "uses your own logged-in session".
+1. `opencli twitter post` / `opencli twitter reply`, only when `opencli twitter --help` lists `post`
+2. `twitter post` / `twitter post --reply-to`, only when `twitter --help` lists `post`
+3. An X web intent: `https://x.com/intent/post?text=...` (and `in_reply_to` on the first part). One intent per part. Termy X copies the part and opens the intent; you click Post.
+
+`x doctor` reports each free provider as `working`, `missing`, or `not logged in`, plus the AI endpoint. It says **No X API credits are needed.** It never posts and never logs in. Cookie and browser-session providers are labeled "uses your own logged-in session". On Windows, command shims resolve in PATHEXT order (`opencli.cmd` ahead of the extensionless shell script, then `.ps1`) and run with `CREATE_NO_WINDOW` so a console does not flash.
 
 ### Optional official API
 
@@ -147,14 +154,24 @@ x auth
 
 Drafts stay drafts. Nothing is auto-posted.
 
+The client is OpenAI-compatible. `TERMY_X_AI_BASE_URL`, `TERMY_X_AI_API_KEY`, and `TERMY_X_AI_MODEL` are the Termy names. `OPENAI_BASE_URL` and `OPENAI_API_KEY` are also accepted. With nothing set, Termy X tries a free local Ollama at `http://127.0.0.1:11434/v1` (model `llama3.2`). If nothing is reachable, `x draft` still returns offline templates labelled `template`.
+
 ```bash
-export TERMY_X_AI_BASE_URL=http://127.0.0.1:11434/v1   # Ollama
+# Ollama (the free default). Pull a small model once: ollama pull llama3.2
+export TERMY_X_AI_BASE_URL=http://127.0.0.1:11434/v1
 export TERMY_X_AI_MODEL=llama3.2
-# export TERMY_X_AI_API_KEY=...   # Groq or OpenRouter, when the server requires one
+
+# LM Studio's local server
+# export TERMY_X_AI_BASE_URL=http://127.0.0.1:1234/v1
+
+# Groq free tier, or an OpenRouter model whose id ends in :free
+# export TERMY_X_AI_BASE_URL=https://api.groq.com/openai/v1
+# export OPENAI_BASE_URL=https://openrouter.ai/api/v1
+# export OPENAI_API_KEY=...
 x draft "ship the panel" --tone informative
 ```
 
-Other free OpenAI-compatible servers: Groq (`https://api.groq.com/openai/v1`) and OpenRouter free models (`https://openrouter.ai/api/v1`). If those variables are unset, `x draft` uses local templates and labels them `template`, not a model. Prompt text lives in `crates/x_core/prompts/default.toml`.
+Other free OpenAI-compatible servers: llama.cpp's `llama-server` and any local server that speaks `/v1/chat/completions`. Prompt text lives in `crates/x_core/prompts/default.toml`.
 
 ### Config
 

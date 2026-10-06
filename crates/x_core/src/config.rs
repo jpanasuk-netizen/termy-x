@@ -26,6 +26,9 @@ pub struct XConfig {
     pub ai_key_env: String,
     pub ai_base_url: String,
     pub ai_model: String,
+    /// Set when a config file or env var chose the endpoint. The free local
+    /// default stays implicit so a dead Ollama falls back to templates.
+    pub ai_explicit: bool,
     pub min_interval_ms: u64,
     pub post_read_usd: f64,
     pub user_read_usd: f64,
@@ -53,6 +56,7 @@ impl Default for XConfig {
             ai_key_env: "TERMY_X_AI_API_KEY".to_string(),
             ai_base_url: String::new(),
             ai_model: String::new(),
+            ai_explicit: false,
             min_interval_ms: 1500,
             post_read_usd: 0.005,
             user_read_usd: 0.010,
@@ -147,7 +151,10 @@ impl XConfig {
             "ai.base_url_env" => self.ai_base_url_env = value.to_string(),
             "ai.model_env" => self.ai_model_env = value.to_string(),
             "ai.api_key_env" => self.ai_key_env = value.to_string(),
-            "ai.base_url" => self.ai_base_url = value.to_string(),
+            "ai.base_url" => {
+                self.ai_base_url = value.to_string();
+                self.ai_explicit = true;
+            }
             "ai.model" => self.ai_model = value.to_string(),
             "shell.min_interval_ms" => {
                 if let Ok(ms) = value.parse() {
@@ -163,21 +170,30 @@ impl XConfig {
     }
 
     pub fn resolve_env(&mut self) {
-        if let Ok(value) = std::env::var(&self.ai_base_url_env) {
-            if !value.trim().is_empty() {
-                self.ai_base_url = value;
-            }
+        let termy_base = nonempty_var(&self.ai_base_url_env);
+        let openai_base = nonempty_var("OPENAI_BASE_URL");
+        let termy_model = nonempty_var(&self.ai_model_env);
+        self.apply_ai_sources(
+            termy_base.as_deref(),
+            openai_base.as_deref(),
+            termy_model.as_deref(),
+        );
+    }
+
+    /// `TERMY_X_AI_BASE_URL` wins, then `OPENAI_BASE_URL`.
+    pub fn apply_ai_sources(&mut self, termy_base: Option<&str>, openai_base: Option<&str>, termy_model: Option<&str>) {
+        if let Some(value) = nonempty(termy_base).or_else(|| nonempty(openai_base)) {
+            self.ai_base_url = value.to_string();
+            self.ai_explicit = true;
         }
-        if let Ok(value) = std::env::var(&self.ai_model_env) {
-            if !value.trim().is_empty() {
-                self.ai_model = value;
-            }
+        if let Some(value) = nonempty(termy_model) {
+            self.ai_model = value.to_string();
         }
     }
 
     /// True when the user pointed drafting at an endpoint explicitly.
     pub fn ai_configured(&self) -> bool {
-        !self.ai_base_url.trim().is_empty() && !self.ai_model.trim().is_empty()
+        !self.ai_base_url.trim().is_empty()
     }
 
     /// Endpoint used for AI drafts: the configured one, else the free local
@@ -197,10 +213,7 @@ impl XConfig {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        std::env::var(&self.ai_key_env)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+        nonempty_var(&self.ai_key_env).or_else(|| nonempty_var("OPENAI_API_KEY"))
     }
 
     pub fn client_id(&self) -> Option<String> {
@@ -250,6 +263,17 @@ pub fn default_config_dir() -> PathBuf {
         .join("termy")
 }
 
+fn nonempty_var(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn parse_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -289,8 +313,9 @@ post_write_usd = 0.010
 # Any OpenAI-compatible /chat/completions endpoint. Env vars win over these.
 # Free default when nothing is set: local Ollama at http://127.0.0.1:11434/v1
 # (model llama3.2). If it is not running, drafts fall back to offline templates.
-# Other free options (see README): Groq free tier, OpenRouter ":free" models,
-# Google Gemini's OpenAI-compatible endpoint, LM Studio, llama.cpp server.
+# Other free options (see README): LM Studio (http://127.0.0.1:1234/v1),
+# OpenRouter ":free" models, Groq's free tier, llama.cpp server.
+# OPENAI_BASE_URL and OPENAI_API_KEY are also accepted.
 base_url_env = "TERMY_X_AI_BASE_URL"
 model_env = "TERMY_X_AI_MODEL"
 api_key_env = "TERMY_X_AI_API_KEY"
@@ -315,8 +340,26 @@ mod tests {
         assert_eq!(config.default_limit, 10);
         assert!(config.provider.is_none());
         assert!(!config.ai_configured());
+        assert!(!config.ai_explicit);
         assert!((config.background_opacity - 0.20).abs() < f32::EPSILON);
         assert_eq!(config.ai_endpoint().0, DEFAULT_AI_BASE_URL);
+        assert_eq!(config.ai_endpoint().1, DEFAULT_AI_MODEL);
+    }
+
+    #[test]
+    fn openai_base_url_is_accepted_when_termy_url_is_unset() {
+        let mut config = XConfig::default();
+        config.apply_ai_sources(None, Some("http://127.0.0.1:1234/v1"), None);
+        assert!(config.ai_explicit);
+        assert_eq!(config.ai_endpoint().0, "http://127.0.0.1:1234/v1");
+        assert_eq!(config.ai_endpoint().1, DEFAULT_AI_MODEL);
+        config.apply_ai_sources(
+            Some("http://127.0.0.1:11434/v1"),
+            Some("http://127.0.0.1:1234/v1"),
+            Some("llama3.2"),
+        );
+        assert_eq!(config.ai_endpoint().0, "http://127.0.0.1:11434/v1");
+        assert_eq!(config.ai_endpoint().1, "llama3.2");
     }
 
     #[test]

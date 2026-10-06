@@ -8,11 +8,13 @@ use crate::ai::draft_variants;
 use crate::config::{example_config, XConfig};
 use crate::doctor::doctor;
 use crate::drafts::{find_draft, load_drafts, new_id, timestamp, upsert_drafts};
-use crate::io::{CommandRunner, Http, Opener, SystemOpener, SystemRunner, UreqHttp};
+use crate::io::{
+    Clipboard, CommandRunner, Http, Opener, SystemClipboard, SystemOpener, SystemRunner, UreqHttp,
+};
 use crate::model::{ProviderId, Tone};
 use crate::providers::Service;
-use crate::publish::{confirm_and_publish, first_available, intent_urls, ConfirmDecision, GateOutcome, IntentPublisher};
-use crate::splash::splash_ansi;
+use crate::publish::{confirm_and_publish, first_available, ConfirmDecision, GateOutcome, IntentPublisher};
+use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
 #[command(name = "x", version, about = "Termy X — read and post without X API credits")]
@@ -38,7 +40,18 @@ enum Cmd {
     /// Look up a user
     Lookup { handle: String },
     /// Read a post and its thread
-    Post { id_or_url: String },
+    Thread { id_or_url: String },
+    /// Publish text after you type yes. `--dry-run` prints the plan and never posts.
+    Post {
+        text: String,
+        /// Print the exact parts, counts, and intent URLs. Never posts.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        reply_to: Option<String>,
+    },
+    /// Unicode bird
+    Splash,
     /// Search posts
     Search {
         query: String,
@@ -85,7 +98,7 @@ enum Cmd {
         #[arg(long)]
         reply_to: Option<String>,
     },
-    /// Post a saved draft after an explicit y/N confirm
+    /// Post a saved draft after you type yes
     Publish {
         draft_id: String,
         /// Print the exact text and intent URL without posting. On in unit tests.
@@ -109,6 +122,7 @@ pub struct CliIo {
     pub runner: Arc<dyn CommandRunner>,
     pub http: Arc<dyn Http>,
     pub opener: Arc<dyn Opener>,
+    pub clipboard: Arc<dyn Clipboard>,
     pub confirm: ConfirmDecision,
     pub editor_text: Option<String>,
 }
@@ -119,8 +133,9 @@ impl CliIo {
         Self {
             config: XConfig::load(&dir),
             runner: Arc::new(SystemRunner),
-            http: Arc::new(UreqHttp),
+            http: Arc::new(UreqHttp::default()),
             opener: Arc::new(SystemOpener),
+            clipboard: Arc::new(SystemClipboard),
             confirm: ConfirmDecision::No,
             editor_text: None,
         }
@@ -171,18 +186,17 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
     let json = cli.json;
     match cli.command {
         None => {
-            if io.config.background_art {
-                println!("{}", splash_ansi());
-            }
-            println!("Termy X. No X API credits are required.");
-            println!("Try `x doctor`, `x timeline`, or `x --help`.");
+            print!("{}", splash_ansi());
+            println!("Termy X. No X API credits are needed.");
+            println!("Try `x doctor`, `x splash`, or `x --help`.");
+            0
+        }
+        Some(Cmd::Splash) => {
+            print!("{}", splash_ansi());
             0
         }
         Some(Cmd::Doctor) => {
-            if io.config.background_art && !json {
-                println!("{}", splash_ansi());
-            }
-            let report = doctor(&io.config, io.runner.as_ref());
+            let report = doctor(&io.config, io.runner.as_ref(), io.http.as_ref());
             if json {
                 println!("{}", report.as_json());
             } else {
@@ -224,7 +238,14 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
         Cmd::Lookup { handle } => emit(json, service.lookup(&handle).map(|served| (served.status.render(), json_value(served)))),
-        Cmd::Post { id_or_url } => emit(json, service.thread(&id_or_url).map(|served| (served.status.render(), json_value(served)))),
+        Cmd::Thread { id_or_url } => emit(json, service.thread(&id_or_url).map(|served| (served.status.render(), json_value(served)))),
+        Cmd::Splash => {
+            print!("{}", render_splash(true));
+            0
+        }
+        Cmd::Post { text, dry_run, reply_to } => {
+            publish_text(&text, dry_run, reply_to, json, io, interactive)
+        }
         Cmd::Search { query, recent, top: _, limit } => {
             let limit = clamp_limit(limit, io.config.default_limit);
             emit(json, service.search(&query, recent, limit).map(|served| (served.status.render(), json_value(served))))
@@ -277,8 +298,9 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                         eprintln!("could not save drafts: {error}");
                         return 1;
                     }
-                    if !io.config.ai_configured() {
-                        eprintln!("No AI endpoint configured. These are local templates, not a model. Set {} to a free OpenAI-compatible server. Nothing was posted.", io.config.ai_base_url_env);
+                    if drafts.first().is_some_and(|draft| draft.source == "template") {
+                        let (base, model) = io.config.ai_endpoint();
+                        eprintln!("No reachable model at {base} ({model}). These are offline templates, not a model. Set {} or OPENAI_BASE_URL to a free OpenAI-compatible server (Ollama, LM Studio, Groq, or an OpenRouter :free model). Nothing was posted.", io.config.ai_base_url_env);
                     }
                     if json {
                         println!("{}", serde_json::to_string_pretty(&drafts).unwrap_or_else(|_| "[]".into()));
@@ -355,51 +377,63 @@ fn publish_draft(
         return 1;
     };
     let reply = reply_to.or_else(|| draft.reply_to.clone());
+    publish_text(&draft.text, dry_run, reply, json, io, interactive)
+}
+
+fn publish_text(
+    text: &str,
+    dry_run: bool,
+    reply_to: Option<String>,
+    json: bool,
+    io: &mut CliIo,
+    interactive: bool,
+) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     let mut publishers = service.publishers;
     publishers.push(Box::new(IntentPublisher {
-        open_browser: !dry_run,
+        open_browser: false,
         opener: io.opener.clone(),
     }));
     let Some(publisher) = first_available(publishers.as_slice()) else {
         eprintln!("no publish path");
         return 1;
     };
-    let count = crate::text::weighted_len(&draft.text);
-    let parts = crate::text::split_thread(&draft.text);
-    println!("{}", publisher.id().label());
-    if let Some(session) = publisher.session_note() {
-        println!("{session}");
+    let plan = crate::publish::build_plan(text, reply_to.as_deref(), publisher, dry_run);
+    print_plan(&plan);
+    if dry_run {
+        if json {
+            println!("{}", plan_json(&plan, true));
+        } else {
+            println!(
+                "dry run — would use {} — nothing was posted",
+                plan.provider.label()
+            );
+        }
+        return 0;
     }
-    println!("---");
-    println!("{}", draft.text);
-    println!("---");
-    println!(
-        "{} weighted characters · {} part(s) · limit {}",
-        count.weighted,
-        parts.len(),
-        count.limit
-    );
-    for (index, url) in intent_urls(&parts, reply.as_deref()).iter().enumerate() {
-        println!("intent {}: {url}", index + 1);
-    }
-    let decision = if interactive && io.confirm == ConfirmDecision::No {
+    let decision = if interactive {
         ask_confirm()
     } else {
         io.confirm
     };
-    let outcome = confirm_and_publish(&draft.text, reply.as_deref(), decision, dry_run, publisher);
+    if decision != ConfirmDecision::Yes {
+        eprintln!("not posted");
+        return 1;
+    }
+    if publisher.id() == crate::model::ProviderId::WebIntent {
+        return deliver_intent(&plan, io, interactive);
+    }
+    let outcome = confirm_and_publish(text, reply_to.as_deref(), decision, false, publisher);
     match outcome {
-        GateOutcome::Rejected { .. } => {
+        GateOutcome::Rejected { plan } => {
+            if let Some(error) = &plan.session {
+                eprintln!("{error}");
+            }
             eprintln!("not posted");
             1
         }
         GateOutcome::DryRun { plan } => {
-            if json {
-                println!("{}", plan_json(&plan, true));
-            } else {
-                println!("dry run — nothing was posted");
-            }
+            println!("{}", plan_json(&plan, true));
             0
         }
         GateOutcome::Sent { plan, receipt } => {
@@ -413,14 +447,74 @@ fn publish_draft(
     }
 }
 
+fn print_plan(plan: &crate::publish::PublishPlan) {
+    println!("{}", plan.provider.label());
+    if let Some(session) = &plan.session {
+        println!("{session}");
+    }
+    println!(
+        "{} weighted · {} part(s) · limit {}",
+        plan.count.weighted,
+        plan.parts.len(),
+        plan.count.limit
+    );
+    for (index, part) in plan.parts.iter().enumerate() {
+        let count = crate::text::weighted_len(part);
+        println!(
+            "--- part {}/{} · {} weighted ---",
+            index + 1,
+            plan.parts.len(),
+            count.weighted
+        );
+        println!("{part}");
+        if let Some(url) = plan.intent_urls.get(index) {
+            println!("{url}");
+        }
+    }
+}
+
+fn deliver_intent(plan: &crate::publish::PublishPlan, io: &CliIo, interactive: bool) -> i32 {
+    for (index, part) in plan.parts.iter().enumerate() {
+        match io.clipboard.copy(part) {
+            Ok(()) => println!("copied part {} to the clipboard", index + 1),
+            Err(error) => eprintln!("could not copy part {} to the clipboard: {error}", index + 1),
+        }
+        let Some(url) = plan.intent_urls.get(index) else {
+            continue;
+        };
+        if let Err(error) = io.opener.open(url) {
+            eprintln!("could not open the intent URL: {error}");
+            return 1;
+        }
+        if interactive && index + 1 < plan.parts.len() {
+            print!("next: ");
+            let _ = io::stdout().flush();
+            let mut line = String::new();
+            if io::stdin().read_line(&mut line).is_err() {
+                eprintln!("stopped before the remaining parts");
+                return 1;
+            }
+            if matches!(line.trim(), "q" | "no" | "n") {
+                eprintln!("stopped before the remaining parts");
+                return 1;
+            }
+        }
+    }
+    println!(
+        "opened {} web intent(s). Each part is on the clipboard when its window opens. Click Post yourself.",
+        plan.parts.len()
+    );
+    0
+}
+
 fn ask_confirm() -> ConfirmDecision {
-    print!("Post this exact text? [y/N] ");
+    print!("Type yes to post this exact text: ");
     let _ = io::stdout().flush();
     let mut line = String::new();
     if io::stdin().read_line(&mut line).is_err() {
         return ConfirmDecision::No;
     }
-    if matches!(line.trim(), "y" | "Y" | "yes" | "YES") {
+    if line.trim() == "yes" {
         ConfirmDecision::Yes
     } else {
         ConfirmDecision::No
@@ -528,6 +622,7 @@ mod tests {
             runner: Arc::new(ScriptedRunner::new()),
             http: Arc::new(crate::io::MapHttp::default()),
             opener: Arc::new(RecordingOpener::default()),
+            clipboard: Arc::new(crate::io::RecordingClipboard::default()),
             confirm: ConfirmDecision::Yes,
             editor_text: None,
         }
@@ -543,7 +638,12 @@ mod tests {
             execute(&["lookup".into(), "@termy".into(), "--json".into()], &mut io, false),
             0
         );
-        assert_eq!(execute(&["post".into(), "1001".into()], &mut io, false), 0);
+        assert_eq!(execute(&["thread".into(), "1001".into()], &mut io, false), 0);
+        assert_eq!(execute(&["splash".into()], &mut io, false), 0);
+        assert_eq!(
+            execute(&["post".into(), "--dry-run".into(), "hello world".into()], &mut io, false),
+            0
+        );
         assert_eq!(
             execute(
                 &["search".into(), "panel".into(), "--recent".into(), "--limit".into(), "2".into(), "--json".into()],
@@ -567,15 +667,11 @@ mod tests {
         io.confirm = ConfirmDecision::No;
         assert_eq!(
             execute(&["publish".into(), drafts[0].id.clone(), "--dry-run".into()], &mut io, false),
-            1
+            0
         );
         io.confirm = ConfirmDecision::Yes;
         assert_eq!(
-            execute(
-                &["publish".into(), drafts[0].id.clone(), "--dry-run".into()],
-                &mut io,
-                false
-            ),
+            execute(&["publish".into(), drafts[0].id.clone()], &mut io, false),
             0
         );
         assert_eq!(
