@@ -1,0 +1,8 @@
+﻿OpenCLI
+uses your own logged-in session
+26 weighted ┬╖ 1 part(s) ┬╖ limit 280
+--- part 1/1 ┬╖ 26 weighted ---
+hello from Termy X dry run
+https://x.com/intent/post?text=hello%20from%20Termy%20X%20dry%20run
+dry run ΓÇö would use OpenCLI ΓÇö nothing was posted
+

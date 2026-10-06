@@ -1,0 +1,13 @@
+﻿Termy X doctor
+No X API credits are needed.
+Official X API: off
+
+OpenCLI: working ┬╖ uses your own logged-in session ┬╖ posting supported
+twitter-cli / Agent Reach: working ┬╖ uses your own logged-in session ┬╖ posting not supported
+mock: working ┬╖ fixture data, always available
+intent: working ┬╖ https://x.com/intent/post ΓÇö always available
+
+AI endpoint: working ┬╖ llama3.2 ┬╖ http://127.0.0.1:11434/v1
+Background art: on ┬╖ opacity 0.18
+Config directory: C:\Users\jpana\AppData\Roaming\termy
+
