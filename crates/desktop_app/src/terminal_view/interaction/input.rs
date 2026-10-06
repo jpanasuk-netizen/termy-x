@@ -710,6 +710,15 @@ impl TerminalView {
         action: CommandAction,
         cx: &mut Context<Self>,
     ) -> bool {
+        // When Termy X Compose owns the keyboard, route edit actions into the
+        // panel so Ctrl+V/A/C never hit the left terminal pane.
+        if matches!(
+            action,
+            CommandAction::Copy | CommandAction::Paste | CommandAction::SelectAll
+        ) && self.x_panel_handle_edit_action(action, cx)
+        {
+            return true;
+        }
         match action {
             CommandAction::Copy => {
                 if self.copy_active_inline_input_selection(cx) {

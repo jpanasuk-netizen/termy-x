@@ -150,6 +150,8 @@ pub struct XPanel {
     ui_focus: UiFocus,
     /// Blink loop started once per panel.
     blink_running: bool,
+    /// Dedup KeyDown + action Paste within the same chord.
+    last_edit_chord_at: Option<Instant>,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -245,6 +247,7 @@ impl XPanel {
             blink_visible: true,
             ui_focus: UiFocus::Compose,
             blink_running: false,
+            last_edit_chord_at: None,
         };
         // Instant first paint: fixtures on screen, live fetch in the background.
         if fill_window {
@@ -660,12 +663,15 @@ impl XPanel {
                 self.pending_focus = true;
                 cx.notify();
             }
+            // Never leak Esc into the terminal while the X panel has the key stream.
+            cx.stop_propagation();
             return;
         }
 
         if key == "tab" && !mods.control && !mods.platform && !mods.alt {
             self.cycle_ui_focus(mods.shift);
             self.pending_focus = true;
+            cx.stop_propagation();
             cx.notify();
             return;
         }
@@ -684,6 +690,8 @@ impl XPanel {
                 self.pending_focus = true;
                 cx.notify();
             }
+            // Confirm modal owns the keyboard; never leak into the terminal.
+            cx.stop_propagation();
             return;
         }
 
@@ -722,19 +730,23 @@ impl XPanel {
         self.compose_focused = true;
         self.blink_visible = true;
 
+        // Always stop_propagation for edit chords — even if clipboard is empty —
+        // otherwise TerminalView's Paste/Copy/SelectAll actions still hit the shell.
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
             if let Some(item) = cx.read_from_clipboard() {
                 if let Some(clip) = item.text() {
                     self.insert_text(&clip);
-                    cx.stop_propagation();
-                    cx.notify();
                 }
             }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("a") {
             self.sel_anchor = Some(0);
             self.caret = self.compose.len();
+            self.mark_edit_chord();
             cx.stop_propagation();
             cx.notify();
             return;
@@ -745,7 +757,24 @@ impl XPanel {
                     self.compose[a..b].to_string(),
                 ));
             }
+            self.mark_edit_chord();
             cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if (mods.control || mods.platform) && key.eq_ignore_ascii_case("x") {
+            if let Some((a, b)) = self.selection_range() {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                    self.compose[a..b].to_string(),
+                ));
+                self.compose.replace_range(a..b, "");
+                self.caret = a;
+                self.clear_selection();
+                self.blink_visible = true;
+            }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
             return;
         }
 
@@ -815,6 +844,51 @@ impl XPanel {
         } else {
             self.caret = self.caret.min(self.compose.len());
         }
+    }
+
+    /// True when Compose owns edit chords (Ctrl+V/A/C/X). TerminalView must
+    /// route Paste/Copy/SelectAll here so they never hit the shell.
+    pub fn owns_compose_keys(&self) -> bool {
+        !self.confirm
+            && self.section == XSection::Compose
+            && self.compose_focused
+            && self.ui_focus == UiFocus::Compose
+    }
+
+    pub fn focus_compose_editor_public(&mut self) {
+        self.focus_compose_editor();
+    }
+
+    pub fn insert_compose_text(&mut self, text: &str) {
+        if self.chord_already_applied() {
+            return;
+        }
+        self.insert_text(text);
+        self.mark_edit_chord();
+    }
+
+    pub fn compose_selection_text(&self) -> Option<String> {
+        let (a, b) = self.selection_range()?;
+        Some(self.compose[a..b].to_string())
+    }
+
+    pub fn select_all_compose(&mut self) {
+        if self.chord_already_applied() {
+            return;
+        }
+        self.sel_anchor = Some(0);
+        self.caret = self.compose.len();
+        self.blink_visible = true;
+        self.mark_edit_chord();
+    }
+
+    fn mark_edit_chord(&mut self) {
+        self.last_edit_chord_at = Some(Instant::now());
+    }
+
+    fn chord_already_applied(&self) -> bool {
+        self.last_edit_chord_at
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(80))
     }
 
     fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
@@ -1748,8 +1822,8 @@ impl XPanel {
         let sel = self.selection_range();
 
         if self.compose.is_empty() {
-            // Caret must sit at the LEFT of an empty draft (index 0), not after
-            // the placeholder — otherwise it looks like typing starts on the right.
+            // Caret at LEFT (index 0). Hint only when empty AND unfocused —
+            // once the caret blinks, the placeholder must disappear.
             return div()
                 .mt(px(8.0))
                 .flex()
@@ -1757,14 +1831,14 @@ impl XPanel {
                 .items_center()
                 .gap(px(2.0))
                 .children(show_caret.then(|| self.caret_bar()))
-                .child(
+                .children((!focused).then(|| {
                     div()
                         .text_size(px(14.0))
                         .text_color(rgb(0x93a4c3))
                         .child(
                             "Click here, then type. Ctrl+V pastes. Publish opens confirm instantly.",
-                        ),
-                )
+                        )
+                }))
                 .into_any_element();
         }
 
