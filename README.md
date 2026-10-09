@@ -102,6 +102,9 @@ x splash
 x doctor
 x timeline
 x search "gpui" --recent --limit 10
+x feed --topic "generator sizing" --hot
+x feed --upcoming
+x feed --dry-run --keys "j;r;type:hello from the terminal;p;y"
 x lookup @termy
 x thread 1001
 x trends --place worldwide
@@ -114,6 +117,23 @@ x publish <draft-id> --dry-run
 x research "gpui terminals"
 termy x doctor                   # same commands through the Termy CLI
 ```
+
+
+`x feed` is the hot / upcoming list. With no topic it loads the home timeline on the free OpenCLI session (`twitter timeline`), or `twitter search` when you pass `--topic` or type `/subject`. `--hot` ranks by engagement then recency. `--upcoming` (the default) ranks by recency then engagement. The same list accepts a reply:
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Next / previous tweet |
+| `h` / `u` | Re-rank the current list hot / upcoming. No extra request. |
+| `/subject` | Topic search into the same list. One OpenCLI search. |
+| `r` | Open the reply box for the selected tweet |
+| a line of text, or `type:text` | Set the reply draft. Does not post. |
+| `p` | Preview the exact reply |
+| `y` | Post that preview as the logged-in account. Ignored until `p`. |
+| `esc` | Close the reply box. Nothing is posted. |
+| `q` | Quit |
+
+`y` calls `opencli twitter reply` through the existing confirm path. `--dry-run` prints the plan and does not post. There is no auto-reply and no bulk reply. The status bar shows `quota: N remaining` only when that session response already includes a remaining count. Otherwise it says `quota: not reported`. It does not call the paid X API to ask.
 
 `--json` prints machine-readable output. `--provider mock` forces fixtures (what the tests use). Tones for `x draft` are `punchy`, `informative`, `thread`, and `reply`.
 

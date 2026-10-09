@@ -92,6 +92,26 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// One list of hot or upcoming posts, with an inline reply box. Nothing posts until y.
+    Feed {
+        /// Subject to search. Omit for the home timeline.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Rank by engagement, then newer posts
+        #[arg(long)]
+        hot: bool,
+        /// Rank by recency, then engagement (the default)
+        #[arg(long)]
+        upcoming: bool,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Semicolon-separated keys, for example j;r;type:hello;p;y
+        #[arg(long)]
+        keys: Option<String>,
+        /// Print the reply plan and never post
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Ask the configured free model for draft variants. Never posts.
     Draft {
         idea: String,
@@ -181,6 +201,10 @@ fn print_help_guide() {
     println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
     println!("  x splash              Print the Termy X bird");
     println!("  x search \"query\" [--recent|--top] [--limit N]");
+    println!("  x feed [--topic \"subject\"] [--hot|--upcoming] [--limit N]");
+    println!("    j/k move  h hot  u upcoming  /subject search");
+    println!("    r reply box  type a line  p preview  y post  esc cancel  q quit");
+    println!("  x feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
     println!("  x timeline [--limit N]");
     println!("  x trends [--place NAME] [--limit N]");
     println!("  x lookup handle");
@@ -346,6 +370,58 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                 .timeline(clamp_limit(limit, io.config.default_limit))
                 .map(|served| (served.status.render(), json_value(served))),
         ),
+        Cmd::Feed {
+            topic,
+            hot,
+            upcoming: _,
+            limit,
+            keys,
+            dry_run,
+        } => {
+            let mode = if hot {
+                crate::feed::RankMode::Hot
+            } else {
+                crate::feed::RankMode::Upcoming
+            };
+            let limit = clamp_limit(limit, io.config.default_limit);
+            let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
+            crate::feed::run(
+                crate::feed::RunInput {
+                    topic,
+                    mode,
+                    limit,
+                    keys,
+                    dry_run,
+                    interactive,
+                },
+                |topic, recent, limit| {
+                    if let Some(topic) = topic {
+                        service
+                            .search(topic, recent, limit)
+                            .map(|served| (served.value, served.status))
+                    } else {
+                        let _ = recent;
+                        service
+                            .timeline(limit)
+                            .map(|served| (served.value, served.status))
+                    }
+                },
+                |text, reply_to, dry| {
+                    if !dry {
+                        io.confirm = crate::publish::ConfirmDecision::Yes;
+                    }
+                    publish_text(
+                        text,
+                        dry,
+                        Some(reply_to.to_string()),
+                        Vec::new(),
+                        json,
+                        io,
+                        false,
+                    )
+                },
+            )
+        }
         Cmd::Research { topic } => {
             let hits = service.research(&topic, io.runner.as_ref(), &io.config);
             if json {
@@ -838,6 +914,34 @@ mod tests {
         );
         assert_eq!(
             execute(&["popular".into(), "gpui".into()], &mut io, false),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "feed".into(),
+                    "--topic".into(),
+                    "generator sizing".into(),
+                    "--dry-run".into(),
+                    "--keys".into(),
+                    "j;r;type:hello from the terminal;p;y".into(),
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "feed".into(),
+                    "--dry-run".into(),
+                    "--keys".into(),
+                    "r;type:not yet;y".into(),
+                ],
+                &mut io,
+                false
+            ),
             0
         );
         assert_eq!(

@@ -10,6 +10,7 @@ pub mod cli;
 pub mod config;
 pub mod doctor;
 pub mod drafts;
+pub mod feed;
 pub mod io;
 pub mod model;
 pub mod premium;
