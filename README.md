@@ -141,6 +141,15 @@ termy x doctor                   # same commands through the Termy CLI
 
 `x post` and `x publish` never post until you type `yes`. They print the exact text of every part first, with the weighted count of each part (twitter-text v3, limit 280). `--dry-run` prints the same plan, including which provider would be used, and does not ask and does not post. A thread sent through the web intent opens one intent at a time: each part is copied to the clipboard, then the CLI waits for `next`.
 
+### Connect your own X account
+
+Termy X has no built-in account. It never ships a token, cookie, or default handle, and it always acts as whoever is signed in on your own machine:
+
+- **OpenCLI (recommended):** install [OpenCLI](https://github.com/jackwener/opencli) and its Browser Bridge extension, then log into https://x.com in your own Chrome. Termy X reads and posts through that session.
+- **twitter-cli:** install [twitter-cli](https://github.com/public-clis/twitter-cli) and sign in with it (or set your own `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` from your browser's x.com cookies). These stay on your machine.
+- **Official X API (optional, off by default):** use your own app's client id via `TERMY_X_CLIENT_ID`; the token is stored in your OS keyring.
+
+Run `x doctor` to see which account each provider is using (`whoami`). If nothing is signed in, Termy X falls back to mock data or the X web intent, where you post from your own browser. Your config lives in your own config folder (`%APPDATA%\termy` on Windows, `~/.config/termy` on Linux, `~/Library/Application Support/termy` on macOS).
 ### Free providers
 
 Reads try, in order:

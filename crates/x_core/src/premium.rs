@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn verified_profile_json_counts_as_premium() {
-        let text = r#"[{"screen_name":"Jasper_Black","verified":true}]"#;
+        let text = r#"[{"screen_name":"example_user","verified":true}]"#;
         assert!(profile_looks_premium(text));
         assert!(!profile_looks_premium(r#"{"verified":false}"#));
         assert!(profile_looks_premium(
