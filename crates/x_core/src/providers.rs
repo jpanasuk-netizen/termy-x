@@ -849,6 +849,11 @@ fn opencli_read(args: &[String]) -> Vec<String> {
     opencli_json(args)
 }
 
+/// Public wrapper so `x connect` builds the exact same OpenCLI call as reads.
+pub fn opencli_read_pub(args: &[String]) -> Vec<String> {
+    opencli_read(args)
+}
+
 fn opencli_json(args: &[String]) -> Vec<String> {
     let mut args = args.to_vec();
     args.push("-f".into());

@@ -144,12 +144,31 @@ fn weighted_normalized(text: &str) -> WeightedCount {
 }
 
 fn longest_fit(text: &str, limit: usize) -> usize {
+    // One incremental pass. The old version re-weighed text[..end] for every
+    // unit (O(n^2)): a 12.5k-char post took ~1s to split. Units already align
+    // with grapheme clusters for counting, and split_thread snaps the final cut.
+    let spans = url_spans(text);
     let mut last_ok = 0usize;
     let mut end = 0usize;
+    let mut sum: u32 = 0;
+    let mut urls = 0usize;
+    let mut counted_url: Option<usize> = None;
     for unit in split_units(text) {
+        let start = end;
         end += unit.len();
-        end = snap_grapheme(text, end);
-        if weighted_normalized(&text[..end]).weighted > limit {
+        if let Some((idx, _)) = spans
+            .iter()
+            .enumerate()
+            .find(|(_, (s, e))| start >= *s && start < *e)
+        {
+            if counted_url != Some(idx) {
+                counted_url = Some(idx);
+                urls += 1;
+            }
+        } else {
+            sum += unit_weight(unit);
+        }
+        if (sum / SCALE) as usize + urls * URL_WEIGHT > limit {
             return last_ok;
         }
         last_ok = end;
@@ -266,11 +285,11 @@ fn is_emoji_pict(ch: char) -> bool {
 
 fn url_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
+    let lower_full = text.to_ascii_lowercase();
     let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        let rest = &text[index..];
-        let lower = rest.to_ascii_lowercase();
+        let lower = &lower_full[index..];
         let start_rel = ["https://", "http://", "www."]
             .iter()
             .filter_map(|prefix| lower.find(prefix))

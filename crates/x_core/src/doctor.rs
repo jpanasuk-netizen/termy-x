@@ -120,7 +120,7 @@ fn shell_probe(
     if !runner.exists(bin) {
         return (Probe::Missing, "not on PATH".into());
     }
-    let posting = match runner.run(bin, help_args) {
+    let posting = match runner.run_timeout(bin, help_args, std::time::Duration::from_secs(15)) {
         Ok(output)
             if help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post") =>
         {
@@ -128,7 +128,7 @@ fn shell_probe(
         }
         _ => "posting not supported",
     };
-    let session = match runner.run(bin, session_args) {
+    let session = match runner.run_timeout(bin, session_args, std::time::Duration::from_secs(15)) {
         Ok(output) if output.status == 0 && looks_logged_in(&output.stdout) => Probe::Working,
         _ => Probe::NotLoggedIn,
     };

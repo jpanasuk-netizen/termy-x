@@ -27,6 +27,16 @@ pub struct CommandOutput {
 pub trait CommandRunner: Send + Sync {
     fn exists(&self, program: &str) -> bool;
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String>;
+    /// Bounded variant for probes (doctor / connect) that must never hang
+    /// waiting on a browser bridge. Test doubles just run normally.
+    fn run_timeout(
+        &self,
+        program: &str,
+        args: &[String],
+        _timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.run(program, args)
+    }
 }
 
 pub struct SystemRunner;
@@ -37,11 +47,20 @@ impl CommandRunner for SystemRunner {
     }
 
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+        self.run_timeout(program, args, COMMAND_TIMEOUT)
+    }
+
+    fn run_timeout(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
         let resolved =
             resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
         let mut command = command_for(&resolved, args);
         hide_console(&mut command);
-        output_with_timeout(command, COMMAND_TIMEOUT)
+        output_with_timeout(command, timeout)
     }
 }
 

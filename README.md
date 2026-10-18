@@ -141,13 +141,29 @@ termy x doctor                   # same commands through the Termy CLI
 
 `x post` and `x publish` never post until you type `yes`. They print the exact text of every part first, with the weighted count of each part (twitter-text v3, limit 280). `--dry-run` prints the same plan, including which provider would be used, and does not ask and does not post. A thread sent through the web intent opens one intent at a time: each part is copied to the clipboard, then the CLI waits for `next`.
 
+### Quickstart (60 seconds, no config)
+
+```bash
+cargo build --release -p termy_x_cli   # builds ./target/release/x
+./target/release/x doctor              # what is connected? (free, read-only)
+./target/release/x --provider mock timeline   # try it instantly on fixture data
+./target/release/x post --dry-run "hello world"  # preview a post — never posts
+```
+
+No account yet? That is fine — the commands above work with zero setup.
+Connect yours when you are ready (next section).
+
 ### Connect your own X account
+
+Run `x connect` for these steps inside the tool, and `x connect --check`
+to prove which of *your* accounts is connected (read-only, never posts).
+
 
 Termy X has no built-in account. It never ships a token, cookie, or default handle, and it always acts as whoever is signed in on your own machine:
 
-- **OpenCLI (recommended):** install [OpenCLI](https://github.com/jackwener/opencli) and its Browser Bridge extension, then log into https://x.com in your own Chrome. Termy X reads and posts through that session.
+- **OpenCLI (recommended):** install OpenCLI 2.0.0 (`npm install -g @jackwener/opencli`, [releases](https://github.com/jackwener/OpenCLI/releases/tag/v2.0.0)) and its Browser Bridge extension, then log into https://x.com in your own Chrome. Termy X reads and posts through that session. OpenCLI 1.8.8 also works; 2.0.0 changed its JSON to an `{ok, data}` envelope, which Termy X parses.
 - **twitter-cli:** install [twitter-cli](https://github.com/public-clis/twitter-cli) and sign in with it (or set your own `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` from your browser's x.com cookies). These stay on your machine.
-- **Official X API (optional, off by default):** use your own app's client id via `TERMY_X_CLIENT_ID`; the token is stored in your OS keyring.
+- **Official X API (optional, off by default):** use your own app's client id via `TERMY_X_CLIENT_ID`; the token is stored in your OS keyring. If your app gives you a bearer token, set `TERMY_X_BEARER_TOKEN` in your shell only (never in a file) and run `x connect --check` — it calls `GET /2/users/me` and prints your `@handle`, never the token. Note: an app-only bearer token cannot identify a personal account, so OpenCLI is the reliable personal path.
 
 Run `x doctor` to see which account each provider is using (`whoami`). If nothing is signed in, Termy X falls back to mock data or the X web intent, where you post from your own browser. Your config lives in your own config folder (`%APPDATA%\termy` on Windows, `~/.config/termy` on Linux, `~/Library/Application Support/termy` on macOS).
 ### Free providers

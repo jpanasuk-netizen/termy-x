@@ -23,6 +23,7 @@ use crate::splash::{render_splash, splash_ansi};
     name = "x",
     version,
     about = "Termy X - read and post without X API credits",
+    after_help = "Examples:\n  x doctor                 Check what is connected (free, read-only)\n  x connect --check        Show which of YOUR X accounts is connected\n  x search \"rust\" --recent  Search posts\n  x post --dry-run \"hi\"    Preview a post, never posts\n  x timeline               Your home timeline (or fixtures if not connected)",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -147,6 +148,12 @@ enum Cmd {
     Config,
     /// Start the optional official API login. Off unless you enable it.
     Auth,
+    /// Connect your own X account (OpenCLI session, or your own X developer token)
+    Connect {
+        /// Check the connection with a read-only who-are-you call. Never posts.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 pub struct CliIo {
@@ -226,9 +233,7 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
                 if error.kind() == clap::error::ErrorKind::DisplayHelp
                     || error.kind() == clap::error::ErrorKind::DisplayVersion
                 {
-                    if io.config.background_art {
-                        let _ = writeln!(io_stdout(), "{}", splash_ansi());
-                    }
+                    // Keep --help/--version clean and script-friendly: no splash.
                     let _ = write!(io_stdout(), "{error}");
                     return 0;
                 }
@@ -240,6 +245,12 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
         io.config = XConfig::load(dir);
     }
     if let Some(provider) = &cli.provider {
+        if !provider.eq_ignore_ascii_case("auto") && ProviderId::parse(provider).is_none() {
+            eprintln!(
+                "unknown provider `{provider}`. Use auto, opencli, twitter, mock, or official. Example: x --provider mock timeline"
+            );
+            return 2;
+        }
         io.config.provider = if provider.eq_ignore_ascii_case("auto") {
             None
         } else {
@@ -278,6 +289,7 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
             println!("{}", example_config());
             0
         }
+        Some(Cmd::Connect { check }) => connect(check, io),
         Some(Cmd::Auth) => {
             if !io.config.official_enabled {
                 eprintln!(
@@ -313,6 +325,10 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
+        Cmd::Lookup { handle } if handle.trim().is_empty() => {
+            eprintln!("give a username. Example: x lookup yourname");
+            2
+        }
         Cmd::Lookup { handle } => emit(
             json,
             service
@@ -530,8 +546,129 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             dry_run,
             reply_to,
         } => publish_draft(&draft_id, dry_run, reply_to, json, io, interactive),
-        Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth => 0,
+        Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth | Cmd::Connect { .. } => 0,
     }
+}
+
+pub fn parse_whoami(text: &str) -> Result<String, String> {
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
+        "the account check returned unreadable output. Run `x doctor` and try again.".to_string()
+    })?;
+    if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        let msg = value
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("not logged in");
+        return Err(format!(
+            "not connected: {msg}. Open X in Chrome, log in as yourself, then run `x connect --check` again."
+        ));
+    }
+    let node = value.get("data").unwrap_or(&value);
+    let node = node
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(node);
+    if node.get("logged_in").and_then(|v| v.as_bool()) == Some(false) {
+        return Err("not connected: X says you are logged out. Log in to X in Chrome as yourself, then run `x connect --check` again.".into());
+    }
+    for key in ["username", "screen_name", "handle"] {
+        if let Some(handle) = node.get(key).and_then(|v| v.as_str())
+            && !handle.trim().is_empty()
+        {
+            return Ok(handle.trim().trim_start_matches('@').to_string());
+        }
+    }
+    Err("not connected: could not find your username. Log in to X in Chrome as yourself, then run `x connect --check` again.".into())
+}
+
+fn connect(check: bool, io: &CliIo) -> i32 {
+    let bearer_set = io.config.bearer_token().is_some();
+    let oauth_set = crate::auth::load_access_token(&io.config).is_ok();
+    if !check {
+        println!("Connect YOUR X account — pick one way:");
+        println!();
+        println!("Easiest (no developer key):");
+        println!("  1. Install OpenCLI: npm install -g @jackwener/opencli@2.0.0");
+        println!("  2. Log in to x.com in Chrome as yourself.");
+        println!("  3. Run: x connect --check");
+        println!();
+        println!("Your own X developer token (optional, only if you have one):");
+        println!("  1. Create an app at developer.x.com (your account, your keys).");
+        println!("  2. Set it in your shell only — never paste it into a file or chat:");
+        println!(
+            "       export TERMY_X_BEARER_TOKEN=\"your token\"   # PowerShell: $env:TERMY_X_BEARER_TOKEN=\"your token\""
+        );
+        println!("  3. Run: x connect --check");
+        println!();
+        println!("Termy X never stores your token in the repo and never prints it.");
+        println!(
+            "Token set: {}",
+            if bearer_set || oauth_set { "yes" } else { "no" }
+        );
+        return 0;
+    }
+    // Path 1: OpenCLI uses your logged-in browser session.
+    if io.runner.exists(&io.config.opencli_bin) {
+        let args = crate::providers::opencli_read_pub(&["twitter".into(), "whoami".into()]);
+        if let Ok(output) = io.runner.run_timeout(
+            &io.config.opencli_bin,
+            &args,
+            std::time::Duration::from_secs(15),
+        ) && output.status == 0
+        {
+            match parse_whoami(&output.stdout) {
+                Ok(handle) => {
+                    println!(
+                        "Connected as @{handle} via OpenCLI (your logged-in browser session)."
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    return 1;
+                }
+            }
+        }
+        eprintln!(
+            "OpenCLI is installed but did not confirm your account. Log in to X in Chrome as yourself, then run `x connect --check` again."
+        );
+        return 1;
+    }
+    // Path 2: your own developer / OAuth token, checked with a read-only /users/me call.
+    if let Some(token) = io
+        .config
+        .bearer_token()
+        .or_else(|| crate::auth::load_access_token(&io.config).ok())
+    {
+        match io.http.request(crate::io::HttpRequest {
+            method: "GET",
+            url: "https://api.x.com/2/users/me".into(),
+            body: None,
+            bearer: Some(token),
+            content_type: None,
+        }) {
+            Ok(body) => {
+                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                if let Some(handle) = value.pointer("/data/username").and_then(|v| v.as_str()) {
+                    println!("Connected as @{handle} via your own X developer token.");
+                    return 0;
+                }
+                eprintln!(
+                    "your token answered, but X did not return your username. If this is an app-only bearer token, X cannot tell us who you are — use OpenCLI instead: x connect"
+                );
+                return 1;
+            }
+            Err(error) => {
+                // Never print the token; `error` comes from the HTTP layer and does not contain it.
+                eprintln!(
+                    "your X token did not work ({error}). Check TERMY_X_BEARER_TOKEN in your shell, or use OpenCLI instead: x connect"
+                );
+                return 1;
+            }
+        }
+    }
+    eprintln!("not connected yet. Run `x connect` for the 3 easy steps.");
+    1
 }
 
 fn publish_draft(
@@ -568,6 +705,10 @@ fn publish_text(
     io: &mut CliIo,
     interactive: bool,
 ) -> i32 {
+    if text.trim().is_empty() {
+        eprintln!("nothing to post: the text is empty. Example: x post --dry-run \"hello world\"");
+        return 2;
+    }
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     let mut publishers = service.publishers;
     publishers.push(Box::new(IntentPublisher {
@@ -799,7 +940,7 @@ fn edit_with_editor(initial: &str) -> Result<String, String> {
     let status = std::process::Command::new(&editor)
         .arg(&path)
         .status()
-        .map_err(|error| format!("failed to launch {editor}: {error}"))?;
+        .map_err(|error| format!("could not open an editor ({editor}: {error}). Use x compose --text \"your draft\" instead, or set EDITOR to an editor you have."))?;
     if !status.success() {
         return Err(format!("{editor} exited {status}"));
     }
@@ -857,6 +998,57 @@ mod tests {
             confirm: ConfirmDecision::Yes,
             editor_text: None,
         }
+    }
+
+    #[test]
+    fn dummy_mistakes_are_friendly_errors_not_crashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut io = test_io(dir.path());
+        // Bad provider must not silently fall back to mock.
+        assert_eq!(
+            execute(
+                &["--provider".into(), "bogus".into(), "timeline".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        // Empty post must not create an empty browser intent.
+        assert_eq!(
+            execute(
+                &["post".into(), "--dry-run".into(), "   ".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        assert_eq!(
+            execute(
+                &["post".into(), "--dry-run".into(), "".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        // Empty lookup.
+        assert_eq!(execute(&["lookup".into(), "".into()], &mut io, false), 2);
+        // Connect instructions are printable with no account set up.
+        assert_eq!(execute(&["connect".into()], &mut io, false), 0);
+    }
+
+    #[test]
+    fn whoami_parses_v1_and_v2_opencli_shapes() {
+        assert_eq!(
+            parse_whoami(r#"[{"logged_in":true,"username":"ada"}]"#).unwrap(),
+            "ada"
+        );
+        assert_eq!(
+            parse_whoami(r#"{"ok":true,"data":[{"logged_in":true,"username":"@ada"}]}"#).unwrap(),
+            "ada"
+        );
+        assert!(parse_whoami(r#"{"logged_in":false}"#).is_err());
+        assert!(parse_whoami(r#"{"ok":false,"error":{"message":"nope"}}"#).is_err());
+        assert!(parse_whoami("not json").is_err());
     }
 
     #[test]
