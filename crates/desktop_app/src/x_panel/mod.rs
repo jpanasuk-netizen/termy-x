@@ -98,6 +98,29 @@ enum UiFocus {
     ConfirmBrowser,
 }
 
+/// Which text field owns the keyboard: the big Compose box, the Search
+/// tab's query field, or an inline reply box under a tweet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputTarget {
+    Compose,
+    Search,
+    Reply,
+}
+
+/// The two simple end-caret text fields (Search query, inline reply).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TextField {
+    Search,
+    Reply,
+}
+
+/// Which post a pending image-picker result belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PickTarget {
+    Compose,
+    Reply,
+}
+
 #[derive(Clone, PartialEq)]
 enum ConnState {
     Checking,
@@ -169,6 +192,20 @@ pub struct XPanel {
     blink_running: bool,
     /// Dedup KeyDown + action Paste within the same chord.
     last_edit_chord_at: Option<Instant>,
+    /// Search tab: what the user typed, and the last query actually run
+    /// (empty = never searched yet, so the tab shows a prompt, not posts).
+    search_input: String,
+    searched_query: String,
+    /// Inline reply: the tweet expanded under the cursor, its draft, and
+    /// images attached to that reply (validated like Compose media).
+    reply_post_id: Option<String>,
+    reply_author: String,
+    reply_text: String,
+    reply_media: Vec<PathBuf>,
+    reply_posting: bool,
+    replied_ids: Vec<String>,
+    input_target: InputTarget,
+    pick_target: PickTarget,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -299,6 +336,16 @@ impl XPanel {
             ui_focus: UiFocus::Compose,
             blink_running: false,
             last_edit_chord_at: None,
+            search_input: String::new(),
+            searched_query: String::new(),
+            reply_post_id: None,
+            reply_author: String::new(),
+            reply_text: String::new(),
+            reply_media: Vec::new(),
+            reply_posting: false,
+            replied_ids: Vec::new(),
+            input_target: InputTarget::Compose,
+            pick_target: PickTarget::Compose,
         };
         if fill_window {
             // Preview path fills via load_scene / open_section.
@@ -358,10 +405,30 @@ impl XPanel {
             self.lookup = handle.clone();
         }
 
+        if section == XSection::Search {
+            // Real search is user-driven: focus the query field and wait.
+            // Never auto-run the stale default query behind their back.
+            self.loading = false;
+            self.input_target = InputTarget::Search;
+            self.pending_focus = true;
+            self.status = if self.searched_query.is_empty() {
+                "search \u{b7} type a query and press Enter \u{b7} runs silently in the background"
+                    .into()
+            } else {
+                format!(
+                    "search \u{b7} results for \u{201c}{}\u{201d} \u{b7} type a new query and press Enter",
+                    self.searched_query
+                )
+            };
+            log_switch(section, started, "search-input");
+            return;
+        }
+
         if section == XSection::Compose {
             // Never block: no AI / OpenCLI on the open path. Suggest is a button.
             self.loading = false;
             self.pending_focus = true;
+            self.input_target = InputTarget::Compose;
             self.focus_compose_editor();
             self.status =
                 "compose · click the box · caret blinks · Publish opens confirm instantly".into();
@@ -560,6 +627,14 @@ impl XPanel {
             self.status = "Not connected — press Connect my X above first.".into();
             return;
         }
+        if section == XSection::Search && self.searched_query.is_empty() {
+            // No query yet: the Search tab is a prompt, not a feed.
+            self.loading = false;
+            self.status =
+                "search \u{b7} type a query and press Enter \u{b7} runs silently in the background"
+                    .into();
+            return;
+        }
         if self.live && matches!(self.connection, ConnState::Checking) {
             // Run this tab as soon as we know who is connected.
             self.queued_section = Some(section);
@@ -659,7 +734,7 @@ impl XPanel {
         }
         self.checking_conn = true;
         self.connection = ConnState::Checking;
-        self.status = "Checking your X connection\u{2026}".into();
+        self.status = "Connecting\u{2026} checking your Chrome session silently in the background \u{b7} no Chrome window should pop \u{b7} up to 30s".into();
         cx.spawn(async move |this, cx| {
             let conn = cx
                 .background_executor()
@@ -756,8 +831,8 @@ impl XPanel {
         }
         match &self.connection {
             ConnState::Checking => card(
-                "Checking your X connection\u{2026}".into(),
-                "Looking for the X account you are already logged into in Chrome. One moment."
+                "Connecting\u{2026}".into(),
+                "Checking your Chrome session silently in the background \u{b7} no Chrome window should pop. Usually 10\u{2013}30 seconds."
                     .into(),
             ),
             ConnState::Connected { handle, via } => div()
@@ -1023,6 +1098,12 @@ impl XPanel {
         }
 
         if key == "escape" {
+            if self.reply_post_id.is_some() {
+                self.close_reply();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.confirm {
                 self.confirm = false;
                 self.focus_compose_editor();
@@ -1061,6 +1142,15 @@ impl XPanel {
             }
             // Confirm modal owns the keyboard; never leak into the terminal.
             cx.stop_propagation();
+            return;
+        }
+
+        if self.input_target == InputTarget::Search && self.section == XSection::Search {
+            self.on_text_input_key(event, TextField::Search, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
+            self.on_text_input_key(event, TextField::Reply, cx);
             return;
         }
 
@@ -1275,9 +1365,9 @@ impl XPanel {
                     .await;
                 let keep = this
                     .update(cx, |panel, cx| {
-                        if panel.compose_focused
-                            && !panel.confirm
-                            && panel.section == XSection::Compose
+                        if !panel.confirm
+                            && (panel.input_target != InputTarget::Compose
+                                || (panel.compose_focused && panel.section == XSection::Compose))
                         {
                             panel.blink_visible = !panel.blink_visible;
                             cx.notify();
@@ -1291,6 +1381,226 @@ impl XPanel {
                     break;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Shared keyboard handling for the Search query and inline reply
+    /// fields: plain text appends at the end, Backspace deletes, Ctrl+V
+    /// pastes. Enter runs a search; in a reply Enter adds a line and
+    /// Ctrl+Enter sends. Everything is swallowed so the terminal behind
+    /// the panel never sees these keys.
+    fn on_text_input_key(
+        &mut self,
+        event: &KeyDownEvent,
+        field: TextField,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if key == "enter" && (mods.control || mods.platform) {
+            if field == TextField::Reply {
+                self.submit_reply(cx);
+            } else {
+                self.run_search(cx);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "enter" && !mods.modified() {
+            match field {
+                TextField::Search => self.run_search(cx),
+                TextField::Reply => self.reply_text.push('\n'),
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let target = match field {
+            TextField::Search => &mut self.search_input,
+            TextField::Reply => &mut self.reply_text,
+        };
+        if key == "backspace" {
+            target.pop();
+        } else if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                target.push_str(clip.trim_end_matches(['\r', '\n']));
+            }
+        } else if !(mods.control || mods.alt || mods.platform || mods.function)
+            && let Some(ch) = event.keystroke.key_char.as_deref()
+        {
+            target.push_str(ch);
+        } else {
+            return;
+        }
+        self.blink_visible = true;
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    /// Run the typed query through the active provider (OpenCLI silent
+    /// background session). Empty query = a plain hint, never a fetch.
+    fn run_search(&mut self, cx: &mut Context<Self>) {
+        let query = self.search_input.trim().to_string();
+        if query.is_empty() {
+            self.notice = Some(
+                "Type something to search first — a word, #tag, or from:someone — then press Enter."
+                    .into(),
+            );
+            self.status = "search · nothing typed yet".into();
+            cx.notify();
+            return;
+        }
+        self.query = query.clone();
+        self.searched_query = query.clone();
+        self.search_posts.clear();
+        self.loading = true;
+        self.status = format!(
+            "Searching for \u{201c}{query}\u{201d}\u{2026} silently in the background \u{b7} no Chrome window will pop"
+        );
+        self.schedule_fetch(XSection::Search, cx);
+        cx.notify();
+    }
+
+    fn open_reply(&mut self, post: &Post) {
+        if self.reply_post_id.as_deref() != Some(post.id.as_str()) {
+            self.reply_text.clear();
+            self.reply_media.clear();
+        }
+        self.reply_post_id = Some(post.id.clone());
+        self.reply_author = post.author_handle.clone();
+        self.input_target = InputTarget::Reply;
+        self.pending_focus = true;
+        self.status = format!(
+            "reply to @{} \u{b7} type below, then Reply (or Ctrl+Enter)",
+            post.author_handle
+        );
+    }
+
+    fn close_reply(&mut self) {
+        self.reply_post_id = None;
+        self.reply_author.clear();
+        self.reply_text.clear();
+        self.reply_media.clear();
+        self.input_target = if self.section == XSection::Search {
+            InputTarget::Search
+        } else {
+            InputTarget::Compose
+        };
+        self.status = "reply closed \u{b7} nothing was posted".into();
+    }
+
+    /// Post the inline reply in-app via the active publisher, threaded to
+    /// the selected tweet (`twitter reply <url> <text>` on OpenCLI, all
+    /// `--window background`). Never opens Chrome. A real click on Reply
+    /// is the confirmation — the draft and target are shown in place.
+    fn submit_reply(&mut self, cx: &mut Context<Self>) {
+        if self.reply_posting {
+            self.notice = Some("Already sending that reply — wait for it.".into());
+            cx.notify();
+            return;
+        }
+        let Some(target_id) = self.reply_post_id.clone() else {
+            return;
+        };
+        let text = self.reply_text.trim().to_string();
+        if text.is_empty() {
+            self.notice = Some("Type a reply first.".into());
+            cx.notify();
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never posts a reply.".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = termy_x::publish::validate_media_paths(&self.reply_media) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        if self.reply_media.len() > 1 {
+            self.notice = Some(
+                "Replies can attach 1 image (OpenCLI limit) — remove the extra image first. Nothing was posted."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let media = self.reply_media.clone();
+        let author = self.reply_author.clone();
+        let target_id_for_update = target_id.clone();
+        self.reply_posting = true;
+        self.notice = Some(format!(
+            "Replying to @{author} in-app, silently in the background\u{2026} no browser will open."
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first, then try again."
+                                .to_string(),
+                        );
+                    };
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        Some(&target_id),
+                        termy_x::publish::ConfirmDecision::Yes,
+                        false,
+                        publisher,
+                        char_limit,
+                        &media,
+                    ) {
+                        termy_x::publish::GateOutcome::Sent { receipt, .. } => Ok(receipt),
+                        termy_x::publish::GateOutcome::Rejected { plan } => Err(plan
+                            .session
+                            .unwrap_or_else(|| "the reply was rejected".to_string())),
+                        termy_x::publish::GateOutcome::DryRun { .. } => {
+                            Err("unexpected dry-run".to_string())
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.reply_posting = false;
+                match result {
+                    Ok(_receipt) => {
+                        if !panel.replied_ids.contains(&target_id_for_update) {
+                            panel.replied_ids.push(target_id_for_update.clone());
+                        }
+                        panel.reply_post_id = None;
+                        panel.reply_text.clear();
+                        panel.reply_media.clear();
+                        panel.input_target = if panel.section == XSection::Search {
+                            InputTarget::Search
+                        } else {
+                            InputTarget::Compose
+                        };
+                        panel.notice = Some(format!(
+                            "Replied to @{author} \u{b7} posted in-app, no browser opened."
+                        ));
+                        panel.status = format!("replied to @{author}");
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Could not reply: {error} Nothing was posted; no browser opened."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -1462,7 +1772,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
                 }
             }
             XSection::Search => {
-                if let Ok(served) = service.search(&query, false, 10) {
+                if let Ok(served) = service.search(&query, false, 15) {
                     return FetchPayload::Search {
                         posts: served.value,
                         status: live_status(&served.status),
@@ -1508,7 +1818,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
-                .search(&query, false, 10)
+                .search(&query, false, 15)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
@@ -1969,27 +2279,38 @@ impl XPanel {
                     rows.push(hint("Refreshing timeline...".into()));
                 }
                 for post in &self.posts {
-                    rows.push(post_card(post));
+                    rows.push(self.tweet_card(post, cx));
                 }
             }
             XSection::Search => {
-                if self.search_posts.is_empty() {
-                    if self.loading {
-                        rows.push(empty_state(
-                            "Searching...",
-                            format!("Query: {}. Free session · no credits.", self.query),
-                        ));
-                    } else {
-                        rows.push(empty_state(
-                            "No matches yet",
-                            "Type a query and hit Search. Mock fixtures appear when the free path is offline.",
-                        ));
-                    }
+                rows.push(self.search_bar(cx));
+                if self.searched_query.is_empty() {
+                    rows.push(empty_state(
+                        "Search X for real",
+                        "Type a query above and press Enter (or Search). It runs through your own X session, silently in the background \u{b7} no Chrome window will pop.",
+                    ));
                 } else if self.loading {
-                    rows.push(hint("Refreshing search...".into()));
-                }
-                for post in &self.search_posts {
-                    rows.push(post_card(post));
+                    rows.push(hint(format!(
+                        "Searching for \u{201c}{}\u{201d}\u{2026}",
+                        self.searched_query
+                    )));
+                } else if self.search_posts.is_empty() {
+                    rows.push(empty_state(
+                        "No results",
+                        format!(
+                            "Nothing matched \u{201c}{}\u{201d}. Try a different word, a #tag, or from:someone.",
+                            self.searched_query
+                        ),
+                    ));
+                } else {
+                    rows.push(hint(format!(
+                        "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} click a tweet to reply in place",
+                        self.searched_query,
+                        self.search_posts.len()
+                    )));
+                    for post in &self.search_posts {
+                        rows.push(self.tweet_card(post, cx));
+                    }
                 }
             }
             XSection::Trends => {
@@ -2032,7 +2353,7 @@ impl XPanel {
                         ),
                     ));
                     for post in &profile.posts {
-                        rows.push(post_card(post));
+                        rows.push(self.tweet_card(post, cx));
                     }
                 } else if self.loading {
                     rows.push(empty_state(
@@ -2108,6 +2429,291 @@ impl XPanel {
             .into_any_element()
     }
 
+    /// One tweet in Timeline / Search / Trends. Clicking it expands an
+    /// inline reply box right underneath; a sent reply marks it Replied.
+    fn tweet_card(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let selected = self.reply_post_id.as_deref() == Some(post.id.as_str());
+        let replied = self.replied_ids.iter().any(|id| id == &post.id);
+        let post_for_click = post.clone();
+        let mut el = div()
+            .id(SharedString::from(format!("x-tweet-{}", post.id)))
+            .p(px(12.0))
+            .rounded(px(12.0))
+            .bg(if selected {
+                tint(0x1a1030, 240)
+            } else {
+                tint(0x0c1422, 225)
+            })
+            .border_1()
+            .border_color(if selected {
+                rgb(0xff4fa3)
+            } else {
+                tint(0x7af6ff, 40)
+            })
+            .cursor_pointer()
+            .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xd7fbff))
+                    .child(format!(
+                        "@{} \u{b7} {} likes{} \u{b7} click to reply",
+                        post.author_handle,
+                        post.likes,
+                        if replied {
+                            " \u{b7} \u{2713} Replied"
+                        } else {
+                            ""
+                        }
+                    )),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xe7eefc))
+                    .child(post.text.clone()),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    if this.reply_post_id.as_deref() == Some(post_for_click.id.as_str()) {
+                        // Second click on the open tweet just refocuses it.
+                        this.input_target = InputTarget::Reply;
+                        this.pending_focus = true;
+                    } else {
+                        this.open_reply(&post_for_click);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        if selected {
+            el = el.child(self.reply_box(post, cx));
+        }
+        el.into_any_element()
+    }
+
+    /// The inline reply editor shown under the selected tweet.
+    fn reply_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            .char_limit_or_fallback();
+        let count = weighted_len_limited(&self.reply_text, char_limit);
+        let focused = self.input_target == InputTarget::Reply;
+        let mut box_el = div()
+            .mt(px(8.0))
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .bg(tint(0x0f1c33, 245))
+            .border_1()
+            .border_color(if focused { rgb(0x7af6ff) } else { tint(0x7af6ff, 70) })
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child(format!("Reply to @{}", post.author_handle)),
+            )
+            .child(
+                div()
+                    .id("x-reply-editor")
+                    .min_h(px(44.0))
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(tint(0x0c1422, 235))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(if self.reply_text.is_empty() {
+                                rgb(0x93a4c3)
+                            } else {
+                                rgb(0xf8fbff)
+                            })
+                            .child(if self.reply_text.is_empty() {
+                                "Write your reply\u{2026} (Ctrl+Enter sends)".to_string()
+                            } else if focused && self.blink_visible {
+                                format!("{}\u{258f}", self.reply_text)
+                            } else {
+                                self.reply_text.clone()
+                            }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.input_target = InputTarget::Reply;
+                            this.pending_focus = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(if count.weighted > count.limit {
+                        rgb(0xff5d8f)
+                    } else {
+                        rgb(0x9ad7ff)
+                    })
+                    .child(format!(
+                        "{} / {} characters \u{b7} Ctrl+Enter or the Reply button sends \u{b7} replies attach 1 image",
+                        count.weighted, count.limit
+                    )),
+            );
+        if !self.reply_media.is_empty() {
+            for (index, path) in self.reply_media.iter().enumerate() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                let thumb_source: ImageSource = path.clone().into();
+                box_el = box_el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            img(thumb_source)
+                                .w(px(40.0))
+                                .h(px(40.0))
+                                .object_fit(ObjectFit::Cover)
+                                .rounded_md(),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7af6ff))
+                                .child(name),
+                        )
+                        .child(x_button!(
+                            format!("x-reply-media-remove-{index}"),
+                            "\u{2715} Remove",
+                            cx.listener(move |this, _, _, cx| {
+                                this.remove_reply_media(index, cx);
+                                cx.stop_propagation();
+                            })
+                        )),
+                );
+            }
+        }
+        box_el = box_el.child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .flex_wrap()
+                .child(x_button!(
+                    "x-reply-attach",
+                    "Attach image",
+                    cx.listener(|this, _, _, cx| {
+                        this.pick_target = PickTarget::Reply;
+                        this.attach_images(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-reply-send",
+                    if self.reply_posting {
+                        "Replying\u{2026}"
+                    } else {
+                        "Reply"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.submit_reply(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-reply-cancel",
+                    "Cancel",
+                    cx.listener(|this, _, _, cx| {
+                        this.close_reply();
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                )),
+        );
+        box_el.into_any_element()
+    }
+
+    /// Search tab header: the query field + Run button. Focused when the
+    /// tab opens; Enter runs the same path as the button.
+    fn search_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let focused = self.input_target == InputTarget::Search && self.section == XSection::Search;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child("Search X \u{b7} silent background \u{b7} up to 15 results (OpenCLI has no next-page button here)"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .items_center()
+                    .child(
+                        div()
+                            .id("x-search-input")
+                            .flex_1()
+                            .p(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(if focused {
+                                tint(0x0f1c33, 245)
+                            } else {
+                                tint(0x0c1422, 235)
+                            })
+                            .border_1()
+                            .border_color(if focused {
+                                rgb(0x7af6ff)
+                            } else {
+                                tint(0x7af6ff, 70)
+                            })
+                            .cursor_pointer()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(if self.search_input.is_empty() {
+                                        rgb(0x93a4c3)
+                                    } else {
+                                        rgb(0xf8fbff)
+                                    })
+                                    .child(if self.search_input.is_empty() {
+                                        "Type a query \u{2014} a word, #tag, or from:someone".to_string()
+                                    } else if focused && self.blink_visible {
+                                        format!("{}\u{258f}", self.search_input)
+                                    } else {
+                                        self.search_input.clone()
+                                    }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    this.input_target = InputTarget::Search;
+                                    this.pending_focus = true;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(x_button!(
+                        "x-search-run",
+                        if self.loading { "Searching\u{2026}" } else { "Search" },
+                        cx.listener(|this, _, _, cx| {
+                            this.run_search(cx);
+                            cx.stop_propagation();
+                        })
+                    )),
+            )
+            .into_any_element()
+    }
+
     fn attach_images(&mut self, cx: &mut Context<Self>) {
         // CRITICAL: never run the native file dialog synchronously inside a
         // GPUI mouse/key handler. On Windows the modal dialog pumps window
@@ -2121,8 +2727,12 @@ impl XPanel {
             cx.notify();
             return;
         }
-        if self.media.len() >= 4 {
-            self.notice = Some("Max 4 images per post — remove one first.".into());
+        let attached = match self.pick_target {
+            PickTarget::Compose => self.media.len(),
+            PickTarget::Reply => self.reply_media.len(),
+        };
+        if attached >= 4 {
+            self.notice = Some("Max 4 images — remove one first.".into());
             cx.notify();
             return;
         }
@@ -2155,14 +2765,18 @@ impl XPanel {
             self.notice = Some("No image picked.".into());
             return;
         }
+        let target = match self.pick_target {
+            PickTarget::Compose => &mut self.media,
+            PickTarget::Reply => &mut self.reply_media,
+        };
         let mut added = 0usize;
         let mut rejected: Vec<String> = Vec::new();
         for path in paths {
-            if self.media.len() >= 4 {
+            if target.len() >= 4 {
                 rejected.push("max 4 images".into());
                 break;
             }
-            if self.media.contains(&path) {
+            if target.contains(&path) {
                 rejected.push(format!(
                     "{} (already attached)",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("image")
@@ -2171,16 +2785,16 @@ impl XPanel {
             }
             match termy_x::publish::validate_media_path(&path) {
                 Ok(()) => {
-                    self.media.push(path);
+                    target.push(path);
                     added += 1;
                 }
                 Err(error) => rejected.push(error),
             }
         }
+        let total = target.len();
         self.notice = Some(if rejected.is_empty() {
             format!(
-                "Attached {added} image(s) — {} on this post. They show below; tap ✕ to remove one.",
-                self.media.len()
+                "Attached {added} image(s) \u{2014} {total} attached. They show below; tap \u{2715} to remove one."
             )
         } else {
             format!(
@@ -2201,6 +2815,14 @@ impl XPanel {
                     .unwrap_or("image"),
                 self.media.len()
             ));
+        }
+        cx.notify();
+    }
+
+    fn remove_reply_media(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.reply_media.len() {
+            self.reply_media.remove(index);
+            self.notice = Some(format!("{} reply image(s) left.", self.reply_media.len()));
         }
         cx.notify();
     }
@@ -2247,6 +2869,7 @@ impl XPanel {
                         .gap(px(8.0))
                         .flex_wrap()
                         .child(x_button!("x-attach", "Attach image", attach_active, cx.listener(|this, _, _, cx| {
+                            this.pick_target = PickTarget::Compose;
                             this.attach_images(cx);
                         })))
                         .child(x_button!("x-media-clear", "Clear images", false, cx.listener(|this, _, _, cx| {
