@@ -419,10 +419,7 @@ mod tests {
             std::slice::from_ref(&img),
         );
         assert!(matches!(sent, GateOutcome::Sent { .. }));
-        assert_eq!(
-            media_calls.lock().expect("m").clone(),
-            vec![vec![img]]
-        );
+        assert_eq!(media_calls.lock().expect("m").clone(), vec![vec![img]]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

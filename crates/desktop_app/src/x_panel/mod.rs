@@ -113,6 +113,8 @@ pub struct XPanel {
     media: Vec<PathBuf>,
     /// True while an in-app post is running in the background (prevents double-post).
     posting: bool,
+    /// True while the native image picker is open on a background thread.
+    picking: bool,
     /// Per-section single-flight guard: one OpenCLI/browser-session call at a time,
     /// so rapid clicks cannot spawn a storm of Chrome/OpenCLI processes.
     fetching: [bool; 5],
@@ -237,6 +239,7 @@ impl XPanel {
             lookup: "termy".into(),
             media: Vec::new(),
             posting: false,
+            picking: false,
             fetching: [false; 5],
             last_browser_open: None,
             compose: if fill_window {
@@ -1775,21 +1778,50 @@ impl XPanel {
     }
 
     fn attach_images(&mut self, cx: &mut Context<Self>) {
-        let remaining = 4usize.saturating_sub(self.media.len());
-        if remaining == 0 {
+        // CRITICAL: never run the native file dialog synchronously inside a
+        // GPUI mouse/key handler. On Windows the modal dialog pumps window
+        // messages while GPUI's RefCell is still borrowed, which panicked
+        // with "RefCell already borrowed" and killed the whole app
+        // (crash.log 2026-10-18). The dialog runs on a background thread;
+        // the GPUI update that consumes its result happens afterwards,
+        // outside any handler borrow.
+        if self.picking {
+            self.notice = Some("Image picker is already open.".into());
+            cx.notify();
+            return;
+        }
+        if self.media.len() >= 4 {
             self.notice = Some("Max 4 images per post — remove one first.".into());
             cx.notify();
             return;
         }
-        let paths = rfd::FileDialog::new()
-            .set_title("Attach images to Termy X")
-            .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp"])
-            .pick_files()
-            .unwrap_or_default();
+        self.picking = true;
+        self.notice = Some("Pick images… (JPG/PNG/GIF/WEBP, max 4)".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let paths = cx
+                .background_executor()
+                .spawn(async move {
+                    rfd::FileDialog::new()
+                        .set_title("Attach images to Termy X")
+                        .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp"])
+                        .pick_files()
+                        .unwrap_or_default()
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.picking = false;
+                panel.add_picked_images(paths);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_picked_images(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             // Cancelled picker: say so instead of claiming an attach happened.
             self.notice = Some("No image picked.".into());
-            cx.notify();
             return;
         }
         let mut added = 0usize;
@@ -1825,7 +1857,6 @@ impl XPanel {
                 rejected.join("; ")
             )
         });
-        cx.notify();
     }
 
     fn remove_media(&mut self, index: usize, cx: &mut Context<Self>) {
