@@ -107,6 +107,34 @@ enum InputTarget {
     Reply,
 }
 
+/// Pure predicate behind `XPanel::owns_edit_keys`: does a panel text
+/// field own Ctrl+V/C/A right now? Kept free-standing so the routing
+/// matrix is unit-testable without a GPUI context.
+#[allow(clippy::too_many_arguments)]
+fn edit_keys_owned(
+    confirm: bool,
+    bearer_mode: bool,
+    input_target: InputTarget,
+    section: XSection,
+    reply_open: bool,
+    compose_focused: bool,
+    ui_focus_is_compose: bool,
+) -> bool {
+    if confirm {
+        return false;
+    }
+    if bearer_mode {
+        return true;
+    }
+    match input_target {
+        InputTarget::Compose => {
+            section == XSection::Compose && compose_focused && ui_focus_is_compose
+        }
+        InputTarget::Search => section == XSection::Search,
+        InputTarget::Reply => reply_open,
+    }
+}
+
 /// The two simple end-caret text fields (Search query, inline reply).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextField {
@@ -1320,6 +1348,75 @@ impl XPanel {
             && self.ui_focus == UiFocus::Compose
     }
 
+    /// True when ANY panel text field owns edit chords: Compose, the
+    /// Search query, an open inline reply, or the bearer-key entry.
+    /// GPUI dispatches Ctrl+V/C/A as TerminalView Paste/Copy/SelectAll
+    /// actions *instead of* this panel's `on_key_down`, and Compose only
+    /// worked because `owns_compose_keys` intercepted them. The reply and
+    /// Search fields were not covered, so pasting a reply silently went
+    /// into the terminal shell behind the panel (verified in the real
+    /// GUI: clipboard text landed at the shell prompt, reply unchanged).
+    /// TerminalView must route those actions here whenever this is true.
+    pub fn owns_edit_keys(&self) -> bool {
+        edit_keys_owned(
+            self.confirm,
+            self.bearer_mode,
+            self.input_target,
+            self.section,
+            self.reply_post_id.is_some(),
+            self.compose_focused,
+            self.ui_focus == UiFocus::Compose,
+        )
+    }
+
+    /// Paste clipboard text into whichever panel field is active.
+    /// Mirrors the Compose path (chord dedup included) so the KeyDown
+    /// handler and the TerminalView action cannot insert twice.
+    pub fn paste_active_text(&mut self, text: &str) {
+        if self.chord_already_applied() {
+            return;
+        }
+        let clean = text.trim_end_matches(['\r', '\n']);
+        if self.bearer_mode {
+            self.bearer_input.push_str(clean.trim());
+        } else {
+            match self.input_target {
+                InputTarget::Compose => {
+                    self.focus_compose_editor();
+                    self.insert_text(clean);
+                }
+                InputTarget::Search => self.search_input.push_str(clean),
+                InputTarget::Reply => self.reply_text.push_str(clean),
+            }
+        }
+        self.blink_visible = true;
+        self.mark_edit_chord();
+    }
+
+    /// Text a Copy action should take, if the active field has a
+    /// selection. Search/reply fields are end-caret only (no selection),
+    /// so they return None; the action is still swallowed by the caller
+    /// so the terminal selection is never copied over the clipboard.
+    pub fn active_copy_text(&self) -> Option<String> {
+        if self.input_target == InputTarget::Compose {
+            self.compose_selection_text()
+        } else {
+            None
+        }
+    }
+
+    /// SelectAll for the active field. Search/reply fields have no
+    /// selection model, so this just marks the chord (the caller swallows
+    /// the action, keeping it out of the terminal).
+    pub fn select_all_active(&mut self) {
+        if self.input_target == InputTarget::Compose && !self.bearer_mode {
+            self.select_all_compose();
+        } else if !self.chord_already_applied() {
+            self.mark_edit_chord();
+        }
+        self.blink_visible = true;
+    }
+
     pub fn focus_compose_editor_public(&mut self) {
         self.focus_compose_editor();
     }
@@ -1420,17 +1517,29 @@ impl XPanel {
             cx.notify();
             return;
         }
+        // Read chord/clipboard state before borrowing the target string.
+        let is_paste = (mods.control || mods.platform) && key.eq_ignore_ascii_case("v");
+        let already_applied = is_paste && self.chord_already_applied();
+        let clip_text = if is_paste && !already_applied {
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .map(|clip| clip.trim_end_matches(['\r', '\n']).to_string())
+        } else {
+            None
+        };
+        let mut pasted = false;
         let target = match field {
             TextField::Search => &mut self.search_input,
             TextField::Reply => &mut self.reply_text,
         };
         if key == "backspace" {
             target.pop();
-        } else if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
-            if let Some(item) = cx.read_from_clipboard()
-                && let Some(clip) = item.text()
-            {
-                target.push_str(clip.trim_end_matches(['\r', '\n']));
+        } else if is_paste {
+            // If TerminalView's Paste action already inserted this chord
+            // (it routes here via `paste_active_text`), do not insert twice.
+            if let Some(text) = &clip_text {
+                target.push_str(text);
+                pasted = true;
             }
         } else if !(mods.control || mods.alt || mods.platform || mods.function)
             && let Some(ch) = event.keystroke.key_char.as_deref()
@@ -1438,6 +1547,9 @@ impl XPanel {
             target.push_str(ch);
         } else {
             return;
+        }
+        if pasted {
+            self.mark_edit_chord();
         }
         self.blink_visible = true;
         cx.stop_propagation();
@@ -2516,6 +2628,18 @@ impl XPanel {
             .flex()
             .flex_col()
             .gap(px(6.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    // Clicking anywhere in the reply box (label, padding,
+                    // count line) focuses the editor, not just the small
+                    // text field itself. Buttons/editors inside stop
+                    // propagation first, so their own handlers still win.
+                    this.input_target = InputTarget::Reply;
+                    this.pending_focus = true;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
                     .text_size(px(11.0))
@@ -3639,4 +3763,92 @@ fn empty_state(title: &str, detail: impl Into<String>) -> gpui_kit::AnyElement {
 
 fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
     rgba((color << 8) | u32::from(alpha))
+}
+
+#[cfg(test)]
+mod edit_keys_tests {
+    use super::{InputTarget, XSection, edit_keys_owned};
+
+    #[test]
+    fn reply_and_search_own_paste_but_terminal_states_do_not() {
+        // Inline reply open (any non-Search section): owns edit chords.
+        assert!(edit_keys_owned(
+            false,
+            false,
+            InputTarget::Reply,
+            XSection::Timeline,
+            true,
+            false,
+            false
+        ));
+        // Search field on the Search tab: owns edit chords.
+        assert!(edit_keys_owned(
+            false,
+            false,
+            InputTarget::Search,
+            XSection::Search,
+            false,
+            false,
+            false
+        ));
+        // Reply target with no reply open: must NOT steal terminal paste.
+        assert!(!edit_keys_owned(
+            false,
+            false,
+            InputTarget::Reply,
+            XSection::Timeline,
+            false,
+            false,
+            false
+        ));
+        // Search target off the Search tab: must NOT steal terminal paste.
+        assert!(!edit_keys_owned(
+            false,
+            false,
+            InputTarget::Search,
+            XSection::Timeline,
+            false,
+            false,
+            false
+        ));
+        // Confirm modal owns the keyboard itself; edit actions stay out.
+        assert!(!edit_keys_owned(
+            true,
+            false,
+            InputTarget::Reply,
+            XSection::Timeline,
+            true,
+            false,
+            false
+        ));
+        // Compose keeps its original, stricter gate.
+        assert!(edit_keys_owned(
+            false,
+            false,
+            InputTarget::Compose,
+            XSection::Compose,
+            false,
+            true,
+            true
+        ));
+        assert!(!edit_keys_owned(
+            false,
+            false,
+            InputTarget::Compose,
+            XSection::Compose,
+            false,
+            false,
+            true
+        ));
+        // Bearer-key entry is a text field too.
+        assert!(edit_keys_owned(
+            false,
+            true,
+            InputTarget::Compose,
+            XSection::Timeline,
+            false,
+            false,
+            false
+        ));
+    }
 }
