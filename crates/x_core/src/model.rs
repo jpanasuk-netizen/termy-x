@@ -119,6 +119,22 @@ pub struct Served<T> {
     pub status: StatusLine,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MediaKind {
+    Photo,
+    Video,
+    Gif,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaItem {
+    pub kind: MediaKind,
+    /// Direct media URL (photo image, or mp4 for video/GIF).
+    pub url: String,
+    /// Thumbnail/preview image URL; for photos this equals `url`.
+    pub poster: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Post {
     pub id: String,
@@ -132,6 +148,9 @@ pub struct Post {
     pub replies: u64,
     pub bookmarks: u64,
     pub views: u64,
+    /// Attached photos/videos/GIFs (empty for text-only posts).
+    #[serde(default)]
+    pub media: Vec<MediaItem>,
 }
 
 impl Post {

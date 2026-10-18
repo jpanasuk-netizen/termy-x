@@ -238,17 +238,6 @@ fn normalized_startup_window_size(startup_config: &config::AppConfig) -> gpui_ki
     )
 }
 
-#[cfg(target_os = "windows")]
-fn should_apply_windows_startup_resize(
-    current: gpui_kit::Size<Pixels>,
-    desired: gpui_kit::Size<Pixels>,
-) -> bool {
-    const WINDOW_SIZE_EPSILON: f32 = 0.5;
-
-    (f32::from(current.width) - f32::from(desired.width)).abs() > WINDOW_SIZE_EPSILON
-        || (f32::from(current.height) - f32::from(desired.height)).abs() > WINDOW_SIZE_EPSILON
-}
-
 fn open_main_window(
     cx: &mut App,
     startup_config: config::AppConfig,
@@ -341,18 +330,10 @@ pub(crate) fn open_terminal_window(
                     window.activate_window();
                 }
             }
-            #[cfg(target_os = "windows")]
-            {
-                let startup_window_size = startup_window_size;
-                window.defer(cx, move |window, _cx| {
-                    if should_apply_windows_startup_resize(
-                        window.viewport_size(),
-                        startup_window_size,
-                    ) {
-                        window.resize(startup_window_size);
-                    }
-                });
-            }
+            // Never resize the window after it opens. The initial
+            // Windowed bounds (config size) are the only geometry we set;
+            // a post-open resize yanked the user's window around on
+            // every launch (Jeremy: "stop resizing it, leave it alone").
 
             let view = cx.new({
                 let startup_config = startup_config;
@@ -785,7 +766,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     use super::{
         LEGACY_DEFAULT_WINDOW_HEIGHT, LEGACY_DEFAULT_WINDOW_WIDTH, WINDOWS_DEFAULT_WINDOW_HEIGHT,
-        WINDOWS_DEFAULT_WINDOW_WIDTH, should_apply_windows_startup_resize,
+        WINDOWS_DEFAULT_WINDOW_WIDTH,
     };
     use crate::app_actions;
     use crate::config::AppConfig;
@@ -1169,23 +1150,6 @@ mod tests {
                 px(WINDOWS_DEFAULT_WINDOW_HEIGHT)
             )
         );
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_startup_resize_correction_skips_matching_sizes() {
-        let target = size(px(1280.0), px(820.0));
-
-        assert!(!should_apply_windows_startup_resize(target, target));
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn windows_startup_resize_correction_detects_size_mismatch() {
-        let current = size(px(900.0), px(700.0));
-        let target = size(px(1280.0), px(820.0));
-
-        assert!(should_apply_windows_startup_resize(current, target));
     }
 
     #[gpui_kit::test]

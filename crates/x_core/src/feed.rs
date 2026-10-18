@@ -466,6 +466,7 @@ mod tests {
             replies: 0,
             bookmarks: 0,
             views: 0,
+            media: Vec::new(),
         }
     }
 

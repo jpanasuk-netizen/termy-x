@@ -398,6 +398,7 @@ fn post(
         replies,
         bookmarks,
         views: likes.saturating_mul(20),
+        media: Vec::new(),
     }
 }
 
@@ -1475,7 +1476,92 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         views: number(metrics, &["impression_count", "views", "view_count"]),
         text,
         id,
+        media: media_from_value(item),
     })
+}
+
+/// Media from provider payloads. Verified live against OpenCLI
+/// `twitter timeline -f json` (2026-10-18): rows carry `media_urls`
+/// (photo JPGs on pbs.twimg.com, mp4s on video.twimg.com) with parallel
+/// `media_posters` thumbnails. Also accepts official-API style
+/// `includes.media` / `attachments` and simple `media`/`images` arrays.
+fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
+    use crate::model::{MediaItem, MediaKind};
+    let kind_of = |url: &str| -> MediaKind {
+        let lower = url.to_ascii_lowercase();
+        if lower.contains("/tweet_video/") || lower.ends_with(".gif") {
+            MediaKind::Gif
+        } else if lower.contains("video.twimg.com")
+            || lower.contains(".mp4")
+            || lower.contains(".m3u8")
+        {
+            MediaKind::Video
+        } else {
+            MediaKind::Photo
+        }
+    };
+    let mut out: Vec<MediaItem> = Vec::new();
+    if let Some(urls) = item.get("media_urls").and_then(Value::as_array) {
+        let posters = item.get("media_posters").and_then(Value::as_array);
+        for (i, url) in urls.iter().filter_map(Value::as_str).enumerate() {
+            if url.is_empty() { continue; }
+            let kind = kind_of(url);
+            let poster = posters
+                .and_then(|p| p.get(i))
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string)
+                .or_else(|| (kind == MediaKind::Photo).then(|| url.to_string()));
+            out.push(MediaItem { kind, url: url.to_string(), poster });
+        }
+        return out;
+    }
+    if let Some(list) = item.get("media").and_then(Value::as_array)
+        .or_else(|| item.get("images").and_then(Value::as_array))
+    {
+        for entry in list {
+            let (url, poster) = match entry {
+                Value::String(u) => (u.clone(), None),
+                Value::Object(_) => (
+                    first_str(entry, &["url", "media_url", "media_url_https", "preview_image_url"]).unwrap_or("").to_string(),
+                    first_str(entry, &["preview_image_url", "poster", "thumbnail"]).map(str::to_string),
+                ),
+                _ => (String::new(), None),
+            };
+            if url.is_empty() { continue; }
+            let kind = match first_str(entry, &["type", "kind"]) {
+                Some("video") | Some("animated_gif") => if first_str(entry, &["type"]) == Some("animated_gif") { MediaKind::Gif } else { MediaKind::Video },
+                _ => kind_of(&url),
+            };
+            let poster = poster.or_else(|| (kind == MediaKind::Photo).then(|| url.clone()));
+            out.push(MediaItem { kind, url, poster });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod media_parse_tests {
+    use super::*;
+    use crate::model::MediaKind;
+
+    #[test]
+    fn opencli_media_urls_and_posters_parse_photo_and_video() {
+        // Exact field names from a live `opencli twitter timeline -f json`
+        // row (2026-10-18): video mp4 + poster, and a photo row.
+        let json = r#"[
+          {"id":"1","author":"a","text":"vid https://t.co/x","likes":1,"media_urls":["https://video.twimg.com/amplify_video/9/vid/avc1/320x568/a.mp4?tag=29"],"media_posters":["https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg"],"has_media":true},
+          {"id":"2","author":"b","text":"pic https://t.co/y","likes":2,"media_urls":["https://pbs.twimg.com/media/ABC.jpg"],"media_posters":[],"has_media":true},
+          {"id":"3","author":"c","text":"plain","likes":3}
+        ]"#;
+        let posts = parse_posts(json).unwrap();
+        assert_eq!(posts[0].media.len(), 1);
+        assert_eq!(posts[0].media[0].kind, MediaKind::Video);
+        assert_eq!(posts[0].media[0].poster.as_deref(), Some("https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg"));
+        assert_eq!(posts[1].media[0].kind, MediaKind::Photo);
+        assert_eq!(posts[1].media[0].poster.as_deref(), Some("https://pbs.twimg.com/media/ABC.jpg"));
+        assert!(posts[2].media.is_empty());
+    }
 }
 
 fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {

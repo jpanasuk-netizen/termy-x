@@ -7,9 +7,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+
 use gpui_kit::{
     Context, FocusHandle, Image, ImageSource, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, SharedString,
+    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString,
     StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px, rgb, rgba,
 };
 
@@ -46,7 +48,7 @@ macro_rules! x_button {
 }
 use termy_x::XConfig;
 use termy_x::drafts::new_id;
-use termy_x::model::{Draft, Post, Profile, ResearchHit, Tone, Trend};
+use termy_x::model::{Draft, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{MockProvider, XProvider};
 use termy_x::text::{split_thread_limited, weighted_len_limited};
 
@@ -156,8 +158,24 @@ enum ConnState {
     NotConnected { reason: String, next: String },
 }
 
+/// Remote tweet-media thumbnail state. Downloads/decode happen on the
+/// background executor (prefetch at fetch-apply time); render only reads
+/// this cache, so scrolling/typing never blocks on the network or decode.
+enum MediaState {
+    Loading,
+    Ready(Arc<RenderImage>),
+    Failed,
+}
+
 pub struct XPanel {
     focus: FocusHandle,
+    /// Char limit resolved once at startup. Loading x.toml from disk on
+    /// every render (and again per reply box) was pure waste on the hot path.
+    char_limit: usize,
+    media_cache: HashMap<String, MediaState>,
+    reply_opened_at: Option<Instant>,
+    reply_key_logged: bool,
+    last_render_log: Option<Instant>,
     section: XSection,
     posts: Vec<Post>,
     search_posts: Vec<Post>,
@@ -309,8 +327,14 @@ impl XPanel {
         } else {
             termy_x::connect::load_connected_handle(&config)
         };
+        let char_limit = config.char_limit_or_fallback();
         let mut panel = Self {
             focus: cx.focus_handle(),
+            char_limit,
+            media_cache: HashMap::new(),
+            reply_opened_at: None,
+            reply_key_logged: false,
+            last_render_log: None,
             section: XSection::Timeline,
             posts: Vec::new(),
             search_posts: Vec::new(),
@@ -699,6 +723,7 @@ impl XPanel {
                 }
                 panel.loading = false;
                 panel.apply_fetch(section, payload);
+                panel.prefetch_media(cx);
                 if let Some(next) = panel.queued_section.take()
                     && next != section
                 {
@@ -1465,9 +1490,13 @@ impl XPanel {
                     .await;
                 let keep = this
                     .update(cx, |panel, cx| {
+                        // Only Compose's caret blinks via re-render. Reply /
+                        // Search show a steady caret: a 530ms full-list
+                        // re-render while typing was the reply lag/jitter.
                         if !panel.confirm
-                            && (panel.input_target != InputTarget::Compose
-                                || (panel.compose_focused && panel.section == XSection::Compose))
+                            && panel.input_target == InputTarget::Compose
+                            && panel.compose_focused
+                            && panel.section == XSection::Compose
                         {
                             panel.blink_visible = !panel.blink_visible;
                             cx.notify();
@@ -1551,6 +1580,15 @@ impl XPanel {
         if pasted {
             self.mark_edit_chord();
         }
+        if field == TextField::Reply && !self.reply_key_logged {
+            self.reply_key_logged = true;
+            if let Some(opened) = self.reply_opened_at {
+                perf_log(&format!(
+                    "reply first-key after {}ms",
+                    opened.elapsed().as_millis()
+                ));
+            }
+        }
         self.blink_visible = true;
         cx.stop_propagation();
         cx.notify();
@@ -1589,6 +1627,9 @@ impl XPanel {
         self.reply_author = post.author_handle.clone();
         self.input_target = InputTarget::Reply;
         self.pending_focus = true;
+        self.reply_opened_at = Some(Instant::now());
+        self.reply_key_logged = false;
+        perf_log(&format!("open_reply id={} (local only, no fetch)", post.id));
         self.status = format!(
             "reply to @{} \u{b7} type below, then Reply (or Ctrl+Enter)",
             post.author_handle
@@ -1978,10 +2019,20 @@ impl Render for XPanel {
             self.focus.focus(window, cx);
             self.pending_focus = false;
         }
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-            .char_limit_or_fallback();
-        let count = weighted_len_limited(&self.compose, char_limit);
-        let parts = split_thread_limited(&self.compose, char_limit);
+        let render_started = Instant::now();
+        let char_limit = self.char_limit;
+        // Off the Compose tab the thread math is never displayed; skip it
+        // so Timeline/Search keystrokes and blink frames stay cheap.
+        let (count, parts) = if self.section == XSection::Compose || self.confirm || self.fill_window {
+            let count = weighted_len_limited(&self.compose, char_limit);
+            let parts = split_thread_limited(&self.compose, char_limit);
+            (count, parts)
+        } else {
+            (
+                weighted_len_limited("", char_limit),
+                Vec::new(),
+            )
+        };
         let columns = self.column_count(window);
         let art_opacity = self.bird_opacity();
         let dialog_width = if self.fill_window { 600.0 } else { 432.0 };
@@ -2009,7 +2060,7 @@ impl Render for XPanel {
             root = root.w(px(480.0)).flex_none();
         }
 
-        root.child(self.backdrop(art_opacity))
+        let root = root.child(self.backdrop(art_opacity))
             .child(
                 div()
                     .relative()
@@ -2039,7 +2090,50 @@ impl Render for XPanel {
             )
             .children(self.confirm.then(|| {
                 self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)
-            }))
+            }));
+        let elapsed = render_started.elapsed();
+        if elapsed.as_millis() > 12
+            && self.last_render_log.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+        {
+            self.last_render_log = Some(Instant::now());
+            perf_log(&format!("render slow {}ms section={:?}", elapsed.as_millis(), self.section));
+        }
+        root
+    }
+}
+
+/// Download + decode one remote image on a background thread (5 MB cap).
+/// Local copy of the release-notes loader: x_panel lives in the lib crate,
+/// which cannot reach the binary crate's `ui` module.
+fn fetch_image_rgba(url: &str) -> Result<image::RgbaImage, String> {
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("only http(s) images".into());
+    }
+    use std::io::Read;
+    let response = ureq::get(url)
+        .set("User-Agent", "TermyX/1.0")
+        .call()
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take(5_000_001)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    if bytes.len() > 5_000_000 {
+        return Err("image too large".into());
+    }
+    image::load_from_memory(&bytes)
+        .map(|d| d.to_rgba8())
+        .map_err(|e| e.to_string())
+}
+
+/// Append one line to %TEMP%/termy-x-perf.txt (slow renders + reply timing).
+fn perf_log(line: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("termy-x-perf.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
     }
 }
 
@@ -2248,7 +2342,7 @@ impl XPanel {
             .gap(px(12.0))
             .overflow_hidden();
         row = row.child(self.compose_column(weighted, limit, parts, cx));
-        row = row.child(self.results_column(columns == 2));
+        row = row.child(self.results_column(columns == 2, cx));
         if columns >= 3 {
             row = row.child(self.trends_column());
         }
@@ -2292,7 +2386,7 @@ impl XPanel {
         )
     }
 
-    fn results_column(&self, include_side: bool) -> gpui_kit::AnyElement {
+    fn results_column(&self, include_side: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let mut rows = Vec::new();
         rows.push(hint(format!("Search Â· {}", self.query)));
         let search = if self.search_posts.is_empty() {
@@ -2301,11 +2395,11 @@ impl XPanel {
             &self.search_posts
         };
         for post in search.iter().take(3) {
-            rows.push(post_card(post));
+            rows.push(self.tweet_card(post, cx));
         }
         rows.push(hint("Timeline".into()));
         for post in &self.posts {
-            rows.push(post_card(post));
+            rows.push(self.tweet_card(post, cx));
         }
         if let Some(root) = self.posts.first() {
             let replies = self.posts.iter().skip(1).take(2).count();
@@ -2547,6 +2641,142 @@ impl XPanel {
             .into_any_element()
     }
 
+    /// Start background downloads for every poster/photo in the current
+    /// lists. Called once per fetch-apply, never from render or typing.
+    fn prefetch_media(&mut self, cx: &mut Context<Self>) {
+        let mut urls: Vec<String> = Vec::new();
+        let collect = |posts: &[Post], urls: &mut Vec<String>| {
+            for post in posts {
+                for media in &post.media {
+                    if let Some(poster) = &media.poster
+                        && !poster.is_empty()
+                    {
+                        urls.push(poster.clone());
+                    }
+                }
+            }
+        };
+        collect(&self.posts, &mut urls);
+        collect(&self.search_posts, &mut urls);
+        if let Some(profile) = &self.profile {
+            collect(&profile.posts, &mut urls);
+        }
+        urls.sort();
+        urls.dedup();
+        for url in urls {
+            if self.media_cache.contains_key(&url) {
+                continue;
+            }
+            self.media_cache.insert(url.clone(), MediaState::Loading);
+            let fetch_url = url.clone();
+            let bg = cx.background_executor().spawn(async move {
+                fetch_image_rgba(&fetch_url)
+            });
+            cx.spawn(async move |this, cx| {
+                let result = bg.await;
+                let _ = this.update(cx, |panel, cx| {
+                    let state = match result {
+                        Ok(buffer) => MediaState::Ready(Arc::new(RenderImage::new(vec![
+                            image::Frame::new(buffer),
+                        ]))),
+                        Err(_) => MediaState::Failed,
+                    };
+                    panel.media_cache.insert(url.clone(), state);
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Reserved media area for a tweet: a fixed 170px box, so a photo or
+    /// video thumbnail loading in never changes card height or pushes
+    /// neighbours around. Video/GIF show their poster with a play badge;
+    /// clicking media (only) opens it externally and never expands a reply.
+    fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let media = post.media.first()?;
+        let kind = media.kind;
+        let poster = media.poster.clone().unwrap_or_default();
+        let media_url = media.url.clone();
+        let post_url = post.url.clone();
+        let extra = post.media.len().saturating_sub(1);
+        let badge = match kind {
+            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play",
+            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play",
+            MediaKind::Photo => "",
+        };
+        let mut area = div()
+            .id(SharedString::from(format!("x-media-{}", post.id)))
+            .relative()
+            .w_full()
+            .h(px(170.0))
+            .flex_none()
+            .mt(px(8.0))
+            .rounded(px(10.0))
+            .overflow_hidden()
+            .bg(tint(0x0f1c33, 245))
+            .border_1()
+            .border_color(tint(0x7af6ff, 55))
+            .cursor_pointer();
+        match self.media_cache.get(&poster) {
+            Some(MediaState::Ready(image)) => {
+                let source: ImageSource = ImageSource::Render(image.clone());
+                area = area.child(img(source).w_full().h_full().object_fit(ObjectFit::Cover));
+            }
+            Some(MediaState::Failed) => {
+                area = area.child(
+                    div().p(px(10.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3))
+                        .child(if kind == MediaKind::Photo { "Photo (could not load preview)" } else { "Video (could not load preview)" }),
+                );
+            }
+            _ => {
+                area = area.child(
+                    div().p(px(10.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3))
+                        .child(if kind == MediaKind::Photo { "Loading photo\u{2026}" } else { "Loading video preview\u{2026}" }),
+                );
+            }
+        }
+        if !badge.is_empty() || extra > 0 {
+            let label = if extra > 0 {
+                format!("{badge}  +{extra} more")
+            } else {
+                badge.to_string()
+            };
+            area = area.child(
+                div()
+                    .absolute()
+                    .bottom(px(8.0))
+                    .left(px(8.0))
+                    .px(px(8.0))
+                    .py(px(3.0))
+                    .rounded(px(999.0))
+                    .bg(tint(0x070b14, 220))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xe9fdff))
+                    .child(label),
+            );
+        }
+        let open_url = if kind == MediaKind::Photo { media_url } else if !post_url.is_empty() { post_url } else { media_url };
+        area = area.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                // Explicit media click only: open externally, never a reply.
+                let url = open_url.clone();
+                if !this.live {
+                    this.notice = Some("Preview does not open media.".into());
+                } else {
+                    std::thread::spawn(move || {
+                        let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &url);
+                    });
+                    this.notice = Some("Opened media in your default player/browser.".into());
+                }
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        );
+        Some(area.into_any_element())
+    }
+
     /// One tweet in Timeline / Search / Trends. Clicking it expands an
     /// inline reply box right underneath; a sent reply marks it Replied.
     fn tweet_card(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -2592,6 +2822,7 @@ impl XPanel {
                     .text_color(rgb(0xe7eefc))
                     .child(post.text.clone()),
             )
+            .children(self.media_box(post, cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -2614,8 +2845,7 @@ impl XPanel {
 
     /// The inline reply editor shown under the selected tweet.
     fn reply_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-            .char_limit_or_fallback();
+        let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.reply_text, char_limit);
         let focused = self.input_target == InputTarget::Reply;
         let mut box_el = div()
@@ -2649,7 +2879,11 @@ impl XPanel {
             .child(
                 div()
                     .id("x-reply-editor")
-                    .min_h(px(44.0))
+                    // Fixed height: the box never grows/shrinks as you type
+                    // or as the caret blinks, so cards below never jump.
+                    .h(px(60.0))
+                    .flex_none()
+                    .overflow_hidden()
                     .p(px(8.0))
                     .rounded(px(8.0))
                     .bg(tint(0x0c1422, 235))
@@ -2664,7 +2898,9 @@ impl XPanel {
                             })
                             .child(if self.reply_text.is_empty() {
                                 "Write your reply\u{2026} (Ctrl+Enter sends)".to_string()
-                            } else if focused && self.blink_visible {
+                            } else if focused {
+                                // Steady caret (not blink-toggled): the text
+                                // width must never change between frames.
                                 format!("{}\u{258f}", self.reply_text)
                             } else {
                                 self.reply_text.clone()
@@ -2816,7 +3052,7 @@ impl XPanel {
                                     })
                                     .child(if self.search_input.is_empty() {
                                         "Type a query \u{2014} a word, #tag, or from:someone".to_string()
-                                    } else if focused && self.blink_visible {
+                                    } else if focused {
                                         format!("{}\u{258f}", self.search_input)
                                     } else {
                                         self.search_input.clone()
@@ -3718,13 +3954,6 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
                 .child(body),
         )
         .into_any_element()
-}
-
-fn post_card(post: &Post) -> gpui_kit::AnyElement {
-    card(
-        format!("@{} Â· {} likes", post.author_handle, post.likes),
-        post.text.clone(),
-    )
 }
 
 fn hint(text: String) -> gpui_kit::AnyElement {
