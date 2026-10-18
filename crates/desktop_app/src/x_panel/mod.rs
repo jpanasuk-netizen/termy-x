@@ -756,6 +756,9 @@ impl XPanel {
                             panel.lookup = handle.clone();
                         }
                         panel.status = format!("Connected as @{handle} \u{b7} {via}");
+                        // Clear any stale "Disconnected\u{2026}" notice from a
+                        // previous disconnect_x: it is false once reconnected.
+                        panel.notice = None;
                         panel.connection = ConnState::Connected { handle, via };
                         let next = panel.queued_section.take().unwrap_or(panel.section);
                         let next = if next == XSection::Compose {
