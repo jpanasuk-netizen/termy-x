@@ -4,7 +4,9 @@ pub mod service;
 pub mod source;
 pub mod transport;
 
-pub const DEFAULT_GITHUB_REPO: &str = "lassejlv/termy";
+// Termy-X is a fork: updates must come from the fork's own releases, never
+// upstream lassejlv/termy (upstream builds have no X panel / Ctrl+Shift+X).
+pub const DEFAULT_GITHUB_REPO: &str = "jpanasuk-netizen/termy-x";
 
 pub use notes::{
     ReleaseNotes, ReleaseSummary, fetch_release_list, fetch_release_list_for_repo,
