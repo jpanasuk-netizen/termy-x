@@ -2339,8 +2339,11 @@ impl XPanel {
                         ),
                     ));
                 }
+                if !self.posts.is_empty() {
+                    rows.push(hint("Tweets \u{b7} click one to reply in place".into()));
+                }
                 for post in &self.posts {
-                    rows.push(post_card(post));
+                    rows.push(self.tweet_card(post, cx));
                 }
             }
             XSection::Lookup => {
