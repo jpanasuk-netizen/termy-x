@@ -236,45 +236,51 @@ mod win32 {
     type EnumProc = unsafe extern "system" fn(Hwnd, Lparam) -> Bool;
 
     pub unsafe fn show_window(hwnd: Hwnd, cmd: i32) {
-        if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
-            ShowWindow(hwnd, cmd);
+        unsafe {
+            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                ShowWindow(hwnd, cmd);
+            }
         }
     }
 
     pub unsafe fn enum_windows(found: &mut Vec<(isize, String)>) {
         unsafe extern "system" fn callback(hwnd: Hwnd, lparam: Lparam) -> Bool {
-            let found = &mut *(lparam as *mut Vec<(isize, String)>);
-            if IsWindowVisible(hwnd) == 0 {
-                return 1;
-            }
-            let mut pid: u32 = 0;
-            GetWindowThreadProcessId(hwnd, &mut pid);
-            if pid == 0 || !process_is_chrome(pid) {
-                return 1;
-            }
-            let mut buffer = [0u16; 512];
-            let len = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
-            if len > 0 {
-                let title = String::from_utf16_lossy(&buffer[..len as usize]);
-                if !title.is_empty() {
-                    found.push((hwnd as isize, title));
+            unsafe {
+                let found = &mut *(lparam as *mut Vec<(isize, String)>);
+                if IsWindowVisible(hwnd) == 0 {
+                    return 1;
                 }
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == 0 || !process_is_chrome(pid) {
+                    return 1;
+                }
+                let mut buffer = [0u16; 512];
+                let len = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+                if len > 0 {
+                    let title = String::from_utf16_lossy(&buffer[..len as usize]);
+                    if !title.is_empty() {
+                        found.push((hwnd as isize, title));
+                    }
+                }
+                1
             }
-            1
         }
-        EnumWindows(Some(callback), found as *mut Vec<(isize, String)> as Lparam);
+        unsafe {
+            EnumWindows(Some(callback), found as *mut Vec<(isize, String)> as Lparam);
+        }
     }
 
     unsafe fn process_is_chrome(pid: u32) -> bool {
         // PROCESS_QUERY_LIMITED_INFORMATION
-        let handle = OpenProcess(0x1000, 0, pid);
+        let handle = unsafe { OpenProcess(0x1000, 0, pid) };
         if handle.is_null() {
             return false;
         }
         let mut buffer = [0u16; 512];
         let mut size = buffer.len() as u32;
-        let ok = QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size);
-        CloseHandle(handle);
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+        unsafe { CloseHandle(handle) };
         if ok == 0 {
             return false;
         }
