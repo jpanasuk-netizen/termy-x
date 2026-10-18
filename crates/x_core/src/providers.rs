@@ -1307,6 +1307,11 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
         .get("data")
         .or_else(|| value.get("user"))
         .unwrap_or(&value);
+    // OpenCLI returns a profile as a one-row JSON array (1.8.8 and 2.x).
+    let node = node
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(node);
     let handle = first_str(node, &["username", "screen_name", "screenName", "handle"])
         .unwrap_or(fallback_handle)
         .trim_start_matches('@')
@@ -1667,6 +1672,27 @@ mod tests {
         assert_eq!(timeline.value[0].replies, 2);
         let trends = service.trends(None, 5).unwrap();
         assert_eq!(trends.value[0].name, "#gpui");
+    }
+
+    #[test]
+    fn opencli_array_profile_parses_name_bio_and_counts() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "profile"],
+            r#"[{"screen_name":"ada","name":"Ada Lovelace","bio":"first programmer","followers":293,"following":404}]"#,
+        );
+        let service = Service::free(
+            &quiet_config(),
+            runner,
+            Arc::new(crate::io::MapHttp::default()),
+        );
+        let profile = service.lookup("ada").unwrap().value;
+        assert_eq!(profile.handle, "ada");
+        assert_eq!(profile.name, "Ada Lovelace");
+        assert_eq!(profile.bio, "first programmer");
+        assert_eq!(profile.followers, 293);
+        assert_eq!(profile.following, 404);
     }
 
     #[test]
