@@ -668,7 +668,7 @@ impl Publisher for OpenCliPublisher {
         reply_to: Option<&str>,
         media: &[PathBuf],
     ) -> Result<String, String> {
-        validate_media(media)?;
+        crate::publish::validate_media_paths(media)?;
         let mut previous = reply_to.map(status_url);
         let mut last = String::new();
         for (index, part) in parts.iter().enumerate() {
@@ -820,29 +820,6 @@ pub fn help_lists_command(text: &str, command: &str) -> bool {
         }
     }
     false
-}
-
-fn validate_media(media: &[PathBuf]) -> Result<(), String> {
-    if media.len() > 4 {
-        return Err("X allows at most 4 images per post".into());
-    }
-    for path in media {
-        if !path.is_file() {
-            return Err(format!("media not found: {}", path.display()));
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
-            return Err(format!(
-                "unsupported media type for {}: use jpg/png/gif/webp",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn opencli_read(args: &[String]) -> Vec<String> {

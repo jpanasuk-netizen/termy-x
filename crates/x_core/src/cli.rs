@@ -13,9 +13,7 @@ use crate::io::{
 };
 use crate::model::{ProviderId, Tone};
 use crate::providers::Service;
-use crate::publish::{
-    ConfirmDecision, GateOutcome, IntentPublisher, confirm_and_publish, first_available,
-};
+use crate::publish::{ConfirmDecision, GateOutcome, IntentPublisher, first_available};
 use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
@@ -58,7 +56,7 @@ enum Cmd {
         #[arg(long)]
         reply_to: Option<String>,
         /// Image paths to attach (jpg/png/gif/webp). Repeatable. Max 4.
-        #[arg(long = "media", value_name = "PATH")]
+        #[arg(long = "media", alias = "image", value_name = "PATH")]
         media: Vec<PathBuf>,
     },
     /// Unicode bird
@@ -756,7 +754,16 @@ fn publish_text(
     if publisher.id() == crate::model::ProviderId::WebIntent {
         return deliver_intent(&plan, io, interactive);
     }
-    let outcome = confirm_and_publish(text, reply_to.as_deref(), decision, false, publisher);
+    // MUST use the media-aware path: confirm_and_publish drops attachments.
+    let outcome = crate::publish::confirm_and_publish_with_media(
+        text,
+        reply_to.as_deref(),
+        decision,
+        false,
+        publisher,
+        resolved.limit,
+        &media,
+    );
     match outcome {
         GateOutcome::Rejected { plan } => {
             if let Some(error) = &plan.session {
@@ -847,6 +854,16 @@ fn deliver_intent(plan: &crate::publish::PublishPlan, io: &CliIo, interactive: b
                 return 1;
             }
         }
+    }
+    if !plan.media.is_empty() {
+        println!(
+            "images cannot go through a web intent — attach them in the browser compose box: {}",
+            plan.media
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     println!(
         "opened {} web intent(s). Each part is on the clipboard when its window opens. Click Post yourself.",
@@ -956,26 +973,7 @@ fn io_stderr() -> io::Stderr {
 }
 
 fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
-    if media.len() > 4 {
-        return Err("at most 4 images per post".into());
-    }
-    for path in media {
-        if !path.is_file() {
-            return Err(format!("media not found: {}", path.display()));
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
-            return Err(format!(
-                "unsupported media {}: use jpg/png/gif/webp",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
+    crate::publish::validate_media_paths(media)
 }
 
 #[cfg(test)]

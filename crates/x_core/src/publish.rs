@@ -90,6 +90,68 @@ impl Publisher for IntentPublisher {
     }
 }
 
+/// X allows at most 4 images per post.
+pub const MAX_MEDIA: usize = 4;
+/// X photo limit (jpg/png/webp); GIFs may be larger.
+pub const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+pub const MAX_GIF_BYTES: u64 = 15 * 1024 * 1024;
+
+/// Validate one image path: exists, supported type, within X size limits.
+/// Friendly, dummy-proof errors (no panics, no raw OS errors leaked verbatim).
+pub fn validate_media_path(path: &std::path::Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!(
+            "image not found: {} — pick a file that exists",
+            path.display()
+        ));
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+        return Err(format!(
+            "unsupported image {}: use jpg, png, gif, or webp",
+            path.display()
+        ));
+    }
+    let size = std::fs::metadata(path)
+        .map(|m| m.len())
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let limit = if ext == "gif" {
+        MAX_GIF_BYTES
+    } else {
+        MAX_IMAGE_BYTES
+    };
+    if size > limit {
+        return Err(format!(
+            "image too large: {} is {:.1} MB — X allows at most {} MB for .{ext}",
+            path.display(),
+            size as f64 / 1_048_576.0,
+            limit / 1_048_576
+        ));
+    }
+    if size == 0 {
+        return Err(format!("image is empty: {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Validate a whole attachment list (count + every file).
+pub fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
+    if media.len() > MAX_MEDIA {
+        return Err(format!(
+            "at most {MAX_MEDIA} images per post (you picked {})",
+            media.len()
+        ));
+    }
+    for path in media {
+        validate_media_path(path)?;
+    }
+    Ok(())
+}
+
 pub fn intent_urls(parts: &[String], reply_to: Option<&str>) -> Vec<String> {
     parts
         .iter()
@@ -254,6 +316,7 @@ mod tests {
 
     struct RecordingPublisher {
         calls: Arc<Mutex<Vec<Vec<String>>>>,
+        media_calls: Arc<Mutex<Vec<Vec<PathBuf>>>>,
     }
 
     impl Publisher for RecordingPublisher {
@@ -270,9 +333,10 @@ mod tests {
             &self,
             parts: &[String],
             _reply_to: Option<&str>,
-            _media: &[PathBuf],
+            media: &[PathBuf],
         ) -> Result<String, String> {
             self.calls.lock().expect("calls").push(parts.to_vec());
+            self.media_calls.lock().expect("media").push(media.to_vec());
             Ok("posted".to_string())
         }
     }
@@ -282,6 +346,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = RecordingPublisher {
             calls: calls.clone(),
+            media_calls: Arc::new(Mutex::new(Vec::new())),
         };
         let text = "exact post text";
         let rejected = confirm_and_publish(text, None, ConfirmDecision::No, false, &publisher);
@@ -303,6 +368,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = RecordingPublisher {
             calls: calls.clone(),
+            media_calls: Arc::new(Mutex::new(Vec::new())),
         };
         let outcome = confirm_and_publish(
             "ship it",
@@ -316,6 +382,82 @@ mod tests {
             calls.lock().expect("calls").clone(),
             vec![vec!["ship it".to_string()]]
         );
+    }
+
+    #[test]
+    fn media_reaches_publisher_on_yes_and_never_on_dry_run() {
+        let dir = std::env::temp_dir().join(format!("termyx-media-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let img = dir.join("pic.png");
+        std::fs::write(&img, b"\x89PNG fake but exists").expect("write img");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let media_calls = Arc::new(Mutex::new(Vec::new()));
+        let publisher = RecordingPublisher {
+            calls: calls.clone(),
+            media_calls: media_calls.clone(),
+        };
+        // Dry-run: publisher must not be called at all.
+        let dry = confirm_and_publish_with_media(
+            "hi",
+            None,
+            ConfirmDecision::Yes,
+            true,
+            &publisher,
+            crate::text::STANDARD_CHAR_LIMIT,
+            std::slice::from_ref(&img),
+        );
+        assert!(matches!(dry, GateOutcome::DryRun { plan } if plan.media == vec![img.clone()]));
+        assert!(media_calls.lock().expect("m").is_empty());
+        // Real yes: media must arrive at the publisher exactly once.
+        let sent = confirm_and_publish_with_media(
+            "hi",
+            None,
+            ConfirmDecision::Yes,
+            false,
+            &publisher,
+            crate::text::STANDARD_CHAR_LIMIT,
+            std::slice::from_ref(&img),
+        );
+        assert!(matches!(sent, GateOutcome::Sent { .. }));
+        assert_eq!(
+            media_calls.lock().expect("m").clone(),
+            vec![vec![img]]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_media_rejects_missing_bad_ext_too_many_and_oversize() {
+        assert!(validate_media_paths(&[]).is_ok());
+        assert!(
+            validate_media_path(std::path::Path::new("/no/such/pic.png"))
+                .unwrap_err()
+                .contains("not found")
+        );
+        let dir = std::env::temp_dir().join(format!("termyx-val-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp");
+        let bad = dir.join("x.bmp");
+        std::fs::write(&bad, b"bm").expect("w");
+        assert!(
+            validate_media_path(&bad)
+                .unwrap_err()
+                .contains("jpg, png, gif")
+        );
+        let big = dir.join("big.png");
+        std::fs::File::create(&big)
+            .expect("f")
+            .set_len(MAX_IMAGE_BYTES + 1)
+            .expect("len");
+        assert!(validate_media_path(&big).unwrap_err().contains("too large"));
+        let ok = dir.join("ok.jpg");
+        std::fs::write(&ok, b"jpg").expect("w");
+        assert!(
+            validate_media_paths(&vec![ok.clone(); 5])
+                .unwrap_err()
+                .contains("at most 4")
+        );
+        assert!(validate_media_paths(&[ok]).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

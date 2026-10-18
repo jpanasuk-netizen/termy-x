@@ -95,6 +95,7 @@ enum UiFocus {
     ConfirmCancel,
     ConfirmCopy,
     ConfirmNext,
+    ConfirmBrowser,
 }
 
 pub struct XPanel {
@@ -110,6 +111,13 @@ pub struct XPanel {
     compose: String,
     /// Local image paths attached to the next publish (max 4).
     media: Vec<PathBuf>,
+    /// True while an in-app post is running in the background (prevents double-post).
+    posting: bool,
+    /// Per-section single-flight guard: one OpenCLI/browser-session call at a time,
+    /// so rapid clicks cannot spawn a storm of Chrome/OpenCLI processes.
+    fetching: [bool; 5],
+    /// Last explicit browser open, for debounce (never reopen in a burst).
+    last_browser_open: Option<Instant>,
     variants: Vec<Draft>,
     drafts: Vec<Draft>,
     status: String,
@@ -228,6 +236,9 @@ impl XPanel {
             query: "gpui terminal".into(),
             lookup: "termy".into(),
             media: Vec::new(),
+            posting: false,
+            fetching: [false; 5],
+            last_browser_open: None,
             compose: if fill_window {
                 "Termy X counts this URL as 23: https://termy.sh".into()
             } else {
@@ -506,6 +517,15 @@ impl XPanel {
         let Some(slot) = section_slot(section) else {
             return;
         };
+        // Single-flight: rapid tab/item clicks must not spawn parallel
+        // OpenCLI calls (each can prod the Chrome session). One at a time.
+        if self.fetching.iter().any(|f| *f) {
+            self.loading = false;
+            self.status =
+                "already loading — one X session call at a time (no extra browser windows)".into();
+            return;
+        }
+        self.fetching[slot] = true;
         self.fetch_seq = self.fetch_seq.wrapping_add(1);
         let seq = self.fetch_seq;
         self.inflight[slot] = seq;
@@ -520,6 +540,7 @@ impl XPanel {
                 .spawn(async move { fetch_section(section, query, lookup, live) })
                 .await;
             let _ = this.update(cx, |panel, cx| {
+                panel.fetching[slot] = false;
                 if panel.inflight[slot] != seq {
                     return;
                 }
@@ -717,8 +738,11 @@ impl XPanel {
                         self.focus_compose_editor();
                     }
                     UiFocus::ConfirmCopy => self.copy_current_part(cx),
-                    UiFocus::ConfirmNext => self.open_current_intent(),
-                    _ => self.open_current_intent(),
+                    // ONLY the explicit browser button may open Chrome/x.com.
+                    UiFocus::ConfirmBrowser => self.open_current_intent(),
+                    // Default/Enter posts IN-APP. It must never fall through
+                    // to a browser intent (that was the reopen-Chrome bug).
+                    _ => self.post_now_async(cx),
                 }
                 self.pending_focus = true;
                 cx.notify();
@@ -1045,6 +1069,7 @@ impl XPanel {
                 UiFocus::ConfirmCancel,
                 UiFocus::ConfirmCopy,
                 UiFocus::ConfirmNext,
+                UiFocus::ConfirmBrowser,
             ]
             .as_slice()
         } else if self.section == XSection::Compose {
@@ -1752,7 +1777,7 @@ impl XPanel {
     fn attach_images(&mut self, cx: &mut Context<Self>) {
         let remaining = 4usize.saturating_sub(self.media.len());
         if remaining == 0 {
-            self.notice = Some("Max 4 images per post.".into());
+            self.notice = Some("Max 4 images per post — remove one first.".into());
             cx.notify();
             return;
         }
@@ -1761,12 +1786,60 @@ impl XPanel {
             .add_filter("Images", &["jpg", "jpeg", "png", "gif", "webp"])
             .pick_files()
             .unwrap_or_default();
-        for path in paths.into_iter().take(remaining) {
-            if path.is_file() {
-                self.media.push(path);
+        if paths.is_empty() {
+            // Cancelled picker: say so instead of claiming an attach happened.
+            self.notice = Some("No image picked.".into());
+            cx.notify();
+            return;
+        }
+        let mut added = 0usize;
+        let mut rejected: Vec<String> = Vec::new();
+        for path in paths {
+            if self.media.len() >= 4 {
+                rejected.push("max 4 images".into());
+                break;
+            }
+            if self.media.contains(&path) {
+                rejected.push(format!(
+                    "{} (already attached)",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("image")
+                ));
+                continue;
+            }
+            match termy_x::publish::validate_media_path(&path) {
+                Ok(()) => {
+                    self.media.push(path);
+                    added += 1;
+                }
+                Err(error) => rejected.push(error),
             }
         }
-        self.notice = Some(format!("Attached {} image(s).", self.media.len()));
+        self.notice = Some(if rejected.is_empty() {
+            format!(
+                "Attached {added} image(s) — {} on this post. They show below; tap ✕ to remove one.",
+                self.media.len()
+            )
+        } else {
+            format!(
+                "Attached {added} image(s). Skipped: {}",
+                rejected.join("; ")
+            )
+        });
+        cx.notify();
+    }
+
+    fn remove_media(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.media.len() {
+            let removed = self.media.remove(index);
+            self.notice = Some(format!(
+                "Removed {}. {} image(s) left.",
+                removed
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image"),
+                self.media.len()
+            ));
+        }
         cx.notify();
     }
 
@@ -1833,17 +1906,38 @@ impl XPanel {
                             .unwrap_or("image")
                             .to_string();
                         let label = format!("[{}] {}", index + 1, name);
+                        let thumb_source: ImageSource = path.clone().into();
                         row = row.child(
                             div()
-                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .px(px(8.0))
                                 .py(px(4.0))
                                 .rounded_md()
                                 .border_1()
                                 .border_color(rgb(0x2f7bff))
                                 .bg(tint(0x12203a, 0xcc))
-                                .text_size(px(12.0))
-                                .text_color(rgb(0x7af6ff))
-                                .child(label),
+                                .child(
+                                    img(thumb_source)
+                                        .w(px(48.0))
+                                        .h(px(48.0))
+                                        .object_fit(ObjectFit::Cover)
+                                        .rounded_md(),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(0x7af6ff))
+                                        .child(label),
+                                )
+                                .child(x_button!(
+                                    format!("x-media-remove-{index}"),
+                                    "✕ Remove",
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.remove_media(index, cx);
+                                    })
+                                )),
                         );
                     }
                 }
@@ -2148,7 +2242,13 @@ impl XPanel {
                     div()
                         .text_size(px(12.0))
                         .text_color(rgb(0x7af6ff))
-                        .child(format!("Attached media ({}):", media_lines.len())),
+                        .child(format!("Attached media ({}):", media_lines.len()))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0xffd0ea))
+                                .child("Post now sends these in-app via OpenCLI --images (no browser). If you choose Open in browser instead, attach them there — a web link can't upload files."),
+                        ),
                 )
                 .children(media_lines.into_iter().map(|name| {
                     div()
@@ -2226,7 +2326,7 @@ impl XPanel {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Nothing is posted automatically. Next post opens one part."),
+                            .child("Nothing is posted automatically. Post now posts in-app (no browser). Open in browser is optional and only happens if you click it."),
                     )
                     .children(part_rows)
                     .child(div().text_size(px(13.0)).child(format!(
@@ -2243,6 +2343,7 @@ impl XPanel {
                         let cancel_active = self.ui_focus == UiFocus::ConfirmCancel;
                         let copy_active = self.ui_focus == UiFocus::ConfirmCopy;
                         let next_active = self.ui_focus == UiFocus::ConfirmNext;
+                        let browser_active = self.ui_focus == UiFocus::ConfirmBrowser;
                         div()
                             .flex()
                             .gap(px(8.0))
@@ -2272,11 +2373,23 @@ impl XPanel {
                             ))
                             .child(x_button!(
                                 "x-next-post",
-                                "Next post",
+                                if self.posting { "Posting…" } else { "Post now" },
                                 next_active,
                                 cx.listener(|this, _, _, cx| {
                                     this.ui_focus = UiFocus::ConfirmNext;
-                                    // Open browser after confirm; spawn is non-blocking.
+                                    // In-app post. Never opens a browser.
+                                    this.post_now_async(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-open-browser",
+                                "Open in browser ↗",
+                                browser_active,
+                                cx.listener(|this, _, _, cx| {
+                                    this.ui_focus = UiFocus::ConfirmBrowser;
+                                    // The ONLY panel action that may open Chrome.
                                     this.open_current_intent();
                                     cx.stop_propagation();
                                     cx.notify();
@@ -2300,9 +2413,122 @@ impl XPanel {
         self.notice = Some("Copied this part.".into());
     }
 
-    /// Opens only the highlighted part. Preview and mock never open a browser.
-    /// Browser launch is fire-and-forget so the confirm UI never freezes.
+    /// Post IN-APP via the active real publisher (OpenCLI `--window background`,
+    /// official API, etc.). Never opens Chrome/x.com. The web-intent publisher is
+    /// deliberately NOT in this chain — browser posting is the explicit button only.
+    fn post_now_async(&mut self, cx: &mut Context<Self>) {
+        if self.posting {
+            self.notice = Some("Already posting — wait for it to finish.".into());
+            cx.notify();
+            return;
+        }
+        if !self.live {
+            self.notice =
+                Some("Preview/mock never posts. Open the real Termy X panel to post.".into());
+            cx.notify();
+            return;
+        }
+        if let Err(error) = termy_x::publish::validate_media_paths(&self.media) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        let text = self.compose.trim().to_string();
+        if text.is_empty() {
+            self.notice = Some("Type something before Publish.".into());
+            cx.notify();
+            return;
+        }
+        let media = self.media.clone();
+        self.posting = true;
+        self.notice = Some(if media.is_empty() {
+            "Posting in-app via your X session… no browser will open.".into()
+        } else {
+            format!(
+                "Posting in-app with {} image(s) via your X session… no browser will open.",
+                media.len()
+            )
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first (x connect),                              or use the explicit 'Open in browser' button."
+                                .to_string(),
+                        );
+                    };
+                    // A publisher that cannot upload must say so, not fake it:
+                    // OpenCLI supports --images; twitter-cli/official reject media.
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        None,
+                        termy_x::publish::ConfirmDecision::Yes,
+                        false,
+                        publisher,
+                        char_limit,
+                        &media,
+                    ) {
+                        termy_x::publish::GateOutcome::Sent { receipt, .. } => Ok(receipt),
+                        termy_x::publish::GateOutcome::Rejected { plan } => Err(plan
+                            .session
+                            .unwrap_or_else(|| "posting was rejected".to_string())),
+                        termy_x::publish::GateOutcome::DryRun { .. } => {
+                            Err("unexpected dry-run".to_string())
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.posting = false;
+                match result {
+                    Ok(receipt) => {
+                        panel.confirm = false;
+                        panel.media.clear();
+                        panel.compose.clear();
+                        panel.caret = 0;
+                        panel.sel_anchor = None;
+                        panel.notice = Some(format!(
+                            "Posted in-app — no browser opened. {receipt}"
+                        ));
+                        panel.focus_compose_editor();
+                        panel.pending_focus = true;
+                    }
+                    Err(error) => {
+                        // Stay on confirm so the user can retry or explicitly
+                        // choose 'Open in browser'. Nothing auto-opens.
+                        panel.notice = Some(format!(
+                            "Could not post in-app: {error} Nothing was posted; no browser opened."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// EXPLICIT browser open only — call this solely from the labelled
+    /// 'Open in browser' button. Opens only the highlighted part.
+    /// Preview and mock never open a browser. Debounced so repeated
+    /// clicks/Enter cannot reopen Chrome in a burst.
     fn open_current_intent(&mut self) {
+        if let Some(at) = self.last_browser_open
+            && at.elapsed() < Duration::from_secs(5)
+        {
+            self.notice = Some("Browser already opened just now — not reopening it.".into());
+            return;
+        }
+        self.last_browser_open = Some(Instant::now());
         let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
             .char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
@@ -2326,11 +2552,20 @@ impl XPanel {
             std::thread::spawn(move || {
                 let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &open_url);
             });
-            self.notice = Some(format!(
-                "Opened part {} of {} in the browser. You still click Post there.",
-                index + 1,
-                parts.len()
-            ));
+            self.notice = Some(if self.media.is_empty() {
+                format!(
+                    "Opened part {} of {} in the browser. You still click Post there.",
+                    index + 1,
+                    parts.len()
+                )
+            } else {
+                format!(
+                    "Opened part {} of {} in the browser. Attach your {} image(s) in the browser compose box, then click Post there.",
+                    index + 1,
+                    parts.len(),
+                    self.media.len()
+                )
+            });
         } else {
             self.notice = Some(format!(
                 "Held part {} of {}. Preview does not open a browser.",
