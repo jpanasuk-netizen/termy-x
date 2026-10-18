@@ -1,4 +1,8 @@
 <p align="center">
+  <img alt="Termy-X logo" src="./assets/logo.jpg" width="360" />
+</p>
+
+<p align="center">
   <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero.png" width="900" />
 </p>
 
