@@ -216,7 +216,7 @@ mod win32 {
     type Bool = i32;
     type Lparam = isize;
 
-    extern "system" {
+    unsafe extern "system" {
         fn EnumWindows(cb: Option<EnumProc>, lparam: Lparam) -> Bool;
         fn IsWindowVisible(hwnd: Hwnd) -> Bool;
         fn IsIconic(hwnd: Hwnd) -> Bool;
