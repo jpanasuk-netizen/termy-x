@@ -446,7 +446,11 @@ impl OpenCliProvider {
 
     fn call(&self, args: &[String]) -> Result<String, String> {
         self.pace.wait();
-        let output = self.runner.run(&self.bin, args)?;
+        // Bounded: OpenCLI's own browser timeout is ~60s; a closed Chrome
+        // must fail in well under that, not the old 180s runner default.
+        let output =
+            self.runner
+                .run_timeout(&self.bin, args, std::time::Duration::from_secs(45))?;
         if output.status != 0 {
             return Err(if output.stderr.is_empty() {
                 format!("opencli exited {}", output.status)
@@ -551,7 +555,9 @@ impl TwitterCliProvider {
 
     fn call(&self, args: &[String]) -> Result<String, String> {
         self.pace.wait();
-        let output = self.runner.run(&self.bin, args)?;
+        let output =
+            self.runner
+                .run_timeout(&self.bin, args, std::time::Duration::from_secs(45))?;
         if output.status != 0 {
             return Err(if output.stderr.is_empty() {
                 format!("twitter exited {}", output.status)

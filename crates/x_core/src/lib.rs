@@ -8,6 +8,7 @@ pub mod ai;
 pub mod auth;
 pub mod cli;
 pub mod config;
+pub mod connect;
 pub mod doctor;
 pub mod drafts;
 pub mod feed;
@@ -20,6 +21,7 @@ pub mod splash;
 pub mod text;
 
 pub use config::XConfig;
+pub use connect::Connection;
 pub use model::{Post, Profile, ProviderId, ResearchHit, Served, StatusLine, Thread, Trend};
 pub use premium::{ResolvedLimit, resolve_char_limit, resolve_char_limit_simple};
 pub use publish::{ConfirmDecision, GateOutcome, PublishPlan};

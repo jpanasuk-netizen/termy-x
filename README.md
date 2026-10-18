@@ -169,7 +169,19 @@ Termy X has no built-in account. It never ships a token, cookie, or default hand
 - **twitter-cli:** install [twitter-cli](https://github.com/public-clis/twitter-cli) and sign in with it (or set your own `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` from your browser's x.com cookies). These stay on your machine.
 - **Official X API (optional, off by default):** use your own app's client id via `TERMY_X_CLIENT_ID`; the token is stored in your OS keyring. If your app gives you a bearer token, set `TERMY_X_BEARER_TOKEN` in your shell only (never in a file) and run `x connect --check` — it calls `GET /2/users/me` and prints your `@handle`, never the token. Note: an app-only bearer token cannot identify a personal account, so OpenCLI is the reliable personal path.
 
-Run `x doctor` to see which account each provider is using (`whoami`). If nothing is signed in, Termy X falls back to mock data or the X web intent, where you post from your own browser. Your config lives in your own config folder (`%APPDATA%\termy` on Windows, `~/.config/termy` on Linux, `~/Library/Application Support/termy` on macOS).
+Run `x doctor` to see which providers are working. If nothing is signed in, the panel and CLI say so in plain words and tell you the next step — they do not sit on silent empty tabs.
+
+**In the panel (easiest):** press `Ctrl+Shift+X`. If you are not connected, a **Connect your X** card sits at the top:
+
+1. Open Chrome.
+2. Go to x.com and log in as yourself.
+3. Press **Connect my X**.
+
+You should see **Connected as @yourname**. Your timeline, search, and trends then fill in as *your* account. **Disconnect / switch account** (next to Connected) forgets this machine's saved key and remembered account; log in to X in Chrome as the other account and press **Connect my X** again to switch. Termy X never asks for your X password.
+
+**Your own developer key instead:** press **Use my own developer key instead** in that card and paste your key (stored in your OS keychain, or a private `0600` file — never in `x.toml`, never shown), or from a terminal run `x connect --save-token`, then `x connect --check`. `x connect --disconnect` forgets it. The key is always *yours* — Termy X ships with no account, token, or default handle.
+
+Your config lives in your own config folder (`%APPDATA%\termy` on Windows, `~/.config/termy` on Linux, `~/Library/Application Support/termy` on macOS).
 ### Free providers
 
 Reads try, in order:

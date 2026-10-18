@@ -151,6 +151,13 @@ enum Cmd {
         /// Check the connection with a read-only who-are-you call. Never posts.
         #[arg(long)]
         check: bool,
+        /// Forget the saved developer key and remembered account on this machine.
+        #[arg(long)]
+        disconnect: bool,
+        /// Paste your own X developer token (read from stdin, never echoed
+        /// back or written to a config file; stored in your OS keychain).
+        #[arg(long)]
+        save_token: bool,
     },
 }
 
@@ -287,7 +294,11 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
             println!("{}", example_config());
             0
         }
-        Some(Cmd::Connect { check }) => connect(check, io),
+        Some(Cmd::Connect {
+            check,
+            disconnect,
+            save_token,
+        }) => connect(check, disconnect, save_token, io),
         Some(Cmd::Auth) => {
             if !io.config.official_enabled {
                 eprintln!(
@@ -549,124 +560,86 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
 }
 
 pub fn parse_whoami(text: &str) -> Result<String, String> {
-    let value: serde_json::Value = serde_json::from_str(text).map_err(|_| {
-        "the account check returned unreadable output. Run `x doctor` and try again.".to_string()
-    })?;
-    if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-        let msg = value
-            .pointer("/error/message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("not logged in");
-        return Err(format!(
-            "not connected: {msg}. Open X in Chrome, log in as yourself, then run `x connect --check` again."
-        ));
-    }
-    let node = value.get("data").unwrap_or(&value);
-    let node = node
-        .as_array()
-        .and_then(|rows| rows.first())
-        .unwrap_or(node);
-    if node.get("logged_in").and_then(|v| v.as_bool()) == Some(false) {
-        return Err("not connected: X says you are logged out. Log in to X in Chrome as yourself, then run `x connect --check` again.".into());
-    }
-    for key in ["username", "screen_name", "handle"] {
-        if let Some(handle) = node.get(key).and_then(|v| v.as_str())
-            && !handle.trim().is_empty()
-        {
-            return Ok(handle.trim().trim_start_matches('@').to_string());
-        }
-    }
-    Err("not connected: could not find your username. Log in to X in Chrome as yourself, then run `x connect --check` again.".into())
+    crate::connect::parse_whoami(text)
 }
 
-fn connect(check: bool, io: &CliIo) -> i32 {
-    let bearer_set = io.config.bearer_token().is_some();
-    let oauth_set = crate::auth::load_access_token(&io.config).is_ok();
+fn connect(check: bool, disconnect: bool, save_token: bool, io: &CliIo) -> i32 {
+    if disconnect {
+        return match crate::connect::disconnect(&io.config) {
+            Ok(()) => {
+                println!(
+                    "Disconnected on this machine: forgot the saved developer key and remembered account."
+                );
+                println!(
+                    "To switch accounts: log in to X in Chrome as the other account, then run `x connect --check`."
+                );
+                println!(
+                    "(Termy X cannot log Chrome out for you, and never asks for your password.)"
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!("could not disconnect: {error}");
+                1
+            }
+        };
+    }
+    if save_token {
+        println!("Paste YOUR OWN X developer token, then press Enter.");
+        println!(
+            "It is stored in your OS keychain (or a private 0600 file) — never in x.toml, never printed."
+        );
+        print!("Token: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err() {
+            eprintln!("could not read the token. Nothing was saved.");
+            return 1;
+        }
+        return match crate::connect::store_bearer_token(&io.config, &line) {
+            Ok(()) => {
+                println!("Saved. Now run `x connect --check` to prove it works.");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+    }
     if !check {
         println!("Connect YOUR X account — pick one way:");
         println!();
-        println!("Easiest (no developer key):");
-        println!("  1. Install OpenCLI: npm install -g @jackwener/opencli@2.0.0");
-        println!("  2. Log in to x.com in Chrome as yourself.");
+        println!("Easiest (no developer key, recommended):");
+        println!("  1. Open Chrome.");
+        println!("  2. Go to x.com and log in as yourself.");
         println!("  3. Run: x connect --check");
+        println!("  You should see: Connected as @yourname");
         println!();
         println!("Your own X developer token (optional, only if you have one):");
         println!("  1. Create an app at developer.x.com (your account, your keys).");
-        println!("  2. Set it in your shell only — never paste it into a file or chat:");
-        println!(
-            "       export TERMY_X_BEARER_TOKEN=\"your token\"   # PowerShell: $env:TERMY_X_BEARER_TOKEN=\"your token\""
-        );
+        println!("  2. Run: x connect --save-token   and paste the token there");
+        println!("     (or set TERMY_X_BEARER_TOKEN in your shell only — never in a file or chat)");
         println!("  3. Run: x connect --check");
         println!();
-        println!("Termy X never stores your token in the repo and never prints it.");
-        println!(
-            "Token set: {}",
-            if bearer_set || oauth_set { "yes" } else { "no" }
-        );
+        println!("Switch or forget this machine: x connect --disconnect");
+        println!("Termy X never stores your password and never prints your token.");
         return 0;
     }
-    // Path 1: OpenCLI uses your logged-in browser session.
-    if io.runner.exists(&io.config.opencli_bin) {
-        let args = crate::providers::opencli_read_pub(&["twitter".into(), "whoami".into()]);
-        if let Ok(output) = io.runner.run_timeout(
-            &io.config.opencli_bin,
-            &args,
-            std::time::Duration::from_secs(15),
-        ) && output.status == 0
-        {
-            match parse_whoami(&output.stdout) {
-                Ok(handle) => {
-                    println!(
-                        "Connected as @{handle} via OpenCLI (your logged-in browser session)."
-                    );
-                    return 0;
-                }
-                Err(error) => {
-                    eprintln!("{error}");
-                    return 1;
-                }
-            }
+    match crate::connect::detect_connection(&io.config, io.runner.as_ref(), io.http.as_ref()) {
+        crate::connect::Connection::Connected { handle, via } => {
+            println!("Connected as @{handle} via {via}.");
+            0
         }
-        eprintln!(
-            "OpenCLI is installed but did not confirm your account. Log in to X in Chrome as yourself, then run `x connect --check` again."
-        );
-        return 1;
-    }
-    // Path 2: your own developer / OAuth token, checked with a read-only /users/me call.
-    if let Some(token) = io
-        .config
-        .bearer_token()
-        .or_else(|| crate::auth::load_access_token(&io.config).ok())
-    {
-        match io.http.request(crate::io::HttpRequest {
-            method: "GET",
-            url: "https://api.x.com/2/users/me".into(),
-            body: None,
-            bearer: Some(token),
-            content_type: None,
-        }) {
-            Ok(body) => {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                if let Some(handle) = value.pointer("/data/username").and_then(|v| v.as_str()) {
-                    println!("Connected as @{handle} via your own X developer token.");
-                    return 0;
-                }
-                eprintln!(
-                    "your token answered, but X did not return your username. If this is an app-only bearer token, X cannot tell us who you are — use OpenCLI instead: x connect"
-                );
-                return 1;
+        crate::connect::Connection::NotConnected { reason, next } => {
+            eprintln!("Not connected — {reason}.");
+            eprintln!("Next steps:");
+            for line in next.lines() {
+                eprintln!("  {line}");
             }
-            Err(error) => {
-                // Never print the token; `error` comes from the HTTP layer and does not contain it.
-                eprintln!(
-                    "your X token did not work ({error}). Check TERMY_X_BEARER_TOKEN in your shell, or use OpenCLI instead: x connect"
-                );
-                return 1;
-            }
+            1
         }
     }
-    eprintln!("not connected yet. Run `x connect` for the 3 easy steps.");
-    1
 }
 
 fn publish_draft(

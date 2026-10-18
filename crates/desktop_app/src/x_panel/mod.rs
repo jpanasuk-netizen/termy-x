@@ -98,6 +98,13 @@ enum UiFocus {
     ConfirmBrowser,
 }
 
+#[derive(Clone, PartialEq)]
+enum ConnState {
+    Checking,
+    Connected { handle: String, via: String },
+    NotConnected { reason: String, next: String },
+}
+
 pub struct XPanel {
     focus: FocusHandle,
     section: XSection,
@@ -133,6 +140,11 @@ pub struct XPanel {
     live: bool,
     art: Option<Arc<Image>>,
     notice: Option<String>,
+    connection: ConnState,
+    checking_conn: bool,
+    bearer_mode: bool,
+    bearer_input: String,
+    queued_section: Option<XSection>,
     /// Per-section last successful fetch. Tab switches reuse data younger than 30s.
     fetched_at: SectionTimes,
     /// Monotonic id so a slow OpenCLI reply cannot overwrite a newer tab's data.
@@ -227,6 +239,11 @@ impl XPanel {
         } else {
             termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
         };
+        let saved_handle = if fill_window {
+            None
+        } else {
+            termy_x::connect::load_connected_handle(&config)
+        };
         let mut panel = Self {
             focus: cx.focus_handle(),
             section: XSection::Timeline,
@@ -236,7 +253,11 @@ impl XPanel {
             research: Vec::new(),
             profile: None,
             query: "gpui terminal".into(),
-            lookup: "termy".into(),
+            lookup: if fill_window {
+                "termy".into()
+            } else {
+                saved_handle.clone().unwrap_or_default()
+            },
             media: Vec::new(),
             posting: false,
             picking: false,
@@ -260,6 +281,11 @@ impl XPanel {
             live: !fill_window,
             art: None,
             notice: None,
+            connection: ConnState::Checking,
+            checking_conn: false,
+            bearer_mode: false,
+            bearer_input: String::new(),
+            queued_section: None,
             fetched_at: SectionTimes::default(),
             fetch_seq: 0,
             inflight: [0; 5],
@@ -274,13 +300,14 @@ impl XPanel {
             blink_running: false,
             last_edit_chord_at: None,
         };
-        // Instant first paint: fixtures on screen, live fetch in the background.
         if fill_window {
             // Preview path fills via load_scene / open_section.
         } else {
-            panel.seed_fixtures();
             panel.prewarm_art(cx);
-            panel.schedule_fetch(XSection::Timeline, cx);
+            // Who is connected comes first: real tabs must never sit
+            // silently empty (or on fixtures) with no profile behind them.
+            panel.status = "Checking your X connection\u{2026}".into();
+            panel.start_connection_check(cx);
         }
         panel.caret = panel.compose.len();
         panel.start_caret_blink(cx);
@@ -322,6 +349,13 @@ impl XPanel {
             }
             log_switch(section, started, "local");
             return;
+        }
+
+        if section == XSection::Lookup
+            && self.lookup.trim().is_empty()
+            && let ConnState::Connected { handle, .. } = &self.connection
+        {
+            self.lookup = handle.clone();
         }
 
         if section == XSection::Compose {
@@ -387,6 +421,7 @@ impl XPanel {
     }
 
     /// Seed fixture lists without turning off live mode.
+    #[allow(dead_code)]
     fn seed_fixtures(&mut self) {
         if self.posts.is_empty() {
             self.posts = MockProvider
@@ -520,10 +555,22 @@ impl XPanel {
         let Some(slot) = section_slot(section) else {
             return;
         };
-        // Single-flight: rapid tab/item clicks must not spawn parallel
-        // OpenCLI calls (each can prod the Chrome session). One at a time.
-        if self.fetching.iter().any(|f| *f) {
+        if self.live && matches!(self.connection, ConnState::NotConnected { .. }) {
             self.loading = false;
+            self.status = "Not connected — press Connect my X above first.".into();
+            return;
+        }
+        if self.live && matches!(self.connection, ConnState::Checking) {
+            // Run this tab as soon as we know who is connected.
+            self.queued_section = Some(section);
+            self.loading = true;
+            return;
+        }
+        // Single-flight: rapid tab/item clicks must not spawn parallel
+        // OpenCLI calls (each can prod the Chrome session). One at a time,
+        // but never drop the click: queue the latest tab and run it next.
+        if self.fetching.iter().any(|f| *f) {
+            self.queued_section = Some(section);
             self.status =
                 "already loading — one X session call at a time (no extra browser windows)".into();
             return;
@@ -549,6 +596,12 @@ impl XPanel {
                 }
                 panel.loading = false;
                 panel.apply_fetch(section, payload);
+                if let Some(next) = panel.queued_section.take()
+                    && next != section
+                {
+                    panel.loading = true;
+                    panel.schedule_fetch(next, cx);
+                }
                 cx.notify();
             });
         })
@@ -598,6 +651,237 @@ impl XPanel {
             Arc::new(termy_x::io::SystemRunner),
             Arc::new(termy_x::io::UreqHttp::default()),
         )
+    }
+
+    fn start_connection_check(&mut self, cx: &mut Context<Self>) {
+        if self.checking_conn {
+            return;
+        }
+        self.checking_conn = true;
+        self.connection = ConnState::Checking;
+        self.status = "Checking your X connection\u{2026}".into();
+        cx.spawn(async move |this, cx| {
+            let conn = cx
+                .background_executor()
+                .spawn(async move {
+                    let config =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    termy_x::connect::detect_connection(
+                        &config,
+                        &termy_x::io::SystemRunner,
+                        &termy_x::io::UreqHttp::default(),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.checking_conn = false;
+                match conn {
+                    termy_x::connect::Connection::Connected { handle, via } => {
+                        if panel.lookup.trim().is_empty() || panel.lookup == "termy" {
+                            panel.lookup = handle.clone();
+                        }
+                        panel.status = format!("Connected as @{handle} \u{b7} {via}");
+                        panel.connection = ConnState::Connected { handle, via };
+                        let next = panel.queued_section.take().unwrap_or(panel.section);
+                        let next = if next == XSection::Compose {
+                            XSection::Timeline
+                        } else {
+                            next
+                        };
+                        panel.loading = true;
+                        panel.schedule_fetch(next, cx);
+                    }
+                    termy_x::connect::Connection::NotConnected { reason, next } => {
+                        panel.status = format!("Not connected \u{2014} {reason}");
+                        panel.connection = ConnState::NotConnected { reason, next };
+                        panel.loading = false;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn disconnect_x(&mut self, cx: &mut Context<Self>) {
+        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let _ = termy_x::connect::disconnect(&config);
+        self.posts.clear();
+        self.search_posts.clear();
+        self.trends.clear();
+        self.research.clear();
+        self.profile = None;
+        self.fetched_at = SectionTimes::default();
+        self.bearer_mode = false;
+        self.bearer_input.clear();
+        self.connection = ConnState::NotConnected {
+            reason: "you disconnected on this machine".into(),
+            next: "1. To use a different account, log in to X in Chrome as that account.\n2. Press \u{201c}Connect my X\u{201d}.\n(Termy X cannot log Chrome out for you, and never asks for your password.)".into(),
+        };
+        self.notice =
+            Some("Disconnected on this machine. Your Chrome login was not touched.".into());
+        self.status = "Not connected \u{2014} you disconnected on this machine".into();
+        cx.notify();
+    }
+
+    fn begin_bearer(&mut self, cx: &mut Context<Self>) {
+        self.bearer_mode = true;
+        self.bearer_input.clear();
+        self.notice = Some(
+            "Paste your own X developer key (Ctrl+V), then press Enter to save it on this machine. Esc cancels. It is stored in your OS keychain and never shown or written to x.toml.".into(),
+        );
+        self.pending_focus = true;
+        cx.notify();
+    }
+
+    fn save_bearer(&mut self, cx: &mut Context<Self>) {
+        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        match termy_x::connect::store_bearer_token(&config, &self.bearer_input) {
+            Ok(()) => {
+                self.bearer_mode = false;
+                self.bearer_input.clear();
+                self.notice = Some("Key saved on this machine. Checking it now\u{2026}".into());
+                self.start_connection_check(cx);
+            }
+            Err(error) => {
+                self.notice = Some(error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn connection_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        if self.fill_window {
+            return div().into_any_element();
+        }
+        match &self.connection {
+            ConnState::Checking => card(
+                "Checking your X connection\u{2026}".into(),
+                "Looking for the X account you are already logged into in Chrome. One moment."
+                    .into(),
+            ),
+            ConnState::Connected { handle, via } => div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .flex_wrap()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x8affc1))
+                        .child(format!("\u{25cf} Connected as @{handle} \u{b7} {via}")),
+                )
+                .child(x_button!(
+                    "x-conn-refresh",
+                    "Check again",
+                    cx.listener(|this, _, _, cx| {
+                        this.start_connection_check(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-disconnect",
+                    "Disconnect / switch account",
+                    cx.listener(|this, _, _, cx| {
+                        this.disconnect_x(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+            ConnState::NotConnected { reason, next } => {
+                let mut col = div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .p(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(tint(0x2a1408, 220))
+                    .border_1()
+                    .border_color(rgb(0xffb36b));
+                col = col.child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(rgb(0xffd9ad))
+                        .child("Connect your X \u{2014} it takes about 10 seconds"),
+                );
+                col = col.child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xf3e2cf))
+                        .child(format!("Why you see this: {reason}.")),
+                );
+                for line in next.lines() {
+                    col = col.child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xe7eefc))
+                            .child(line.to_string()),
+                    );
+                }
+                col = col.child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .child(x_button!(
+                            "x-connect",
+                            "Connect my X",
+                            cx.listener(|this, _, _, cx| {
+                                this.start_connection_check(cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            })
+                        ))
+                        .child(x_button!(
+                            "x-bearer-mode",
+                            "Use my own developer key instead",
+                            cx.listener(|this, _, _, cx| {
+                                this.begin_bearer(cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            })
+                        )),
+                );
+                if self.bearer_mode {
+                    let masked = "\u{2022}".repeat(self.bearer_input.chars().count().min(24));
+                    col = col.child(
+                        div().text_size(px(12.0)).text_color(rgb(0x7af6ff))
+                            .child(format!(
+                                "Your key: {masked} ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
+                                self.bearer_input.chars().count()
+                            )),
+                    );
+                    col = col.child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .flex_wrap()
+                            .child(x_button!(
+                                "x-bearer-save",
+                                "Save key on this machine",
+                                cx.listener(|this, _, _, cx| {
+                                    this.save_bearer(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-bearer-cancel",
+                                "Cancel",
+                                cx.listener(|this, _, _, cx| {
+                                    this.bearer_mode = false;
+                                    this.bearer_input.clear();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            )),
+                    );
+                }
+                col.into_any_element()
+            }
+        }
     }
 
     fn suggest_templates(&mut self) {
@@ -712,6 +996,31 @@ impl XPanel {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+
+        if self.bearer_mode {
+            if key == "escape" {
+                self.bearer_mode = false;
+                self.bearer_input.clear();
+                self.notice = Some("Key entry cancelled. Nothing was saved.".into());
+            } else if key == "enter" {
+                self.save_bearer(cx);
+            } else if key == "backspace" {
+                self.bearer_input.pop();
+            } else if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
+                if let Some(item) = cx.read_from_clipboard()
+                    && let Some(clip) = item.text()
+                {
+                    self.bearer_input.push_str(clip.trim());
+                }
+            } else if !(mods.control || mods.alt || mods.platform || mods.function)
+                && let Some(ch) = event.keystroke.key_char.as_deref()
+            {
+                self.bearer_input.push_str(ch);
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
 
         if key == "escape" {
             if self.confirm {
@@ -1129,6 +1438,17 @@ fn next_boundary(text: &str, offset: usize) -> usize {
         .map_or(text.len(), |c| offset + c.len_utf8())
 }
 
+fn live_status(status: &termy_x::StatusLine) -> String {
+    if status.provider == termy_x::ProviderId::Mock {
+        format!(
+            "{} \u{b7} No live X session answered \u{2014} open Chrome, make sure x.com is logged in as you, then press \u{201c}Connect my X\u{201d} above.",
+            status.render()
+        )
+    } else {
+        status.render()
+    }
+}
+
 fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -> FetchPayload {
     if live {
         let service = XPanel::service_free();
@@ -1137,7 +1457,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
                 if let Ok(served) = service.timeline(10) {
                     return FetchPayload::Timeline {
                         posts: served.value,
-                        status: served.status.render(),
+                        status: live_status(&served.status),
                     };
                 }
             }
@@ -1145,7 +1465,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
                 if let Ok(served) = service.search(&query, false, 10) {
                     return FetchPayload::Search {
                         posts: served.value,
-                        status: served.status.render(),
+                        status: live_status(&served.status),
                     };
                 }
             }
@@ -1153,7 +1473,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
                 if let Ok(served) = service.trends(Some("worldwide"), 8) {
                     return FetchPayload::Trends {
                         trends: served.value,
-                        status: served.status.render(),
+                        status: live_status(&served.status),
                     };
                 }
             }
@@ -1161,7 +1481,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
                 if let Ok(served) = service.lookup(&lookup) {
                     return FetchPayload::Lookup {
                         profile: Some(served.value),
-                        status: served.status.render(),
+                        status: live_status(&served.status),
                     };
                 }
             }
@@ -1275,6 +1595,7 @@ impl Render for XPanel {
                     .gap(px(10.0))
                     .child(self.header(cx))
                     .child(self.tabs(cx))
+                    .child(self.connection_bar(cx))
                     .child(self.status_line())
                     .child(if columns == 1 {
                         div()
@@ -1619,6 +1940,16 @@ impl XPanel {
         let mut rows = Vec::new();
         if let Some(notice) = &self.notice {
             rows.push(hint(notice.clone()));
+        }
+        if self.live
+            && matches!(self.connection, ConnState::NotConnected { .. })
+            && self.section != XSection::Compose
+        {
+            rows.push(card(
+                "Not connected yet".into(),
+                "Press \u{201c}Connect my X\u{201d} above and follow the 3 steps. Your timeline, search, and trends fill in here as your account \u{2014} nothing is shown from anyone else's account.".into(),
+            ));
+            return rows;
         }
         match self.section {
             XSection::Timeline => {

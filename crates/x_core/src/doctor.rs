@@ -47,7 +47,7 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
         &config.opencli_bin,
         &[
             "twitter".into(),
-            "whoami".into(),
+            "profile".into(),
             "-f".into(),
             "json".into(),
             "--window".into(),
@@ -120,7 +120,7 @@ fn shell_probe(
     if !runner.exists(bin) {
         return (Probe::Missing, "not on PATH".into());
     }
-    let posting = match runner.run_timeout(bin, help_args, std::time::Duration::from_secs(15)) {
+    let posting = match runner.run_timeout(bin, help_args, std::time::Duration::from_secs(35)) {
         Ok(output)
             if help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post") =>
         {
@@ -128,7 +128,7 @@ fn shell_probe(
         }
         _ => "posting not supported",
     };
-    let session = match runner.run_timeout(bin, session_args, std::time::Duration::from_secs(15)) {
+    let session = match runner.run_timeout(bin, session_args, std::time::Duration::from_secs(35)) {
         Ok(output) if output.status == 0 && looks_logged_in(&output.stdout) => Probe::Working,
         _ => Probe::NotLoggedIn,
     };
@@ -145,7 +145,9 @@ fn looks_logged_in(stdout: &str) -> bool {
     {
         return false;
     }
-    compact.contains("\"logged_in\":true") || compact.contains("\"authenticated\":true")
+    compact.contains("\"logged_in\":true")
+        || compact.contains("\"authenticated\":true")
+        || compact.contains("\"screen_name\":")
 }
 
 fn ai_line(config: &XConfig, http: &dyn Http) -> String {
@@ -207,8 +209,8 @@ mod tests {
         );
         runner.script(
             "opencli",
-            &["twitter", "whoami"],
-            r#"{"logged_in": true, "username": "ada"}"#,
+            &["twitter", "profile"],
+            r#"[{"screen_name": "ada", "name": "Ada"}]"#,
         );
         runner.script("twitter", &["--help"], "  post        Post a new tweet.\n");
         runner.script(
