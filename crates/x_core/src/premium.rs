@@ -118,32 +118,12 @@ pub fn resolve_char_limit_simple(config: &XConfig) -> usize {
 }
 
 fn detect_via_opencli(config: &XConfig, runner: &dyn CommandRunner) -> Result<bool, String> {
-    let who = runner.run(
-        &config.opencli_bin,
-        &[
-            "twitter".into(),
-            "whoami".into(),
-            "-f".into(),
-            "json".into(),
-            "--window".into(),
-            "background".into(),
-        ],
-    )?;
-    if who.status != 0 {
-        return Err(who.stderr);
-    }
-    let username = extract_username(&who.stdout).ok_or_else(|| "no username".to_string())?;
+    // One ephemeral background profile call (no username = logged-in
+    // user). The old whoami+profile pair navigated the browser twice,
+    // and whoami is a persistent session that leaves an X tab open.
     let profile = runner.run(
         &config.opencli_bin,
-        &[
-            "twitter".into(),
-            "profile".into(),
-            username,
-            "-f".into(),
-            "json".into(),
-            "--window".into(),
-            "background".into(),
-        ],
+        &crate::providers::opencli_read_pub(&["twitter".into(), "profile".into()]),
     )?;
     if profile.status != 0 {
         return Err(profile.stderr);
@@ -181,22 +161,6 @@ fn profile_node(value: &Value) -> &Value {
         .get("data")
         .or_else(|| value.get("user"))
         .unwrap_or(value)
-}
-
-fn extract_username(text: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(text).ok()?;
-    let node = if let Some(array) = value.as_array() {
-        array.first()?
-    } else {
-        &value
-    };
-    first_str(node, &["username", "screen_name", "screenName", "handle"])
-        .map(|s| s.trim_start_matches('@').to_string())
-}
-
-fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
-    keys.iter()
-        .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
 fn boolish(value: &Value, keys: &[&str]) -> bool {

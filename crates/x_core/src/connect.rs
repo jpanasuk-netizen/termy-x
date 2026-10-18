@@ -37,10 +37,10 @@ impl Connection {
 const NEXT_OPENCLI: &str = "1. Open Chrome.\n2. Go to x.com and log in as yourself (your normal login — Termy X never sees your password).\n3. Press “Connect my X” again.";
 const NEXT_NO_OPENCLI: &str = "1. Install OpenCLI: npm install -g @jackwener/opencli\n2. Add its Browser Bridge extension to Chrome (opencli doctor shows the link).\n3. Open Chrome, log in to x.com as yourself, then press “Connect my X” again.";
 
-/// Read-only detection. Tries, in order: the user's own developer token
-/// (users/me), then OpenCLI `twitter profile` with no username (defaults
-/// to the logged-in user — reliable on OpenCLI 1.8.8 and 2.x), then
-/// OpenCLI `twitter whoami` for versions where profile needs a name.
+/// Read-only detection. Tries the user's own developer token (users/me)
+/// when one is saved, otherwise ONE OpenCLI `twitter profile` call with no
+/// username (defaults to the logged-in user — reliable on OpenCLI 1.8.8
+/// and 2.x). Deliberately no `whoami` fallback: see below.
 pub fn detect_connection(
     config: &XConfig,
     runner: &dyn CommandRunner,
@@ -85,46 +85,30 @@ pub fn detect_connection(
         };
     }
 
-    // `twitter profile` with no username = the logged-in user.
+    // ONE probe only. `twitter profile` with no username = the logged-in
+    // user, and it runs as an ephemeral background session (see
+    // `opencli_read_pub`). The old second probe, `twitter whoami`, is a
+    // *persistent* session in OpenCLI's manifest: it forces its tab to stay
+    // open on x.com and made Connect visibly cycle x.com pages a second
+    // time before parking on about:blank. One call, in-panel progress,
+    // done — and a hard 30s ceiling so Connect can never spin forever.
     let profile_args = opencli_read_pub(&["twitter".into(), "profile".into()]);
-    let mut last_detail: String;
-    match runner.run_timeout(&config.opencli_bin, &profile_args, Duration::from_secs(40)) {
-        Ok(output) => {
-            last_detail = format!("{}\n{}", output.stdout, output.stderr);
-            if output.status == 0
-                && let Ok(handle) = parse_profile_self(&output.stdout)
-            {
-                let _ = save_connected_handle(config, &handle);
-                return Connection::Connected {
-                    handle,
-                    via: "OpenCLI · your Chrome session".into(),
-                };
+    let last_detail =
+        match runner.run_timeout(&config.opencli_bin, &profile_args, Duration::from_secs(30)) {
+            Ok(output) => {
+                if output.status == 0
+                    && let Ok(handle) = parse_profile_self(&output.stdout)
+                {
+                    let _ = save_connected_handle(config, &handle);
+                    return Connection::Connected {
+                        handle,
+                        via: "OpenCLI · your Chrome session".into(),
+                    };
+                }
+                format!("{}\n{}", output.stdout, output.stderr)
             }
-        }
-        Err(error) => last_detail = error,
-    }
-    // Fallback for OpenCLI builds whose profile needs an explicit name.
-    let whoami_args = opencli_read_pub(&["twitter".into(), "whoami".into()]);
-    match runner.run_timeout(&config.opencli_bin, &whoami_args, Duration::from_secs(40)) {
-        Ok(output) => {
-            last_detail = format!("{}\n{}", output.stdout, output.stderr);
-            if output.status == 0
-                && let Ok(handle) = parse_whoami(&output.stdout)
-            {
-                let _ = save_connected_handle(config, &handle);
-                return Connection::Connected {
-                    handle,
-                    via: "OpenCLI · your Chrome session".into(),
-                };
-            }
-        }
-        Err(error) => {
-            // Keep the profile failure: it is the primary probe.
-            if !error.is_empty() && last_detail.trim().is_empty() {
-                last_detail = error;
-            }
-        }
-    }
+            Err(error) => error,
+        };
 
     let (reason, next) = classify_opencli_failure(&last_detail, config);
     Connection::NotConnected { reason, next }
@@ -328,8 +312,14 @@ mod tests {
             &["twitter", "profile"],
             r#"[{"screen_name":"ada","name":"Ada"}]"#,
         );
-        runner.fail("opencli", &["twitter", "whoami"], "AUTH_REQUIRED");
         let conn = detect_connection(&config, &runner, &MapHttp::default());
+        // Exactly one silent probe: no whoami second navigation.
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(calls[0].1.iter().any(|a| a == "ephemeral"), "{calls:?}");
+            assert!(calls[0].1.iter().any(|a| a == "background"), "{calls:?}");
+        }
         assert_eq!(
             conn,
             Connection::Connected {
@@ -348,11 +338,6 @@ mod tests {
         runner.fail(
             "opencli",
             &["twitter", "profile"],
-            "BROWSER_CONNECT Browser Bridge extension not connected",
-        );
-        runner.fail(
-            "opencli",
-            &["twitter", "whoami"],
             "BROWSER_CONNECT Browser Bridge extension not connected",
         );
         let conn = detect_connection(&config, &runner, &MapHttp::default());

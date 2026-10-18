@@ -52,6 +52,10 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
             "json".into(),
             "--window".into(),
             "background".into(),
+            "--site-session".into(),
+            "ephemeral".into(),
+            "--keep-tab".into(),
+            "false".into(),
         ],
         &["twitter".into(), "--help".into()],
     );

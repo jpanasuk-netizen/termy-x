@@ -688,15 +688,30 @@ impl Publisher for OpenCliPublisher {
             } else {
                 vec!["twitter".into(), "post".into(), part.clone()]
             };
-            // OpenCLI --images only on the first part (max 4).
+            // Media on the first part only. `twitter post` takes
+            // `--images a,b,c` (max 4, validated above), but
+            // `twitter reply` takes a single `--image <path>` (verified in
+            // `opencli twitter reply --help` on 1.8.8) — say so plainly
+            // instead of silently dropping the extra images.
             if index == 0 && !media.is_empty() {
-                let joined = media
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                args.push("--images".into());
-                args.push(joined);
+                if reply_to.is_some() {
+                    if media.len() > 1 {
+                        return Err(
+                            "OpenCLI replies can attach 1 image — remove the extra image(s) and try again. Nothing was posted."
+                                .into(),
+                        );
+                    }
+                    args.push("--image".into());
+                    args.push(media[0].display().to_string());
+                } else {
+                    let joined = media
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    args.push("--images".into());
+                    args.push(joined);
+                }
             }
             let args = opencli_json(&args);
             let output = self.runner.run(&self.bin, &args)?;
@@ -841,8 +856,19 @@ fn opencli_json(args: &[String]) -> Vec<String> {
     let mut args = args.to_vec();
     args.push("-f".into());
     args.push("json".into());
+    // Silent background, verified against OpenCLI 1.8.8 `--help` on Windows:
+    // `--window background` never focuses Chrome, and an explicit ephemeral
+    // site session with `--keep-tab false` releases the tab lease when the
+    // command finishes (the extension parks its automation tab on
+    // about:blank instead of leaving an x.com page open). Never use
+    // `twitter whoami` for this: it is a *persistent* session in OpenCLI's
+    // manifest, which forces keep-tab on and leaves a live X tab behind.
     args.push("--window".into());
     args.push("background".into());
+    args.push("--site-session".into());
+    args.push("ephemeral".into());
+    args.push("--keep-tab".into());
+    args.push("false".into());
     args
 }
 
@@ -1712,6 +1738,91 @@ mod tests {
             "post"
         ));
         assert!(!help_lists_command("profile, search, timeline", "post"));
+    }
+
+    #[test]
+    fn opencli_reply_threads_to_target_with_silent_background_args() {
+        // Real reply mechanism (OpenCLI 1.8.8 `twitter reply --help`):
+        // `twitter reply <url> <text> [--image <one path>]`. The publish
+        // gate must thread to the target id and stay in the background.
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "reply"],
+            r#"[{"status":"ok","url":"https://x.com/ada/status/999"}]"#,
+        );
+        let config = quiet_config();
+        let publisher = OpenCliPublisher::new(&config, runner.clone());
+        let outcome = crate::publish::confirm_and_publish_with_media(
+            "nice post",
+            Some("123"),
+            crate::publish::ConfirmDecision::Yes,
+            false,
+            &publisher,
+            280,
+            &[],
+        );
+        assert!(matches!(outcome, crate::publish::GateOutcome::Sent { .. }));
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let args = &calls[0].1;
+        assert_eq!(args[0], "twitter");
+        assert_eq!(args[1], "reply");
+        assert_eq!(args[2], "https://x.com/i/status/123", "{args:?}");
+        assert_eq!(args[3], "nice post");
+        for flag in [
+            "--window",
+            "background",
+            "--site-session",
+            "ephemeral",
+            "--keep-tab",
+            "false",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "--images"), "{args:?}");
+    }
+
+    #[test]
+    fn opencli_reply_rejects_two_images_before_calling() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut media = Vec::new();
+        for name in ["a.png", "b.png"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"png").unwrap();
+            media.push(path);
+        }
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.install("opencli");
+        let config = quiet_config();
+        let publisher = OpenCliPublisher::new(&config, runner.clone());
+        let error = publisher
+            .publish(&["hi".to_string()], Some("123"), &media)
+            .unwrap_err();
+        assert!(error.contains("1 image"), "{error}");
+        assert!(runner.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn opencli_reply_dry_run_never_calls_the_publisher() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.install("opencli");
+        let config = quiet_config();
+        let publisher = OpenCliPublisher::new(&config, runner.clone());
+        let outcome = crate::publish::confirm_and_publish_with_media(
+            "draft reply",
+            Some("123"),
+            crate::publish::ConfirmDecision::Yes,
+            true,
+            &publisher,
+            280,
+            &[],
+        );
+        assert!(matches!(
+            outcome,
+            crate::publish::GateOutcome::DryRun { .. }
+        ));
+        assert!(runner.calls.lock().unwrap().is_empty());
     }
 
     #[test]
