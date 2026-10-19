@@ -1550,7 +1550,7 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
     return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)}};
   }}
   function parsePage(data, seen) {{
@@ -1730,7 +1730,7 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || HANDLE;
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
     return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
   }
   // Pinned extraction, the mechanism that actually works against the
@@ -1871,7 +1871,7 @@ const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
     return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
   }
   const one = await gql("TweetResultByRestId", {tweetId: TWEET_ID, withCommunity: false, includePromotedContent: false, withVoice: false});
@@ -3567,9 +3567,9 @@ mod tests {
     #[test]
     fn eval_scripts_unwrap_retweeted_status() {
         let timeline = timeline_eval_js(TimelineFeed::ForYou, None, 20);
-        assert!(timeline.contains("retweeted_status_result"), "timeline unwraps reposts");
+        assert!(timeline.contains("tw.retweeted_status_result"), "timeline unwraps reposts from the tweet result (GraphQL carries it there, not on legacy)");
         let profile = profile_eval_js("someone", 30);
-        assert!(profile.contains("retweeted_status_result"), "profile unwraps reposts");
+        assert!(profile.contains("tw.retweeted_status_result"), "profile unwraps reposts from the tweet result");
     }
 
     #[test]
