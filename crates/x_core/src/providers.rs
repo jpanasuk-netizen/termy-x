@@ -345,7 +345,16 @@ impl XProvider for MockProvider {
                 following: 40,
                 posts: sample_posts()
                     .into_iter()
+                    .skip(1)
                     .take(2)
+                    .map(|mut post| {
+                        post.author_handle = handle.to_string();
+                        post
+                    })
+                    .collect(),
+                pinned: sample_posts()
+                    .into_iter()
+                    .take(1)
                     .map(|mut post| {
                         post.author_handle = handle.to_string();
                         post
@@ -506,6 +515,7 @@ fn fixtures() -> Vec<Profile> {
         followers: 4096,
         following: 120,
         posts: sample_posts().into_iter().take(2).collect(),
+        pinned: Vec::new(),
     }]
 }
 
@@ -618,9 +628,18 @@ impl OpenCliProvider {
         cursor: Option<&str>,
         count: usize,
     ) -> Result<TimelinePage, String> {
+        let stdout = self.eval_js("https://x.com/home", &timeline_eval_js(feed, cursor, count))?;
+        parse_timeline_eval(&stdout)
+    }
+
+    /// One silent background browser session that runs `js` in a
+    /// logged-in x.com page and returns its stdout. Shared by the
+    /// timeline walker and the profile (pinned/latest) walker; the
+    /// page's cookies never leave the page.
+    fn eval_js(&self, open_url: &str, js: &str) -> Result<String, String> {
         let session = "termyx";
         let open = self.browser_cmd(
-            &["browser", session, "open", "https://x.com/home", "--window", "background"],
+            &["browser", session, "open", open_url, "--window", "background"],
             Duration::from_secs(60),
         )?;
         if open.status != 0 {
@@ -649,7 +668,6 @@ impl OpenCliProvider {
                 _ => std::thread::sleep(Duration::from_millis(800)),
             }
         }
-        let js = timeline_eval_js(feed, cursor, count);
         // Ship the script in chunks: on Windows every arg travels
         // through `cmd.exe /c opencli.cmd ...`, whose command line is
         // capped at 8191 chars — one base64 blob for this script is
@@ -696,12 +714,26 @@ impl OpenCliProvider {
         let eval = eval?;
         if eval.status != 0 {
             return Err(if eval.stderr.trim().is_empty() {
-                format!("timeline session exited {}", eval.status)
+                format!("browser session exited {}", eval.status)
             } else {
                 eval.stderr.trim().to_string()
             });
         }
-        parse_timeline_eval(&eval.stdout)
+        Ok(eval.stdout)
+    }
+
+    /// Latest + pinned posts for one profile, from the same silent
+    /// browser GraphQL path as the timeline. Best-effort: any failure
+    /// returns empty vecs rather than failing the profile lookup.
+    fn eval_profile_posts(&self, handle: &str, want: usize) -> (Vec<Post>, Vec<Post>) {
+        let url = format!("https://x.com/{handle}");
+        match self.eval_js(&url, &profile_eval_js(handle, want)) {
+            Ok(stdout) => parse_profile_eval(&stdout).unwrap_or_default(),
+            Err(error) => {
+                log_raw_provider_error("profile eval", &error);
+                (Vec::new(), Vec::new())
+            }
+        }
     }
 }
 
@@ -718,7 +750,34 @@ impl XProvider for OpenCliProvider {
             "profile".into(),
             handle.into(),
         ]))?;
-        let profile = parse_profile(&stdout, handle)?;
+        let mut profile = parse_profile(&stdout, handle)?;
+        // Latest posts: `twitter tweets` is chronological and already
+        // excludes the pinned post (its GraphQL walk skips pin
+        // entries). A tweets failure (protected/suspended account)
+        // keeps the profile and just shows no Latest section.
+        let latest = self
+            .call(&opencli_read(&[
+                "twitter".into(),
+                "tweets".into(),
+                handle.into(),
+                "--limit".into(),
+                "30".into(),
+                "--page-delay".into(),
+                "1".into(),
+            ]))
+            .and_then(|out| parse_posts(&out))
+            .unwrap_or_else(|error| {
+                log_raw_provider_error("lookup tweets", &error);
+                Vec::new()
+            });
+        // Pinned + eval latest come from the silent GraphQL session;
+        // eval posts are also the fallback when the CLI tweets call
+        // came back empty.
+        let (eval_latest, pinned) = self.eval_profile_posts(handle, 30);
+        let mut latest = if latest.is_empty() { eval_latest } else { latest };
+        latest = crate::model::exclude_pinned(&latest, &pinned);
+        profile.posts = dedupe_posts(latest);
+        profile.pinned = pinned;
         Ok(session_served(ProviderId::OpenCli, profile, "profile"))
     }
     fn thread(&self, id: &str) -> Result<Served<Thread>, String> {
@@ -1411,6 +1470,161 @@ fn parse_timeline_eval(stdout: &str) -> Result<TimelinePage, String> {
     Ok(TimelinePage { posts, next_cursor })
 }
 
+/// In-page pinned-post finder. OpenCLI's `twitter tweets` (the Latest
+/// source) excludes the pinned post, and hand-rolled UserByScreenName /
+/// UserTweets GraphQL calls are rejected by the current web client
+/// (422 GRAPHQL_VALIDATION_FAILED), so this uses what works: the
+/// profile page renders the pinned post first with a "Pinned" marker —
+/// take its status id from the DOM and fetch the full row via
+/// TweetResultByRestId. Returns `{posts: [], pinned}` in the same
+/// normalized row shape as the timeline eval; Latest comes from the
+/// CLI. No marker means the account has no pinned post.
+fn profile_eval_js(handle: &str, want: usize) -> String {
+    let handle_js = serde_json::to_string(handle).expect("handle js");
+    PROFILE_EVAL_JS
+        .replace("__HANDLE_JSON__", &handle_js)
+        .replace("__WANT__", &want.to_string())
+}
+
+const PROFILE_EVAL_JS: &str = r##"(async () => {
+  const HANDLE = __HANDLE_JSON__;
+  const WANT = __WANT__;
+  let ct0 = null;
+  for (let w = 0; w < 24; w++) {
+    ct0 = (document.cookie.match(/(?:^|; )ct0=([^;]+)/) || [])[1];
+    if (ct0) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  if (!ct0) return JSON.stringify({error: "not logged into x.com (no ct0 cookie)", posts: [], pinned: null});
+  const FEATURES = {"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_enhance_cards_enabled":false};
+  const headers = {Authorization: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA", "X-Csrf-Token": decodeURIComponent(ct0), "X-Twitter-Auth-Type": "OAuth2Session", "X-Twitter-Active-User": "yes"};
+  const gqlDiag = {};
+  async function resolveQid(op) {
+    try {
+      const urlSet = new Set();
+      [...document.scripts].forEach(s => { if (s.src) urlSet.add(s.src); });
+      try { performance.getEntriesByType("resource").forEach(r => { if (r.name && r.name.includes(".js")) urlSet.add(r.name); }); } catch (e) {}
+      const srcs = [...urlSet];
+      for (const src of srcs) {
+        const txt = await (await fetch(src)).text();
+        let i = txt.indexOf(op);
+        let hops = 0;
+        while (i >= 0 && hops < 6) {
+          const seg = txt.slice(Math.max(0, i - 1200), i + 1200);
+          const m = seg.match(/queryId:"([A-Za-z0-9_-]{10,})"/);
+          if (m) return m[1];
+          i = txt.indexOf(op, i + 1); hops++;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  async function gql(op, vars) {
+    let qid = await resolveQid(op);
+    if (!qid) { gqlDiag[op] = "noqid"; return null; }
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const url = "/i/api/graphql/" + qid + "/" + op + "?variables=" + encodeURIComponent(JSON.stringify(vars)) + "&features=" + encodeURIComponent(JSON.stringify(FEATURES));
+      const r = await fetch(url, {method: "GET", headers, credentials: "include"});
+      if (r.status === 404 && attempt === 0) {
+        const q2 = await resolveQid(op);
+        if (q2 && q2 !== qid) { qid = q2; continue; }
+      }
+      if (!r.ok) { try { gqlDiag[op] = r.status + " " + (await r.text()).slice(0, 200); } catch (e) { gqlDiag[op] = r.status; } return null; }
+      gqlDiag[op] = r.status;
+      return await r.json();
+    }
+    return null;
+  }
+  function mediaOf(l) {
+    const media = (l.extended_entities && l.extended_entities.media) || (l.entities && l.entities.media) || [];
+    const urls = [], posters = [], durations = [];
+    for (const m of media) {
+      if (!m) continue;
+      if (m.type === "video" || m.type === "animated_gif") {
+        let best = null;
+        for (const v of (m.video_info && m.video_info.variants) || []) {
+          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+        }
+        urls.push(best ? best.url : m.media_url_https);
+        posters.push(m.media_url_https);
+        durations.push((m.video_info && m.video_info.duration_millis) || 0);
+      } else {
+        urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
+      }
+    }
+    return {has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations};
+  }
+  function extract(result, seen) {
+    if (!result) return null;
+    const tw = result.tweet || result;
+    const l = tw.legacy || {};
+    if (!tw.rest_id || seen.has(tw.rest_id)) return null;
+    seen.add(tw.rest_id);
+    const u = tw.core && tw.core.user_results && tw.core.user_results.result;
+    const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || HANDLE;
+    const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
+    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, ...mediaOf(l)};
+  }
+  // Pinned extraction, the mechanism that actually works against the
+  // live client: the profile page renders the pinned post first with a
+  // "Pinned" marker, so read its status id from the DOM, then fetch the
+  // full normalized row with TweetResultByRestId. (Hand-rolled
+  // profile GraphQL calls get 422s from the current client, and
+  // `twitter tweets` never includes the pin.)
+  let pinned = null, domPinId = null;
+  for (let w = 0; w < 16 && !domPinId; w++) {
+    try {
+      const arts = [...document.querySelectorAll("article")];
+      for (const a of arts) {
+        const tx = (a.innerText || "").slice(0, 80);
+        if (tx.includes("Pinned")) {
+          const lk = a.querySelector("a[href*='/status/']");
+          if (lk) { const mm = lk.getAttribute("href").match(/\/status\/(\d+)/); if (mm) { domPinId = mm[1]; break; } }
+        }
+      }
+      if (!arts.length && !domPinId) await new Promise(r => setTimeout(r, 500));
+    } catch (e) {}
+    if (!domPinId) await new Promise(r => setTimeout(r, 250));
+  }
+  if (domPinId) {
+    const one = await gql("TweetResultByRestId", {tweetId: domPinId, withCommunity: false, includePromotedContent: false, withVoice: false});
+    const tr = one && one.data && one.data.tweetResult && one.data.tweetResult.result;
+    if (tr) pinned = extract(tr, new Set());
+  }
+  const diag = {domPinId, gql: gqlDiag};
+  return JSON.stringify({posts: [], pinned, diag});
+})()"##;
+
+/// Parse one profile-eval payload into (latest, pinned). An `error`
+/// with no posts at all is a real failure; partial data is kept.
+fn parse_profile_eval(stdout: &str) -> Result<(Vec<Post>, Vec<Post>), String> {
+    let value: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("profile session returned unreadable output: {e}"))?;
+    if let Some(diag) = value.get("diag") {
+        log_raw_provider_error(
+            "profile diag",
+            &serde_json::to_string(diag).unwrap_or_else(|_| "?".to_string()),
+        );
+    }
+    let posts = match value.get("posts") {
+        Some(rows) if rows.is_array() => parse_posts(&rows.to_string()).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let pinned = match value.get("pinned") {
+        Some(row) if row.is_object() => {
+            parse_posts(&serde_json::json!([row]).to_string()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if let Some(error) = value.get("error").and_then(Value::as_str)
+        && posts.is_empty()
+        && pinned.is_empty()
+    {
+        return Err(error.to_string());
+    }
+    Ok((posts, pinned))
+}
+
 fn opencli_read(args: &[String]) -> Vec<String> {
     opencli_json(args)
 }
@@ -1720,6 +1934,51 @@ pub fn research_topic(
         {
             hits.extend(parse_research("youtube", &output.stdout, Some(SESSION_OWN)));
         }
+        // Labeled read-only lanes where OpenCLI has a real query
+        // search today. Each is cookie-session/background like the X
+        // reads; a platform that isn't logged in or is walled simply
+        // contributes no hits — never an error, never a browser pop.
+        // Instagram is deliberately absent: its search is users-only,
+        // not topic content.
+        if let Ok(output) = runner.run(
+            &config.opencli_bin,
+            &opencli_read(&[
+                "tiktok".into(),
+                "search".into(),
+                topic.into(),
+                "--limit".into(),
+                "5".into(),
+            ]),
+        ) && output.status == 0
+        {
+            hits.extend(parse_tiktok(&output.stdout));
+        }
+        if let Ok(output) = runner.run(
+            &config.opencli_bin,
+            &opencli_read(&[
+                "pinterest".into(),
+                "search-pins".into(),
+                topic.into(),
+                "--limit".into(),
+                "5".into(),
+            ]),
+        ) && output.status == 0
+        {
+            hits.extend(parse_research("pinterest", &output.stdout, Some(SESSION_OWN)));
+        }
+        if let Ok(output) = runner.run(
+            &config.opencli_bin,
+            &opencli_read(&[
+                "facebook".into(),
+                "search".into(),
+                topic.into(),
+                "--limit".into(),
+                "5".into(),
+            ]),
+        ) && output.status == 0
+        {
+            hits.extend(parse_facebook(&output.stdout));
+        }
     }
     if runner.exists(&config.youtube_bin) {
         let query = format!("ytsearch5:{topic}");
@@ -1858,6 +2117,65 @@ fn xml_text(item: &str, tag: &str) -> String {
         .join(" ")
 }
 
+/// TikTok search rows: {rank, desc, author, url, plays, likes,
+/// comments, shares}. Title is the caption; stats go to the excerpt.
+fn parse_tiktok(text: &str) -> Vec<ResearchHit> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    array_of(&value)
+        .into_iter()
+        .map(|item| {
+            let title = first_str(item, &["desc", "text", "title"]).unwrap_or("TikTok video");
+            let author = first_str(item, &["author"]).unwrap_or("");
+            let mut stats: Vec<String> = Vec::new();
+            if !author.is_empty() {
+                stats.push(format!("@{author}"));
+            }
+            for (key, label) in [
+                ("plays", "plays"),
+                ("likes", "likes"),
+                ("comments", "comments"),
+                ("shares", "shares"),
+            ] {
+                if let Some(n) = item.get(key).and_then(Value::as_u64) {
+                    stats.push(format!("{n} {label}"));
+                }
+            }
+            ResearchHit {
+                source: "tiktok".into(),
+                title: title.to_string(),
+                url: first_str(item, &["url", "link"]).unwrap_or("").to_string(),
+                excerpt: stats.join(" \u{b7} "),
+                session: Some(SESSION_OWN.to_string()),
+            }
+        })
+        .collect()
+}
+
+/// Facebook search rows: {index, title, text, url} mixing people,
+/// pages, and posts — labeled as one facebook lane, text as excerpt.
+fn parse_facebook(text: &str) -> Vec<ResearchHit> {
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    array_of(&value)
+        .into_iter()
+        .map(|item| {
+            let excerpt = first_str(item, &["text", "description", "body"]).unwrap_or("");
+            ResearchHit {
+                source: "facebook".into(),
+                title: first_str(item, &["title", "name"])
+                    .unwrap_or("Facebook result")
+                    .to_string(),
+                url: first_str(item, &["url", "link"]).unwrap_or("").to_string(),
+                excerpt: excerpt.chars().take(240).collect(),
+                session: Some(SESSION_OWN.to_string()),
+            }
+        })
+        .collect()
+}
+
 fn parse_research(source: &str, text: &str, session: Option<&str>) -> Vec<ResearchHit> {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return Vec::new();
@@ -1938,6 +2256,7 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
         followers: number(metrics, &["followers_count", "followers"]),
         following: number(metrics, &["following_count", "friends_count", "following"]),
         posts,
+        pinned: Vec::new(),
     })
 }
 
@@ -2653,6 +2972,70 @@ mod tests {
         assert_eq!(timeline.value[0].replies, 2);
         let trends = service.trends(None, 5).unwrap();
         assert_eq!(trends.value[0].name, "#gpui");
+    }
+
+    #[test]
+    fn platform_lanes_parse_their_real_payload_shapes() {
+        // TikTok: {desc, author, url, plays, likes} -> caption title + stats.
+        let tiktok = r#"[{"rank": 1, "desc": "rust macros explained", "author": "devguy", "url": "https://www.tiktok.com/@devguy/video/1", "plays": 1200, "likes": 90}]"#;
+        let hits = parse_tiktok(tiktok);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "tiktok");
+        assert_eq!(hits[0].title, "rust macros explained");
+        assert!(hits[0].excerpt.contains("@devguy"));
+        assert!(hits[0].excerpt.contains("1200 plays"));
+
+        // Facebook: {title, text, url} mixed results.
+        let facebook = r#"[{"index": 1, "title": "Rust Devs Group", "text": "A group for rust developers", "url": "https://facebook.com/groups/rust"}]"#;
+        let hits = parse_facebook(facebook);
+        assert_eq!(hits[0].source, "facebook");
+        assert_eq!(hits[0].title, "Rust Devs Group");
+        assert_eq!(hits[0].excerpt, "A group for rust developers");
+
+        // Pinterest rows flow through the generic parser with its label.
+        let pinterest = r#"[{"pinId": "9", "title": "Terminal setup", "description": "dark desk", "pinner": "amy", "url": "https://pinterest.com/pin/9"}]"#;
+        let hits = parse_research("pinterest", pinterest, None);
+        assert_eq!(hits[0].source, "pinterest");
+        assert_eq!(hits[0].title, "Terminal setup");
+        assert_eq!(hits[0].excerpt, "dark desk");
+    }
+
+    #[test]
+    fn profile_eval_payload_splits_pinned_from_latest() {
+        // Normalized rows in the exact shape profile_eval_js returns.
+        let json = r##"{
+          "posts": [
+            {"id": "30", "author": "someone", "text": "newest", "likes": 3},
+            {"id": "20", "author": "someone", "text": "the pinned one", "likes": 9}
+          ],
+          "pinned": {"id": "20", "author": "someone", "text": "the pinned one", "likes": 9}
+        }"##;
+        let (latest, pinned) = parse_profile_eval(json).unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, "20");
+        assert_eq!(latest.len(), 2, "eval keeps both; dedupe happens at assembly");
+        let deduped = crate::model::exclude_pinned(&latest, &pinned);
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].id, "30", "pinned renders once, in Pinned only");
+    }
+
+    #[test]
+    fn profile_eval_error_with_no_posts_is_a_failure() {
+        let json = r#"{"error": "profile posts unavailable", "posts": [], "pinned": null}"#;
+        assert!(parse_profile_eval(json).is_err());
+    }
+
+    #[test]
+    fn profile_eval_js_finds_pin_via_dom_and_tweet_result() {
+        // Guard the mechanism: pinned comes from the GraphQL pin entry,
+        // cross-checked against the user's pinned id list — if either
+        // string disappears the feature silently died, so fail loudly.
+        let js = profile_eval_js("someone", 30);
+        assert!(js.contains("Pinned"), "dom pin marker");
+        assert!(js.contains("TweetResultByRestId"), "pinned row source");
+        assert!(js.contains("article"), "dom scan");
+        assert!(!js.contains("UserByScreenName"), "422-prone op removed");
+        assert!(js.contains("\"someone\""), "handle injected");
     }
 
     #[test]

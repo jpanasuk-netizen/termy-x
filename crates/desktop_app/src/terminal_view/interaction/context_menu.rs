@@ -123,7 +123,9 @@ impl TerminalView {
                 cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
             }
         } else {
-            let _ = self.execute_input_command_action(action, cx);
+            // The terminal's own context menu is a terminal gesture:
+            // no window focus routing, paste lands in the shell.
+            let _ = self.execute_input_command_action(action, None, cx);
         }
     }
 

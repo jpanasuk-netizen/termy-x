@@ -708,14 +708,18 @@ impl TerminalView {
     pub(in super::super) fn execute_input_command_action(
         &mut self,
         action: CommandAction,
+        window: Option<&Window>,
         cx: &mut Context<Self>,
     ) -> bool {
-        // When Termy X Compose owns the keyboard, route edit actions into the
-        // panel so Ctrl+V/A/C never hit the left terminal pane.
+        // When the Termy X panel owns the keyboard (panel focused and a
+        // panel editor active), route edit actions into the panel so
+        // Ctrl+V/A/C never hit the left terminal pane. With the terminal
+        // focused, Ctrl+C keeps terminal semantics below: copy the
+        // selection if there is one, otherwise send ^C to interrupt.
         if matches!(
             action,
             CommandAction::Copy | CommandAction::Paste | CommandAction::SelectAll
-        ) && self.x_panel_handle_edit_action(action, cx)
+        ) && window.is_some_and(|w| self.x_panel_handle_edit_action(action, w, cx))
         {
             return true;
         }

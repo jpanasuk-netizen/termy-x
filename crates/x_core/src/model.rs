@@ -203,7 +203,23 @@ pub struct Profile {
     pub bio: String,
     pub followers: u64,
     pub following: u64,
+    /// Latest posts (pinned excluded — see `pinned`).
     pub posts: Vec<Post>,
+    /// The account's pinned post(s), proven from the provider payload
+    /// (GraphQL TimelinePinEntry cross-checked against
+    /// pinned_tweet_ids_str). Empty when the payload offers no proof.
+    #[serde(default)]
+    pub pinned: Vec<Post>,
+}
+
+/// Latest posts with any pinned duplicates removed, so a pinned post
+/// renders once (in the Pinned section), never twice.
+pub fn exclude_pinned(latest: &[Post], pinned: &[Post]) -> Vec<Post> {
+    if pinned.is_empty() {
+        return latest.to_vec();
+    }
+    let ids: std::collections::HashSet<&str> = pinned.iter().map(|p| p.id.as_str()).collect();
+    latest.iter().filter(|p| !ids.contains(p.id.as_str())).cloned().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

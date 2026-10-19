@@ -273,7 +273,7 @@ impl TerminalView {
                 window.minimize_window();
             }
             CommandAction::Copy | CommandAction::Paste | CommandAction::SelectAll => {
-                self.execute_input_command_action(action, cx);
+                self.execute_input_command_action(action, Some(window), cx);
             }
             CommandAction::ClearScreen => {
                 // Form feed is the control character produced by Ctrl+L.

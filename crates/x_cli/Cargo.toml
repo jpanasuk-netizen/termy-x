@@ -5,13 +5,16 @@ edition = "2024"
 license = "MIT"
 description = "Termy X command line"
 readme = "README.md"
-default-run = "x"
+default-run = "termy-xcli"
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "x"
+# Named termy-xcli on purpose: a bare "x.exe" is misdetected by
+# Overwolf/Outplayed as the game "X: Beyond the Frontier" and pops
+# the Outplayed window on process exit.
+name = "termy-xcli"
 path = "src/main.rs"
 
 [dependencies]

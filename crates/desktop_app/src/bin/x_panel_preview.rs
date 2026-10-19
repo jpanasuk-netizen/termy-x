@@ -21,6 +21,7 @@ struct PreviewArgs {
     entities: bool,
     trends: bool,
     search: bool,
+    lookupdemo: bool,
     research: bool,
     researchdemo: bool,
     width: f32,
@@ -37,6 +38,7 @@ fn preview_args() -> PreviewArgs {
         entities: false,
         trends: false,
         search: false,
+        lookupdemo: false,
         research: false,
         researchdemo: false,
         bench_tabs: false,
@@ -60,6 +62,7 @@ fn preview_args() -> PreviewArgs {
             "--entities" | "entities" => args.entities = true,
             "--trends" | "trends" => args.trends = true,
             "--search" | "search" => args.search = true,
+            "--lookupdemo" | "lookupdemo" => args.lookupdemo = true,
             "--researchdemo" | "researchdemo" => args.researchdemo = true,
             "--research" | "research" => args.research = true,
             "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
@@ -94,28 +97,28 @@ fn preview_args() -> PreviewArgs {
 fn main() {
     let args = preview_args();
     // `--splash` is the empty full-strength bird. `--mock` and the default stay on fixtures.
-    let scene = match (
-        args.splash,
-        args.posted,
-        args.posted_card,
-        args.entities,
-        args.trends,
-        args.search,
-        args.research,
-        args.researchdemo,
-        args.compose,
-        args.mock,
-    ) {
-        (true, _, _, _, _, _, _, _, _, _) => "splash",
-        (_, true, _, _, _, _, _, _, _, _) => "posted",
-        (_, _, true, _, _, _, _, _, _, _) => "posted-card",
-        (_, _, _, true, _, _, _, _, _, _) => "entities",
-        (_, _, _, _, true, _, _, _, _, _) => "trends",
-        (_, _, _, _, _, true, _, _, _, _) => "search",
-        (_, _, _, _, _, _, true, _, _, _) => "research",
-        (_, _, _, _, _, _, _, true, _, _) => "researchdemo",
-        (_, _, _, _, _, _, _, _, true, _) => "compose",
-        _ => "mock",
+    let scene = if args.splash {
+        "splash"
+    } else if args.posted {
+        "posted"
+    } else if args.posted_card {
+        "posted-card"
+    } else if args.entities {
+        "entities"
+    } else if args.trends {
+        "trends"
+    } else if args.search {
+        "search"
+    } else if args.lookupdemo {
+        "lookupdemo"
+    } else if args.research {
+        "research"
+    } else if args.researchdemo {
+        "researchdemo"
+    } else if args.compose {
+        "compose"
+    } else {
+        "mock"
     };
     let width = args.width;
     let height = args.height;

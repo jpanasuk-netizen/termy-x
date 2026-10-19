@@ -155,6 +155,14 @@ fn edit_keys_owned(
     }
 }
 
+/// Focus decides edit-chord routing (Jeremy's rule): the panel only
+/// intercepts Ctrl+C/V/A while the panel itself holds keyboard focus.
+/// Panel open with the terminal focused means the shell owns Ctrl+C
+/// (interrupt), no matter which panel tab or stale editor flag is set.
+pub fn edit_action_goes_to_panel(panel_open: bool, panel_focused: bool, owns_edit_keys: bool) -> bool {
+    panel_open && panel_focused && owns_edit_keys
+}
+
 /// The two simple end-caret text fields (Search query, inline reply).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextField {
@@ -893,6 +901,16 @@ impl XPanel {
             }
             // Dev-preview only: full mock trend set (Top 20 + topic
             // groups + filter field with its caret on show).
+            // Dev-preview only: Lookup with a pinned + latest split.
+            "lookupdemo" => {
+                self.load_mock_dashboard();
+                self.profile = MockProvider
+                    .lookup("someone")
+                    .ok()
+                    .map(|served| served.value);
+                self.lookup = "someone".into();
+                self.open_section(XSection::Lookup, cx);
+            }
             "trends" => {
                 self.load_mock_dashboard();
                 self.open_section(XSection::Trends, cx);
@@ -2091,6 +2109,13 @@ impl XPanel {
     /// into the terminal shell behind the panel (verified in the real
     /// GUI: clipboard text landed at the shell prompt, reply unchanged).
     /// TerminalView must route those actions here whenever this is true.
+    /// True while this panel holds GPUI keyboard focus. TerminalView
+    /// combines this with `owns_edit_keys` before routing edit chords:
+    /// focus, not tab state, decides who gets Ctrl+C.
+    pub fn is_focused(&self, window: &gpui_kit::Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     pub fn owns_edit_keys(&self) -> bool {
         edit_keys_owned(
             self.confirm,
@@ -4707,8 +4732,26 @@ impl XPanel {
                             profile.bio, profile.followers, profile.following
                         ),
                     ));
-                    for post in &profile.posts {
-                        rows.push(self.tweet_card(post, cx));
+                    if !profile.pinned.is_empty() {
+                        rows.push(section_label("Pinned"));
+                        for post in &profile.pinned {
+                            rows.push(self.tweet_card(post, cx));
+                        }
+                    }
+                    if !profile.posts.is_empty() {
+                        rows.push(section_label(&format!(
+                            "Latest \u{b7} {}",
+                            profile.posts.len()
+                        )));
+                        for post in &profile.posts {
+                            rows.push(self.tweet_card(post, cx));
+                        }
+                    }
+                    if profile.pinned.is_empty() && profile.posts.is_empty() {
+                        rows.push(hint(format!(
+                            "No recent posts returned for @{}.",
+                            profile.handle
+                        )));
                     }
                 } else if self.loading {
                     rows.push(empty_state(
@@ -4734,7 +4777,7 @@ impl XPanel {
                             div()
                                 .text_size(px(12.0))
                                 .text_color(rgb(0x7af6ff))
-                                .child("Research \u{b7} Reddit, YouTube, the web + RSS \u{b7} silent background"),
+                                .child("Research \u{b7} Reddit, YouTube, TikTok, Pinterest, Facebook, web + RSS \u{b7} silent background"),
                         )
                         .child(
                             div()
@@ -4756,7 +4799,7 @@ impl XPanel {
                 if self.researched_query.is_empty() {
                     rows.push(empty_state(
                         "Research a topic",
-                        "Type a topic above and press Enter. It runs Reddit search, YouTube search, web notes, and RSS \u{2014} silently in the background, no Chrome window will pop.",
+                        "Type a topic above and press Enter. It runs Reddit, YouTube, TikTok, Pinterest, and Facebook search plus web notes and RSS \u{2014} silently in the background, no Chrome window will pop. Platforms you are not signed into simply contribute nothing.",
                     ));
                 } else if self.loading && self.research.is_empty() {
                     rows.push(empty_state(
@@ -6096,7 +6139,7 @@ impl XPanel {
             ),
             TextField::Research => (
                 self.research_input.as_str(),
-                "Search Reddit, YouTube, the web + RSS \u{2014} Enter runs it",
+                "Search Reddit, YouTube, TikTok, Pinterest, Facebook, web + RSS \u{2014} Enter runs it",
                 "glow-research",
                 "x-research-input",
                 "caret-research",
@@ -7133,6 +7176,17 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
         .into_any_element()
 }
 
+/// Small section header used by Lookup (Pinned / Latest) and friends.
+fn section_label(text: &str) -> gpui_kit::AnyElement {
+    div()
+        .mt(px(4.0))
+        .text_size(px(13.0))
+        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+        .text_color(rgb(0xd7fbff))
+        .child(text.to_string())
+        .into_any_element()
+}
+
 fn hint(text: String) -> gpui_kit::AnyElement {
     div()
         .text_size(px(12.0))
@@ -7229,11 +7283,18 @@ mod edit_keys_tests {
         assert_eq!(next_timeline_limit(9999), None);
     }
 
-    use super::{InputTarget, XSection, edit_keys_owned};
+    use super::{InputTarget, XSection, edit_action_goes_to_panel, edit_keys_owned};
 
     #[test]
     fn reply_and_search_own_paste_but_terminal_states_do_not() {
         // Inline reply open (any non-Search section): owns edit chords.
+        // Focus routing matrix: panel must actually hold focus before
+        // any edit chord is intercepted (the Ctrl+C-in-PowerShell bug).
+        assert!(edit_action_goes_to_panel(true, true, true));
+        assert!(!edit_action_goes_to_panel(true, false, true));
+        assert!(!edit_action_goes_to_panel(true, true, false));
+        assert!(!edit_action_goes_to_panel(false, true, true));
+        assert!(!edit_action_goes_to_panel(false, false, false));
         assert!(edit_keys_owned(
             false,
             false,
