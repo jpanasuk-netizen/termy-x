@@ -25,12 +25,14 @@ serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3"
 unicode-width = "0.2"
-# Pure-Rust HTTP/TLS everywhere: ureq `tls` = rustls + webpki-roots (no
-# OpenSSL / native-tls / system cert store), so Windows->Linux cross builds
-# need no C TLS toolchain. Explicit default-features=false pins exactly the
-# set previously pulled in implicitly by ureq defaults (tls+gzip)+json --
-# no behaviour change, it just cannot drift to a native backend.
-ureq = { version = "2", default-features = false, features = ["json", "tls", "gzip"] }
+# Pure-Rust TLS only: ureq's "tls" feature is rustls + webpki-roots (ring
+# crypto), never native-tls/OpenSSL. Spelled out with default-features = false
+# (identical set to ureq's old defaults: tls + gzip) so no future default or
+# feature unification can silently pull openssl-sys/native-tls into any
+# target -- notably x86_64-unknown-linux-gnu cross builds. The app's own
+# endpoints are unchanged: local Ollama/LM Studio over plain http on
+# 127.0.0.1, plus https to api.x.com / api.github.com through this stack.
+ureq = { version = "2", default-features = false, features = ["gzip", "json", "tls"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 

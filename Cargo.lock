@@ -7770,7 +7770,6 @@ dependencies = [
  "fs4",
  "gpui-kit",
  "image",
- "libsqlite3-sys",
  "log",
  "mimalloc",
  "notify 8.2.0",

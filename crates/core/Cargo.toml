@@ -15,8 +15,8 @@ serde = { workspace = true, features = ["derive", "rc"] }
 flume = { workspace = true }
 log = { workspace = true }
 dirs = { workspace = true }
-# rust_backend = miniz_oxide (pure Rust). Pinning it (was the implicit
-# default) keeps zlib-ng/cloudflare C backends out of cross builds.
+# rust_backend = miniz_oxide (pure Rust). Explicit so the zlib/zlib-ng C
+# backends can never be unified in; identical to flate2's previous default.
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 fontdb = "0.23"
 polling = { workspace = true }

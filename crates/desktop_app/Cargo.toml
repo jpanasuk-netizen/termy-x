@@ -46,11 +46,6 @@ unicode-width = { workspace = true }
 termy_core = { path = "../core" }
 termy_x = { path = "../x_core" }
 
-
-[target."cfg(not(target_os = \"windows\"))".dependencies]
-libsqlite3-sys = "0.30.1"
-
-
 [target."cfg(target_os = \"linux\")".dependencies]
 font-kit = { package = "zed-font-kit", version = "0.14.1-zed", features = ["source-fontconfig-dlopen"] }
 
