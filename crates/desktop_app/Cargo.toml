@@ -45,7 +45,6 @@ resvg = "0.46.0"
 unicode-width = { workspace = true }
 termy_core = { path = "../core" }
 termy_x = { path = "../x_core" }
-mimalloc = "0.1"
 
 
 [target."cfg(not(target_os = \"windows\"))".dependencies]
@@ -73,6 +72,12 @@ objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, 
 winresource = "0.1"
 
 [target."cfg(target_os = \"windows\")".dependencies]
+# Jeremy's speed stack, step 1: mimalloc as the process-global allocator.
+# Windows-only on purpose: the shipped app is Windows, the default Windows
+# heap is the weak one, and this keeps allocator behaviour on macOS/Linux
+# (where the GPUI/font stacks are already tuned) completely untouched.
+# Revert = delete this line and the #[global_allocator] static in src/main.rs.
+mimalloc = "0.1"
 raw-window-handle = "0.6"
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 

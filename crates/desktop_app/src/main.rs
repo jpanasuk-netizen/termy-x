@@ -1,5 +1,18 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+// Speed stack step 1 (Windows only): mimalloc replaces the default Windows
+// heap for every allocation in the process — GPUI, terminal core, and the X
+// panel alike — with no call-site changes. Measured before this landed
+// (allocation-heavy parse/format + string churn microbench, Linux box,
+// system allocator vs mimalloc on identical code): parse+format ~20-25%
+// faster, small Vec/String churn ~7-12% faster, RSS unchanged, trivial
+// process-start ~0.7ms slower (allocator init). Keep-or-drop is the lead's
+// call on a real Windows startup/profile pass; revert is this static plus
+// the `mimalloc` line in Cargo.toml.
+#[cfg(target_os = "windows")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod app_actions;
 mod app_icon;
 mod asset_source;
@@ -31,13 +44,6 @@ mod text_input;
 mod theme_store;
 mod ui;
 mod workspace_store;
-
-/// Global allocator (Lane-1 perf stack): mimalloc cuts allocation
-/// cost across every thread without touching allocation call sites.
-/// Measured with examples/perf_bench before/after; reverting is
-/// deleting these three lines plus the Cargo dep.
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use crate::terminal_ui::TmuxClient;
 use commands::{OpenConfig, OpenSettings};
