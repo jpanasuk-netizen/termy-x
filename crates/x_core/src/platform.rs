@@ -145,6 +145,9 @@ pub fn existing_browser_profile_dirs() -> Vec<PathBuf> {
 mod tests {
     use super::*;
 
+    // Linux-only expectations (XDG paths); the Windows/macOS config-base
+    // branches return different roots by design.
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_config_base_prefers_absolute_xdg_then_home_dot_config() {
         let home = PathBuf::from("/home/ada");
