@@ -82,6 +82,11 @@ pub trait Publisher: Send + Sync {
     ) -> Result<String, String> {
         Err("this posting path cannot like / retweet / quote".into())
     }
+    /// Follow or unfollow an account by handle. Default: this posting
+    /// path cannot (web-intent/mock) — the UI must say so, not fake it.
+    fn set_follow(&self, _handle: &str, _follow: bool) -> Result<String, String> {
+        Err("this posting path cannot follow / unfollow".into())
+    }
     fn publish(
         &self,
         parts: &[String],

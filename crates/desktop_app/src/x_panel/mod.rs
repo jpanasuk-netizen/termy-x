@@ -188,6 +188,28 @@ pub struct CardTextSelection {
 /// selection instead of a click.
 pub const CARD_DRAG_PX: f32 = 6.0;
 
+/// Follow button label from the payload's real following flag plus
+/// an in-flight target. `None` flag = payload silent: show Follow and
+/// let only a verified action change the state (never fake Following).
+pub fn follow_button_label(viewer_following: Option<bool>, pending: Option<bool>) -> &'static str {
+    match pending {
+        Some(true) => "Following\u{2026}",
+        Some(false) => "Unfollowing\u{2026}",
+        None => match viewer_following {
+            Some(true) => "Following \u{b7} Unfollow",
+            _ => "Follow",
+        },
+    }
+}
+
+/// Your own profile never gets a follow button.
+pub fn is_own_profile(profile_handle: &str, own_handle: Option<&str>) -> bool {
+    own_handle.is_some_and(|own| {
+        own.trim_start_matches('@')
+            .eq_ignore_ascii_case(profile_handle.trim_start_matches('@'))
+    })
+}
+
 pub fn card_drag_promotes(start: (f32, f32), now: (f32, f32)) -> bool {
     let dx = now.0 - start.0;
     let dy = now.1 - start.1;
@@ -356,6 +378,10 @@ pub struct XPanel {
     /// Post ids with a like/retweet/quote call in flight (buttons for
     /// these are inert until the call lands).
     engage_pending: Vec<String>,
+    /// (handle, target state) while a follow/unfollow write is in flight.
+    follow_pending: Option<(String, bool)>,
+    /// Session-verified follow states (set only on write success).
+    follow_overrides: std::collections::HashMap<String, bool>,
     /// Inline quote composer state (quote = retweet with your own words).
     quote_post_id: Option<String>,
     quote_author: String,
@@ -643,6 +669,8 @@ impl XPanel {
             repost_cache: std::collections::HashMap::new(),
             repost_resolving: false,
             engage_pending: Vec::new(),
+            follow_pending: None,
+            follow_overrides: std::collections::HashMap::new(),
             quote_post_id: None,
             quote_author: String::new(),
             quote_text: String::new(),
@@ -2969,6 +2997,76 @@ impl XPanel {
     /// engage in the background. Failure reverts the flip and says why;
     /// counts move locally with the flip, never via a re-fetch, so the
     /// scroll position cannot jump.
+    /// Follow/unfollow the profile on screen. State shown is the
+    /// payload's real flag or a session-verified override — never a
+    /// guess; on failure nothing flips and the error is humanized.
+    fn toggle_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
+        if self.follow_pending.is_some() {
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never follows anyone.".into());
+            cx.notify();
+            return;
+        }
+        let current = self
+            .follow_overrides
+            .get(handle)
+            .copied()
+            .or_else(|| {
+                self.profile
+                    .as_ref()
+                    .filter(|p| p.handle.eq_ignore_ascii_case(handle))
+                    .and_then(|p| p.viewer_following)
+            })
+            .unwrap_or(false);
+        let target = !current;
+        let handle = handle.to_string();
+        self.follow_pending = Some((handle.clone(), target));
+        cx.notify();
+        let handle_for_call = handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first, then try again."
+                                .to_string(),
+                        );
+                    };
+                    publisher.set_follow(&handle_for_call, target)
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.follow_pending = None;
+                match result {
+                    Ok(message) => {
+                        panel.follow_overrides.insert(handle.clone(), target);
+                        if let Some(profile) = &mut panel.profile {
+                            if profile.handle.eq_ignore_ascii_case(&handle) {
+                                profile.viewer_following = Some(target);
+                            }
+                        }
+                        panel.status = message;
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "That did not go through: {} Nothing changed on X.",
+                            termy_x::publish::humanize_error(&error)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn toggle_engage(
         &mut self,
         action: termy_x::publish::EngageAction,
@@ -5390,7 +5488,6 @@ impl XPanel {
     /// payload carried them (initials placeholder otherwise — never a
     /// guessed URL), then name, handle, bio and follower counts.
     fn profile_info_card(&self, profile: &Profile, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let _ = cx;
         let initials: String = profile
             .name
             .split_whitespace()
@@ -5503,6 +5600,38 @@ impl XPanel {
                         profile.followers, profile.following
                     )),
             );
+        // Follow/Unfollow (hidden on your own profile). Label follows
+        // the payload flag / verified session state; while a write is
+        // in flight the label shows progress and clicks are ignored.
+        let own_handle = match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+            _ => None,
+        };
+        if !is_own_profile(&profile.handle, own_handle) {
+            let viewer = self
+                .follow_overrides
+                .get(&profile.handle)
+                .copied()
+                .or(profile.viewer_following);
+            let pending = self
+                .follow_pending
+                .as_ref()
+                .filter(|(h, _)| h.eq_ignore_ascii_case(&profile.handle))
+                .map(|(_, target)| *target);
+            let label = follow_button_label(viewer, pending);
+            let click_handle = profile.handle.clone();
+            card_el = card_el.child(
+                div().flex().child(x_button!(
+                    "x-follow-toggle",
+                    label,
+                    viewer == Some(true),
+                    cx.listener(move |this, _, _, cx| {
+                        this.toggle_follow(&click_handle, cx);
+                        cx.stop_propagation();
+                    })
+                )),
+            );
+        }
         card_el.into_any_element()
     }
 
@@ -7857,7 +7986,26 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 #[cfg(test)]
 mod edit_keys_tests {
     use super::next_timeline_limit;
-    use super::{BURST_MS, burst_style_at, caret_visual_line, soft_wrap_ranges};
+    use super::{BURST_MS, burst_style_at, caret_visual_line, follow_button_label, is_own_profile, soft_wrap_ranges};
+
+    #[test]
+    fn follow_button_labels_reflect_payload_state_and_flight() {
+        // Payload silent: honest Follow (no invented Following state).
+        assert_eq!(follow_button_label(None, None), "Follow");
+        assert_eq!(follow_button_label(Some(false), None), "Follow");
+        assert_eq!(follow_button_label(Some(true), None), "Following \u{b7} Unfollow");
+        // In flight: progress label wins; the click guard ignores clicks.
+        assert_eq!(follow_button_label(None, Some(true)), "Following\u{2026}");
+        assert_eq!(follow_button_label(Some(true), Some(false)), "Unfollowing\u{2026}");
+    }
+
+    #[test]
+    fn follow_button_hidden_on_own_profile() {
+        assert!(is_own_profile("Jasper_Black", Some("@jasper_black")));
+        assert!(is_own_profile("jasper_black", Some("Jasper_Black")));
+        assert!(!is_own_profile("spacex", Some("Jasper_Black")));
+        assert!(!is_own_profile("spacex", None));
+    }
 
     #[test]
     fn soft_wrap_breaks_at_spaces_and_never_overflows() {

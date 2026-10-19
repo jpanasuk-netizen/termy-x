@@ -400,6 +400,7 @@ impl XProvider for MockProvider {
                 following: 40,
                 avatar_url: None,
                 banner_url: None,
+                viewer_following: None,
                 posts: sample_posts()
                     .into_iter()
                     .skip(1)
@@ -598,6 +599,7 @@ fn fixtures() -> Vec<Profile> {
         following: 120,
         avatar_url: None,
         banner_url: None,
+        viewer_following: Some(false),
         posts: sample_posts().into_iter().take(2).collect(),
         pinned: Vec::new(),
     }]
@@ -1244,6 +1246,43 @@ impl Publisher for OpenCliPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         self.engage_opencli(action, target_url, text, media)
+    }
+
+    /// `opencli twitter follow|unfollow <handle>` — same success rule
+    /// as engage: exit 0 AND no `ok:false` envelope (check_opencli_output),
+    /// same 90s engage budget, timeouts say "check before retrying".
+    fn set_follow(&self, handle: &str, follow: bool) -> Result<String, String> {
+        let handle = handle.trim().trim_start_matches('@');
+        if handle.is_empty() {
+            return Err("no handle to follow \u{2014} nothing was sent".into());
+        }
+        let verb = if follow { "follow" } else { "unfollow" };
+        let what = if follow { "following" } else { "unfollowing" };
+        let args = opencli_json(&["twitter".into(), verb.into(), handle.into()]);
+        let call_started = Instant::now();
+        let output = match self.runner.run_timeout(&self.bin, &args, ENGAGE_TIMEOUT) {
+            Ok(output) => {
+                write_perf_line(&format!(
+                    "write {verb} cli_ms={} status={}",
+                    call_started.elapsed().as_millis(),
+                    output.status
+                ));
+                output
+            }
+            Err(error) => {
+                write_perf_line(&format!(
+                    "write {verb} cli_ms={} runner-error",
+                    call_started.elapsed().as_millis()
+                ));
+                return Err(write_timeout_error(error, what, ENGAGE_TIMEOUT));
+            }
+        };
+        check_opencli_output(&output, "opencli follow/unfollow")?;
+        Ok(if follow {
+            format!("Following @{handle}")
+        } else {
+            format!("Unfollowed @{handle}")
+        })
     }
 }
 
@@ -2534,6 +2573,20 @@ fn profile_image_str(node: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
+/// The payload's own word on whether the connected account follows
+/// this profile: a boolean `following` (or is_following /
+/// viewer_following) on the user object or its `legacy` sub-object.
+/// A numeric `following` is the following-COUNT, not this flag —
+/// `as_bool` correctly ignores it. Absent flag -> None, never guessed.
+fn viewer_following_from(node: &Value) -> Option<bool> {
+    for key in ["following", "is_following", "viewer_following"] {
+        if let Some(flag) = node.get(key).and_then(Value::as_bool) {
+            return Some(flag);
+        }
+    }
+    node.get("legacy").and_then(viewer_following_from)
+}
+
 fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
     let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     let node = value
@@ -2577,6 +2630,7 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
             "bannerUrl",
             "cover_url",
         ]),
+        viewer_following: viewer_following_from(node),
         posts,
         pinned: Vec::new(),
     })
@@ -3106,6 +3160,73 @@ mod tests {
         assert!(!err.contains("ok:false") && !err.contains('{'));
         // A status:"error" row is a failure too.
         assert!(check_opencli_output(&out(0, r#"[{"status":"error"}]"#, ""), "test").is_err());
+    }
+
+    #[test]
+    fn follow_unfollow_verbs_args_and_failure_envelope() {
+        use std::sync::Mutex as StdMutex;
+        struct RecRunner {
+            calls: StdMutex<Vec<Vec<String>>>,
+            fail: bool,
+        }
+        impl crate::io::CommandRunner for RecRunner {
+            fn exists(&self, _program: &str) -> bool {
+                true
+            }
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                if self.fail {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: r#"{"ok":false,"error":{"code":"command_exec","message":"User not found."}}"#.into(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: r#"{"ok":true}"#.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let rec = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: false });
+        let publisher = OpenCliPublisher {
+            bin: "opencli".into(),
+            runner: rec.clone(),
+            post_ok: StdMutex::new(Some(true)),
+        };
+        // Handle is normalized (@ stripped) and rides the follow verb.
+        publisher.set_follow("@jack", true).expect("follow should succeed");
+        publisher.set_follow("jack", false).expect("unfollow should succeed");
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls[0][1], "follow");
+        assert_eq!(calls[0][2], "jack");
+        assert_eq!(calls[1][1], "unfollow");
+        drop(calls);
+        // An ok:false envelope is a failure even with exit 0.
+        let failing = OpenCliPublisher {
+            bin: "opencli".into(),
+            runner: Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: true }),
+            post_ok: StdMutex::new(Some(true)),
+        };
+        assert!(failing.set_follow("jack", true).is_err());
+        assert!(failing.set_follow("", true).is_err(), "empty handle must not reach the CLI");
+    }
+
+    #[test]
+    fn viewer_following_reads_only_real_bool_flags() {
+        // Boolean flag on the user object (or legacy) is honored.
+        let p = parse_profile(r#"{"username":"a","following":true}"#, "a").unwrap();
+        assert_eq!(p.viewer_following, Some(true));
+        let p = parse_profile(r#"{"username":"a","legacy":{"following":false}}"#, "a").unwrap();
+        assert_eq!(p.viewer_following, Some(false));
+        // The following COUNT (a number) is not the flag.
+        let p = parse_profile(r#"{"username":"a","following":120,"followers_count":5}"#, "a").unwrap();
+        assert_eq!(p.viewer_following, None);
+        assert_eq!(p.following, 120);
+        // No flag anywhere -> unknown, never guessed.
+        let p = parse_profile(r#"{"username":"a"}"#, "a").unwrap();
+        assert_eq!(p.viewer_following, None);
     }
 
     #[test]

@@ -262,6 +262,12 @@ pub struct Profile {
     /// Banner/cover image URL when the payload carries one.
     #[serde(default)]
     pub banner_url: Option<String>,
+    /// Whether the connected account follows this profile, ONLY when
+    /// the provider payload actually says so (`following` flag on the
+    /// user object). `None` = payload silent: the UI shows Follow and
+    /// updates state only after a verified follow/unfollow action.
+    #[serde(default)]
+    pub viewer_following: Option<bool>,
     /// Latest posts (pinned excluded — see `pinned`).
     pub posts: Vec<Post>,
     /// The account's pinned post(s), read from the provider payload
@@ -840,6 +846,7 @@ mod profile_section_tests {
             following: 0,
             avatar_url: None,
             banner_url: None,
+            viewer_following: None,
             posts,
             pinned,
         }
