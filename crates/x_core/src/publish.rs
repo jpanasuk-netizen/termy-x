@@ -39,6 +39,19 @@ pub enum EngageAction {
     Quote,
 }
 
+/// Burst label for a verified engagement, or None for no burst.
+/// Posts/replies/quotes and Retweet all read "\u{2713} Posted"
+/// (Jeremy's wording: a retweet posts). Like reads "\u{2713} Liked".
+/// Removals (unlike/unretweet) get no burst — taking a post away is
+/// not a post; the state flip alone confirms them.
+pub fn engage_burst_label(action: EngageAction) -> Option<&'static str> {
+    match action {
+        EngageAction::Like => Some("\u{2713} Liked"),
+        EngageAction::Retweet => Some("\u{2713} Posted"),
+        EngageAction::Unlike | EngageAction::Unretweet | EngageAction::Quote => None,
+    }
+}
+
 impl EngageAction {
     /// The `opencli twitter <verb>` subcommand (verified against
     /// OpenCLI 1.8.8 `--help`: like/unlike/retweet/unretweet/quote all
@@ -584,6 +597,14 @@ mod tests {
         );
         assert!(validate_media_paths(&[ok]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn burst_labels_cover_posts_and_likes_but_not_removals() {
+        assert_eq!(engage_burst_label(EngageAction::Like), Some("\u{2713} Liked"));
+        assert_eq!(engage_burst_label(EngageAction::Retweet), Some("\u{2713} Posted"));
+        assert_eq!(engage_burst_label(EngageAction::Unlike), None);
+        assert_eq!(engage_burst_label(EngageAction::Unretweet), None);
     }
 
     #[test]

@@ -56,7 +56,7 @@ use termy_x::XConfig;
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, MediaItem, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
-use termy_x::text::{split_thread_limited, weighted_len_limited};
+use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XSection {
@@ -280,6 +280,14 @@ pub struct XPanel {
     /// sets it (text stays, plain error shows instead).
     post_burst: Option<PostBurst>,
     burst_seq: u64,
+    /// Verified @handles (existence only ever caches positive results),
+    /// the single in-flight lookup, and the last-edit stamp driving the
+    /// debounce. Hashtags/cashtags have no existence check on X, so only
+    /// mentions are verified.
+    mention_cache: std::collections::HashMap<String, bool>,
+    mention_inflight: Option<String>,
+    mention_dirty_at: Option<std::time::Instant>,
+    mention_timer: bool,
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
@@ -529,6 +537,10 @@ impl XPanel {
             compose_scroll: ScrollHandle::new(),
             post_burst: None,
             burst_seq: 0,
+            mention_cache: std::collections::HashMap::new(),
+            mention_inflight: None,
+            mention_dirty_at: None,
+            mention_timer: false,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
             search_posts: Vec::new(),
@@ -748,6 +760,17 @@ impl XPanel {
 
     fn load_scene(&mut self, scene: &str, cx: &mut Context<Self>) {
         match scene {
+            // Dev-preview only: Compose preloaded with entity samples
+            // (@/#/$ highlighting) — renders, never publishes.
+            "entities" => {
+                self.open_section(XSection::Compose, cx);
+                self.compose =
+                    "hey @jack see #rust and $AAPL \u{2014} mail a@b.co is not a mention, $$ and #123 stay plain"
+                        .into();
+                self.caret = self.compose.len();
+                self.sel_anchor = None;
+                self.focus_compose_editor();
+            }
             "search" => self.open_section(XSection::Search, cx),
             "compose" => self.open_section(XSection::Compose, cx),
             // Dev-preview only: show the Posted burst state without
@@ -761,6 +784,8 @@ impl XPanel {
                     target: BurstTarget::Compose,
                     seq: 1,
                     started: Instant::now(),
+                    card_id: None,
+                    label: "\u{2713} Posted",
                 });
                 self.notice =
                     Some("Posted in-app \u{2014} no browser opened. 1 part(s) posted".into());
@@ -781,6 +806,21 @@ impl XPanel {
                 self.status = "splash Â· background art at full strength".into();
             }
             "mock" => self.load_mock_dashboard(),
+            // Dev-preview only: card burst (Like) on the first mock
+            // tweet, rendered without any provider call.
+            "posted-card" => {
+                self.load_mock_dashboard();
+                if let Some(first) = self.posts.first() {
+                    let id = first.id.clone();
+                    self.post_burst = Some(PostBurst {
+                        target: BurstTarget::Card,
+                        seq: 1,
+                        started: Instant::now(),
+                        card_id: Some(id),
+                        label: "\u{2713} Liked",
+                    });
+                }
+            }
             "trends" => self.open_section(XSection::Trends, cx),
             _ => self.open_section(XSection::Timeline, cx),
         }
@@ -1955,7 +1995,8 @@ impl XPanel {
     /// Mirrors the Compose path (chord dedup included) so the KeyDown
     /// handler and the TerminalView action cannot insert twice.
     pub fn paste_active_text(&mut self, text: &str) {
-        if self.chord_already_applied() {
+
+        self.mention_dirty_at = Some(std::time::Instant::now());        if self.chord_already_applied() {
             return;
         }
         let clean = text.trim_end_matches(['\r', '\n']);
@@ -2049,7 +2090,8 @@ impl XPanel {
         field: TextField,
         cx: &mut Context<Self>,
     ) {
-        let key = event.keystroke.key.as_str();
+
+        self.mention_dirty_at = Some(std::time::Instant::now());        let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         if key == "enter" && (mods.control || mods.platform) {
             if field == TextField::Reply {
@@ -2175,16 +2217,120 @@ impl XPanel {
     /// Start the Posted burst in the editor a post just succeeded
     /// from, and schedule its end (~1.15s): the box then closes clean.
     /// Called ONLY from verified-success handlers.
+    /// Debounced, background-only @mention existence check. Runs via
+    /// the existing read path (OpenCLI profile lookup), one handle at a
+    /// time, 900ms after the last keystroke, successes cached. A failed
+    /// or slow check caches nothing and shows nothing, and nothing here
+    /// can block typing or posting.
+    fn maybe_spawn_mention_check(&mut self, cx: &mut Context<Self>) {
+        if !self.live || self.mention_inflight.is_some() {
+            return;
+        }
+        let Some(dirty) = self.mention_dirty_at else {
+            return;
+        };
+        if dirty.elapsed() < std::time::Duration::from_millis(900) {
+            if !self.mention_timer {
+                self.mention_timer = true;
+                let executor = cx.background_executor().clone();
+                cx.spawn(async move |this, cx| {
+                    executor.timer(std::time::Duration::from_millis(950)).await;
+                    let _ = this.update(cx, |panel, cx| {
+                        panel.mention_timer = false;
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+            return;
+        }
+        let mut target: Option<String> = None;
+        'scan: for text in [&self.compose, &self.reply_text, &self.quote_text] {
+            for (start, end, kind) in entity_spans(text) {
+                if kind == termy_x::text::EntityKind::Mention {
+                    let handle = text[start + 1..end].to_lowercase();
+                    if !self.mention_cache.contains_key(&handle) {
+                        target = Some(handle);
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        let Some(handle) = target else {
+            self.mention_dirty_at = None;
+            return;
+        };
+        self.mention_inflight = Some(handle.clone());
+        self.mention_dirty_at = None;
+        let lookup_handle = handle.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let result = executor
+                .spawn(async move { Self::service_free().lookup(&lookup_handle) })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.mention_inflight = None;
+                if result.is_ok() {
+                    panel.mention_cache.insert(handle, true);
+                    // More handles may queue behind this one.
+                    panel.mention_dirty_at =
+                        Some(std::time::Instant::now() - std::time::Duration::from_millis(950));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Subtle "✓ @name" line for mentions already verified to exist.
+    /// Unverified or unknown handles show nothing at all.
+    fn mention_hint(&self, text: &str) -> Option<gpui_kit::AnyElement> {
+        let mut seen: Vec<String> = Vec::new();
+        for (start, end, kind) in entity_spans(text) {
+            if kind == termy_x::text::EntityKind::Mention {
+                let handle = text[start + 1..end].to_lowercase();
+                if self.mention_cache.get(&handle).copied().unwrap_or(false)
+                    && !seen.contains(&handle)
+                {
+                    seen.push(handle);
+                }
+            }
+        }
+        if seen.is_empty() {
+            return None;
+        }
+        seen.truncate(3);
+        let label = seen
+            .iter()
+            .map(|h| format!("\u{2713} @{h}"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        Some(
+            div()
+                .mt(px(4.0))
+                .text_size(px(11.0))
+                .text_color(rgb(0x35d99a))
+                .child(label)
+                .into_any_element(),
+        )
+    }
+
     fn begin_post_burst(&mut self, target: BurstTarget, cx: &mut Context<Self>) {
         self.burst_seq += 1;
         let seq = self.burst_seq;
-        self.post_burst = Some(PostBurst { target, seq, started: Instant::now() });
+        self.post_burst = Some(PostBurst {
+            target,
+            seq,
+            started: Instant::now(),
+            card_id: None,
+            label: "\u{2713} Posted",
+        });
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(BURST_MS + 80))
                 .await;
             let _ = this.update(cx, |panel, cx| {
-                if panel.post_burst.is_some_and(|b| b.seq == seq) {
+                if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
                     panel.finish_post_burst(target);
                     cx.notify();
                 }
@@ -2195,6 +2341,31 @@ impl XPanel {
 
     /// Burst over (or Esc during it): close the originating box. The
     /// post DID land, so this never claims "nothing was posted".
+    /// Start the burst over one tweet card (Like / Retweet success).
+    fn begin_card_burst(&mut self, post_id: &str, label: &'static str, cx: &mut Context<Self>) {
+        self.burst_seq += 1;
+        let seq = self.burst_seq;
+        self.post_burst = Some(PostBurst {
+            target: BurstTarget::Card,
+            seq,
+            started: Instant::now(),
+            card_id: Some(post_id.to_string()),
+            label,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BURST_MS + 80))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
+                    panel.finish_post_burst(BurstTarget::Card);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn finish_post_burst(&mut self, target: BurstTarget) {
         self.post_burst = None;
         match target {
@@ -2216,12 +2387,35 @@ impl XPanel {
                     InputTarget::Compose
                 };
             }
-            BurstTarget::Compose => {}
+            BurstTarget::Compose | BurstTarget::Card => {}
         }
     }
 
     fn burst_for(&self, target: BurstTarget) -> Option<PostBurst> {
-        self.post_burst.filter(|b| b.target == target)
+        self.post_burst.clone().filter(|b| b.target == target)
+    }
+
+    /// The burst overlay for this card, if a Like/Retweet burst is
+    /// playing on it: centered over the card, grow + explode.
+    fn card_burst_overlay(&self, post: &Post) -> Option<gpui_kit::AnyElement> {
+        let burst = self.burst_for(BurstTarget::Card)?;
+        if burst.card_id.as_deref() != Some(post.id.as_str()) {
+            return None;
+        }
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(tint(0x03060c, 110))
+                .rounded(px(12.0))
+                .child(posted_burst_element(burst.seq, burst.label))
+                .into_any_element(),
+        )
     }
 
     /// Wrap width (chars) for the small editors at the current panel
@@ -2311,6 +2505,7 @@ impl XPanel {
         }
         let url = url.to_string();
         let author = author.to_string();
+        let engage_started = Instant::now();
         let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
         let now_active = match action {
             EngageAction::Like | EngageAction::Retweet => true,
@@ -2338,6 +2533,10 @@ impl XPanel {
                         .map_err(|e| e)
                 })
                 .await;
+            perf_log(&format!(
+                "engage {action:?} confirmed_ms={}",
+                engage_started.elapsed().as_millis()
+            ));
             let _ = this.update(cx, |panel, cx| {
                 panel.engage_pending.retain(|p| p != &id);
                 match result {
@@ -2353,6 +2552,12 @@ impl XPanel {
                             },
                             author
                         );
+                        // Verified success only: Like and Retweet get
+                        // the card burst. Removals (unlike/unretweet)
+                        // just flip state — taking away is not a post.
+                        if let Some(label) = termy_x::publish::engage_burst_label(action) {
+                            panel.begin_card_burst(&id, label, cx);
+                        }
                     }
                     Err(error) => {
                         // Revert the optimistic flip.
@@ -2493,6 +2698,7 @@ impl XPanel {
             author
         ));
         cx.notify();
+        let submit_started = Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2515,6 +2721,7 @@ impl XPanel {
                     )
                 })
                 .await;
+            perf_log(&format!("submit quote confirmed_ms={}", submit_started.elapsed().as_millis()));
             let _ = this.update(cx, |panel, cx| {
                 panel.quote_posting = false;
                 match result {
@@ -2589,6 +2796,7 @@ impl XPanel {
             "Replying to @{author} in-app, silently in the background\u{2026} no browser will open."
         ));
         cx.notify();
+        let submit_started = Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -2624,6 +2832,7 @@ impl XPanel {
                     }
                 })
                 .await;
+            perf_log(&format!("submit reply confirmed_ms={}", submit_started.elapsed().as_millis()));
             let _ = this.update(cx, |panel, cx| {
                 panel.reply_posting = false;
                 match result {
@@ -2664,7 +2873,8 @@ impl XPanel {
     }
 
     fn insert_text(&mut self, text: &str) {
-        if let Some((a, b)) = self.selection_range() {
+
+        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, text);
             self.caret = a + text.len();
         } else {
@@ -2677,7 +2887,8 @@ impl XPanel {
     }
 
     fn backspace(&mut self) {
-        if let Some((a, b)) = self.selection_range() {
+
+        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
@@ -2694,7 +2905,8 @@ impl XPanel {
     }
 
     fn delete_forward(&mut self) {
-        if let Some((a, b)) = self.selection_range() {
+
+        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
@@ -2975,6 +3187,7 @@ impl Drop for XPanel {
 
 impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_spawn_mention_check(cx);
         self.sync_video_player(window, cx);
         if self.pending_focus {
             self.focus.focus(window, cx);
@@ -3348,19 +3561,27 @@ enum BurstTarget {
     Reply,
     Quote,
     Compose,
+    /// On a tweet card itself (Like / Retweet confirmations).
+    Card,
 }
 
 /// A playing "Posted" burst. Pure timing math lives in
 /// `burst_style_at` / `BURST_MS` so the state machine is unit-testable
 /// without a GPUI context.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PostBurst {
     target: BurstTarget,
     seq: u64,
     started: Instant,
+    /// For BurstTarget::Card: the tweet whose card shows the burst.
+    card_id: Option<String>,
+    /// Full burst text ("\u{2713} Posted" / "\u{2713} Liked").
+    label: &'static str,
 }
 
 const BURST_MS: u64 = 1_150;
+/// X brand blue for @mentions / #hashtags / $cashtags in editors.
+const ENTITY_BLUE: u32 = 0x1d9bf0;
 
 /// Burst look at animation progress `v` (0..1): (font px, opacity).
 /// First ~55%: "Posted" grows small -> big at full opacity. Rest:
@@ -3441,7 +3662,7 @@ fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
 }
 
 /// The centered "Posted" burst element (one scoped animated element).
-fn posted_burst_element(seq: u64) -> gpui_kit::AnyElement {
+fn posted_burst_element(seq: u64, label: &'static str) -> gpui_kit::AnyElement {
     div()
         .flex()
         .items_center()
@@ -3451,7 +3672,7 @@ fn posted_burst_element(seq: u64) -> gpui_kit::AnyElement {
         .child(
             div()
                 .text_color(rgb(0x8affc1))
-                .child("\u{2713} Posted")
+                .child(label)
                 .with_animation(format!("posted-burst-{seq}"), Animation::new(Duration::from_millis(BURST_MS)), |el, v| {
                     let (font, opacity) = burst_style_at(v);
                     el.text_size(px(font)).opacity(opacity)
@@ -4737,6 +4958,7 @@ impl XPanel {
         let click_author = post.author_handle.clone();
         let mut el = div()
             .id(SharedString::from(format!("x-tweet-{}", post.id)))
+            .relative()
             .p(px(12.0))
             .rounded(px(12.0))
             .bg(if selected {
@@ -4776,6 +4998,7 @@ impl XPanel {
             )
             .children(self.media_box(post, cx))
             .child(self.tweet_actions(post, cx))
+            .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -4913,12 +5136,37 @@ impl XPanel {
                 .into_any_element();
         }
         let ranges = soft_wrap_ranges(text, self.editor_max_chars());
+        let entities = entity_spans(text);
         let last = ranges.len() - 1;
         let mut col = div().flex().flex_col().text_size(px(13.0)).text_color(rgb(0xf8fbff));
         for (idx, (a, b)) in ranges.iter().enumerate() {
             let seg = &text[*a..*b];
             let mut row = div().flex().flex_row().items_center().min_h(px(19.0));
-            row = row.child(if seg.is_empty() { " ".to_string() } else { seg.to_string() });
+            if seg.is_empty() {
+                row = row.child(" ".to_string());
+            } else {
+                // Split the visual segment at entity edges: mentions,
+                // hashtags, and cashtags render X-blue, the rest plain.
+                let mut cuts: Vec<usize> = vec![*a, *b];
+                for (es, ee, _) in &entities {
+                    for edge in [*es, *ee] {
+                        if edge > *a && edge < *b {
+                            cuts.push(edge);
+                        }
+                    }
+                }
+                cuts.sort_unstable();
+                cuts.dedup();
+                for w in cuts.windows(2) {
+                    let (cs, ce) = (w[0], w[1]);
+                    let in_entity = entities.iter().any(|(es, ee, _)| cs >= *es && ce <= *ee);
+                    let mut chunk = div().child(text[cs..ce].to_string());
+                    if in_entity {
+                        chunk = chunk.text_color(rgb(ENTITY_BLUE));
+                    }
+                    row = row.child(chunk);
+                }
+            }
             if focused && idx == last {
                 row = row.child(caret_element(caret_id));
             }
@@ -4944,7 +5192,7 @@ impl XPanel {
             .border_color(tint(0x7af6ff, 70))
             .cursor_pointer()
             .child(if let Some(burst) = self.burst_for(BurstTarget::Quote) {
-                posted_burst_element(burst.seq)
+                posted_burst_element(burst.seq, burst.label)
             } else {
                 self.small_editor_body(
                     &self.quote_text,
@@ -5134,7 +5382,7 @@ impl XPanel {
                     .bg(tint(0x0c1422, 235))
                     .cursor_pointer()
                     .child(if let Some(burst) = self.burst_for(BurstTarget::Reply) {
-                        posted_burst_element(burst.seq)
+                        posted_burst_element(burst.seq, burst.label)
                     } else {
                         self.small_editor_body(
                             &self.reply_text,
@@ -5664,6 +5912,7 @@ impl XPanel {
                     .text_color(if weighted > limit { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
                     .child(counter),
             )
+            .children(self.mention_hint(&self.compose))
             .child(
                 div()
                     .text_size(px(12.0))
@@ -5722,7 +5971,7 @@ impl XPanel {
         if let Some(burst) = self.burst_for(BurstTarget::Compose) {
             return div()
                 .mt(px(8.0))
-                .child(posted_burst_element(burst.seq))
+                .child(posted_burst_element(burst.seq, burst.label))
                 .into_any_element();
         }
 
@@ -5749,6 +5998,7 @@ impl XPanel {
 
         let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
         let text = self.compose.as_str();
+        let entities = entity_spans(text);
         let mut offset = 0usize;
         let parts: Vec<&str> = text.split('\n').collect();
         let max_chars = self.editor_max_chars();
@@ -5769,6 +6019,14 @@ impl XPanel {
                 marks.push(sa.saturating_sub(line_start).min(line.len()));
                 marks.push(sb.saturating_sub(line_start).min(line.len()));
             }
+            // Entity edges split chunks so mentions/tags render blue.
+            for (es, ee, _) in &entities {
+                for edge in [*es, *ee] {
+                    if edge > line_start && edge < line_end {
+                        marks.push(edge - line_start);
+                    }
+                }
+            }
             marks.sort_unstable();
             marks.dedup();
 
@@ -5783,6 +6041,9 @@ impl XPanel {
                     let abs_s = line_start + s;
                     let abs_e = line_start + e;
                     let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
+                    let in_entity = entities
+                        .iter()
+                        .any(|(es, ee, _)| abs_s >= *es && abs_e <= *ee);
                     let chunk = &line[s..e];
                     let mut el = div().text_size(px(14.0));
                     if selected {
@@ -5791,6 +6052,8 @@ impl XPanel {
                             .rounded(px(3.0))
                             .bg(tint(0xff4fa3, 130))
                             .text_color(rgb(0xffe8f5));
+                    } else if in_entity {
+                        el = el.text_color(rgb(ENTITY_BLUE));
                     } else {
                         el = el.text_color(rgb(0xf8fbff));
                     }
@@ -6084,6 +6347,7 @@ impl XPanel {
             )
         });
         cx.notify();
+        let submit_started = Instant::now();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -6122,6 +6386,7 @@ impl XPanel {
                     }
                 })
                 .await;
+            perf_log(&format!("submit post confirmed_ms={}", submit_started.elapsed().as_millis()));
             let _ = this.update(cx, |panel, cx| {
                 panel.posting = false;
                 match result {

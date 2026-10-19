@@ -17,6 +17,8 @@ struct PreviewArgs {
     mock: bool,
     compose: bool,
     posted: bool,
+    posted_card: bool,
+    entities: bool,
     width: f32,
     height: f32,
 }
@@ -27,6 +29,8 @@ fn preview_args() -> PreviewArgs {
         mock: false,
         compose: false,
         posted: false,
+        posted_card: false,
+        entities: false,
         bench_tabs: false,
         width: std::env::var("TERMY_X_PREVIEW_WIDTH")
             .ok()
@@ -44,6 +48,8 @@ fn preview_args() -> PreviewArgs {
             "--mock" | "mock" => args.mock = true,
             "--compose" | "compose" => args.compose = true,
             "--posted" | "posted" => args.posted = true,
+            "--posted-card" | "posted-card" => args.posted_card = true,
+            "--entities" | "entities" => args.entities = true,
             "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
             "--width" => {
                 if let Some(value) = raw.next().and_then(|text| text.parse().ok()) {
@@ -76,10 +82,19 @@ fn preview_args() -> PreviewArgs {
 fn main() {
     let args = preview_args();
     // `--splash` is the empty full-strength bird. `--mock` and the default stay on fixtures.
-    let scene = match (args.splash, args.posted, args.compose, args.mock) {
-        (true, _, _, _) => "splash",
-        (_, true, _, _) => "posted",
-        (_, _, true, _) => "compose",
+    let scene = match (
+        args.splash,
+        args.posted,
+        args.posted_card,
+        args.entities,
+        args.compose,
+        args.mock,
+    ) {
+        (true, _, _, _, _, _) => "splash",
+        (_, true, _, _, _, _) => "posted",
+        (_, _, true, _, _, _) => "posted-card",
+        (_, _, _, true, _, _) => "entities",
+        (_, _, _, _, true, _) => "compose",
         _ => "mock",
     };
     let width = args.width;

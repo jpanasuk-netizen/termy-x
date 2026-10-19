@@ -1176,15 +1176,30 @@ fn posting_supported(
     if !runner.exists(bin) {
         return false;
     }
-    let mut cached = cache.lock().expect("post support");
-    if let Some(ok) = *cached {
+    {
+        let cached = cache.lock().expect("post support");
+        if let Some(ok) = *cached {
+            return ok;
+        }
+    }
+    // Process-wide cache: submit paths rebuild their publisher on
+    // every click, so the per-instance cache alone re-ran a full
+    // `opencli twitter --help` cold start (~0.7s measured) before
+    // EVERY post/like/retweet. Probe once per process, not per click.
+    static GLOBAL: std::sync::OnceLock<Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let global = GLOBAL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = format!("{bin}|{}", help_args.join(" "));
+    if let Some(ok) = global.lock().expect("post support global").get(&key).copied() {
+        *cache.lock().expect("post support") = Some(ok);
         return ok;
     }
     let ok = match runner.run(bin, help_args) {
         Ok(output) => help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post"),
         Err(_) => false,
     };
-    *cached = Some(ok);
+    global.lock().expect("post support global").insert(key, ok);
+    *cache.lock().expect("post support") = Some(ok);
     ok
 }
 
