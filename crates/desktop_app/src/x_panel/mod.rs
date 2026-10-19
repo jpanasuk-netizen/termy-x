@@ -56,7 +56,7 @@ use termy_x::XConfig;
 use termy_x::drafts::new_id;
 use termy_x::model::{
     filter_trends, group_trends, sort_trends, trend_rank, Draft, MediaItem, MediaKind, Post,
-    Profile, ResearchHit, Tone, Trend, TrendBucket,
+    Profile, ResearchHit, Tone, Trend, TrendBucket, profile_sections,
 };
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
 use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
@@ -4958,29 +4958,44 @@ impl XPanel {
                         .into_any_element(),
                 );
                 if let Some(profile) = &self.profile {
-                    rows.push(card(
-                        format!("@{} · {}", profile.handle, profile.name),
-                        format!(
-                            "{}\n{} followers · {} following",
-                            profile.bio, profile.followers, profile.following
-                        ),
-                    ));
+                    let sections = profile_sections(profile);
+                    // Two separate categories (Jeremy's layout):
+                    // Section 1 = profile info + Top 20, Section 2 =
+                    // All Tweets below it, up to 120 deep.
+                    rows.push(section_label("Profile"));
+                    rows.push(self.profile_info_card(profile, cx));
                     if !profile.pinned.is_empty() {
                         rows.push(section_label("Pinned"));
                         for post in &profile.pinned {
-                            rows.push(self.tweet_card(post, cx));
+                            rows.push(self.tweet_card_scoped(post, "pin", cx));
                         }
                     }
-                    if !profile.posts.is_empty() {
+                    if !sections.top.is_empty() {
+                        rows.push(section_label(&if sections.top_ranked {
+                            format!(
+                                "Top {} \u{b7} ranked by engagement (likes + 3\u{d7} reposts + 2\u{d7} replies + 5\u{d7} bookmarks)",
+                                sections.top.len()
+                            )
+                        } else {
+                            format!(
+                                "Top {} \u{b7} latest \u{b7} no engagement counts in the returned posts, so no ranking is claimed",
+                                sections.top.len()
+                            )
+                        }));
+                        for post in &sections.top {
+                            rows.push(self.tweet_card_scoped(post, "top", cx));
+                        }
+                    }
+                    if !sections.all.is_empty() {
                         rows.push(section_label(&format!(
-                            "Latest \u{b7} {}",
-                            profile.posts.len()
+                            "All tweets \u{b7} {} returned \u{b7} up to 120 deep",
+                            sections.all.len()
                         )));
-                        for post in &profile.posts {
-                            rows.push(self.tweet_card(post, cx));
+                        for post in &sections.all {
+                            rows.push(self.tweet_card_scoped(post, "all", cx));
                         }
                     }
-                    if profile.pinned.is_empty() && profile.posts.is_empty() {
+                    if profile.pinned.is_empty() && sections.all.is_empty() {
                         rows.push(hint(format!(
                             "No recent posts returned for @{}.",
                             profile.handle
@@ -5134,6 +5149,15 @@ impl XPanel {
         collect(&self.search_posts, &mut urls);
         if let Some(profile) = &self.profile {
             collect(&profile.posts, &mut urls);
+            collect(&profile.pinned, &mut urls);
+            for image in [&profile.avatar_url, &profile.banner_url]
+                .into_iter()
+                .flatten()
+            {
+                if !image.is_empty() {
+                    urls.push(image.clone());
+                }
+            }
         }
         urls.sort();
         urls.dedup();
@@ -5276,7 +5300,131 @@ impl XPanel {
     /// letterboxed on the dark card, never cropped or squashed. Height is
     /// reserved before decode, so cards do not jump. Clicking media (only)
     /// opens the in-app viewer and never expands a reply or a browser.
+    /// Profile Section 1 header card: banner + avatar images when the
+    /// payload carried them (initials placeholder otherwise — never a
+    /// guessed URL), then name, handle, bio and follower counts.
+    fn profile_info_card(&self, profile: &Profile, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let _ = cx;
+        let initials: String = profile
+            .name
+            .split_whitespace()
+            .filter_map(|word| word.chars().next())
+            .take(2)
+            .collect::<String>()
+            .to_uppercase();
+        let initials = if initials.is_empty() { "?".to_string() } else { initials };
+        let mut card_el = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .p(px(12.0))
+            .rounded(px(12.0))
+            .bg(tint(0x0c1422, 225))
+            .border_1()
+            .border_color(tint(0x7af6ff, 40));
+        if let Some(banner) = &profile.banner_url {
+            card_el = card_el.child(match self.media_cache.get(banner) {
+                Some(MediaState::Ready(cached)) => {
+                    let source: ImageSource = ImageSource::Render(cached.image.clone());
+                    div()
+                        .h(px(96.0))
+                        .rounded(px(8.0))
+                        .overflow_hidden()
+                        .child(img(source).w_full().h(px(96.0)).object_fit(ObjectFit::Cover))
+                        .into_any_element()
+                }
+                Some(MediaState::Failed) => div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child("Banner image could not load.")
+                    .into_any_element(),
+                _ => div()
+                    .h(px(96.0))
+                    .rounded(px(8.0))
+                    .bg(tint(0x0f1c33, 245))
+                    .p(px(10.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child("Loading banner\u{2026}")
+                    .into_any_element(),
+            });
+        }
+        let avatar: gpui_kit::AnyElement = match profile
+            .avatar_url
+            .as_ref()
+            .and_then(|url| self.media_cache.get(url))
+        {
+            Some(MediaState::Ready(cached)) => {
+                let source: ImageSource = ImageSource::Render(cached.image.clone());
+                img(source)
+                    .w(px(52.0))
+                    .h(px(52.0))
+                    .rounded(px(999.0))
+                    .object_fit(ObjectFit::Cover)
+                    .into_any_element()
+            }
+            _ => div()
+                .w(px(52.0))
+                .h(px(52.0))
+                .rounded(px(999.0))
+                .bg(rgb(0x1636c9))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(16.0))
+                .text_color(rgb(0xe9fdff))
+                .child(initials)
+                .into_any_element(),
+        };
+        card_el = card_el
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(avatar)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(15.0))
+                                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xd7fbff))
+                                    .child(profile.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(0x93a4c3))
+                                    .child(format!("@{}", profile.handle)),
+                            ),
+                    ),
+            )
+            .children((!profile.bio.is_empty()).then(|| {
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xe7eefc))
+                    .child(profile.bio.clone())
+            }))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x9ad7ff))
+                    .child(format!(
+                        "{} followers \u{b7} {} following",
+                        profile.followers, profile.following
+                    )),
+            );
+        card_el.into_any_element()
+    }
+
     fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        self.media_box_scoped(post, "main", cx)
+    }
+
+    fn media_box_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let media = post.media.first()?;
         let kind = media.kind;
         let poster = media.poster.clone().unwrap_or_default();
@@ -5296,7 +5444,7 @@ impl XPanel {
             MediaKind::Photo => "\u{1f50d} tap to view",
         };
         let mut area = div()
-            .id(SharedString::from(format!("x-media-{}", post.id)))
+            .id(SharedString::from(format!("x-media-{scope}-{}", post.id)))
             .relative()
             .w(px(fit_w))
             .h(px(box_h))
@@ -5820,6 +5968,13 @@ impl XPanel {
     }
 
     fn tweet_card(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        self.tweet_card_scoped(post, "main", cx)
+    }
+
+    /// Same card with a section-scoped element-id prefix, so one post
+    /// can appear in two Profile sections (Top 20 and All Tweets)
+    /// without duplicate GPUI element ids.
+    fn tweet_card_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         // A repost renders its embedded original inline (native-X
         // style) under a "reposted" header; reply/engage target the
         // original tweet, exactly as on X.
@@ -5832,7 +5987,7 @@ impl XPanel {
         let click_id = display.id.clone();
         let click_author = display.author_handle.clone();
         let mut el = div()
-            .id(SharedString::from(format!("x-tweet-{}", post.id)))
+            .id(SharedString::from(format!("x-tweet-{scope}-{}", post.id)))
             .relative()
             .p(px(12.0))
             .rounded(px(12.0))
@@ -5888,8 +6043,8 @@ impl XPanel {
                     .text_color(rgb(0xe7eefc))
                     .child(post.card_text().to_string()),
             )
-            .children(self.media_box(display, cx))
-            .child(self.tweet_actions(display, cx))
+            .children(self.media_box_scoped(display, scope, cx))
+            .child(self.tweet_actions_scoped(display, scope, cx))
             .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
@@ -5918,7 +6073,7 @@ impl XPanel {
     /// click targets that stop propagation, so hitting one never opens
     /// the reply editor (and vice versa). Counts shown are the post's
     /// own payload counts, moved locally by optimistic flips.
-    fn tweet_actions(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn tweet_actions_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let id = post.id.clone();
         let url = if post.url.is_empty() {
             format!("https://x.com/{}/status/{}", post.author_handle, post.id)
@@ -5940,7 +6095,7 @@ impl XPanel {
             .gap(px(8.0))
             .flex_wrap()
             .child(x_button!(
-                format!("x-like-{}", post.id),
+                format!("x-like-{scope}-{}", post.id),
                 if pending {
                     "\u{2026}"
                 } else if liked {
@@ -5966,7 +6121,7 @@ impl XPanel {
                     .child(format!("{} likes \u{b7} {} retweets", post.likes, post.reposts)),
             )
             .child(x_button!(
-                format!("x-rt-{}", post.id),
+                format!("x-rt-{scope}-{}", post.id),
                 if pending {
                     "\u{2026}"
                 } else if retweeted {
@@ -5986,7 +6141,7 @@ impl XPanel {
                 })
             ))
             .child(x_button!(
-                format!("x-quote-{}", post.id),
+                format!("x-quote-{scope}-{}", post.id),
                 "Quote",
                 cx.listener(move |this, _, _, cx| {
                     this.open_quote(&quote_id, &quote_author);
