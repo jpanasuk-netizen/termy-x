@@ -392,35 +392,92 @@ impl TrendBucket {
 
 /// Bucket a trend by its real category string. Local/context lines like
 /// "Trending in United States" carry no topic and land in Other.
+///
+/// One Aho-Corasick pass (all 50 needles, built once) over the same
+/// lowercased string the old sequential `contains` chain scanned, picking
+/// the bucket with the highest priority (Politics first, as before).
+/// `find_overlapping_iter` reports nested needles too (e.g. "ai" inside
+/// "entertainment"), so the winning bucket is identical to the chain's.
+const BUCKET_NEEDLES: &[(&str, u8, TrendBucket)] = &[
+    ("politic", 0, TrendBucket::Politics),
+    ("election", 0, TrendBucket::Politics),
+    ("government", 0, TrendBucket::Politics),
+    ("congress", 0, TrendBucket::Politics),
+    ("senate", 0, TrendBucket::Politics),
+    ("sport", 1, TrendBucket::Sports),
+    ("nfl", 1, TrendBucket::Sports),
+    ("nba", 1, TrendBucket::Sports),
+    ("mlb", 1, TrendBucket::Sports),
+    ("nhl", 1, TrendBucket::Sports),
+    ("soccer", 1, TrendBucket::Sports),
+    ("football", 1, TrendBucket::Sports),
+    ("baseball", 1, TrendBucket::Sports),
+    ("basketball", 1, TrendBucket::Sports),
+    ("tennis", 1, TrendBucket::Sports),
+    ("golf", 1, TrendBucket::Sports),
+    ("ufc", 1, TrendBucket::Sports),
+    ("wwe", 1, TrendBucket::Sports),
+    ("f1", 1, TrendBucket::Sports),
+    ("racing", 1, TrendBucket::Sports),
+    ("hockey", 1, TrendBucket::Sports),
+    ("olympic", 1, TrendBucket::Sports),
+    ("cricket", 1, TrendBucket::Sports),
+    ("boxing", 1, TrendBucket::Sports),
+    ("news", 2, TrendBucket::News),
+    ("breaking", 2, TrendBucket::News),
+    ("world news", 2, TrendBucket::News),
+    ("journalism", 2, TrendBucket::News),
+    ("entertainment", 3, TrendBucket::Entertainment),
+    ("music", 3, TrendBucket::Entertainment),
+    ("movie", 3, TrendBucket::Entertainment),
+    ("film", 3, TrendBucket::Entertainment),
+    ("tv", 3, TrendBucket::Entertainment),
+    ("television", 3, TrendBucket::Entertainment),
+    ("celebrity", 3, TrendBucket::Entertainment),
+    ("gaming", 3, TrendBucket::Entertainment),
+    ("game", 3, TrendBucket::Entertainment),
+    ("anime", 3, TrendBucket::Entertainment),
+    ("comedy", 3, TrendBucket::Entertainment),
+    ("streaming", 3, TrendBucket::Entertainment),
+    ("tech", 4, TrendBucket::Technology),
+    ("science", 4, TrendBucket::Technology),
+    ("ai", 4, TrendBucket::Technology),
+    ("artificial intelligence", 4, TrendBucket::Technology),
+    ("software", 4, TrendBucket::Technology),
+    ("computing", 4, TrendBucket::Technology),
+    ("space", 4, TrendBucket::Technology),
+    ("crypto", 4, TrendBucket::Technology),
+    ("business", 4, TrendBucket::Technology),
+    ("finance", 4, TrendBucket::Technology),
+];
+
+fn bucket_automaton() -> &'static aho_corasick::AhoCorasick {
+    static AC: std::sync::OnceLock<aho_corasick::AhoCorasick> = std::sync::OnceLock::new();
+    AC.get_or_init(|| {
+        aho_corasick::AhoCorasick::new(BUCKET_NEEDLES.iter().map(|(n, _, _)| n))
+            .expect("static bucket needles always build")
+    })
+}
+
 pub fn trend_bucket(category: Option<&str>) -> TrendBucket {
     let Some(raw) = category else {
         return TrendBucket::Other;
     };
     let c = raw.to_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| c.contains(n));
-    if has(&["politic", "election", "government", "congress", "senate"]) {
-        TrendBucket::Politics
-    } else if has(&[
-        "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "baseball",
-        "basketball", "tennis", "golf", "ufc", "wwe", "f1", "racing", "hockey",
-        "olympic", "cricket", "boxing",
-    ]) {
-        TrendBucket::Sports
-    } else if has(&["news", "breaking", "world news", "journalism"]) {
-        TrendBucket::News
-    } else if has(&[
-        "entertainment", "music", "movie", "film", "tv", "television",
-        "celebrity", "gaming", "game", "anime", "comedy", "streaming",
-    ]) {
-        TrendBucket::Entertainment
-    } else if has(&[
-        "tech", "science", "ai", "artificial intelligence", "software",
-        "computing", "space", "crypto", "business", "finance",
-    ]) {
-        TrendBucket::Technology
-    } else {
-        TrendBucket::Other
+    let mut best: Option<(u8, TrendBucket)> = None;
+    for m in bucket_automaton().find_overlapping_iter(&c) {
+        let (prio, bucket) = (
+            BUCKET_NEEDLES[m.pattern().as_usize()].1,
+            BUCKET_NEEDLES[m.pattern().as_usize()].2,
+        );
+        if prio == 0 {
+            return bucket; // Politics: nothing outranks it.
+        }
+        if best.is_none_or(|(b, _)| prio < b) {
+            best = Some((prio, bucket));
+        }
     }
+    best.map_or(TrendBucket::Other, |(_, bucket)| bucket)
 }
 
 /// Trends sorted for display: provider rank order when ranks exist,
@@ -434,32 +491,41 @@ pub fn sort_trends(trends: &[Trend]) -> Vec<Trend> {
 /// Group ALL trends by bucket (canonical order, empty groups omitted).
 /// Every trend lands in exactly one group, so group counts sum to the
 /// input length — the Top-20 overlap is presentational, not data loss.
+/// Bucket is computed once per trend (was: once per bucket per trend).
 pub fn group_trends(trends: &[Trend]) -> Vec<(TrendBucket, Vec<Trend>)> {
     let sorted = sort_trends(trends);
-    TrendBucket::all()
+    let order = TrendBucket::all();
+    let mut buckets: [Vec<Trend>; 6] = Default::default();
+    for trend in sorted {
+        let bucket = trend_bucket(trend.category.as_deref());
+        let idx = order.iter().position(|b| *b == bucket).unwrap_or(5);
+        buckets[idx].push(trend);
+    }
+    order
         .into_iter()
-        .filter_map(|bucket| {
-            let items: Vec<Trend> = sorted
-                .iter()
-                .filter(|t| trend_bucket(t.category.as_deref()) == bucket)
-                .cloned()
-                .collect();
-            (!items.is_empty()).then_some((bucket, items))
-        })
+        .zip(buckets)
+        .filter(|(_, items)| !items.is_empty())
         .collect()
 }
 
 /// Case-insensitive instant filter over name, query, category, and
 /// place. A multi-word filter requires every word to match somewhere.
 ///
-/// Perf (Lane-1 stack): fields are concatenated into one buffer and
-/// lowercased in a single pass, instead of format! + 4 to_lowercase
-/// allocations per trend (0.084ms -> 0.037-0.047ms per 500 trends). An
-/// Aho-Corasick version was measured and REVERTED: rebuilding the
-/// automaton on every call cost 0.239ms vs 0.084ms for this path on
-/// 500 trends (examples/perf_bench) - it pays off only with a
-/// persistent automaton and many patterns, not a per-keystroke
-/// rebuild. Semantics unchanged; the model tests pin the behavior.
+/// Equivalence with the old `format!("{name} {query} {category} {place}")`
+/// haystack + per-word `contains`: a filter word never contains whitespace
+/// (it came from `split_whitespace`), so it cannot match across the single
+/// space joining two fields — matching each lowercased field separately
+/// finds exactly the same words. Lowercasing field-by-field is also
+/// identical at those boundaries (the joining space is neither cased nor
+/// case-ignorable, so e.g. final-sigma context is unchanged).
+///
+/// Aho-Corasick was benchmarked for the multi-word case (see
+/// examples/filter_bench.rs) and lost at every realistic word count —
+/// even with a pre-built automaton it was 1.3-1.9x slower than per-word
+/// `contains` on these short fields, plus ~13-15us to build per call —
+/// so this keeps the fast `contains` path and drops only the per-trend
+/// `format!` haystack allocation. AC is used in `trend_bucket`, where
+/// 50 patterns make it a 9x win.
 pub fn filter_trends(trends: &[Trend], filter: &str) -> Vec<Trend> {
     let words: Vec<String> = filter
         .to_lowercase()
@@ -472,18 +538,15 @@ pub fn filter_trends(trends: &[Trend], filter: &str) -> Vec<Trend> {
     sort_trends(trends)
         .into_iter()
         .filter(|t| {
-            let mut raw = String::with_capacity(t.name.len() + t.query.len() + 24);
-            for field in [
-                t.name.as_str(),
-                t.query.as_str(),
-                t.category.as_deref().unwrap_or_default(),
-                t.place.as_deref().unwrap_or_default(),
-            ] {
-                raw.push_str(field);
-                raw.push(' ');
-            }
-            let hay = raw.to_lowercase();
-            words.iter().all(|w| hay.contains(w.as_str()))
+            let fields = [
+                t.name.to_lowercase(),
+                t.query.to_lowercase(),
+                t.category.as_deref().unwrap_or_default().to_lowercase(),
+                t.place.as_deref().unwrap_or_default().to_lowercase(),
+            ];
+            words
+                .iter()
+                .all(|w| fields.iter().any(|f| f.contains(w.as_str())))
         })
         .collect()
 }
@@ -680,6 +743,69 @@ mod trend_tests {
         // Multi-word requires all words.
         assert_eq!(filter_trends(&all, "breaking storm").len(), 1);
         assert_eq!(filter_trends(&all, "breaking nfl").len(), 0);
+    }
+
+    // ---- Equivalence oracle: verbatim pre-AC implementations ----
+    fn bucket_ref(category: Option<&str>) -> TrendBucket {
+        let Some(raw) = category else { return TrendBucket::Other };
+        let c = raw.to_lowercase();
+        let has = |n: &[&str]| n.iter().any(|x| c.contains(x));
+        if has(&["politic","election","government","congress","senate"]) { TrendBucket::Politics }
+        else if has(&["sport","nfl","nba","mlb","nhl","soccer","football","baseball","basketball","tennis","golf","ufc","wwe","f1","racing","hockey","olympic","cricket","boxing"]) { TrendBucket::Sports }
+        else if has(&["news","breaking","world news","journalism"]) { TrendBucket::News }
+        else if has(&["entertainment","music","movie","film","tv","television","celebrity","gaming","game","anime","comedy","streaming"]) { TrendBucket::Entertainment }
+        else if has(&["tech","science","ai","artificial intelligence","software","computing","space","crypto","business","finance"]) { TrendBucket::Technology }
+        else { TrendBucket::Other }
+    }
+    fn filter_ref(trends: &[Trend], filter: &str) -> Vec<Trend> {
+        let words: Vec<String> = filter.to_lowercase().split_whitespace().map(str::to_string).collect();
+        if words.is_empty() { return super::sort_trends(trends); }
+        super::sort_trends(trends).into_iter().filter(|t| {
+            let hay = format!("{} {} {} {}", t.name.to_lowercase(), t.query.to_lowercase(), t.category.as_deref().unwrap_or_default().to_lowercase(), t.place.as_deref().unwrap_or_default().to_lowercase());
+            words.iter().all(|w| hay.contains(w.as_str()))
+        }).collect()
+    }
+    struct Lcg(u64);
+    impl Lcg { fn next(&mut self) -> u64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1); self.0 >> 11 } }
+
+    #[test]
+    fn bucket_matches_reference_on_corpus_and_fuzz() {
+        let corpus = [None, Some(""), Some("Sports"), Some("NFL · Trending"), Some("Politics"), Some("Technology"),
+            Some("Trending in United States"), Some("Entertainment Tonight"), Some("Daily AI News"), Some("BREAKING sports election"),
+            Some("artificial intelligence"), Some("a tv game"), Some("CAFÉ society"), Some("İstanbul news"), Some("ΟΛΥΜΠΙΑΚΟΣ"),
+            Some("world news journalism"), Some("cricket f1 racing"), Some("plain words only"), Some("said the mayor")];
+        for c in corpus { assert_eq!(trend_bucket(c), bucket_ref(c), "bucket {c:?}"); }
+        // Deterministic fuzz from needle fragments (catches overlap/priority diffs).
+        let frags = ["ai","news","sport","nfl","tv","game","tech","election","breaking"," ","x","film","space","golf","f1","music","senate","crypto","olympic","world news"];
+        let mut rng = Lcg(0x5eed);
+        for _ in 0..4000 {
+            let n = (rng.next() % 5) as usize;
+            let mut s = String::new();
+            for _ in 0..n { s.push_str(frags[(rng.next() % frags.len() as u64) as usize]); }
+            assert_eq!(trend_bucket(Some(&s)), bucket_ref(Some(&s)), "fuzz bucket {s:?}");
+        }
+    }
+
+    #[test]
+    fn filter_and_group_match_reference() {
+        let mut rng = Lcg(0xcafe);
+        let words = ["nfl","breaking","storm","ai","rust","café","live","ΟΛΥΜΠΙΑΚΟΣ","daily","x"];
+        let cats = [Some("Sports"), Some("News"), Some("Trending in United States"), None, Some("Technology")];
+        let trends: Vec<Trend> = (0..120).map(|i| {
+            let pick = |r: &mut Lcg| words[(r.next() % words.len() as u64) as usize];
+            let (a,b) = (pick(&mut rng), pick(&mut rng));
+            Trend { name: format!("{a} {b}"), query: format!("@u{i}"), volume: None, place: Some("United States".into()), rank: Some((119-i) as u64), category: cats[i % cats.len()].map(str::to_string) }
+        }).collect();
+        for q in ["", " ", "nfl", "NFL", "breaking storm", "breaking nfl", "ai ai", "café live", "İ", "ΟΛΥΜΠΙΑΚΟΣ", "live daily x", "zzz qq"] {
+            assert_eq!(filter_trends(&trends, q), filter_ref(&trends, q), "filter {q:?}");
+        }
+        // Group equivalence against old per-bucket re-filtering.
+        let sorted = super::sort_trends(&trends);
+        let expected: Vec<(TrendBucket, Vec<Trend>)> = TrendBucket::all().into_iter().filter_map(|b| {
+            let items: Vec<Trend> = sorted.iter().filter(|t| bucket_ref(t.category.as_deref()) == b).cloned().collect();
+            (!items.is_empty()).then_some((b, items))
+        }).collect();
+        assert_eq!(group_trends(&trends), expected);
     }
 }
 
