@@ -233,6 +233,19 @@ pub struct XPanel {
     sb_drag: Option<SbDrag>,
     /// Saved list offset per feed, restored on feed switch.
     feed_offset: [f32; 2],
+    /// How deep each feed is loaded (OpenCLI limit last requested).
+    feed_depth: [usize; 2],
+    /// One-shot (append, limit) override consumed by the next fetch.
+    next_fetch: Option<(bool, usize)>,
+    /// A Load-more (append) fetch is in flight: the button shows the
+    /// breathing bird and cannot be re-clicked.
+    append_inflight: bool,
+    /// Per feed: the source returned no older tweets, so Load more is
+    /// done (button reads "No more older tweets" and disables).
+    feed_exhausted: [bool; 2],
+    /// Manual refresh asked to land at the top when its content applies
+    /// (pull-to-refresh semantics: refresh = newest first).
+    pending_top: bool,
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
@@ -312,6 +325,19 @@ const FRESH_FOR: Duration = Duration::from_secs(30);
 /// Deep timeline: one OpenCLI call per feed returns this many unique
 /// tweets (verified live; no pagination flag exists or is needed).
 const TIMELINE_LIMIT: usize = 160;
+/// Load more grows the OpenCLI limit by one batch (+160) at a time.
+/// The real end is data-driven (a fetch that returns no new tweets);
+/// this is only a high perf safety ceiling.
+const TIMELINE_MAX: usize = 1600;
+
+/// Next Load-more limit for a feed loaded to `current`, or None at cap.
+fn next_timeline_limit(current: usize) -> Option<usize> {
+    if current >= TIMELINE_MAX {
+        None
+    } else {
+        Some((current + TIMELINE_LIMIT).min(TIMELINE_MAX))
+    }
+}
 
 /// Scrollbar thumb drag state captured on mouse-down.
 #[derive(Clone, Copy)]
@@ -349,6 +375,10 @@ enum FetchPayload {
         posts: Vec<Post>,
         status: String,
         feed: TimelineFeed,
+        /// Load-more fetch: append only unseen ids behind the loaded list.
+        append: bool,
+        /// The OpenCLI limit this batch was requested with.
+        requested: usize,
     },
     Search {
         posts: Vec<Post>,
@@ -435,6 +465,11 @@ impl XPanel {
             autoscroll_scale: 1.0,
             sb_drag: None,
             feed_offset: [0.0, 0.0],
+            feed_depth: [TIMELINE_LIMIT, TIMELINE_LIMIT],
+            next_fetch: None,
+            append_inflight: false,
+            feed_exhausted: [false, false],
+            pending_top: false,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
             search_posts: Vec::new(),
@@ -532,6 +567,12 @@ impl XPanel {
             cx.notify();
             return;
         }
+        // Refresh means "newest again": depth resets to one batch.
+        if section == XSection::Timeline {
+            let idx = Self::feed_index(self.timeline_feed);
+            self.feed_depth[idx] = TIMELINE_LIMIT;
+            self.feed_exhausted[idx] = false;
+        }
         // Bypass the 30s freshness cache for this tab only.
         match section {
             XSection::Timeline => match self.timeline_feed {
@@ -545,6 +586,7 @@ impl XPanel {
             XSection::Compose => {}
         }
         self.last_refresh = Some(local_hms());
+        self.pending_top = true;
         self.loading = true;
         self.status = format!("refreshing {}\u{2026} (silent, background)", section.label());
         if section == XSection::Search && self.searched_query.is_empty() {
@@ -747,6 +789,97 @@ impl XPanel {
         }
     }
 
+    /// Load more (Timeline only): silently fetch the next older batch by
+    /// re-requesting a larger OpenCLI limit and appending only unseen
+    /// tweet ids behind the loaded list. Single-flight: while anything
+    /// is fetching, the click just notes it; calls never stack. The
+    /// scroll offset is never touched, so the user stays put.
+    fn load_more_timeline(&mut self, cx: &mut Context<Self>) {
+        if self.section != XSection::Timeline || self.feed_posts().is_empty() {
+            return;
+        }
+        if self.loading || self.fetching.iter().any(|f| *f) {
+            self.status =
+                "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        let feed = self.timeline_feed;
+        let idx = Self::feed_index(feed);
+        if self.feed_exhausted[idx] {
+            self.status = format!(
+                "no more older tweets \u{b7} {} shown",
+                self.feed_posts().len()
+            );
+            cx.notify();
+            return;
+        }
+        let Some(next) = next_timeline_limit(self.feed_depth[idx]) else {
+            self.status = format!(
+                "{} shown \u{b7} safety limit ({TIMELINE_MAX})",
+                self.feed_posts().len()
+            );
+            cx.notify();
+            return;
+        };
+        self.next_fetch = Some((true, next));
+        self.append_inflight = true;
+        self.loading = true;
+        self.status = format!("loading older {} tweets\u{2026}", feed.label());
+        self.schedule_fetch(XSection::Timeline, cx);
+        cx.notify();
+    }
+
+    /// The Load more row rendered after the last timeline card.
+    fn load_more_row(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let idx = Self::feed_index(self.timeline_feed);
+        if self.feed_exhausted[idx] && !self.append_inflight {
+            return hint(format!(
+                "No more older tweets \u{b7} {} shown \u{b7} \u{21bb} refreshes to the newest {}",
+                self.feed_posts().len(),
+                TIMELINE_LIMIT
+            ));
+        }
+        if next_timeline_limit(self.feed_depth[idx]).is_none() {
+            return hint(format!(
+                "{} shown \u{b7} safety limit ({TIMELINE_MAX}) \u{b7} \u{21bb} refreshes to the newest {TIMELINE_LIMIT}",
+                self.feed_posts().len()
+            ));
+        }
+        if self.append_inflight {
+            // In-flight: breathing bird + label, clicks guarded off by
+            // load_more_timeline's single-flight check as well.
+            return div()
+                .id("x-load-more-loading")
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .border_1()
+                .border_color(tint(0x7af6ff, 55))
+                .bg(rgb(0x1636c9))
+                .text_size(px(12.0))
+                .text_color(rgb(0xf8fbff))
+                .child(breathing_bird())
+                .child("Loading older tweets\u{2026}")
+                .into_any_element();
+        }
+        let label = format!(
+            "Load more \u{b7} older tweets ({} shown)",
+            self.feed_posts().len()
+        );
+        x_button!(
+            "x-load-more",
+            label,
+            cx.listener(|this, _, _, cx| this.load_more_timeline(cx))
+        )
+        .into_any_element()
+    }
+
     fn feed_posts(&self) -> &Vec<Post> {
         match self.timeline_feed {
             TimelineFeed::ForYou => &self.posts,
@@ -894,11 +1027,17 @@ impl XPanel {
         let lookup = self.lookup.clone();
         let live = self.live;
         let feed = self.timeline_feed;
+        let (append, limit) = self.next_fetch.take().unwrap_or((
+            false,
+            self.feed_depth[Self::feed_index(feed)],
+        ));
 
         cx.spawn(async move |this, cx| {
             let payload = cx
                 .background_executor()
-                .spawn(async move { fetch_section(section, query, lookup, live, feed) })
+                .spawn(async move {
+                    fetch_section(section, query, lookup, live, feed, append, limit)
+                })
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 panel.fetching[slot] = false;
@@ -923,18 +1062,68 @@ impl XPanel {
     fn apply_fetch(&mut self, section: XSection, payload: FetchPayload) {
         let now = Instant::now();
         match payload {
-            FetchPayload::Timeline { posts, status, feed } => {
-                match feed {
-                    TimelineFeed::ForYou => {
-                        self.posts = posts;
-                        self.fetched_at.timeline = Some(now);
+            FetchPayload::Timeline {
+                posts,
+                status,
+                feed,
+                append,
+                requested,
+            } => {
+                let idx = Self::feed_index(feed);
+                self.feed_depth[idx] = requested;
+                self.append_inflight = false;
+                if append {
+                    // Load more: existing order untouched, only unseen
+                    // ids extend the list downward. Scroll is not moved.
+                    let (total, added) = match feed {
+                        TimelineFeed::ForYou => {
+                            let before = self.posts.len();
+                            self.posts = termy_x::providers::append_new_posts(
+                                std::mem::take(&mut self.posts),
+                                posts,
+                            );
+                            (self.posts.len(), self.posts.len() - before)
+                        }
+                        TimelineFeed::Following => {
+                            let before = self.following_posts.len();
+                            self.following_posts =
+                                termy_x::providers::append_new_posts(
+                                    std::mem::take(&mut self.following_posts),
+                                    posts,
+                                );
+                            (
+                                self.following_posts.len(),
+                                self.following_posts.len() - before,
+                            )
+                        }
+                    };
+                    if added == 0 {
+                        self.feed_exhausted[idx] = true;
                     }
-                    TimelineFeed::Following => {
-                        self.following_posts = posts;
-                        self.fetched_at.timeline_following = Some(now);
+                    self.status = if added == 0 {
+                        format!("no older tweets came back \u{b7} {total} shown")
+                    } else {
+                        format!("+{added} older tweets \u{b7} {total} shown")
+                    };
+                    match feed {
+                        TimelineFeed::ForYou => self.fetched_at.timeline = Some(now),
+                        TimelineFeed::Following => {
+                            self.fetched_at.timeline_following = Some(now)
+                        }
                     }
+                } else {
+                    match feed {
+                        TimelineFeed::ForYou => {
+                            self.posts = posts;
+                            self.fetched_at.timeline = Some(now);
+                        }
+                        TimelineFeed::Following => {
+                            self.following_posts = posts;
+                            self.fetched_at.timeline_following = Some(now);
+                        }
+                    }
+                    self.status = status;
                 }
-                self.status = status;
             }
             FetchPayload::Search { posts, status } => {
                 self.search_posts = posts;
@@ -955,6 +1144,16 @@ impl XPanel {
                 self.research = hits;
                 self.status = status;
                 self.fetched_at.research = Some(now);
+            }
+        }
+        // Manual refresh lands on the newest post: jump the shared list
+        // to the very top as the refreshed content applies. Refresh wins
+        // over saved per-feed scroll positions; other fetch kinds
+        // (switch, append) never set the flag, so they never jump.
+        if self.pending_top {
+            self.pending_top = false;
+            if section == self.section {
+                self.list_scroll.set_offset(point(px(0.0), px(0.0)));
             }
         }
         // Keep status accurate if the user already left this tab.
@@ -2100,16 +2299,26 @@ fn live_status(status: &termy_x::StatusLine) -> String {
     }
 }
 
-fn fetch_section(section: XSection, query: String, lookup: String, live: bool, feed: TimelineFeed) -> FetchPayload {
+fn fetch_section(
+    section: XSection,
+    query: String,
+    lookup: String,
+    live: bool,
+    feed: TimelineFeed,
+    append: bool,
+    limit: usize,
+) -> FetchPayload {
     if live {
         let service = XPanel::service_free();
         match section {
             XSection::Timeline => {
-                if let Ok(served) = service.timeline_feed(feed, TIMELINE_LIMIT) {
+                if let Ok(served) = service.timeline_feed(feed, limit) {
                     return FetchPayload::Timeline {
                         posts: served.value,
                         status: live_status(&served.status),
                         feed,
+                        append,
+                        requested: limit,
                     };
                 }
             }
@@ -2153,11 +2362,13 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool, f
     match section {
         XSection::Timeline => FetchPayload::Timeline {
             posts: MockProvider
-                .timeline_feed(feed, TIMELINE_LIMIT)
+                .timeline_feed(feed, limit)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             feed,
             status: "mock Â· fixture data Â· no X API credits".into(),
+            append,
+            requested: limit,
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
@@ -2197,6 +2408,8 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool, f
             posts: Vec::new(),
             status: "compose".into(),
             feed,
+            append: false,
+            requested: TIMELINE_LIMIT,
         },
     }
 }
@@ -2508,6 +2721,22 @@ fn breathing_bird() -> gpui_kit::AnyElement {
         return div().w(px(30.0)).h(px(18.0)).into_any_element();
     };
     let source: ImageSource = image.into();
+    // Red glow layer: the pre-rasterized warm-red variant of the same
+    // bird, crossfaded in only at the inhale peak (opacity driven by
+    // the same breath cycle). Cheap: opacity/scale on the tiny glyph,
+    // both rasters cached once per process, nothing decoded per frame.
+    let red_layer = art::cached_red_image().map(|red| {
+        let red_source: ImageSource = red.into();
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .child(img(red_source).size_full().object_fit(ObjectFit::Contain))
+            .with_animation("x-loading-bird-red", breath_animation(2_800), |el, v| {
+                el.opacity(v * v * 0.95)
+            })
+    });
     div()
         .w(px(30.0))
         .h(px(18.0))
@@ -2517,7 +2746,9 @@ fn breathing_bird() -> gpui_kit::AnyElement {
         .justify_center()
         .child(
             div()
+                .relative()
                 .child(img(source).size_full().object_fit(ObjectFit::Contain))
+                .children(red_layer)
                 .with_animation("x-loading-bird", breath_animation(2_800), |el, v| {
                     let w = 19.0 + 5.0 * v;
                     el.w(px(w)).h(px(w * 0.625)).opacity(0.30 + 0.70 * v)
@@ -2929,6 +3160,9 @@ impl XPanel {
                 }
                 for post in self.feed_posts() {
                     rows.push(self.tweet_card(post, cx));
+                }
+                if !self.feed_posts().is_empty() {
+                    rows.push(self.load_more_row(cx));
                 }
             }
             XSection::Search => {
@@ -3619,6 +3853,14 @@ impl XPanel {
         let Some(drag) = self.sb_drag else {
             return false;
         };
+        // Hold-to-drag, Chrome-style: the drag exists only while the
+        // left button is physically held. If the release happened
+        // outside the panel (so no mouse-up was delivered here), the
+        // first plain move ends the drag instead of latching it on.
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.sb_drag = None;
+            return false;
+        }
         let mouse_y: f32 = event.position.y.into();
         let (start_thumb_y, _) =
             scroll_math::thumb_geometry(drag.viewport_h, drag.max_y, drag.start_offset_y);
@@ -4992,6 +5234,17 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 
 #[cfg(test)]
 mod edit_keys_tests {
+    use super::next_timeline_limit;
+
+    #[test]
+    fn load_more_limit_grows_by_batch_to_cap() {
+        assert_eq!(next_timeline_limit(160), Some(320));
+        assert_eq!(next_timeline_limit(320), Some(480));
+        assert_eq!(next_timeline_limit(1440), Some(1600));
+        assert_eq!(next_timeline_limit(1600), None);
+        assert_eq!(next_timeline_limit(9999), None);
+    }
+
     use super::{InputTarget, XSection, edit_keys_owned};
 
     #[test]

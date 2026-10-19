@@ -128,6 +128,54 @@ pub fn cached_image() -> Option<Arc<Image>> {
     load().map(|art| art.image)
 }
 
+/// Warm-red variant of the same SVG, rasterized ONCE (small, for the
+/// loading glyph only) and cached for the process. The breathing bird
+/// crossfades to this at the inhale peak so it glows brighter/redder;
+/// no image is decoded or rasterized per frame.
+pub fn cached_red_image() -> Option<Arc<Image>> {
+    static RED: OnceLock<Option<ArtLoad>> = OnceLock::new();
+    RED.get_or_init(|| {
+        // Blue/cyan palette -> warm red palette; dark sky stays dark.
+        let svg = termy_x::splash::BIRD_SVG
+            .replace("#7af6ff", "#ffc9b0")
+            .replace("#2f7bff", "#ff4a3d")
+            .replace("#1236c9", "#8f1208")
+            .replace("#19d7ff", "#ff6a4d")
+            .replace("#0a3ea8", "#7a0d05")
+            .replace("#d9fbff", "#fff1e6")
+            .replace("#4cc8ff", "#ff7a59")
+            .replace("#1a4dff", "#d91f0f")
+            .replace("#163cff", "#e62e1b")
+            .replace("#e9fdff", "#fff5ec")
+            .replace("#bff7ff", "#ffd9c4")
+            .replace("#0c2f9a", "#6e0a04")
+            .replace("#2aa7ff", "#ff5a3c")
+            .replace("#124bff", "#a11208")
+            .replace("#d7f7ff", "#ffe3d3");
+        let options = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_str(&svg, &options).ok()?;
+        let width = 480u32;
+        let height = height_for(width);
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+        let size = tree.size();
+        let transform = resvg::tiny_skia::Transform::from_scale(
+            width as f32 / size.width(),
+            height as f32 / size.height(),
+        );
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        let bytes = pixmap.encode_png().ok()?;
+        Some(ArtLoad {
+            image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+            width,
+            height,
+            source: ArtSource::Rendered,
+            elapsed: Duration::ZERO,
+        })
+    })
+    .as_ref()
+    .map(|art| Arc::clone(&art.image))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -41,6 +41,25 @@ impl TimelineFeed {
 /// Merge post pages preserving order, dropping later duplicates by tweet
 /// id (posts with no id are always kept). Used so a deep timeline fetch
 /// can never show the same tweet twice.
+/// Append a freshly fetched batch behind what is already loaded:
+/// existing order is untouched, and only tweets whose id is not already
+/// loaded are appended (in fetch order). This is the Load more merge —
+/// the visible list can only ever grow downward with new unique tweets.
+pub fn append_new_posts(existing: Vec<Post>, incoming: Vec<Post>) -> Vec<Post> {
+    let mut seen: std::collections::HashSet<String> = existing
+        .iter()
+        .filter(|post| !post.id.is_empty())
+        .map(|post| post.id.clone())
+        .collect();
+    let mut merged = existing;
+    for post in incoming {
+        if post.id.is_empty() || seen.insert(post.id.clone()) {
+            merged.push(post);
+        }
+    }
+    merged
+}
+
 pub fn dedupe_posts(posts: Vec<Post>) -> Vec<Post> {
     let mut seen = std::collections::HashSet::new();
     posts
@@ -1745,6 +1764,35 @@ mod tests {
     }
 
     #[test]
+    fn append_new_posts_only_appends_unseen_ids() {
+        let mk = |id: &str| Post {
+            id: id.into(),
+            url: String::new(),
+            author_handle: "a".into(),
+            author_name: "a".into(),
+            text: "t".into(),
+            created_at: None,
+            likes: 0,
+            reposts: 0,
+            replies: 0,
+            bookmarks: 0,
+            views: 0,
+            media: Vec::new(),
+        };
+        let existing = vec![mk("300"), mk("200"), mk("100")];
+        // Batch overlaps the loaded tail and extends below it.
+        let incoming = vec![mk("200"), mk("90"), mk("100"), mk("80"), mk("90")];
+        let merged = append_new_posts(existing, incoming);
+        let ids: Vec<&str> = merged.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["300", "200", "100", "90", "80"]);
+        // Nothing new: list is unchanged (no fake growth).
+        let same = append_new_posts(merged.clone(), vec![mk("300"), mk("80")]);
+        assert_eq!(same.len(), merged.len());
+        // Empty-id posts are always appended (cannot be deduped).
+        let with_blank = append_new_posts(merged, vec![mk("")]);
+        assert_eq!(with_blank.len(), 6);
+    }
+
     fn dedupe_posts_preserves_order_and_drops_later_dupes() {
         let mk = |id: &str, text: &str| Post {
             id: id.into(),
