@@ -13,6 +13,42 @@ use crate::model::{
 use crate::publish::{Publisher, session_label};
 use std::path::PathBuf;
 
+/// X's two home timelines. OpenCLI exposes both via
+/// `twitter timeline --type for-you|following` (verified live 2026-10-18:
+/// default is the algorithmic for-you feed; no cursor/pagination flag, but
+/// a single `--limit 160` call returns 160 unique tweets per feed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TimelineFeed {
+    ForYou,
+    Following,
+}
+
+impl TimelineFeed {
+    pub fn label(self) -> &'static str {
+        match self {
+            TimelineFeed::ForYou => "For you",
+            TimelineFeed::Following => "Following",
+        }
+    }
+    pub fn opencli_value(self) -> &'static str {
+        match self {
+            TimelineFeed::ForYou => "for-you",
+            TimelineFeed::Following => "following",
+        }
+    }
+}
+
+/// Merge post pages preserving order, dropping later duplicates by tweet
+/// id (posts with no id are always kept). Used so a deep timeline fetch
+/// can never show the same tweet twice.
+pub fn dedupe_posts(posts: Vec<Post>) -> Vec<Post> {
+    let mut seen = std::collections::HashSet::new();
+    posts
+        .into_iter()
+        .filter(|post| post.id.is_empty() || seen.insert(post.id.clone()))
+        .collect()
+}
+
 pub trait XProvider: Send + Sync {
     fn id(&self) -> ProviderId;
     fn available(&self) -> bool;
@@ -20,6 +56,15 @@ pub trait XProvider: Send + Sync {
     fn thread(&self, id: &str) -> Result<Served<Thread>, String>;
     fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String>;
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String>;
+    /// Feed-aware home timeline. Providers that cannot distinguish X's
+    /// two home feeds must say so instead of faking one from the other.
+    fn timeline_feed(
+        &self,
+        _feed: TimelineFeed,
+        _limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
+        Err("this provider does not expose separate For you / Following feeds".into())
+    }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String>;
 }
 
@@ -138,6 +183,16 @@ impl Service {
 
     pub fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         self.read(|reader| reader.timeline(limit))
+    }
+
+    pub fn timeline_feed(
+        &self,
+        feed: TimelineFeed,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
+        let mut served = self.read(|reader| reader.timeline_feed(feed, limit))?;
+        served.value = dedupe_posts(served.value);
+        Ok(served)
     }
 
     pub fn popular(&self, topic: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
@@ -286,6 +341,18 @@ impl XProvider for MockProvider {
         let mut posts = sample_posts();
         posts.truncate(limit);
         Ok(served(posts, "fixture timeline"))
+    }
+    fn timeline_feed(
+        &self,
+        feed: TimelineFeed,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
+        let mut posts = sample_posts();
+        posts.truncate(limit);
+        Ok(served(posts, match feed {
+            TimelineFeed::ForYou => "fixture timeline (for you)",
+            TimelineFeed::Following => "fixture timeline (following)",
+        }))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
         let mut trends = vec![
@@ -520,6 +587,28 @@ impl XProvider for OpenCliProvider {
             ProviderId::OpenCli,
             parse_posts(&stdout)?,
             "timeline",
+        ))
+    }
+    fn timeline_feed(
+        &self,
+        feed: TimelineFeed,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
+        let stdout = self.call(&opencli_read(&[
+            "twitter".into(),
+            "timeline".into(),
+            "--type".into(),
+            feed.opencli_value().into(),
+            "--limit".into(),
+            limit.to_string(),
+        ]))?;
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_posts(&stdout)?,
+            match feed {
+                TimelineFeed::ForYou => "timeline · for you",
+                TimelineFeed::Following => "timeline · following",
+            },
         ))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
@@ -1031,6 +1120,19 @@ impl XProvider for OfficialProvider {
             self.config.post_read_usd,
             &format!("{resources} posts"),
         ))
+    }
+    fn timeline_feed(
+        &self,
+        feed: TimelineFeed,
+        limit: usize,
+    ) -> Result<Served<Vec<Post>>, String> {
+        match feed {
+            // reverse_chronological is X's Following home timeline.
+            TimelineFeed::Following => self.timeline(limit),
+            TimelineFeed::ForYou => {
+                Err("official API exposes only the Following (reverse chronological) home timeline, not For you".into())
+            }
+        }
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
         let _ = (place, limit);
@@ -1639,6 +1741,59 @@ mod tests {
                 .iter()
                 .any(|attempt| attempt.provider == ProviderId::OpenCli
                     && attempt.kind == AttemptKind::Skipped)
+        );
+    }
+
+    #[test]
+    fn dedupe_posts_preserves_order_and_drops_later_dupes() {
+        let mk = |id: &str, text: &str| Post {
+            id: id.into(),
+            url: String::new(),
+            author_handle: "ada".into(),
+            author_name: "Ada".into(),
+            text: text.into(),
+            created_at: None,
+            likes: 0,
+            reposts: 0,
+            replies: 0,
+            bookmarks: 0,
+            views: 0,
+            media: Vec::new(),
+        };
+        let out = dedupe_posts(vec![
+            mk("1", "a"),
+            mk("2", "b"),
+            mk("1", "a-dupe"),
+            mk("", "no-id-1"),
+            mk("3", "c"),
+            mk("2", "b-dupe"),
+            mk("", "no-id-2"),
+        ]);
+        let ids: Vec<&str> = out.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "", "3", ""]);
+        assert_eq!(out[0].text, "a");
+    }
+
+    #[test]
+    fn opencli_following_feed_passes_type_flag() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "timeline", "--type", "following"],
+            r#"[{"id":"7","text":"from following","username":"ada"}]"#,
+        );
+        let service = Service::free(
+            &quiet_config(),
+            runner.clone(),
+            Arc::new(crate::io::MapHttp::default()),
+        );
+        let feed = service.timeline_feed(TimelineFeed::Following, 160).unwrap();
+        assert_eq!(feed.status.provider, ProviderId::OpenCli);
+        assert_eq!(feed.value[0].text, "from following");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(
+            calls.iter().any(|(_, args)| args.join(" ").contains("--type following")),
+            "calls: {calls:?}"
         );
     }
 

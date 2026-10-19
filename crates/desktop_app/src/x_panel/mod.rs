@@ -3,6 +3,7 @@
 
 pub mod art;
 mod media_fit;
+mod scroll_math;
 mod player;
 
 use std::path::PathBuf;
@@ -12,9 +13,12 @@ use std::time::{Duration, Instant};
 use std::collections::HashMap;
 
 use gpui_kit::{
-    Context, FocusHandle, Image, ImageSource, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString,
-    StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px, rgb, rgba,
+    Animation, AnimationExt, Context, FocusHandle, Image, ImageSource, InteractiveElement,
+    IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement,
+    Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
+    ScrollDelta, StatefulInteractiveElement, Styled,
+    StyledImage, Window, div, img, point, px, rgb, rgba,
 };
 
 macro_rules! x_button {
@@ -51,7 +55,7 @@ macro_rules! x_button {
 use termy_x::XConfig;
 use termy_x::drafts::new_id;
 use termy_x::model::{Draft, MediaItem, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
-use termy_x::providers::{MockProvider, XProvider};
+use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
 use termy_x::text::{split_thread_limited, weighted_len_limited};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -213,6 +217,25 @@ pub struct XPanel {
     last_render_log: Option<Instant>,
     section: XSection,
     posts: Vec<Post>,
+    /// Following home feed (kept separate so each feed keeps its data).
+    following_posts: Vec<Post>,
+    timeline_feed: TimelineFeed,
+    /// Shared scroll state for the tweet list (wheel, middle-click
+    /// autoscroll and the draggable scrollbar all drive this one handle).
+    list_scroll: ScrollHandle,
+    autoscroll: Option<AutoScroll>,
+    /// Bumped on every autoscroll engage/disengage so stale loops exit.
+    autoscroll_gen: u64,
+    /// Window handle + scale captured at engage for global cursor polls.
+    autoscroll_hwnd: isize,
+    autoscroll_scale: f32,
+    /// Active scrollbar-thumb drag (start mouse Y, start offset, metrics).
+    sb_drag: Option<SbDrag>,
+    /// Saved list offset per feed, restored on feed switch.
+    feed_offset: [f32; 2],
+    /// Poster URLs waiting for background decode (drained in batches).
+    media_queue: std::collections::VecDeque<String>,
+    media_draining: bool,
     search_posts: Vec<Post>,
     trends: Vec<Trend>,
     research: Vec<ResearchHit>,
@@ -265,12 +288,8 @@ pub struct XPanel {
     caret: usize,
     /// Selection anchor; range is between anchor and caret when set.
     sel_anchor: Option<usize>,
-    /// Blinking caret phase.
-    blink_visible: bool,
     /// Keyboard / Tab focus target for neon chrome.
     ui_focus: UiFocus,
-    /// Blink loop started once per panel.
-    blink_running: bool,
     /// Dedup KeyDown + action Paste within the same chord.
     last_edit_chord_at: Option<Instant>,
     /// Search tab: what the user typed, and the last query actually run
@@ -290,10 +309,34 @@ pub struct XPanel {
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
+/// Deep timeline: one OpenCLI call per feed returns this many unique
+/// tweets (verified live; no pagination flag exists or is needed).
+const TIMELINE_LIMIT: usize = 160;
+
+/// Scrollbar thumb drag state captured on mouse-down.
+#[derive(Clone, Copy)]
+struct SbDrag {
+    start_y: f32,
+    start_offset_y: f32,
+    viewport_h: f32,
+    max_y: f32,
+}
+
+/// Middle-click autoscroll state (list-relative coordinates): the press
+/// anchor plus the latest in-window mouse Y. While engaged, a timer loop
+/// polls the GLOBAL cursor position (Chrome keeps autoscrolling when the
+/// pointer leaves the window) and scrolls at proportional velocity.
+#[derive(Clone, Copy)]
+struct AutoScroll {
+    anchor_x: f32,
+    anchor_y: f32,
+    mouse_y: f32,
+}
 
 #[derive(Clone, Copy, Default)]
 struct SectionTimes {
     timeline: Option<Instant>,
+    timeline_following: Option<Instant>,
     search: Option<Instant>,
     trends: Option<Instant>,
     lookup: Option<Instant>,
@@ -305,6 +348,7 @@ enum FetchPayload {
     Timeline {
         posts: Vec<Post>,
         status: String,
+        feed: TimelineFeed,
     },
     Search {
         posts: Vec<Post>,
@@ -382,6 +426,17 @@ impl XPanel {
             last_render_log: None,
             section: XSection::Timeline,
             posts: Vec::new(),
+            following_posts: Vec::new(),
+            timeline_feed: TimelineFeed::ForYou,
+            list_scroll: ScrollHandle::new(),
+            autoscroll: None,
+            autoscroll_gen: 0,
+            autoscroll_hwnd: 0,
+            autoscroll_scale: 1.0,
+            sb_drag: None,
+            feed_offset: [0.0, 0.0],
+            media_queue: std::collections::VecDeque::new(),
+            media_draining: false,
             search_posts: Vec::new(),
             trends: Vec::new(),
             research: Vec::new(),
@@ -429,9 +484,7 @@ impl XPanel {
             compose_focused: false,
             caret: 0,
             sel_anchor: None,
-            blink_visible: true,
             ui_focus: UiFocus::Compose,
-            blink_running: false,
             last_edit_chord_at: None,
             search_input: String::new(),
             searched_query: String::new(),
@@ -454,7 +507,6 @@ impl XPanel {
             panel.start_connection_check(cx);
         }
         panel.caret = panel.compose.len();
-        panel.start_caret_blink(cx);
         panel
     }
 
@@ -482,7 +534,10 @@ impl XPanel {
         }
         // Bypass the 30s freshness cache for this tab only.
         match section {
-            XSection::Timeline => self.fetched_at.timeline = None,
+            XSection::Timeline => match self.timeline_feed {
+                TimelineFeed::ForYou => self.fetched_at.timeline = None,
+                TimelineFeed::Following => self.fetched_at.timeline_following = None,
+            },
             XSection::Search => self.fetched_at.search = None,
             XSection::Trends => self.fetched_at.trends = None,
             XSection::Lookup => self.fetched_at.lookup = None,
@@ -692,9 +747,54 @@ impl XPanel {
         }
     }
 
+    fn feed_posts(&self) -> &Vec<Post> {
+        match self.timeline_feed {
+            TimelineFeed::ForYou => &self.posts,
+            TimelineFeed::Following => &self.following_posts,
+        }
+    }
+
+    fn feed_index(feed: TimelineFeed) -> usize {
+        match feed {
+            TimelineFeed::ForYou => 0,
+            TimelineFeed::Following => 1,
+        }
+    }
+
+    /// Switch the Timeline between X's For you and Following home feeds.
+    /// Silent background fetch on the existing single-flight path; each
+    /// feed keeps its own posts and scroll offset.
+    fn set_timeline_feed(&mut self, feed: TimelineFeed, cx: &mut Context<Self>) {
+        if feed == self.timeline_feed {
+            return;
+        }
+        let old = Self::feed_index(self.timeline_feed);
+        self.feed_offset[old] = self.list_scroll.offset().y.into();
+        self.timeline_feed = feed;
+        self.autoscroll = None;
+        if self.reply_post_id.is_some() {
+            self.close_reply();
+        }
+        let saved = self.feed_offset[Self::feed_index(feed)];
+        self.list_scroll
+            .set_offset(point(px(0.0), px(saved)));
+        if self.is_fresh(XSection::Timeline) {
+            self.loading = false;
+            self.status = format!("{} \u{b7} cached (<30s)", feed.label());
+        } else {
+            self.loading = true;
+            self.status = format!("loading {} timeline...", feed.label());
+            self.schedule_fetch(XSection::Timeline, cx);
+        }
+        cx.notify();
+    }
+
     fn is_fresh(&self, section: XSection) -> bool {
         let at = match section {
-            XSection::Timeline => self.fetched_at.timeline,
+            XSection::Timeline => match self.timeline_feed {
+                TimelineFeed::ForYou => self.fetched_at.timeline,
+                TimelineFeed::Following => self.fetched_at.timeline_following,
+            },
             XSection::Search => self.fetched_at.search,
             XSection::Trends => self.fetched_at.trends,
             XSection::Lookup => self.fetched_at.lookup,
@@ -709,7 +809,7 @@ impl XPanel {
 
     fn section_has_data(&self, section: XSection) -> bool {
         match section {
-            XSection::Timeline => !self.posts.is_empty(),
+            XSection::Timeline => !self.feed_posts().is_empty(),
             XSection::Search => !self.search_posts.is_empty(),
             XSection::Trends => !self.trends.is_empty(),
             XSection::Lookup => self.profile.is_some(),
@@ -793,11 +893,12 @@ impl XPanel {
         let query = self.query.clone();
         let lookup = self.lookup.clone();
         let live = self.live;
+        let feed = self.timeline_feed;
 
         cx.spawn(async move |this, cx| {
             let payload = cx
                 .background_executor()
-                .spawn(async move { fetch_section(section, query, lookup, live) })
+                .spawn(async move { fetch_section(section, query, lookup, live, feed) })
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 panel.fetching[slot] = false;
@@ -822,10 +923,18 @@ impl XPanel {
     fn apply_fetch(&mut self, section: XSection, payload: FetchPayload) {
         let now = Instant::now();
         match payload {
-            FetchPayload::Timeline { posts, status } => {
-                self.posts = posts;
+            FetchPayload::Timeline { posts, status, feed } => {
+                match feed {
+                    TimelineFeed::ForYou => {
+                        self.posts = posts;
+                        self.fetched_at.timeline = Some(now);
+                    }
+                    TimelineFeed::Following => {
+                        self.following_posts = posts;
+                        self.fetched_at.timeline_following = Some(now);
+                    }
+                }
                 self.status = status;
-                self.fetched_at.timeline = Some(now);
             }
             FetchPayload::Search { posts, status } => {
                 self.search_posts = posts;
@@ -1068,9 +1177,16 @@ impl XPanel {
                 if self.bearer_mode {
                     let masked = "\u{2022}".repeat(self.bearer_input.chars().count().min(24));
                     col = col.child(
-                        div().text_size(px(12.0)).text_color(rgb(0x7af6ff))
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x7af6ff))
+                            .child(format!("Your key: {masked}"))
+                            .child(caret_element("caret-bearer"))
                             .child(format!(
-                                "Your key: {masked} ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
+                                " ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
                                 self.bearer_input.chars().count()
                             )),
                     );
@@ -1244,6 +1360,11 @@ impl XPanel {
         }
 
         if key == "escape" {
+            if self.autoscroll.take().is_some() {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.viewer.is_some() {
                 self.close_viewer();
                 self.notice = Some("Viewer closed \u{b7} nothing was posted.".into());
@@ -1358,7 +1479,6 @@ impl XPanel {
             self.focus_compose_editor();
         }
         self.compose_focused = true;
-        self.blink_visible = true;
 
         // Always stop_propagation for edit chords — even if clipboard is empty —
         // otherwise TerminalView's Paste/Copy/SelectAll actions still hit the shell.
@@ -1400,7 +1520,6 @@ impl XPanel {
                 self.compose.replace_range(a..b, "");
                 self.caret = a;
                 self.clear_selection();
-                self.blink_visible = true;
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -1466,7 +1585,6 @@ impl XPanel {
     fn focus_compose_editor(&mut self) {
         self.compose_focused = true;
         self.ui_focus = UiFocus::Compose;
-        self.blink_visible = true;
         if self.compose.is_empty() {
             // Empty draft: caret at left (index 0), never a phantom selection.
             self.caret = 0;
@@ -1526,7 +1644,6 @@ impl XPanel {
                 InputTarget::Reply => self.reply_text.push_str(clean),
             }
         }
-        self.blink_visible = true;
         self.mark_edit_chord();
     }
 
@@ -1551,7 +1668,6 @@ impl XPanel {
         } else if !self.chord_already_applied() {
             self.mark_edit_chord();
         }
-        self.blink_visible = true;
     }
 
     pub fn focus_compose_editor_public(&mut self) {
@@ -1577,7 +1693,6 @@ impl XPanel {
         }
         self.sel_anchor = Some(0);
         self.caret = self.compose.len();
-        self.blink_visible = true;
         self.mark_edit_chord();
     }
 
@@ -1588,42 +1703,6 @@ impl XPanel {
     fn chord_already_applied(&self) -> bool {
         self.last_edit_chord_at
             .is_some_and(|t| t.elapsed() < Duration::from_millis(80))
-    }
-
-    fn start_caret_blink(&mut self, cx: &mut Context<Self>) {
-        if self.blink_running {
-            return;
-        }
-        self.blink_running = true;
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(530))
-                    .await;
-                let keep = this
-                    .update(cx, |panel, cx| {
-                        // Only Compose's caret blinks via re-render. Reply /
-                        // Search show a steady caret: a 530ms full-list
-                        // re-render while typing was the reply lag/jitter.
-                        if !panel.confirm
-                            && panel.input_target == InputTarget::Compose
-                            && panel.compose_focused
-                            && panel.section == XSection::Compose
-                        {
-                            panel.blink_visible = !panel.blink_visible;
-                            cx.notify();
-                        } else {
-                            panel.blink_visible = true;
-                        }
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
-                }
-            }
-        })
-        .detach();
     }
 
     /// Shared keyboard handling for the Search query and inline reply
@@ -1701,7 +1780,6 @@ impl XPanel {
                 ));
             }
         }
-        self.blink_visible = true;
         cx.stop_propagation();
         cx.notify();
     }
@@ -1730,22 +1808,23 @@ impl XPanel {
         cx.notify();
     }
 
-    fn open_reply(&mut self, post: &Post) {
+    fn open_reply_parts(&mut self, post_id: &str, author_handle: &str) {
+        self.autoscroll = None;
         self.close_viewer();
-        if self.reply_post_id.as_deref() != Some(post.id.as_str()) {
+        if self.reply_post_id.as_deref() != Some(post_id) {
             self.reply_text.clear();
             self.reply_media.clear();
         }
-        self.reply_post_id = Some(post.id.clone());
-        self.reply_author = post.author_handle.clone();
+        self.reply_post_id = Some(post_id.to_string());
+        self.reply_author = author_handle.to_string();
         self.input_target = InputTarget::Reply;
         self.pending_focus = true;
         self.reply_opened_at = Some(Instant::now());
         self.reply_key_logged = false;
-        perf_log(&format!("open_reply id={} (local only, no fetch)", post.id));
+        perf_log(&format!("open_reply id={post_id} (local only, no fetch)"));
         self.status = format!(
-            "reply to @{} \u{b7} type below, then Reply (or Ctrl+Enter)",
-            post.author_handle
+            "reply to @{} \u{b7} type below, then Post (or Ctrl+Enter)",
+            author_handle
         );
     }
 
@@ -1895,7 +1974,6 @@ impl XPanel {
             self.caret = at + text.len();
         }
         self.clear_selection();
-        self.blink_visible = true;
     }
 
     fn backspace(&mut self) {
@@ -1903,7 +1981,6 @@ impl XPanel {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
-            self.blink_visible = true;
             return;
         }
         if self.caret == 0 {
@@ -1912,7 +1989,6 @@ impl XPanel {
         let prev = prev_boundary(&self.compose, self.caret);
         self.compose.replace_range(prev..self.caret, "");
         self.caret = prev;
-        self.blink_visible = true;
     }
 
     fn delete_forward(&mut self) {
@@ -1920,7 +1996,6 @@ impl XPanel {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
-            self.blink_visible = true;
             return;
         }
         if self.caret >= self.compose.len() {
@@ -1928,7 +2003,6 @@ impl XPanel {
         }
         let next = next_boundary(&self.compose, self.caret);
         self.compose.replace_range(self.caret..next, "");
-        self.blink_visible = true;
     }
 
     fn move_caret(&mut self, motion: CaretMove, extend: bool) {
@@ -1951,7 +2025,6 @@ impl XPanel {
                 self.caret = tail;
             }
         }
-        self.blink_visible = true;
     }
 
     fn cycle_ui_focus(&mut self, reverse: bool) {
@@ -1984,7 +2057,6 @@ impl XPanel {
         };
         self.ui_focus = order[next];
         self.compose_focused = self.ui_focus == UiFocus::Compose && !self.confirm;
-        self.blink_visible = true;
     }
 }
 
@@ -2028,15 +2100,16 @@ fn live_status(status: &termy_x::StatusLine) -> String {
     }
 }
 
-fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -> FetchPayload {
+fn fetch_section(section: XSection, query: String, lookup: String, live: bool, feed: TimelineFeed) -> FetchPayload {
     if live {
         let service = XPanel::service_free();
         match section {
             XSection::Timeline => {
-                if let Ok(served) = service.timeline(10) {
+                if let Ok(served) = service.timeline_feed(feed, TIMELINE_LIMIT) {
                     return FetchPayload::Timeline {
                         posts: served.value,
                         status: live_status(&served.status),
+                        feed,
                     };
                 }
             }
@@ -2080,9 +2153,10 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
     match section {
         XSection::Timeline => FetchPayload::Timeline {
             posts: MockProvider
-                .timeline(10)
+                .timeline_feed(feed, TIMELINE_LIMIT)
                 .map(|served| served.value)
                 .unwrap_or_default(),
+            feed,
             status: "mock Â· fixture data Â· no X API credits".into(),
         },
         XSection::Search => FetchPayload::Search {
@@ -2122,6 +2196,7 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
         XSection::Compose => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
+            feed,
         },
     }
 }
@@ -2194,16 +2269,118 @@ impl Render for XPanel {
                     .child(self.tabs(cx))
                     .child(self.connection_bar(cx))
                     .child(self.status_line())
+                    .children((columns == 1 && self.section == XSection::Timeline).then(|| {
+                        self.feed_switch(cx)
+                    }))
                     .child(if columns == 1 {
                         div()
-                            .id("x-scroll")
+                            .relative()
                             .flex_1()
                             .min_h(px(0.0))
-                            .overflow_y_scroll()
-                            .flex()
-                            .flex_col()
-                            .gap(px(8.0))
-                            .children(self.body(count.weighted, count.limit, &parts, cx))
+                            .child(
+                                div()
+                                    .id("x-scroll")
+                                    .size_full()
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.list_scroll)
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(8.0))
+                                    .children(self.body(count.weighted, count.limit, &parts, cx))
+                                    .on_scroll_wheel(cx.listener(
+                                        |this, event: &ScrollWheelEvent, window, cx| {
+                                            // GPUI applies the raw wheel delta
+                                            // natively in this same dispatch;
+                                            // adjust the offset so the net is
+                                            // tamed_wheel_delta (Chrome-like
+                                            // reading speed, well under one
+                                            // tweet per notch). Additive, so
+                                            // listener order does not matter.
+                                            let native: f32 = event
+                                                .delta
+                                                .pixel_delta(window.line_height())
+                                                .y
+                                                .into();
+                                            // Exactly Chrome: line wheels
+                                            // scroll ~100px per notch;
+                                            // precise (hi-res/touchpad)
+                                            // deltas pass through 1:1, and
+                                            // a per-event cap stops driver
+                                            // multipliers throwing pages.
+                                            let desired = match &event.delta {
+                                                ScrollDelta::Lines(p) => {
+                                                    scroll_math::chrome_line_delta(p.y)
+                                                }
+                                                ScrollDelta::Pixels(p) => {
+                                                    f32::from(p.y).clamp(-110.0, 110.0)
+                                                }
+                                            };
+                                            let correction = desired - native;
+                                            if correction.abs() > 0.5 {
+                                                let cur = this.list_scroll.offset();
+                                                let max_y: f32 =
+                                                    this.list_scroll.max_offset().y.into();
+                                                let new_y = (f32::from(cur.y) + correction)
+                                                    .clamp(-max_y.max(0.0), 0.0);
+                                                this.list_scroll
+                                                    .set_offset(point(cur.x, px(new_y)));
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Middle,
+                                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                            this.toggle_autoscroll(event, window, cx);
+                                            cx.stop_propagation();
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
+                            .children(self.scrollbar_overlay(cx))
+                            .children(self.autoscroll.map(|anchor| {
+                                div()
+                                    .absolute()
+                                    .left(px(anchor.anchor_x - 14.0))
+                                    .top(px(anchor.anchor_y - 14.0))
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .rounded_full()
+                                    .border_1()
+                                    .border_color(rgb(0x7af6ff))
+                                    .bg(rgba(0x0f1c33ee))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_size(px(15.0))
+                                    .text_color(rgb(0x7af6ff))
+                                    .child("\u{2195}")
+                            }))
+                            .on_mouse_move(cx.listener(
+                                |this, event: &MouseMoveEvent, _, cx| {
+                                    if this.scrollbar_drag_move(event)
+                                        || this.autoscroll_move(event)
+                                    {
+                                        cx.notify();
+                                    }
+                                },
+                            ))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                                    if this.sb_drag.take().is_some() {
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, _| {
+                                    // Any plain click disengages autoscroll;
+                                    // the click itself still works normally.
+                                    this.autoscroll = None;
+                                }),
+                            )
                             .into_any_element()
                     } else {
                         self.dashboard(columns, count.weighted, count.limit, &parts, cx)
@@ -2250,6 +2427,38 @@ fn fetch_image_rgba(url: &str) -> Result<image::RgbaImage, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Global cursor Y in list-relative logical coordinates, read straight
+/// from the OS so autoscroll keeps tracking (Chrome-style) even when the
+/// pointer is outside the Termy window. `None` off Windows or on failure,
+/// in which case callers fall back to the last in-window mouse position.
+#[cfg(target_os = "windows")]
+fn global_cursor_list_y(hwnd: isize, scale: f32, list_top: f32) -> Option<f32> {
+    #[repr(C)]
+    struct Pt {
+        x: i32,
+        y: i32,
+    }
+    unsafe extern "system" {
+        fn GetCursorPos(pt: *mut Pt) -> i32;
+        fn ScreenToClient(hwnd: isize, pt: *mut Pt) -> i32;
+    }
+    if hwnd == 0 {
+        return None;
+    }
+    let mut pt = Pt { x: 0, y: 0 };
+    unsafe {
+        if GetCursorPos(&mut pt) == 0 || ScreenToClient(hwnd, &mut pt) == 0 {
+            return None;
+        }
+    }
+    Some(pt.y as f32 / scale.max(0.5) - list_top)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn global_cursor_list_y(_hwnd: isize, _scale: f32, _list_top: f32) -> Option<f32> {
+    None
+}
+
 /// Local wall-clock HH:MM:SS for the refresh status label.
 fn local_hms() -> String {
     #[cfg(target_os = "windows")]
@@ -2266,6 +2475,55 @@ fn local_hms() -> String {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
         format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
     }
+}
+
+/// Slow "breath" cycle for loading/caret pulses: eased 0 -> 1 -> 0 over
+/// one period, so elements gently solidify/grow then faint/shrink instead
+/// of flashing on/off. GPUI drives the frames (max ~9 fps); no entity
+/// notify loop, so a breathing caret can never starve typing.
+fn breath_animation(cycle_ms: u64) -> Animation {
+    Animation::new(Duration::from_millis(cycle_ms))
+        .repeat()
+        .with_max_fps(9.0)
+        .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
+}
+
+/// Breathing text caret shared by every panel editor. Always rendered
+/// (fixed cell, zero layout shift); only its opacity breathes.
+fn caret_element(id: &'static str) -> gpui_kit::AnyElement {
+    div()
+        .flex_none()
+        .child("|")
+        .with_animation(id, breath_animation(2_300), |el, v| {
+            el.opacity(0.12 + 0.88 * v)
+        })
+        .into_any_element()
+}
+
+/// Small breathing bird shown while any tab loads (shared status line):
+/// scales up + solidifies on the inhale, shrinks + fades on the exhale.
+/// Exists only while `loading`, so the animation stops itself.
+fn breathing_bird() -> gpui_kit::AnyElement {
+    let Some(image) = art::cached_image() else {
+        return div().w(px(30.0)).h(px(18.0)).into_any_element();
+    };
+    let source: ImageSource = image.into();
+    div()
+        .w(px(30.0))
+        .h(px(18.0))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .child(img(source).size_full().object_fit(ObjectFit::Contain))
+                .with_animation("x-loading-bird", breath_animation(2_800), |el, v| {
+                    let w = 19.0 + 5.0 * v;
+                    el.w(px(w)).h(px(w * 0.625)).opacity(0.30 + 0.70 * v)
+                }),
+        )
+        .into_any_element()
 }
 
 /// Append one line to %TEMP%/termy-x-perf.txt (slow renders + reply timing).
@@ -2481,15 +2739,25 @@ impl XPanel {
     }
 
     fn status_line(&self) -> impl IntoElement {
+        // Shared loading label for every tab: while `loading`, the little
+        // bird breathes next to the status text; it unmounts (and stops)
+        // the moment loading finishes.
         let label = if self.loading {
-            format!("â³ {}", self.status)
+            self.status.clone()
         } else {
             match &self.last_refresh { Some(at) => format!("{} \u{b7} updated {at}", self.status), None => self.status.clone() }
         };
-        div()
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
             .text_size(px(11.0))
-            .text_color(rgb(0x93a4c3))
-            .child(label)
+            .text_color(rgb(0x93a4c3));
+        if self.loading {
+            row = row.child(breathing_bird());
+        }
+        row.child(label)
     }
 
     fn dashboard(
@@ -2637,7 +2905,14 @@ impl XPanel {
         }
         match self.section {
             XSection::Timeline => {
-                if self.posts.is_empty() {
+                if !self.feed_posts().is_empty() {
+                    rows.push(hint(format!(
+                        "{} \u{b7} {} shown",
+                        self.timeline_feed.label(),
+                        self.feed_posts().len()
+                    )));
+                }
+                if self.feed_posts().is_empty() {
                     if self.loading {
                         rows.push(empty_state(
                             "Loading timeline...",
@@ -2652,7 +2927,7 @@ impl XPanel {
                 } else if self.loading {
                     rows.push(hint("Refreshing timeline...".into()));
                 }
-                for post in &self.posts {
+                for post in self.feed_posts() {
                     rows.push(self.tweet_card(post, cx));
                 }
             }
@@ -2808,6 +3083,10 @@ impl XPanel {
 
     /// Start background downloads for every poster/photo in the current
     /// lists. Called once per fetch-apply, never from render or typing.
+    /// Queue poster decodes instead of firing them all at once: with a
+    /// 160-post timeline an all-at-once burst would flood the network and
+    /// the render loop. The drain loop starts a few at a time on the
+    /// background executor; scrolling and typing never wait on it.
     fn prefetch_media(&mut self, cx: &mut Context<Self>) {
         let mut urls: Vec<String> = Vec::new();
         let collect = |posts: &[Post], urls: &mut Vec<String>| {
@@ -2822,6 +3101,7 @@ impl XPanel {
             }
         };
         collect(&self.posts, &mut urls);
+        collect(&self.following_posts, &mut urls);
         collect(&self.search_posts, &mut urls);
         if let Some(profile) = &self.profile {
             collect(&profile.posts, &mut urls);
@@ -2829,8 +3109,48 @@ impl XPanel {
         urls.sort();
         urls.dedup();
         for url in urls {
-            self.spawn_media_fetch(url, cx);
+            if !self.media_cache.contains_key(&url) && !self.media_queue.contains(&url) {
+                self.media_queue.push_back(url);
+            }
         }
+        self.drain_media_queue(cx);
+    }
+
+    fn drain_media_queue(&mut self, cx: &mut Context<Self>) {
+        if self.media_draining {
+            return;
+        }
+        self.media_draining = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                let started = this
+                    .update(cx, |panel, cx| {
+                        let mut started = 0;
+                        while started < 6 {
+                            let Some(url) = panel.media_queue.pop_front() else {
+                                break;
+                            };
+                            if panel.media_cache.contains_key(&url) {
+                                continue;
+                            }
+                            panel.spawn_media_fetch(url, cx);
+                            started += 1;
+                        }
+                        if started == 0 {
+                            panel.media_draining = false;
+                        }
+                        started
+                    })
+                    .unwrap_or(0);
+                if started == 0 {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     fn spawn_media_fetch(&mut self, url: String, cx: &mut Context<Self>) {
@@ -2875,6 +3195,7 @@ impl XPanel {
     }
 
     fn open_viewer(&mut self, media: &MediaItem, post_id: &str, cx: &mut Context<Self>) {
+        self.autoscroll = None;
         self.stop_video_player();
         self.viewer = Some(Viewer {
             kind: media.kind,
@@ -3219,10 +3540,231 @@ impl XPanel {
 
     /// One tweet in Timeline / Search / Trends. Clicking it expands an
     /// inline reply box right underneath; a sent reply marks it Replied.
+    /// Thin draggable scrollbar overlaid on the list's right edge.
+    /// Geometry comes from the shared scroll handle, so wheel scrolling,
+    /// middle-click autoscroll and this thumb never disagree. Track
+    /// clicks page up/down. Painted absolutely: zero layout width cost.
+    fn scrollbar_overlay(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let bounds = self.list_scroll.bounds();
+        let viewport_h: f32 = bounds.size.height.into();
+        let max_y: f32 = self.list_scroll.max_offset().y.into();
+        if viewport_h <= 1.0 || max_y <= 1.0 {
+            return None;
+        }
+        let offset_y: f32 = self.list_scroll.offset().y.into();
+        let (thumb_y, thumb_h) = scroll_math::thumb_geometry(viewport_h, max_y, offset_y);
+        let dragging = self.sb_drag.is_some();
+        let top_edge: f32 = bounds.origin.y.into();
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(12.0))
+                .h_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        // Track click: page toward the click.
+                        let rel_y: f32 = event.position.y.into();
+                        let rel_y = rel_y - top_edge;
+                        let page = viewport_h * 0.9;
+                        let cur: f32 = this.list_scroll.offset().y.into();
+                        let new = if rel_y < thumb_y {
+                            (cur + page).min(0.0)
+                        } else {
+                            (cur - page).max(-max_y)
+                        };
+                        let cur_point = this.list_scroll.offset();
+                        this.list_scroll.set_offset(point(cur_point.x, px(new)));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(2.0))
+                        .top(px(thumb_y))
+                        .w(px(8.0))
+                        .h(px(thumb_h))
+                        .rounded(px(4.0))
+                        .bg(if dragging {
+                            rgb(0x7af6ff)
+                        } else {
+                            rgba(0x3b82c4cc)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                let start_y: f32 = event.position.y.into();
+                                this.sb_drag = Some(SbDrag {
+                                    start_y,
+                                    start_offset_y: offset_y,
+                                    viewport_h,
+                                    max_y,
+                                });
+                                this.autoscroll = None;
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Mouse moved while dragging the scrollbar thumb.
+    fn scrollbar_drag_move(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(drag) = self.sb_drag else {
+            return false;
+        };
+        let mouse_y: f32 = event.position.y.into();
+        let (start_thumb_y, _) =
+            scroll_math::thumb_geometry(drag.viewport_h, drag.max_y, drag.start_offset_y);
+        let new_offset = scroll_math::offset_for_thumb_y(
+            drag.viewport_h,
+            drag.max_y,
+            start_thumb_y + (mouse_y - drag.start_y),
+        );
+        let current = self.list_scroll.offset();
+        if (f32::from(current.y) - new_offset).abs() < 0.5 {
+            return false;
+        }
+        self.list_scroll.set_offset(point(current.x, px(new_offset)));
+        true
+    }
+
+    /// "For you" / "Following" toggle at the top of the Timeline tab.
+    /// Both are real X home feeds via OpenCLI `--type`.
+    fn feed_switch(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let feed = self.timeline_feed;
+        div()
+            .flex()
+            .gap(px(6.0))
+            .child(x_button!(
+                "x-feed-for-you",
+                "For you",
+                feed == TimelineFeed::ForYou,
+                cx.listener(|this, _, _, cx| {
+                    this.set_timeline_feed(TimelineFeed::ForYou, cx);
+                    cx.stop_propagation();
+                })
+            ))
+            .child(x_button!(
+                "x-feed-following",
+                "Following",
+                feed == TimelineFeed::Following,
+                cx.listener(|this, _, _, cx| {
+                    this.set_timeline_feed(TimelineFeed::Following, cx);
+                    cx.stop_propagation();
+                })
+            ))
+            .into_any_element()
+    }
+
+    /// Middle-click: engage autoscroll at this anchor, or disengage if
+    /// already active. Never triggers reply/media (those are Left-only).
+    /// Chrome semantics: engaging starts a loop that keeps scrolling
+    /// while the cursor is held away from the anchor — no further mouse
+    /// movement needed — tracking the GLOBAL cursor so leaving the
+    /// window neither pauses nor disengages; only a click or Esc exits.
+    fn toggle_autoscroll(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.autoscroll_gen += 1;
+        if self.autoscroll.take().is_some() {
+            return;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = HasWindowHandle::window_handle(window)
+                && let RawWindowHandle::Win32(win32) = handle.as_raw()
+            {
+                self.autoscroll_hwnd = win32.hwnd.get() as isize;
+            }
+            self.autoscroll_scale = window.scale_factor();
+        }
+        let bounds = self.list_scroll.bounds();
+        let anchor_x: f32 = event.position.x.into();
+        let anchor_y: f32 = event.position.y.into();
+        let top: f32 = bounds.origin.y.into();
+        let left: f32 = bounds.origin.x.into();
+        self.autoscroll = Some(AutoScroll {
+            anchor_x: anchor_x - left,
+            anchor_y: anchor_y - top,
+            mouse_y: anchor_y - top,
+        });
+        let agen = self.autoscroll_gen;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(30))
+                    .await;
+                let keep = this
+                    .update(cx, |panel, cx| {
+                        if panel.autoscroll_gen != agen {
+                            return false;
+                        }
+                        let Some(anchor) = panel.autoscroll else {
+                            return false;
+                        };
+                        let bounds = panel.list_scroll.bounds();
+                        let top: f32 = bounds.origin.y.into();
+                        let mouse_y = global_cursor_list_y(
+                            panel.autoscroll_hwnd,
+                            panel.autoscroll_scale,
+                            top,
+                        )
+                        .unwrap_or(anchor.mouse_y);
+                        let velocity = scroll_math::autoscroll_velocity(anchor.anchor_y, mouse_y);
+                        if velocity.abs() > 0.0 {
+                            let cur = panel.list_scroll.offset();
+                            let max_y: f32 = panel.list_scroll.max_offset().y.into();
+                            let new_y = (f32::from(cur.y) + velocity * 0.03)
+                                .clamp(-max_y.max(0.0), 0.0);
+                            if (f32::from(cur.y) - new_y).abs() > 0.01 {
+                                panel.list_scroll.set_offset(point(cur.x, px(new_y)));
+                                cx.notify();
+                            }
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// In-window mouse moved while autoscrolling: record the position as
+    /// the fallback for platforms without global cursor reads. The
+    /// engage loop does the actual scrolling; the anchor never moves.
+    fn autoscroll_move(&mut self, event: &MouseMoveEvent) -> bool {
+        let Some(anchor) = &mut self.autoscroll else {
+            return false;
+        };
+        let bounds = self.list_scroll.bounds();
+        let mouse_y: f32 = event.position.y.into();
+        let top: f32 = bounds.origin.y.into();
+        anchor.mouse_y = mouse_y - top;
+        false
+    }
+
     fn tweet_card(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let selected = self.reply_post_id.as_deref() == Some(post.id.as_str());
         let replied = self.replied_ids.iter().any(|id| id == &post.id);
-        let post_for_click = post.clone();
+        // Click handlers capture only the two small strings they need:
+        // cloning the whole Post (text + media) for every card on every
+        // render was measurable with a 160-post list.
+        let click_id = post.id.clone();
+        let click_author = post.author_handle.clone();
         let mut el = div()
             .id(SharedString::from(format!("x-tweet-{}", post.id)))
             .p(px(12.0))
@@ -3266,12 +3808,12 @@ impl XPanel {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    if this.reply_post_id.as_deref() == Some(post_for_click.id.as_str()) {
+                    if this.reply_post_id.as_deref() == Some(click_id.as_str()) {
                         // Second click on the open tweet just refocuses it.
                         this.input_target = InputTarget::Reply;
                         this.pending_focus = true;
                     } else {
-                        this.open_reply(&post_for_click);
+                        this.open_reply_parts(&click_id, &click_author);
                     }
                     cx.stop_propagation();
                     cx.notify();
@@ -3337,13 +3879,19 @@ impl XPanel {
                                 rgb(0xf8fbff)
                             })
                             .child(if self.reply_text.is_empty() {
-                                "Write your reply\u{2026} (Ctrl+Enter sends)".to_string()
+                                div().child("Write your reply\u{2026} (Ctrl+Enter sends)")
                             } else if focused {
-                                // Steady caret (not blink-toggled): the text
-                                // width must never change between frames.
-                                format!("{}\u{258f}", self.reply_text)
+                                // Breathing caret in a fixed cell: always
+                                // present, only its opacity pulses, so the
+                                // text width never changes between frames.
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .child(self.reply_text.clone())
+                                    .child(caret_element("caret-reply"))
                             } else {
-                                self.reply_text.clone()
+                                div().child(self.reply_text.clone())
                             }),
                     )
                     .on_mouse_down(
@@ -3365,7 +3913,7 @@ impl XPanel {
                         rgb(0x9ad7ff)
                     })
                     .child(format!(
-                        "{} / {} characters \u{b7} Ctrl+Enter or the Reply button sends \u{b7} replies attach 1 image",
+                        "{} / {} characters \u{b7} Ctrl+Enter or the Post button sends \u{b7} replies attach 1 image",
                         count.weighted, count.limit
                     )),
             );
@@ -3423,9 +3971,9 @@ impl XPanel {
                 .child(x_button!(
                     "x-reply-send",
                     if self.reply_posting {
-                        "Replying\u{2026}"
+                        "Posting\u{2026}"
                     } else {
-                        "Reply"
+                        "Post"
                     },
                     cx.listener(|this, _, _, cx| {
                         this.submit_reply(cx);
@@ -3491,11 +4039,16 @@ impl XPanel {
                                         rgb(0xf8fbff)
                                     })
                                     .child(if self.search_input.is_empty() {
-                                        "Type a query \u{2014} a word, #tag, or from:someone".to_string()
+                                        div().child("Type a query \u{2014} a word, #tag, or from:someone")
                                     } else if focused {
-                                        format!("{}\u{258f}", self.search_input)
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .child(self.search_input.clone())
+                                            .child(caret_element("caret-search"))
                                     } else {
-                                        self.search_input.clone()
+                                        div().child(self.search_input.clone())
                                     }),
                             )
                             .on_mouse_down(
@@ -3886,7 +4439,7 @@ impl XPanel {
 
     fn render_compose_editor(&self) -> gpui_kit::AnyElement {
         let focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
-        let show_caret = focused && self.blink_visible;
+        let show_caret = focused;
         let caret = self.caret.min(self.compose.len());
         let sel = self.selection_range();
 
@@ -3994,6 +4547,9 @@ impl XPanel {
             .rounded(px(1.0))
             .bg(rgb(0x7af6ff))
             .flex_none()
+            .with_animation("caret-compose", breath_animation(2_300), |el, v| {
+                el.opacity(0.12 + 0.88 * v)
+            })
             .into_any_element()
     }
 
