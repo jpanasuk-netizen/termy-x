@@ -20,6 +20,18 @@ impl TerminalView {
         cx.notify();
     }
 
+    /// Horizontal space the docked X panel takes from the terminal
+    /// content area while open (zero when closed). The terminal pane
+    /// layout subtracts this so the CLI grid ends at the panel edge
+    /// instead of extending underneath it.
+    pub(super) fn x_panel_reserved_width(&self) -> f32 {
+        if self.x_panel_open && self.x_panel.is_some() {
+            termy::x_panel::PANEL_DOCKED_WIDTH
+        } else {
+            0.0
+        }
+    }
+
     fn ensure_x_panel(&mut self, cx: &mut Context<Self>) {
         if self.x_panel.is_none() {
             self.x_panel = Some(cx.new(|cx| XPanel::new(cx, false)));

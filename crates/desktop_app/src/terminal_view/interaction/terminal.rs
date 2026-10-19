@@ -441,7 +441,14 @@ impl TerminalView {
             .tabs
             .get(self.session.active_tab)
             .map_or(0, |tab| tab.panes.len());
-        let total_sidebar_width = sidebar_width + self.workspace_sidebar_width();
+        // The docked X panel reserves width on the right just like the
+        // sidebars: including it here both shrinks the grid to the space
+        // left of the panel and changes the resize signature, so
+        // toggling the panel (Ctrl+Shift+X) reflows the terminal
+        // instead of leaving the grid sized for the full window with
+        // the panel drawn over its right edge.
+        let total_sidebar_width =
+            sidebar_width + self.workspace_sidebar_width() + self.x_panel_reserved_width();
         let resize_signature = self.terminal_resize_signature(
             viewport_width,
             viewport_height,

@@ -80,6 +80,18 @@ impl TerminalView {
         Self::window_titlebar_height_for(sidebar_tabs, show_tab_strip_chrome)
     }
 
+    /// Terminal content width: viewport minus every chrome strip that
+    /// eats horizontal space (right tab sidebar, left workspace
+    /// sidebar, docked X panel). Pure so the allocation is testable.
+    pub(in super::super) fn terminal_content_width(
+        viewport_width: f32,
+        sidebar_width: f32,
+        workspace_width: f32,
+        panel_width: f32,
+    ) -> f32 {
+        (viewport_width - sidebar_width - workspace_width - panel_width).max(0.0)
+    }
+
     pub(in super::super) fn terminal_content_top_inset(&self) -> f32 {
         Self::terminal_content_top_inset_for(
             false,
@@ -92,6 +104,23 @@ impl TerminalView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_content_width_subtracts_docked_x_panel() {
+        // Panel closed: terminal keeps the full width.
+        assert_eq!(TerminalView::terminal_content_width(1296.0, 0.0, 0.0, 0.0), 1296.0);
+        // Panel open at the standing outer size: grid gets the rest.
+        assert_eq!(
+            TerminalView::terminal_content_width(1296.0, 0.0, 0.0, 480.0),
+            816.0
+        );
+        // Sidebars and panel stack; never negative.
+        assert_eq!(
+            TerminalView::terminal_content_width(1296.0, 200.0, 48.0, 480.0),
+            568.0
+        );
+        assert_eq!(TerminalView::terminal_content_width(300.0, 0.0, 0.0, 480.0), 0.0);
+    }
 
     #[test]
     fn window_y_to_terminal_content_y_subtracts_non_zero_chrome() {

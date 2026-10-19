@@ -122,6 +122,13 @@ enum InputTarget {
     Lookup,
 }
 
+/// Width of the panel when docked beside the terminal (as opposed to
+/// the standalone full-window preview). TerminalView subtracts exactly
+/// this much from the terminal content bounds while the panel is open,
+/// so the CLI grid shrinks to the remaining space instead of sliding
+/// underneath the panel.
+pub const PANEL_DOCKED_WIDTH: f32 = 480.0;
+
 /// Pure predicate behind `XPanel::owns_edit_keys`: does a panel text
 /// field own Ctrl+V/C/A right now? Kept free-standing so the routing
 /// matrix is unit-testable without a GPUI context.
@@ -3486,7 +3493,7 @@ impl Render for XPanel {
         if self.fill_window {
             root = root.size_full();
         } else {
-            root = root.w(px(480.0)).flex_none();
+            root = root.w(px(PANEL_DOCKED_WIDTH)).flex_none();
         }
 
         let root = root.child(self.backdrop(art_opacity))

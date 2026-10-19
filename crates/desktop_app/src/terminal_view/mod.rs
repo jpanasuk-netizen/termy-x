@@ -2412,8 +2412,12 @@ impl TerminalView {
         TerminalContentRect::new(
             0.0,
             0.0,
-            (viewport_width - self.effective_sidebar_width() - self.workspace_sidebar_width())
-                .max(0.0),
+            Self::terminal_content_width(
+                viewport_width,
+                self.effective_sidebar_width(),
+                self.workspace_sidebar_width(),
+                self.x_panel_reserved_width(),
+            ),
             viewport_height - self.terminal_content_top_inset() - self.inspector_bottom_inset(),
         )
     }
