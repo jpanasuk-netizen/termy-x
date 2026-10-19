@@ -73,6 +73,17 @@ pub trait XProvider: Send + Sync {
     fn available(&self) -> bool;
     fn lookup(&self, handle: &str) -> Result<Served<Profile>, String>;
     fn thread(&self, id: &str) -> Result<Served<Thread>, String>;
+    /// One tweet by id. Default: the thread root (providers whose
+    /// thread path already unwraps reposts get the embed for free).
+    /// OpenCli overrides with a TweetResultByRestId eval, whose row
+    /// carries `retweeted` when the tweet is a repost.
+    fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
+        let served = self.thread(id)?;
+        Ok(Served {
+            value: served.value.root,
+            status: served.status,
+        })
+    }
     fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String>;
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String>;
     /// Feed-aware home timeline. Providers that cannot distinguish X's
@@ -208,6 +219,50 @@ impl Service {
     pub fn thread(&self, id: &str) -> Result<Served<Thread>, String> {
         let id = crate::model::post_id_from_input(id);
         self.read(|reader| reader.thread(&id))
+    }
+
+    pub fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
+        let id = crate::model::post_id_from_input(id);
+        self.read(|reader| reader.post_by_id(&id))
+    }
+
+    /// Fill in the embedded original for bare reposts (`RT @handle:`
+    /// rows with no `retweeted` payload) by fetching each repost by id
+    /// through the existing by-id path. `cache` maps repost id ->
+    /// resolved original (None = tried, could not resolve); cached ids
+    /// are never fetched twice. At most `max_fetches` new fetches run
+    /// per call so a feed full of reposts cannot stall a load; call
+    /// again to drain the rest. Returns how many posts got their
+    /// original filled in.
+    pub fn resolve_bare_reposts(
+        &self,
+        posts: &mut [Post],
+        cache: &mut std::collections::HashMap<String, Option<Post>>,
+        max_fetches: usize,
+    ) -> usize {
+        let mut filled = 0;
+        let mut fetches = 0;
+        for post in posts.iter_mut() {
+            if post.bare_repost_handle().is_none() {
+                continue;
+            }
+            if !cache.contains_key(&post.id) {
+                if fetches >= max_fetches {
+                    continue;
+                }
+                fetches += 1;
+                let resolved = self
+                    .post_by_id(&post.id)
+                    .ok()
+                    .and_then(|served| served.value.retweeted.map(|inner| *inner));
+                cache.insert(post.id.clone(), resolved);
+            }
+            if let Some(Some(original)) = cache.get(&post.id) {
+                post.retweeted = Some(Box::new(original.clone()));
+                filled += 1;
+            }
+        }
+        filled
     }
 
     pub fn search(
@@ -818,6 +873,17 @@ impl XProvider for OpenCliProvider {
             ProviderId::OpenCli,
             parse_thread(&stdout, id)?,
             "thread",
+        ))
+    }
+    fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
+        // TweetResultByRestId through the silent session: the row for a
+        // repost carries the embedded original (`retweeted`), which is
+        // exactly what bare-repost resolution needs.
+        let stdout = self.eval_js("https://x.com/home", &tweet_by_id_eval_js(id))?;
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_tweet_by_id_eval(&stdout)?,
+            "tweet by id",
         ))
     }
     fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String> {
@@ -1722,6 +1788,112 @@ fn parse_profile_eval(stdout: &str) -> Result<(Vec<Post>, Vec<Post>), String> {
         return Err(error.to_string());
     }
     Ok((posts, pinned))
+}
+
+
+/// Single-tweet fetch for bare-repost resolution: TweetResultByRestId
+/// in the silent session (same GraphQL path the pinned-post fetch
+/// proved against the live client). Returns `{post: <normalized row>}`
+/// where the row's `retweeted` carries the original when the tweet is
+/// a repost, or `{error, post: null}`.
+fn tweet_by_id_eval_js(id: &str) -> String {
+    let id_js = serde_json::to_string(id).expect("tweet id js");
+    TWEET_BY_ID_EVAL_JS.replace("__TWEET_ID_JSON__", &id_js)
+}
+
+const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
+  const TWEET_ID = __TWEET_ID_JSON__;
+  let ct0 = null;
+  for (let w = 0; w < 24; w++) {
+    ct0 = (document.cookie.match(/(?:^|; )ct0=([^;]+)/) || [])[1];
+    if (ct0) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  if (!ct0) return JSON.stringify({error: "not logged into x.com (no ct0 cookie)", post: null});
+  const FEATURES = {{"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_enhance_cards_enabled":false}};
+  const headers = {Authorization: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA", "X-Csrf-Token": decodeURIComponent(ct0), "X-Twitter-Auth-Type": "OAuth2Session", "X-Twitter-Active-User": "yes"};
+  async function resolveQid(op) {
+    try {
+      const urlSet = new Set();
+      [...document.scripts].forEach(sc => { if (sc.src) urlSet.add(sc.src); });
+      try { performance.getEntriesByType("resource").forEach(r => { if (r.name && r.name.includes(".js")) urlSet.add(r.name); }); } catch (e) {}
+      for (const src of [...urlSet]) {
+        const txt = await (await fetch(src)).text();
+        let i = txt.indexOf(op);
+        let hops = 0;
+        while (i >= 0 && hops < 6) {
+          const seg = txt.slice(Math.max(0, i - 1200), i + 1200);
+          const mm = seg.match(/queryId:"([A-Za-z0-9_-]{10,})"/);
+          if (mm) return mm[1];
+          i = txt.indexOf(op, i + 1); hops++;
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+  async function gql(op, vars) {
+    const qid = await resolveQid(op);
+    if (!qid) return null;
+    const url = "/i/api/graphql/" + qid + "/" + op + "?variables=" + encodeURIComponent(JSON.stringify(vars)) + "&features=" + encodeURIComponent(JSON.stringify(FEATURES));
+    const r = await fetch(url, {method: "GET", headers, credentials: "include"});
+    if (!r.ok) return null;
+    return await r.json();
+  }
+  function mediaOf(l) {
+    const media = (l.extended_entities && l.extended_entities.media) || (l.entities && l.entities.media) || [];
+    const urls = [], posters = [], durations = [];
+    for (const m of media) {
+      if (!m) continue;
+      if (m.type === "video" || m.type === "animated_gif") {
+        let best = null;
+        for (const v of (m.video_info && m.video_info.variants) || []) {
+          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+        }
+        urls.push(best ? best.url : m.media_url_https);
+        posters.push(m.media_url_https);
+        durations.push((m.video_info && m.video_info.duration_millis) || 0);
+      } else {
+        urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
+      }
+    }
+    return {has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations};
+  }
+  function extract(result, seen) {
+    if (!result) return null;
+    const tw = result.tweet || result;
+    const l = tw.legacy || {};
+    if (!tw.rest_id || seen.has(tw.rest_id)) return null;
+    seen.add(tw.rest_id);
+    const u = tw.core && tw.core.user_results && tw.core.user_results.result;
+    const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
+    const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
+    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
+  }
+  const one = await gql("TweetResultByRestId", {tweetId: TWEET_ID, withCommunity: false, includePromotedContent: false, withVoice: false});
+  const tr = one && one.data && one.data.tweetResult && one.data.tweetResult.result;
+  if (!tr) return JSON.stringify({error: "tweet not found", post: null});
+  const post = extract(tr, new Set());
+  if (!post) return JSON.stringify({error: "tweet payload unreadable", post: null});
+  return JSON.stringify({post});
+})()"##;
+
+/// Parse one `tweet_by_id_eval_js` payload into the normalized post.
+fn parse_tweet_by_id_eval(stdout: &str) -> Result<Post, String> {
+    let value: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("tweet session returned unreadable output: {e}"))?;
+    if let Some(row) = value.get("post").filter(|row| row.is_object()) {
+        let posts = parse_posts(&serde_json::json!([row]).to_string())?;
+        return posts
+            .into_iter()
+            .next()
+            .ok_or_else(|| "tweet payload carried no post".to_string());
+    }
+    Err(value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("tweet not found")
+        .to_string())
 }
 
 fn opencli_read(args: &[String]) -> Vec<String> {
@@ -3221,6 +3393,136 @@ mod tests {
         // blanket reads as an infinite hang.
         assert_eq!(POST_TIMEOUT.as_secs(), 150);
         assert_eq!(ENGAGE_TIMEOUT.as_secs(), 90);
+    }
+
+    #[test]
+    fn bare_repost_detection_and_card_text() {
+        let mut bare = post_from_value(
+            &serde_json::json!({"id": "60", "author": "reposter", "text": "RT @orig: hello world"}),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bare.bare_repost_handle(), Some("orig"));
+        assert_eq!(bare.card_text(), "hello world");
+        // A mention that merely starts a post is not a repost marker.
+        bare.text = "RT @orig hello world".into();
+        assert_eq!(bare.bare_repost_handle(), None);
+        // With the original embedded, the card shows the original text
+        // and nothing counts as bare anymore.
+        bare.text = "RT @orig: hello world".into();
+        let mut original = bare.clone();
+        original.id = "59".into();
+        original.author_handle = "orig".into();
+        original.text = "hello world".into();
+        bare.retweeted = Some(Box::new(original));
+        assert_eq!(bare.bare_repost_handle(), None);
+        assert_eq!(bare.card_text(), "hello world");
+        assert_eq!(bare.engage_target().id, "59");
+    }
+
+    struct StubById {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl XProvider for StubById {
+        fn id(&self) -> ProviderId {
+            ProviderId::Mock
+        }
+        fn available(&self) -> bool {
+            true
+        }
+        fn lookup(&self, _handle: &str) -> Result<Served<Profile>, String> {
+            Err("stub".into())
+        }
+        fn thread(&self, _id: &str) -> Result<Served<Thread>, String> {
+            Err("stub".into())
+        }
+        fn search(
+            &self,
+            _query: &str,
+            _recent: bool,
+            _limit: usize,
+        ) -> Result<Served<Vec<Post>>, String> {
+            Err("stub".into())
+        }
+        fn timeline(&self, _limit: usize) -> Result<Served<Vec<Post>>, String> {
+            Err("stub".into())
+        }
+        fn trends(
+            &self,
+            _place: Option<&str>,
+            _limit: usize,
+        ) -> Result<Served<Vec<Trend>>, String> {
+            Err("stub".into())
+        }
+        fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut outer = post_from_value(
+                &serde_json::json!({"id": id, "author": "reposter", "text": "RT @orig: hello"}),
+                &[],
+            )
+            .unwrap();
+            let mut original = outer.clone();
+            original.id = "59".into();
+            original.author_handle = "orig".into();
+            original.text = "hello".into();
+            outer.retweeted = Some(Box::new(original));
+            Ok(served(outer, "stub by-id"))
+        }
+    }
+
+    #[test]
+    fn resolve_bare_reposts_fetches_once_and_caches() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let service = Service {
+            readers: vec![Box::new(StubById {
+                calls: calls.clone(),
+            })],
+            publishers: Vec::new(),
+        };
+        let fetch_count = || calls.load(std::sync::atomic::Ordering::SeqCst);
+        let bare = || {
+            post_from_value(
+                &serde_json::json!({"id": "60", "author": "reposter", "text": "RT @orig: hello"}),
+                &[],
+            )
+            .unwrap()
+        };
+        let mut posts = vec![bare(), bare()];
+        let mut cache = std::collections::HashMap::new();
+        // Both copies of the same repost resolve from ONE fetch.
+        assert_eq!(service.resolve_bare_reposts(&mut posts, &mut cache, 6), 2);
+        assert_eq!(posts[0].engage_target().id, "59");
+        assert_eq!(posts[1].engage_target().id, "59");
+        assert_eq!(fetch_count(), 1, "same repost id fetched exactly once");
+        // Second pass: cache hit, no new fetch.
+        let mut again = vec![bare()];
+        assert_eq!(service.resolve_bare_reposts(&mut again, &mut cache, 6), 1);
+        assert_eq!(fetch_count(), 1, "cache hit must not refetch");
+        // Fetch budget respected: with max 0 nothing is fetched or filled.
+        let mut fresh = vec![bare()];
+        let mut fresh_cache = std::collections::HashMap::new();
+        fresh[0].id = "61".into();
+        assert_eq!(service.resolve_bare_reposts(&mut fresh, &mut fresh_cache, 0), 0);
+        assert!(fresh[0].retweeted.is_none());
+        assert!(fresh_cache.is_empty());
+    }
+
+    #[test]
+    fn tweet_by_id_eval_uses_rest_id_and_parses_embed() {
+        let js = tweet_by_id_eval_js("12345");
+        assert!(js.contains("TweetResultByRestId"), "by-id op");
+        assert!(js.contains("retweeted_status_result"), "by-id unwraps reposts");
+        assert!(js.contains("12345"), "id substituted");
+        let stdout = r##"{"post": {"id": "60", "author": "reposter", "text": "RT @orig: hi",
+          "retweeted": {"id": "59", "author": "orig", "text": "hi", "likes": 7}}}"##;
+        let post = parse_tweet_by_id_eval(stdout).unwrap();
+        assert_eq!(post.id, "60");
+        assert_eq!(post.engage_target().id, "59");
+        assert_eq!(post.engage_target().likes, 7);
+        let err = parse_tweet_by_id_eval(r#"{"error": "tweet not found", "post": null}"#)
+            .unwrap_err();
+        assert!(err.contains("not found"), "honest error: {err}");
     }
 
     #[test]

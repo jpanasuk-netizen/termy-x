@@ -203,6 +203,42 @@ impl Post {
         self.retweeted.as_deref().unwrap_or(self)
     }
 
+    /// Handle of the original author when this post is a *bare*
+    /// repost: no embedded original in the payload, only the classic
+    /// `RT @handle:` text prefix some providers emit. Returns None for
+    /// normal posts and for reposts that already carry the original.
+    pub fn bare_repost_handle(&self) -> Option<&str> {
+        if self.retweeted.is_some() {
+            return None;
+        }
+        let rest = self.text.strip_prefix("RT @")?;
+        let handle = rest.split(':').next()?;
+        if handle.is_empty()
+            || !handle
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return None;
+        }
+        // The colon must be present: "RT @x hello" without one is a
+        // mention that merely starts a post, not a repost marker.
+        rest[handle.len()..].starts_with(':').then_some(handle)
+    }
+
+    /// Text a card should show: the embedded original's text for a
+    /// repost, otherwise this post's own text with any bare `RT @h:`
+    /// repost prefix stripped (the reposter header carries that part).
+    pub fn card_text(&self) -> &str {
+        if let Some(inner) = &self.retweeted {
+            return &inner.text;
+        }
+        if let Some(handle) = self.bare_repost_handle() {
+            let prefix_len = "RT @".len() + handle.len() + 1;
+            return self.text[prefix_len..].trim_start();
+        }
+        &self.text
+    }
+
     pub fn engagement(&self) -> u64 {
         self.likes
             .saturating_add(self.reposts.saturating_mul(3))

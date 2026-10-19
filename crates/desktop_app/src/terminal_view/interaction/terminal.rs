@@ -910,4 +910,30 @@ mod tests {
         );
         assert_eq!(cols_no_sidebar - cols_with_sidebar, 30);
     }
+
+    #[test]
+    fn docked_x_panel_reservation_shrinks_grid_beside_other_chrome() {
+        // Ctrl+Shift+X with other content already open (tab sidebar +
+        // workspace sidebar on screen): the panel's slice stacks with
+        // the existing chrome, and the grid loses exactly the panel's
+        // columns -- terminal pane shrinks, panel never overlaps it.
+        let panel = termy::x_panel::PANEL_DOCKED_WIDTH;
+        let other_chrome = 240.0 + 48.0;
+        let grid = |total_sidebar: f32| {
+            TerminalView::terminal_grid_size_for_pane_count(
+                1, 1296.0, 800.0, total_sidebar, 32.0, 8.0, 8.0, 8.0, 16.0,
+            )
+            .0
+        };
+        let without_panel = grid(other_chrome);
+        let with_panel = grid(other_chrome + panel);
+        assert!(with_panel < without_panel);
+        assert_eq!(
+            without_panel - with_panel,
+            (panel / 8.0) as u16,
+            "grid must lose exactly the docked panel's columns"
+        );
+        // Closing the panel hands the columns straight back.
+        assert_eq!(grid(other_chrome), without_panel);
+    }
 }

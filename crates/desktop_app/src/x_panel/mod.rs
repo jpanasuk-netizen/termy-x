@@ -308,6 +308,12 @@ pub struct XPanel {
     /// only reflects clicks made here; counts move locally with them).
     liked_ids: Vec<String>,
     retweeted_ids: Vec<String>,
+    /// Bare-repost resolution cache: repost id -> embedded original
+    /// fetched by id (None = tried, unresolved). Session-long so a
+    /// repost is fetched at most once, however often it re-renders.
+    repost_cache: std::collections::HashMap<String, Option<Post>>,
+    /// A background bare-repost resolution pass is in flight.
+    repost_resolving: bool,
     /// Post ids with a like/retweet/quote call in flight (buttons for
     /// these are inert until the call lands).
     engage_pending: Vec<String>,
@@ -588,6 +594,8 @@ impl XPanel {
             feed_cursor_ok: [false, false],
             liked_ids: Vec::new(),
             retweeted_ids: Vec::new(),
+            repost_cache: std::collections::HashMap::new(),
+            repost_resolving: false,
             engage_pending: Vec::new(),
             quote_post_id: None,
             quote_author: String::new(),
@@ -1309,6 +1317,7 @@ impl XPanel {
                 }
                 panel.loading = false;
                 panel.apply_fetch(section, payload);
+                panel.resolve_bare_reposts(cx);
                 panel.prefetch_media(cx);
                 if let Some(next) = panel.queued_section.take()
                     && next != section
@@ -1462,6 +1471,77 @@ impl XPanel {
             // leave current tab's status alone if it has its own message
         }
         let _ = section;
+    }
+
+    /// Bare reposts (payload carried no embedded original) get theirs
+    /// fetched by id in the background and patched into every loaded
+    /// list in place. The session cache guarantees each repost id is
+    /// fetched at most once; a failed resolve is cached too, so a dead
+    /// id never refetches on every render. Six fetches per pass, then
+    /// the completion re-scans and drains the rest.
+    fn resolve_bare_reposts(&mut self, cx: &mut Context<Self>) {
+        if self.repost_resolving {
+            return;
+        }
+        let mut wanted: Vec<String> = Vec::new();
+        let mut scan = |posts: &[Post], wanted: &mut Vec<String>| {
+            for post in posts {
+                if post.bare_repost_handle().is_some()
+                    && !self.repost_cache.contains_key(&post.id)
+                    && !wanted.contains(&post.id)
+                {
+                    wanted.push(post.id.clone());
+                }
+            }
+        };
+        scan(&self.posts, &mut wanted);
+        scan(&self.following_posts, &mut wanted);
+        scan(&self.search_posts, &mut wanted);
+        if let Some(profile) = &self.profile {
+            scan(&profile.posts, &mut wanted);
+            scan(&profile.pinned, &mut wanted);
+        }
+        wanted.truncate(6);
+        if wanted.is_empty() {
+            return;
+        }
+        self.repost_resolving = true;
+        cx.spawn(async move |this, cx| {
+            let resolved = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    wanted
+                        .iter()
+                        .map(|id| {
+                            let original = service
+                                .post_by_id(id)
+                                .ok()
+                                .and_then(|served| served.value.retweeted.map(|inner| *inner));
+                            (id.clone(), original)
+                        })
+                        .collect::<Vec<(String, Option<Post>)>>()
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.repost_resolving = false;
+                for (id, original) in resolved {
+                    panel.repost_cache.insert(id.clone(), original.clone());
+                    if let Some(original) = original {
+                        patch_repost_original(&mut panel.posts, &id, &original);
+                        patch_repost_original(&mut panel.following_posts, &id, &original);
+                        patch_repost_original(&mut panel.search_posts, &id, &original);
+                        if let Some(profile) = &mut panel.profile {
+                            patch_repost_original(&mut profile.posts, &id, &original);
+                            patch_repost_original(&mut profile.pinned, &id, &original);
+                        }
+                    }
+                }
+                panel.resolve_bare_reposts(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn service_free() -> termy_x::providers::Service {
@@ -3367,6 +3447,16 @@ fn live_status(status: &termy_x::StatusLine) -> String {
         )
     } else {
         status.render()
+    }
+}
+
+/// Fill one repost's embedded original in a loaded list (in place, so
+/// scroll position and card identity are untouched).
+fn patch_repost_original(posts: &mut [Post], repost_id: &str, original: &Post) {
+    for post in posts.iter_mut() {
+        if post.id == repost_id && post.retweeted.is_none() {
+            post.retweeted = Some(Box::new(original.clone()));
+        }
     }
 }
 
@@ -5759,12 +5849,22 @@ impl XPanel {
             })
             .cursor_pointer()
             .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
-            .children(post.retweeted.as_ref().map(|_| {
-                div()
-                    .text_size(px(11.0))
-                    .text_color(rgb(0x93a4c3))
-                    .child(format!("@{} reposted", post.author_handle))
-            }))
+            .children(
+                if post.retweeted.is_some() {
+                    Some(format!("@{} reposted", post.author_handle))
+                } else {
+                    // Bare repost (original not fetched yet / could not
+                    // be resolved): still label it a repost, honestly.
+                    post.bare_repost_handle()
+                        .map(|handle| format!("@{} reposted @{}", post.author_handle, handle))
+                }
+                .map(|label| {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x93a4c3))
+                        .child(label)
+                }),
+            )
             .child(
                 div()
                     .mt(px(2.0))
@@ -5786,7 +5886,7 @@ impl XPanel {
                     .mt(px(4.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe7eefc))
-                    .child(display.text.clone()),
+                    .child(post.card_text().to_string()),
             )
             .children(self.media_box(display, cx))
             .child(self.tweet_actions(display, cx))
