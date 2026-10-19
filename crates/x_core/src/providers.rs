@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::config::XConfig;
-use crate::io::{CommandRunner, Http, HttpRequest};
+use crate::io::{CommandOutput, CommandRunner, Http, HttpRequest};
 use crate::model::{
     Attempt, AttemptKind, CostEstimate, Post, Profile, ProviderId, ResearchHit, SESSION_OWN,
     Served, StatusLine, Thread, Trend, post_url, rank_by_engagement, strip_handle,
@@ -897,6 +897,54 @@ fn session_served<T>(provider: ProviderId, value: T, note: &str) -> Served<T> {
     }
 }
 
+/// Raw provider failures go here (same file as the panel perf log:
+/// %TEMP%/termy-x-perf.txt), never to the panel. The panel only ever
+/// sees `publish::humanize_error` output.
+fn log_raw_provider_error(context: &str, raw: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("termy-x-perf.txt");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let flat = raw.replace(['\n', '\r'], " ");
+        let _ = writeln!(f, "provider-error {context}: {flat}");
+    }
+}
+
+/// OpenCLI success contract for write commands: exit 0 AND no failure
+/// marker in the JSON payload. Exit-0-with-ok:false happens (the CLI
+/// prints a JSON error envelope), so status alone is not proof.
+fn check_opencli_output(output: &CommandOutput, context: &str) -> Result<String, String> {
+    let combined = format!("{}\n{}", output.stdout, output.stderr);
+    if output.status != 0 {
+        log_raw_provider_error(context, &combined);
+        return Err(crate::publish::humanize_error(&combined));
+    }
+    if let Ok(value) = serde_json::from_str::<Value>(output.stdout.trim()) {
+        let failure = json_failure_message(&value);
+        if let Some(message) = failure {
+            log_raw_provider_error(context, &combined);
+            return Err(crate::publish::humanize_error(&message));
+        }
+    }
+    Ok(output.stdout.clone())
+}
+
+/// A parsed OpenCLI payload that reports failure: `ok:false`, or a
+/// `status` of error/failed, at the top level or in the first row.
+fn json_failure_message(value: &Value) -> Option<String> {
+    let node = value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(value);
+    if node.get("ok").and_then(Value::as_bool) == Some(false) {
+        return Some(value.to_string());
+    }
+    let status = node.get("status").and_then(Value::as_str).unwrap_or("");
+    if matches!(status, "error" | "failed" | "failure") {
+        return Some(value.to_string());
+    }
+    None
+}
+
 struct OpenCliPublisher {
     bin: String,
     runner: Arc<dyn CommandRunner>,
@@ -979,15 +1027,8 @@ impl Publisher for OpenCliPublisher {
             }
             let args = opencli_json(&args);
             let output = self.runner.run(&self.bin, &args)?;
-            if output.status != 0 {
-                return Err(if output.stderr.is_empty() {
-                    format!("opencli exited {}", output.status)
-                } else {
-                    output.stderr
-                });
-            }
-            last = output.stdout.clone();
-            if let Some(next) = status_ref_from_output(&output.stdout) {
+            last = check_opencli_output(&output, "opencli post/reply")?;
+            if let Some(next) = status_ref_from_output(&last) {
                 previous = Some(next);
             }
         }
@@ -996,10 +1037,8 @@ impl Publisher for OpenCliPublisher {
         } else {
             format!(" with {} image(s)", media.len())
         };
-        Ok(format!(
-            "opencli posted {} part(s){media_note}: {last}",
-            parts.len()
-        ))
+        let _ = last;
+        Ok(format!("{} part(s) posted{media_note}", parts.len()))
     }
 
     fn engage(
@@ -1014,8 +1053,13 @@ impl Publisher for OpenCliPublisher {
 }
 
 impl OpenCliPublisher {
-    /// `opencli twitter like|unlike|retweet|unretweet|quote <url> …`
-    /// through the same silent-background shim as posts/replies.
+    /// `opencli twitter like|unlike|retweet|unretweet <url>` through
+    /// the same silent-background shim as posts/replies. Quote does
+    /// NOT use `twitter quote`: current x.com no longer renders the
+    /// quoted card on the compose page that command drives, so it
+    /// always aborts (verified live). A quote here is a normal post
+    /// whose text ends with the source tweet URL, which X renders as
+    /// a native quote embed — same post pipeline as Compose.
     fn engage_opencli(
         &self,
         action: crate::publish::EngageAction,
@@ -1041,22 +1085,17 @@ impl OpenCliPublisher {
                         .into(),
                 );
             }
-            args.push(text.to_string());
-            if let Some(image) = media.first() {
-                args.push("--image".into());
-                args.push(image.display().to_string());
+            // Post path (see the note above): user's words + the
+            // source URL; media rides the post `--images` handling.
+            let combined = crate::publish::quote_post_text(text, target_url);
+            if combined.is_empty() {
+                return Err("write your quote first — nothing was posted".into());
             }
+            return self.publish(&[combined], None, media);
         }
         let args = opencli_json(&args);
         let output = self.runner.run(&self.bin, &args)?;
-        if output.status != 0 {
-            return Err(if output.stderr.is_empty() {
-                format!("opencli exited {}", output.status)
-            } else {
-                output.stderr
-            });
-        }
-        Ok(output.stdout)
+        check_opencli_output(&output, "opencli engage")
     }
 }
 
@@ -2244,6 +2283,97 @@ mod tests {
         }
         let joined: Vec<u8> = pieces.concat();
         assert_eq!(joined, b64.as_bytes());
+    }
+
+    #[test]
+    fn quote_engages_via_post_path_with_source_url() {
+        use crate::publish::EngageAction;
+        use std::sync::Mutex as StdMutex;
+        struct RecRunner {
+            calls: StdMutex<Vec<Vec<String>>>,
+            fail: bool,
+        }
+        impl CommandRunner for RecRunner {
+            fn exists(&self, _program: &str) -> bool {
+                true
+            }
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                if self.fail {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: r#"{"ok":false,"error":{"code":"command_exec","message":"Quote target did not render in the composer."}}"#.into(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"status":"success","id":"9","url":"https://x.com/me/status/9"}]"#.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let rec = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: false });
+        let publisher = OpenCliPublisher {
+            bin: "opencli".into(),
+            runner: rec.clone(),
+            post_ok: StdMutex::new(Some(true)),
+        };
+        let url = "https://x.com/jack/status/20";
+        publisher
+            .engage(EngageAction::Quote, url, Some("my words"), &[])
+            .expect("quote via post path should succeed");
+        let calls = rec.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0];
+        assert_eq!(args[1], "post", "quote must ride the post command: {args:?}");
+        assert!(!args.iter().any(|a| a == "quote"), "old quote verb must not be used: {args:?}");
+        assert_eq!(args[2], format!("my words\n{url}"));
+        drop(calls);
+        // And a failure envelope on a like comes back humanized.
+        let rec2 = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: true });
+        let publisher2 = OpenCliPublisher {
+            bin: "opencli".into(),
+            runner: rec2,
+            post_ok: StdMutex::new(Some(true)),
+        };
+        let err = publisher2
+            .engage(EngageAction::Like, url, None, &[])
+            .unwrap_err();
+        assert_eq!(err, "X didn't attach the quoted tweet.");
+    }
+
+    #[test]
+    fn opencli_output_contract_rejects_exit0_failure_envelopes() {
+        let out = |status: i32, stdout: &str, stderr: &str| CommandOutput {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        // Real success envelope passes.
+        assert!(check_opencli_output(
+            &out(0, r#"[{"status":"success","message":"posted"}]"#, ""),
+            "test"
+        )
+        .is_ok());
+        // Exit 0 but ok:false (Jeremy's quote failure shape): reject,
+        // humanized, with no raw JSON leaking into the message.
+        let err = check_opencli_output(
+            &out(
+                0,
+                r#"{"ok":false,"error":{"code":"command_exec","message":"Quote target did not render in the composer."}}"#,
+                "",
+            ),
+            "test",
+        )
+        .unwrap_err();
+        assert_eq!(err, "X didn't attach the quoted tweet.");
+        // Non-zero exit with a JSON dump on stderr: same treatment.
+        let err = check_opencli_output(&out(1, "", r#"{"ok":false,"error":{"message":"boom"}}"#), "test")
+            .unwrap_err();
+        assert!(!err.contains("ok:false") && !err.contains('{'));
+        // A status:"error" row is a failure too.
+        assert!(check_opencli_output(&out(0, r#"[{"status":"error"}]"#, ""), "test").is_err());
     }
 
     #[test]

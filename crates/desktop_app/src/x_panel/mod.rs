@@ -270,6 +270,16 @@ pub struct XPanel {
     quote_text: String,
     quote_media: Vec<std::path::PathBuf>,
     quote_posting: bool,
+    /// Internal scroll for the three text editors (fixed-height boxes;
+    /// long drafts scroll inside instead of overflowing the card).
+    reply_scroll: ScrollHandle,
+    quote_scroll: ScrollHandle,
+    compose_scroll: ScrollHandle,
+    /// "Posted" burst playing in the editor a post just succeeded
+    /// from. Set only on a verified provider success; failure never
+    /// sets it (text stays, plain error shows instead).
+    post_burst: Option<PostBurst>,
+    burst_seq: u64,
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
@@ -514,6 +524,11 @@ impl XPanel {
             quote_text: String::new(),
             quote_media: Vec::new(),
             quote_posting: false,
+            reply_scroll: ScrollHandle::new(),
+            quote_scroll: ScrollHandle::new(),
+            compose_scroll: ScrollHandle::new(),
+            post_burst: None,
+            burst_seq: 0,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
             search_posts: Vec::new(),
@@ -735,6 +750,21 @@ impl XPanel {
         match scene {
             "search" => self.open_section(XSection::Search, cx),
             "compose" => self.open_section(XSection::Compose, cx),
+            // Dev-preview only: show the Posted burst state without
+            // posting anything (the preview binary never publishes).
+            "posted" => {
+                self.open_section(XSection::Compose, cx);
+                self.compose.clear();
+                self.caret = 0;
+                self.sel_anchor = None;
+                self.post_burst = Some(PostBurst {
+                    target: BurstTarget::Compose,
+                    seq: 1,
+                    started: Instant::now(),
+                });
+                self.notice =
+                    Some("Posted in-app \u{2014} no browser opened. 1 part(s) posted".into());
+            }
             "confirm" => {
                 self.open_section(XSection::Compose, cx);
                 self.arm_confirm();
@@ -1942,6 +1972,11 @@ impl XPanel {
                 InputTarget::Quote => self.quote_text.push_str(clean),
             }
         }
+        match self.input_target {
+            InputTarget::Reply => self.scroll_small_editor_to_end(TextField::Reply),
+            InputTarget::Quote => self.scroll_small_editor_to_end(TextField::Quote),
+            _ => {}
+        }
         self.mark_edit_chord();
     }
 
@@ -2034,6 +2069,9 @@ impl XPanel {
                 TextField::Reply => self.reply_text.push('\n'),
                 TextField::Quote => self.quote_text.push('\n'),
             }
+            if field != TextField::Search {
+                self.scroll_small_editor_to_end(field);
+            }
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2072,6 +2110,9 @@ impl XPanel {
         }
         if pasted {
             self.mark_edit_chord();
+        }
+        if field != TextField::Search {
+            self.scroll_small_editor_to_end(field);
         }
         if field == TextField::Reply && !self.reply_key_logged {
             self.reply_key_logged = true;
@@ -2131,7 +2172,109 @@ impl XPanel {
         );
     }
 
+    /// Start the Posted burst in the editor a post just succeeded
+    /// from, and schedule its end (~1.15s): the box then closes clean.
+    /// Called ONLY from verified-success handlers.
+    fn begin_post_burst(&mut self, target: BurstTarget, cx: &mut Context<Self>) {
+        self.burst_seq += 1;
+        let seq = self.burst_seq;
+        self.post_burst = Some(PostBurst { target, seq, started: Instant::now() });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BURST_MS + 80))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.post_burst.is_some_and(|b| b.seq == seq) {
+                    panel.finish_post_burst(target);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Burst over (or Esc during it): close the originating box. The
+    /// post DID land, so this never claims "nothing was posted".
+    fn finish_post_burst(&mut self, target: BurstTarget) {
+        self.post_burst = None;
+        match target {
+            BurstTarget::Reply => {
+                self.reply_post_id = None;
+                self.reply_author.clear();
+                self.input_target = if self.section == XSection::Search {
+                    InputTarget::Search
+                } else {
+                    InputTarget::Compose
+                };
+            }
+            BurstTarget::Quote => {
+                self.quote_post_id = None;
+                self.quote_author.clear();
+                self.input_target = if self.section == XSection::Search {
+                    InputTarget::Search
+                } else {
+                    InputTarget::Compose
+                };
+            }
+            BurstTarget::Compose => {}
+        }
+    }
+
+    fn burst_for(&self, target: BurstTarget) -> Option<PostBurst> {
+        self.post_burst.filter(|b| b.target == target)
+    }
+
+    /// Wrap width (chars) for the small editors at the current panel
+    /// width: ~6.8px per 13px-font char inside the card padding.
+    fn editor_max_chars(&self) -> usize {
+        let panel_w = if self.fill_window {
+            self.viewport_w
+        } else if self.viewport_w > 0.0 {
+            480.0_f32.min(self.viewport_w)
+        } else {
+            480.0
+        };
+        (((panel_w - 70.0) / 6.8) as usize).clamp(24, 240)
+    }
+
+    /// Keep the end caret of a reply/quote draft visible: scroll the
+    /// fixed-height editor so the last visual line is in view.
+    fn scroll_small_editor_to_end(&mut self, field: TextField) {
+        let (text, handle) = match field {
+            TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
+            TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
+            TextField::Search => return,
+        };
+        let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
+        let overflow = lines as f32 * 19.0 - 44.0;
+        handle.set_offset(point(px(0.0), px(if overflow > 0.0 { -overflow } else { 0.0 })));
+    }
+
+    /// Keep the Compose caret's visual line inside the scroll view.
+    fn follow_compose_caret(&mut self) {
+        let max_chars = self.editor_max_chars();
+        let line = caret_visual_line(&self.compose, self.caret.min(self.compose.len()), max_chars);
+        let line_h = 22.0_f32;
+        let view_h = 118.0_f32;
+        let cur: f32 = self.compose_scroll.offset().y.into();
+        let top = -cur;
+        let caret_top = line as f32 * line_h;
+        let mut new_top = top;
+        if caret_top < top {
+            new_top = caret_top;
+        } else if caret_top + line_h > top + view_h {
+            new_top = caret_top + line_h - view_h;
+        }
+        if (new_top - top).abs() > 0.5 {
+            self.compose_scroll.set_offset(point(px(0.0), px(-new_top)));
+        }
+    }
+
     fn close_reply(&mut self) {
+        if self.burst_for(BurstTarget::Reply).is_some() {
+            self.finish_post_burst(BurstTarget::Reply);
+            return;
+        }
         self.reply_post_id = None;
         self.reply_author.clear();
         self.reply_text.clear();
@@ -2215,7 +2358,8 @@ impl XPanel {
                         // Revert the optimistic flip.
                         panel.set_engage_state(&id, is_like, !now_active);
                         panel.notice = Some(format!(
-                            "That did not go through: {error} Nothing changed on X."
+                            "That did not go through: {} Nothing changed on X.",
+                            termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
@@ -2278,6 +2422,10 @@ impl XPanel {
     }
 
     fn close_quote(&mut self) {
+        if self.burst_for(BurstTarget::Quote).is_some() {
+            self.finish_post_burst(BurstTarget::Quote);
+            return;
+        }
         self.quote_post_id = None;
         self.quote_author.clear();
         self.quote_text.clear();
@@ -2374,23 +2522,19 @@ impl XPanel {
                         if !panel.retweeted_ids.contains(&target_id) {
                             panel.retweeted_ids.push(target_id.clone());
                         }
-                        panel.quote_post_id = None;
                         panel.quote_text.clear();
                         panel.quote_media.clear();
-                        panel.input_target = if panel.section == XSection::Search {
-                            InputTarget::Search
-                        } else {
-                            InputTarget::Compose
-                        };
                         panel.notice = Some(format!(
                             "Quoted @{} \u{b7} posted in-app, no browser opened.",
                             author
                         ));
                         panel.status = format!("quoted @{}", author);
+                        panel.begin_post_burst(BurstTarget::Quote, cx);
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not quote: {error} Nothing was posted; no browser opened."
+                            "Could not quote: {} Nothing was posted; no browser opened.",
+                            termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
@@ -2487,22 +2631,18 @@ impl XPanel {
                         if !panel.replied_ids.contains(&target_id_for_update) {
                             panel.replied_ids.push(target_id_for_update.clone());
                         }
-                        panel.reply_post_id = None;
                         panel.reply_text.clear();
                         panel.reply_media.clear();
-                        panel.input_target = if panel.section == XSection::Search {
-                            InputTarget::Search
-                        } else {
-                            InputTarget::Compose
-                        };
                         panel.notice = Some(format!(
                             "Replied to @{author} \u{b7} posted in-app, no browser opened."
                         ));
                         panel.status = format!("replied to @{author}");
+                        panel.begin_post_burst(BurstTarget::Reply, cx);
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not reply: {error} Nothing was posted; no browser opened."
+                            "Could not reply: {} Nothing was posted; no browser opened.",
+                            termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
@@ -2533,6 +2673,7 @@ impl XPanel {
             self.caret = at + text.len();
         }
         self.clear_selection();
+        self.follow_compose_caret();
     }
 
     fn backspace(&mut self) {
@@ -2540,6 +2681,7 @@ impl XPanel {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
+            self.follow_compose_caret();
             return;
         }
         if self.caret == 0 {
@@ -2548,6 +2690,7 @@ impl XPanel {
         let prev = prev_boundary(&self.compose, self.caret);
         self.compose.replace_range(prev..self.caret, "");
         self.caret = prev;
+        self.follow_compose_caret();
     }
 
     fn delete_forward(&mut self) {
@@ -2562,6 +2705,7 @@ impl XPanel {
         }
         let next = next_boundary(&self.compose, self.caret);
         self.compose.replace_range(self.caret..next, "");
+        self.follow_compose_caret();
     }
 
     fn move_caret(&mut self, motion: CaretMove, extend: bool) {
@@ -2584,6 +2728,7 @@ impl XPanel {
                 self.caret = tail;
             }
         }
+        self.follow_compose_caret();
     }
 
     fn cycle_ui_focus(&mut self, reverse: bool) {
@@ -3192,6 +3337,124 @@ fn breathing_bird() -> gpui_kit::AnyElement {
                 .with_animation("x-loading-bird", breath_animation(2_800), |el, v| {
                     let w = 19.0 + 5.0 * v;
                     el.w(px(w)).h(px(w * 0.625)).opacity(0.30 + 0.70 * v)
+                }),
+        )
+        .into_any_element()
+}
+
+/// Which editor a successful post came from (for the Posted burst).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BurstTarget {
+    Reply,
+    Quote,
+    Compose,
+}
+
+/// A playing "Posted" burst. Pure timing math lives in
+/// `burst_style_at` / `BURST_MS` so the state machine is unit-testable
+/// without a GPUI context.
+#[derive(Clone, Copy)]
+struct PostBurst {
+    target: BurstTarget,
+    seq: u64,
+    started: Instant,
+}
+
+const BURST_MS: u64 = 1_150;
+
+/// Burst look at animation progress `v` (0..1): (font px, opacity).
+/// First ~55%: "Posted" grows small -> big at full opacity. Rest:
+/// keeps expanding while fading out (the explode). Transform/opacity
+/// only, driven by GPUI's animation on that one element.
+fn burst_style_at(v: f32) -> (f32, f32) {
+    let v = v.clamp(0.0, 1.0);
+    if v < 0.55 {
+        let t = v / 0.55;
+        (15.0 + 23.0 * t, 1.0)
+    } else {
+        let t = (v - 0.55) / 0.45;
+        (38.0 + 30.0 * t, 1.0 - t)
+    }
+}
+
+/// Soft-wrap ranges (byte ranges into `text`) for one editor width.
+/// Visual only: ranges are substrings of the original text, no
+/// characters are inserted or removed (a space at a wrap point is
+/// simply not drawn at either line end). Hard lines (real `\n`)
+/// keep their breaks; long words hard-break at the width.
+fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
+    let max_chars = max_chars.max(1);
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut hard_start = 0usize;
+    for hard in text.split('\n') {
+        let base = hard_start;
+        let chars: Vec<(usize, char)> = hard.char_indices().collect();
+        if chars.is_empty() {
+            out.push((base, base));
+        } else {
+            let mut line_start = 0usize; // char index into chars
+            let mut i = 0usize;
+            while i < chars.len() {
+                if i - line_start >= max_chars {
+                    // Break at the last space in this visual line if
+                    // there is one past the line start, else hard-break.
+                    let mut space_at: Option<usize> = None;
+                    for j in line_start..i {
+                        if chars[j].1 == ' ' {
+                            space_at = Some(j);
+                        }
+                    }
+                    match space_at {
+                        Some(sp) if sp > line_start => {
+                            out.push((base + chars[line_start].0, base + chars[sp].0));
+                            line_start = sp + 1;
+                        }
+                        _ => {
+                            out.push((base + chars[line_start].0, base + chars[i].0));
+                            line_start = i;
+                        }
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out.push((base + chars[line_start].0, base + hard.len()));
+        }
+        hard_start = base + hard.len() + 1;
+    }
+    out
+}
+
+/// Which visual line (0-based) a byte caret lands on, given the wrap.
+fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
+    let ranges = soft_wrap_ranges(text, max_chars);
+    for (idx, &(start, end)) in ranges.iter().enumerate() {
+        if caret <= end {
+            return idx;
+        }
+        // Caret on a skipped wrap-space: it belongs to the next line.
+        if caret > end && ranges.get(idx + 1).is_some_and(|&(ns, _)| caret < ns) {
+            return idx + 1;
+        }
+    }
+    ranges.len().saturating_sub(1)
+}
+
+/// The centered "Posted" burst element (one scoped animated element).
+fn posted_burst_element(seq: u64) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w_full()
+        .py(px(10.0))
+        .child(
+            div()
+                .text_color(rgb(0x8affc1))
+                .child("\u{2713} Posted")
+                .with_animation(format!("posted-burst-{seq}"), Animation::new(Duration::from_millis(BURST_MS)), |el, v| {
+                    let (font, opacity) = burst_style_at(v);
+                    el.text_size(px(font)).opacity(opacity)
                 }),
         )
         .into_any_element()
@@ -4622,6 +4885,48 @@ impl XPanel {
     /// Inline quote composer under a card: retweet with your own words.
     /// Same shape as the reply box (fixed height, breathing caret from
     /// the first focused frame, Post button, Esc/Cancel, 1 image).
+    /// Body of a small (reply/quote) editor: soft-wrapped visual
+    /// lines of the draft, end caret on the last line when focused.
+    /// Rendering only — the stored text is untouched.
+    fn small_editor_body(
+        &self,
+        text: &str,
+        focused: bool,
+        caret_id: &'static str,
+        placeholder: &'static str,
+    ) -> gpui_kit::AnyElement {
+        if text.is_empty() {
+            return div()
+                .text_size(px(13.0))
+                .text_color(rgb(0x93a4c3))
+                .child(if focused {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .child(caret_element(caret_id))
+                        .child(placeholder)
+                        .into_any_element()
+                } else {
+                    div().child(placeholder).into_any_element()
+                })
+                .into_any_element();
+        }
+        let ranges = soft_wrap_ranges(text, self.editor_max_chars());
+        let last = ranges.len() - 1;
+        let mut col = div().flex().flex_col().text_size(px(13.0)).text_color(rgb(0xf8fbff));
+        for (idx, (a, b)) in ranges.iter().enumerate() {
+            let seg = &text[*a..*b];
+            let mut row = div().flex().flex_row().items_center().min_h(px(19.0));
+            row = row.child(if seg.is_empty() { " ".to_string() } else { seg.to_string() });
+            if focused && idx == last {
+                row = row.child(caret_element(caret_id));
+            }
+            col = col.child(row);
+        }
+        col.into_any_element()
+    }
+
     fn quote_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.quote_text, char_limit);
@@ -4630,43 +4935,24 @@ impl XPanel {
             .id("x-quote-editor")
             .h(px(60.0))
             .flex_none()
-            .overflow_hidden()
+            .overflow_y_scroll()
+            .track_scroll(&self.quote_scroll)
             .p(px(8.0))
             .rounded(px(8.0))
             .bg(tint(0x0c1422, 235))
             .border_1()
             .border_color(tint(0x7af6ff, 70))
             .cursor_pointer()
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(if self.quote_text.is_empty() {
-                        rgb(0x93a4c3)
-                    } else {
-                        rgb(0xf8fbff)
-                    })
-                    .child(if self.quote_text.is_empty() {
-                        if focused {
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .child(caret_element("caret-quote"))
-                                .child("Add your words\u{2026} (Ctrl+Enter posts the quote)")
-                        } else {
-                            div().child("Add your words\u{2026} (Ctrl+Enter posts the quote)")
-                        }
-                    } else if focused {
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .child(self.quote_text.clone())
-                            .child(caret_element("caret-quote"))
-                    } else {
-                        div().child(self.quote_text.clone())
-                    }),
-            )
+            .child(if let Some(burst) = self.burst_for(BurstTarget::Quote) {
+                posted_burst_element(burst.seq)
+            } else {
+                self.small_editor_body(
+                    &self.quote_text,
+                    focused,
+                    "caret-quote",
+                    "Add your words\u{2026} (Ctrl+Enter posts the quote)",
+                )
+            })
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -4719,6 +5005,9 @@ impl XPanel {
                         count.weighted, count.limit
                     )),
             );
+        if self.burst_for(BurstTarget::Quote).is_some() {
+            return box_el.into_any_element();
+        }
         if !self.quote_media.is_empty() {
             for (index, path) in self.quote_media.iter().enumerate() {
                 let name = path
@@ -4834,46 +5123,26 @@ impl XPanel {
                     .id("x-reply-editor")
                     // Fixed height: the box never grows/shrinks as you type
                     // or as the caret blinks, so cards below never jump.
+                    // Long drafts scroll inside (wheel over the editor
+                    // scrolls the text first).
                     .h(px(60.0))
                     .flex_none()
-                    .overflow_hidden()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.reply_scroll)
                     .p(px(8.0))
                     .rounded(px(8.0))
                     .bg(tint(0x0c1422, 235))
                     .cursor_pointer()
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(if self.reply_text.is_empty() {
-                                rgb(0x93a4c3)
-                            } else {
-                                rgb(0xf8fbff)
-                            })
-                            .child(if self.reply_text.is_empty() {
-                                if focused {
-                                    div()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .child(caret_element("caret-reply"))
-                                        .child("Write your reply\u{2026} (Ctrl+Enter sends)")
-                                } else {
-                                    div().child("Write your reply\u{2026} (Ctrl+Enter sends)")
-                                }
-                            } else if focused {
-                                // Breathing caret in a fixed cell: always
-                                // present, only its opacity pulses, so the
-                                // text width never changes between frames.
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .child(self.reply_text.clone())
-                                    .child(caret_element("caret-reply"))
-                            } else {
-                                div().child(self.reply_text.clone())
-                            }),
-                    )
+                    .child(if let Some(burst) = self.burst_for(BurstTarget::Reply) {
+                        posted_burst_element(burst.seq)
+                    } else {
+                        self.small_editor_body(
+                            &self.reply_text,
+                            focused,
+                            "caret-reply",
+                            "Write your reply\u{2026} (Ctrl+Enter sends)",
+                        )
+                    })
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -4897,6 +5166,9 @@ impl XPanel {
                         count.weighted, count.limit
                     )),
             );
+        if self.burst_for(BurstTarget::Reply).is_some() {
+            return box_el.into_any_element();
+        }
         if !self.reply_media.is_empty() {
             for (index, path) in self.reply_media.iter().enumerate() {
                 let name = path
@@ -5360,7 +5632,14 @@ impl XPanel {
                                     .child("Tab cycles · Esc cancels confirm"),
                             ),
                     )
-                    .child(self.render_compose_editor())
+                    .child(
+                        div()
+                            .id("x-compose-scroll")
+                            .h(px(132.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.compose_scroll)
+                            .child(self.render_compose_editor()),
+                    )
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -5440,6 +5719,13 @@ impl XPanel {
         let caret = self.caret.min(self.compose.len());
         let sel = self.selection_range();
 
+        if let Some(burst) = self.burst_for(BurstTarget::Compose) {
+            return div()
+                .mt(px(8.0))
+                .child(posted_burst_element(burst.seq))
+                .into_any_element();
+        }
+
         if self.compose.is_empty() {
             // Caret at LEFT (index 0). Hint only when empty AND unfocused —
             // once the caret blinks, the placeholder must disappear.
@@ -5465,8 +5751,11 @@ impl XPanel {
         let text = self.compose.as_str();
         let mut offset = 0usize;
         let parts: Vec<&str> = text.split('\n').collect();
-        for (idx, line) in parts.iter().enumerate() {
-            let line_start = offset;
+        let max_chars = self.editor_max_chars();
+        for (idx, hard_line) in parts.iter().enumerate() {
+          for (sub_start, sub_end) in soft_wrap_ranges(hard_line, max_chars) {
+            let line = &hard_line[sub_start..sub_end];
+            let line_start = offset + sub_start;
             let line_end = line_start + line.len();
             let caret_on_line = caret >= line_start && caret <= line_end;
             let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
@@ -5525,7 +5814,8 @@ impl XPanel {
             }
 
             rows.push(row.into_any_element());
-            offset = line_end + if idx + 1 < parts.len() { 1 } else { 0 };
+          }
+            offset += hard_line.len() + if idx + 1 < parts.len() { 1 } else { 0 };
         }
 
         div()
@@ -5846,12 +6136,14 @@ impl XPanel {
                         ));
                         panel.focus_compose_editor();
                         panel.pending_focus = true;
+                        panel.begin_post_burst(BurstTarget::Compose, cx);
                     }
                     Err(error) => {
                         // Stay on confirm so the user can retry or explicitly
                         // choose 'Open in browser'. Nothing auto-opens.
                         panel.notice = Some(format!(
-                            "Could not post in-app: {error} Nothing was posted; no browser opened."
+                            "Could not post in-app: {} Nothing was posted; no browser opened.",
+                            termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
@@ -5990,6 +6282,51 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 #[cfg(test)]
 mod edit_keys_tests {
     use super::next_timeline_limit;
+    use super::{BURST_MS, burst_style_at, caret_visual_line, soft_wrap_ranges};
+
+    #[test]
+    fn soft_wrap_breaks_at_spaces_and_never_overflows() {
+        let text = "hello world this is a long line";
+        let ranges = soft_wrap_ranges(text, 10);
+        assert!(ranges.len() > 1);
+        for (a, b) in &ranges {
+            assert!(text[*a..*b].chars().count() <= 10, "range too wide: {:?}", &text[*a..*b]);
+            assert!(!text[*a..*b].starts_with(' '));
+        }
+        // No non-space character is lost by wrapping.
+        let kept: String = ranges.iter().map(|(a, b)| &text[*a..*b]).collect::<Vec<_>>().join("");
+        assert_eq!(kept.replace(' ', ""), text.replace(' ', ""));
+    }
+
+    #[test]
+    fn soft_wrap_hard_breaks_long_words_and_keeps_newlines() {
+        let word = "abcdefghijklmnopqrstuvwxyz";
+        let ranges = soft_wrap_ranges(word, 10);
+        assert_eq!(ranges.len(), 3);
+        let kept: String = ranges.iter().map(|(a, b)| &word[*a..*b]).collect::<Vec<_>>().join("");
+        assert_eq!(kept, word);
+        assert_eq!(soft_wrap_ranges("ab\ncd", 10), vec![(0, 2), (3, 5)]);
+        assert_eq!(soft_wrap_ranges("", 10), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn caret_visual_line_tracks_wrap() {
+        let text = "hello world this is a long line";
+        assert_eq!(caret_visual_line(text, 0, 10), 0);
+        let last = soft_wrap_ranges(text, 10).len() - 1;
+        assert_eq!(caret_visual_line(text, text.len(), 10), last);
+    }
+
+    #[test]
+    fn burst_grows_then_explodes_and_fades() {
+        assert_eq!(BURST_MS, 1_150);
+        let (f0, o0) = burst_style_at(0.0);
+        let (f1, o1) = burst_style_at(0.55);
+        let (f2, o2) = burst_style_at(1.0);
+        assert!(f0 < f1 && f1 < f2, "font must keep growing: {f0} {f1} {f2}");
+        assert_eq!((o0, o1), (1.0, 1.0));
+        assert_eq!(o2, 0.0, "burst ends fully faded (exploded)");
+    }
 
     #[test]
     fn load_more_limit_grows_by_batch_to_cap() {

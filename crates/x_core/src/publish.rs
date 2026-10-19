@@ -189,6 +189,98 @@ pub fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
+/// The text of a quote post published through the plain post path:
+/// the user's own words plus the source tweet's URL on its own line.
+/// X renders a bare status URL in a post as a native quote embed, so
+/// this IS a quote tweet — it just avoids OpenCLI's `twitter quote`,
+/// whose compose-page card check fails against current x.com (the
+/// `compose/post?url=…` page no longer renders the quoted card, so the
+/// command aborts with "Quote target did not render" and posts nothing;
+/// verified live 2026-10-19 against OpenCLI 1.8.8, whose quote.js is
+/// byte-identical to upstream 2.0.0).
+pub fn quote_post_text(user_text: &str, target_url: &str) -> String {
+    let text = user_text.trim();
+    let url = target_url.trim();
+    if text.is_empty() || url.is_empty() || text.contains(url) {
+        return text.to_string();
+    }
+    format!("{text}\n{url}")
+}
+
+/// Turn a raw provider failure (OpenCLI JSON dump, stderr, exit-code
+/// prose) into ONE short human sentence for the panel. Raw text must
+/// never reach the UI: it goes to the log file instead (see
+/// `providers::log_raw_provider_error`). The result never contains
+/// JSON, `ok:false`, `command_exec`, or exit codes.
+pub fn humanize_error(raw: &str) -> String {
+    let extracted = extract_error_message(raw);
+    let msg = extracted.as_deref().unwrap_or(raw).trim();
+    let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+    let lower = collapsed.to_lowercase();
+    let mapped: &str = if lower.contains("did not render") || lower.contains("deleted or restricted") {
+        "X didn't attach the quoted tweet."
+    } else if lower.contains("could not find the") && lower.contains("button") {
+        "X didn't show that button on the tweet."
+    } else if lower.contains("429") || (lower.contains("rate") && lower.contains("limit")) {
+        "X is rate-limiting right now. Wait a few minutes and try again."
+    } else if lower.contains("not logged") || lower.contains("are you logged in")
+        || lower.contains("login required") || lower.contains("not signed in") {
+        "X isn't signed in right now."
+    } else if lower.contains("timed out") || lower.contains("timeout")
+        || lower.contains("did not complete") || lower.contains("did not confirm") {
+        "X took too long to confirm that. Check your profile before retrying."
+    } else if lower.contains("empty") && lower.contains("text") {
+        "Write something first."
+    } else if collapsed.is_empty()
+        || collapsed.len() > 160
+        || collapsed.contains('{')
+        || collapsed.contains('}')
+        || lower.contains("ok:false")
+        || lower.contains("ok: false")
+        || lower.contains("command_exec")
+        || lower.contains("exitcode")
+        || lower.contains("exit code")
+        || lower.starts_with("opencli exited")
+        || lower.starts_with("twitter exited")
+    {
+        "X couldn't do that right now."
+    } else {
+        // A short plain message from the provider is fine as-is.
+        return ensure_sentence(&collapsed);
+    };
+    mapped.to_string()
+}
+
+fn ensure_sentence(text: &str) -> String {
+    let t = text.trim().trim_end_matches(['.', '!', '?']);
+    format!("{t}.")
+}
+
+/// Pull `error.message` / `message` out of an OpenCLI JSON error dump;
+/// None when the text is not (or does not contain) such JSON.
+fn extract_error_message(raw: &str) -> Option<String> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&raw[start..=end]).ok()?;
+    let error = value.get("error");
+    if let Some(message) = error
+        .and_then(|e| e.get("message"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(message.to_string());
+    }
+    if let Some(message) = error.and_then(serde_json::Value::as_str) {
+        return Some(message.to_string());
+    }
+    value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
 pub fn intent_urls(parts: &[String], reply_to: Option<&str>) -> Vec<String> {
     parts
         .iter()
@@ -492,6 +584,38 @@ mod tests {
         );
         assert!(validate_media_paths(&[ok]).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quote_post_text_appends_source_url_once() {
+        let url = "https://x.com/jack/status/20";
+        assert_eq!(quote_post_text("my words", url), format!("my words\n{url}"));
+        // Already containing the URL: never duplicated.
+        let with = format!("look {url}");
+        assert_eq!(quote_post_text(&with, url), with);
+        assert_eq!(quote_post_text("  padded  ", url), format!("padded\n{url}"));
+        assert_eq!(quote_post_text("", url), "");
+    }
+
+    #[test]
+    fn humanize_error_strips_opencli_json_dumps() {
+        let raw = r#"{"ok":false,"error":{"code":"command_exec","message":"Quote target did not render in the composer. The source tweet may be deleted or restricted.","help":"Nothing was posted. Open the tweet in the browser and retry."},"exitcode":1}"#;
+        let clean = humanize_error(raw);
+        assert_eq!(clean, "X didn't attach the quoted tweet.");
+        for banned in ["ok:false", "command_exec", "exitcode", "{", "}"] {
+            assert!(!clean.contains(banned), "leaked {banned}: {clean}");
+        }
+        assert_eq!(humanize_error("opencli exited 1"), "X couldn't do that right now.");
+        assert_eq!(
+            humanize_error("Could not find the Like button on this tweet after waiting 10 seconds. Nothing changed."),
+            "X didn't show that button on the tweet."
+        );
+        assert_eq!(
+            humanize_error("HTTP 429 too many requests"),
+            "X is rate-limiting right now. Wait a few minutes and try again."
+        );
+        // A short plain provider sentence survives (gains its period).
+        assert_eq!(humanize_error("write your quote first"), "write your quote first.");
     }
 
     #[test]
