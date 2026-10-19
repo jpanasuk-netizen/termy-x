@@ -174,34 +174,20 @@ pub fn edit_action_goes_to_panel(panel_open: bool, panel_focused: bool, owns_edi
 /// single-line search/filter boxes (Search, Trends filter, Research,
 /// Lookup) run their search on Enter; tweet-writing boxes (Reply,
 /// Quote, and Compose, handled in `on_key`) insert a newline and NEVER
-/// post. Ctrl+Enter is the one deliberate keyboard submit, writers only.
+/// post. Only the Post button submits a writer — no keyboard submit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EnterAction {
     RunSearch,
     Newline,
-    Submit,
 }
 
-fn enter_action(field: TextField, ctrl: bool) -> EnterAction {
+fn enter_action(field: TextField) -> EnterAction {
     match field {
         TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
             EnterAction::RunSearch
         }
-        TextField::Reply | TextField::Quote => {
-            if ctrl {
-                EnterAction::Submit
-            } else {
-                EnterAction::Newline
-            }
-        }
+        TextField::Reply | TextField::Quote => EnterAction::Newline,
     }
-}
-
-/// In the Compose confirm dialog, plain Enter must never post (that's
-/// how a stray Return published a draft); only Ctrl+Enter submits from
-/// the keyboard. The Post button is always available.
-fn confirm_enter_posts(ctrl: bool) -> bool {
-    ctrl
 }
 
 /// The two simple end-caret text fields (Search query, inline reply).
@@ -1938,12 +1924,6 @@ impl XPanel {
                 self.pending_focus = true;
                 cx.notify();
             }
-            if key == "enter" && confirm_enter_posts(mods.control || mods.platform) {
-                // The one deliberate keyboard submit in the dialog.
-                self.post_now_async(cx);
-                self.pending_focus = true;
-                cx.notify();
-            }
             // Confirm modal owns the keyboard; never leak into the terminal.
             cx.stop_propagation();
             return;
@@ -2271,7 +2251,7 @@ impl XPanel {
     /// Shared keyboard handling for the Search query and inline reply
     /// fields: plain text appends at the end, Backspace deletes, Ctrl+V
     /// pastes. Enter runs a search; in a reply Enter adds a line and
-    /// Ctrl+Enter sends. Everything is swallowed so the terminal behind
+    /// never sends (only the Post button does). Everything is swallowed so the terminal behind
     /// the panel never sees these keys.
     fn on_text_input_key(
         &mut self,
@@ -2283,16 +2263,12 @@ impl XPanel {
         self.mention_dirty_at = Some(std::time::Instant::now());        let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         if key == "enter" {
-            match enter_action(field, mods.control || mods.platform) {
+            match enter_action(field) {
                 EnterAction::RunSearch => match field {
                     TextField::Trends => self.enter_trends_filter(cx),
                     TextField::Research => self.run_research(cx),
                     TextField::Lookup => self.run_lookup(cx),
                     _ => self.run_search(cx),
-                },
-                EnterAction::Submit => match field {
-                    TextField::Reply => self.submit_reply(cx),
-                    _ => self.submit_quote(cx),
                 },
                 EnterAction::Newline => match field {
                     TextField::Reply => self.reply_text.push('\n'),
@@ -2470,7 +2446,7 @@ impl XPanel {
         self.reply_key_logged = false;
         perf_log(&format!("open_reply id={post_id} (local only, no fetch)"));
         self.status = format!(
-            "reply to @{} \u{b7} type below, then Post (or Ctrl+Enter)",
+            "reply to @{} \u{b7} type below, then Post",
             author_handle
         );
     }
@@ -5996,7 +5972,7 @@ impl XPanel {
                     &self.quote_text,
                     focused,
                     "caret-quote",
-                    "Add your words\u{2026} (Ctrl+Enter posts the quote)",
+                    "Add your words\u{2026} (Post button sends the quote)",
                 )
             })
             .on_mouse_down(
@@ -6047,7 +6023,7 @@ impl XPanel {
                         rgb(0x9ad7ff)
                     })
                     .child(format!(
-                        "{} / {} characters \u{b7} Ctrl+Enter or Post sends \u{b7} quotes attach 1 image",
+                        "{} / {} characters \u{b7} Post button sends \u{b7} quotes attach 1 image",
                         count.weighted, count.limit
                     )),
             );
@@ -6186,7 +6162,7 @@ impl XPanel {
                             &self.reply_text,
                             focused,
                             "caret-reply",
-                            "Write your reply\u{2026} (Ctrl+Enter sends)",
+                            "Write your reply\u{2026} (Post button sends)",
                         )
                     })
                     .on_mouse_down(
@@ -6208,7 +6184,7 @@ impl XPanel {
                         rgb(0x9ad7ff)
                     })
                     .child(format!(
-                        "{} / {} characters \u{b7} Ctrl+Enter or the Post button sends \u{b7} replies attach 1 image",
+                        "{} / {} characters \u{b7} Post button sends \u{b7} replies attach 1 image",
                         count.weighted, count.limit
                     )),
             );
@@ -7071,7 +7047,7 @@ impl XPanel {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Nothing is posted automatically. Send with the Post now button (or Ctrl+Enter) \u{2014} plain Enter never posts. Open in browser is optional and only happens if you click it."),
+                            .child("Nothing is posted automatically. Send with the Post now button \u{2014} Enter never posts. Open in browser is optional and only happens if you click it."),
                     )
                     .children(part_rows)
                     .child(div().text_size(px(13.0)).child(format!(
@@ -7469,7 +7445,7 @@ mod edit_keys_tests {
     }
 
     use super::{
-        EnterAction, InputTarget, TextField, XSection, confirm_enter_posts, edit_action_goes_to_panel,
+        EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel,
         edit_keys_owned, enter_action,
     };
 
@@ -7477,20 +7453,14 @@ mod edit_keys_tests {
     fn reply_and_search_own_paste_but_terminal_states_do_not() {
         // Inline reply open (any non-Search section): owns edit chords.
         // Enter per-surface matrix (Jeremy's rule): search/filter
-        // boxes search on Enter; writing boxes newline, never post;
-        // Ctrl+Enter is the only keyboard submit for writers.
-        assert_eq!(enter_action(TextField::Search, false), EnterAction::RunSearch);
-        assert_eq!(enter_action(TextField::Search, true), EnterAction::RunSearch);
-        assert_eq!(enter_action(TextField::Trends, false), EnterAction::RunSearch);
-        assert_eq!(enter_action(TextField::Research, false), EnterAction::RunSearch);
-        assert_eq!(enter_action(TextField::Lookup, false), EnterAction::RunSearch);
-        assert_eq!(enter_action(TextField::Reply, false), EnterAction::Newline);
-        assert_eq!(enter_action(TextField::Quote, false), EnterAction::Newline);
-        assert_eq!(enter_action(TextField::Reply, true), EnterAction::Submit);
-        assert_eq!(enter_action(TextField::Quote, true), EnterAction::Submit);
-        // Confirm dialog: plain Enter never posts, Ctrl+Enter does.
-        assert!(!confirm_enter_posts(false));
-        assert!(confirm_enter_posts(true));
+        // boxes search on Enter; writing boxes newline, never post.
+        // Only the Post button submits a writer (no keyboard submit).
+        assert_eq!(enter_action(TextField::Search), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Trends), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Research), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Lookup), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Reply), EnterAction::Newline);
+        assert_eq!(enter_action(TextField::Quote), EnterAction::Newline);
         // Focus routing matrix: panel must actually hold focus before
         // any edit chord is intercepted (the Ctrl+C-in-PowerShell bug).
         assert!(edit_action_goes_to_panel(true, true, true));
