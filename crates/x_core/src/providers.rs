@@ -1540,16 +1540,19 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
 /// error with nothing fetched is a real failure (rate limit, logged
 /// out, dead session) and must surface as one.
 fn parse_timeline_eval(stdout: &str) -> Result<TimelinePage, String> {
+    if let Some(page) = crate::parse_borrowed::parse_timeline_eval_borrowed(stdout.trim()) {
+        return page;
+    }
     let value: Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("timeline session returned unreadable output: {e}"))?;
     let next_cursor = value
         .get("nextCursor")
         .and_then(Value::as_str)
         .map(str::to_string);
+    // Already-parsed rows are converted in place; the previous code
+    // re-serialized them to a String and re-parsed the whole array.
     let posts = match value.get("posts") {
-        Some(rows) if rows.is_array() => {
-            parse_posts(&rows.to_string()).unwrap_or_default()
-        }
+        Some(rows) if rows.is_array() => posts_from_value(rows),
         _ => Vec::new(),
     };
     if let Some(error) = value.get("error").and_then(Value::as_str)
@@ -1693,6 +1696,9 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
 /// Parse one profile-eval payload into (latest, pinned). An `error`
 /// with no posts at all is a real failure; partial data is kept.
 fn parse_profile_eval(stdout: &str) -> Result<(Vec<Post>, Vec<Post>), String> {
+    if let Some(parsed) = crate::parse_borrowed::parse_profile_eval_borrowed(stdout.trim()) {
+        return parsed;
+    }
     let value: Value = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("profile session returned unreadable output: {e}"))?;
     if let Some(diag) = value.get("diag") {
@@ -1702,13 +1708,11 @@ fn parse_profile_eval(stdout: &str) -> Result<(Vec<Post>, Vec<Post>), String> {
         );
     }
     let posts = match value.get("posts") {
-        Some(rows) if rows.is_array() => parse_posts(&rows.to_string()).unwrap_or_default(),
+        Some(rows) if rows.is_array() => posts_from_value(rows),
         _ => Vec::new(),
     };
     let pinned = match value.get("pinned") {
-        Some(row) if row.is_object() => {
-            parse_posts(&serde_json::json!([row]).to_string()).unwrap_or_default()
-        }
+        Some(row) if row.is_object() => post_from_value(row, &[]).into_iter().collect(),
         _ => Vec::new(),
     };
     if let Some(error) = value.get("error").and_then(Value::as_str)
@@ -2294,17 +2298,29 @@ fn parse_research(source: &str, text: &str, session: Option<&str>) -> Vec<Resear
 }
 
 pub fn parse_posts(text: &str) -> Result<Vec<Post>, String> {
+    // Zero-copy fast path (borrowed &'a str fields straight from `text`);
+    // any shape it does not model exactly falls back to the legacy
+    // `Value`-tree parser below, so behaviour is unchanged.
+    if let Some(posts) = crate::parse_borrowed::parse_posts_borrowed(text) {
+        return Ok(posts);
+    }
     let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
-    let users = users_by_id(&value);
-    let posts = array_of(&value)
-        .into_iter()
-        .filter_map(|item| post_from_value(item, &users))
-        .collect::<Vec<_>>();
+    let posts = posts_from_value(&value);
     if posts.is_empty() {
         Err("no posts in provider response".into())
     } else {
         Ok(posts)
     }
+}
+
+/// Legacy `Value`-tree conversion, shared by `parse_posts` (fallback)
+/// and the eval-payload parsers (which already hold a `Value`).
+fn posts_from_value(value: &Value) -> Vec<Post> {
+    let users = users_by_id(value);
+    array_of(value)
+        .into_iter()
+        .filter_map(|item| post_from_value(item, &users))
+        .collect()
 }
 
 fn parse_thread(text: &str, fallback_id: &str) -> Result<Thread, String> {
@@ -2343,7 +2359,7 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
         .unwrap_or("")
         .to_string();
     let metrics = node.get("public_metrics").unwrap_or(node);
-    let posts = parse_posts(text).unwrap_or_default();
+    let posts = posts_from_value(&value);
     Ok(Profile {
         handle,
         name,
@@ -2508,19 +2524,7 @@ fn first_embedded<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a Value> {
 /// `includes.media` / `attachments` and simple `media`/`images` arrays.
 fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
     use crate::model::{MediaItem, MediaKind};
-    let kind_of = |url: &str| -> MediaKind {
-        let lower = url.to_ascii_lowercase();
-        if lower.contains("/tweet_video/") || lower.ends_with(".gif") {
-            MediaKind::Gif
-        } else if lower.contains("video.twimg.com")
-            || lower.contains(".mp4")
-            || lower.contains(".m3u8")
-        {
-            MediaKind::Video
-        } else {
-            MediaKind::Photo
-        }
-    };
+    let kind_of = crate::parse_borrowed::media_kind;
     let mut out: Vec<MediaItem> = Vec::new();
     if let Some(urls) = item.get("media_urls").and_then(Value::as_array) {
         let posters = item.get("media_posters").and_then(Value::as_array);
@@ -2607,6 +2611,49 @@ mod media_parse_tests {
         assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg"), None);
         assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg?name=4096x4096"), None);
         assert_eq!(dims_from_media_url("https://x.com/1x1/a.jpg"), None);
+    }
+}
+
+
+#[cfg(test)]
+mod borrowed_parse_tests {
+    use super::*;
+
+    fn legacy(text: &str) -> Vec<Post> {
+        let value: Value = serde_json::from_str(text).unwrap();
+        posts_from_value(&value)
+    }
+
+    #[test]
+    fn borrowed_matches_legacy_on_modelled_and_fallback_shapes() {
+        let cases: &[&str] = &[
+            r#"[{"id":"50","author":"reposter","text":"RT @orig: hi","likes":1,"retweets":2,"retweeted":{"id":"40","author":"orig","text":"hi","likes":99,"media_urls":["https://pbs.twimg.com/media/a.jpg"],"media_posters":[]}},{"id":"51","author":"plain","text":"no embed","likes":0}]"#,
+            r#"{"data":[{"id":"7","text":"api row","author_id":"u1","public_metrics":{"like_count":5,"retweet_count":2,"reply_count":1,"bookmark_count":3,"impression_count":50}}],"includes":{"users":[{"id":"u1","username":"ada","name":"Ada L"}]}}"#,
+            r#"[{"id":"8","full_text":"obj author","user":{"screen_name":"bob","display_name":"Bob"},"metrics":{"likes":4}}]"#,
+            r#"[{"id":"9","author":"ada","text":"quirk","likes":42,"public_metrics":{}}]"#,
+            "[{\"id\":\"10\",\"author\":\"ada\",\"text\":\"line\\nbreak \\u2603\"}]",
+            r#"[{"id":"11","author":"ada","text":"media obj","media":[{"url":"https://video.twimg.com/x/480x270/a.mp4","type":"video"}]}]"#,
+            r#"[{"id":12,"author":"ada","text":"numeric id"}]"#,
+            r#"{"id":"13","author":"ada","text":"single","likes":2}"#,
+            r#"{"tweets":[{"id":"14","author":"ada","text":"env","view_count":9}]}"#,
+            r#"[{"id":"15","author":"ada","text":"string counts","likes":"12"}]"#,
+        ];
+        for (i, json) in cases.iter().enumerate() {
+            assert_eq!(parse_posts(json).unwrap(), legacy(json), "case {i}");
+        }
+    }
+
+    #[test]
+    fn borrowed_eval_parsers_match_legacy_results() {
+        let tl = r#"{"posts":[{"id":"900","author":"ada","text":"hi","likes":3,"retweeted":{"id":"800","author":"orig","text":"orig","likes":9}}],"nextCursor":"CUR2"}"#;
+        let page = parse_timeline_eval(tl).unwrap();
+        assert_eq!(page.posts.len(), 1);
+        assert_eq!(page.posts[0].retweeted.as_ref().unwrap().id, "800");
+        assert_eq!(page.next_cursor.as_deref(), Some("CUR2"));
+        let prof = r#"{"posts":[{"id":"30","author":"someone","text":"newest"}],"pinned":{"id":"20","author":"someone","text":"pinned","likes":9}}"#;
+        let (latest, pinned) = parse_profile_eval(prof).unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(pinned[0].id, "20");
     }
 }
 
