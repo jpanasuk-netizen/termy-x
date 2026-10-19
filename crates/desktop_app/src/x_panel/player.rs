@@ -83,6 +83,18 @@ impl VideoPlayer {
         #[cfg(windows)]
         self.inner.stop_inner();
     }
+    /// False once the mpv process has exited (EOF quit, crash, or its
+    /// window closed) — the panel polls this to clear playing state.
+    pub fn is_alive(&mut self) -> bool {
+        #[cfg(windows)]
+        {
+            self.inner.is_alive()
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -187,7 +199,14 @@ mod win {
                     x, y, w, h, parent as Hwnd, std::ptr::null_mut(), GetModuleHandleW(std::ptr::null()), std::ptr::null_mut())
             };
             if host.is_null() { return Err("could not create the in-app video surface".into()); }
-            let pipe = format!(r"\\.\pipe\termyx-mpv-{}", std::process::id());
+            // Unique pipe per player instance: a process-wide name let a
+            // previous (leaked) poller compete with the next video's mpv.
+            static PIPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let pipe = format!(
+                r"\\.\pipe\termyx-mpv-{}-{}",
+                std::process::id(),
+                PIPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            );
             let mut cmd = Command::new(&bin);
             cmd.args([
                 &format!("--wid={}", host as isize),
@@ -218,14 +237,29 @@ mod win {
                             let _ = writer.write_all(b"{\"command\":[\"get_property\",\"time-pos\"],\"request_id\":11}\n{\"command\":[\"get_property\",\"duration\"],\"request_id\":12}\n");
                             let mut reader = BufReader::new(writer);
                             let (mut pos, mut dur) = (None, None);
+                            // A get_property against a still-loading stream
+                            // is answered with an error line (no "data").
+                            // That still ANSWERS the request, so count
+                            // answers, not just values: waiting for a data
+                            // line that will never come leaves this read
+                            // blocked until mpv happens to emit a seek/EOF
+                            // event, which froze the seek bar at 0:00/0:00
+                            // on fresh plays and hid EOF from the panel.
+                            let (mut answered_pos, mut answered_dur) = (false, false);
                             for _ in 0..8 {
                                 let mut line = String::new();
                                 match reader.read_line(&mut line) {
                                     Ok(0) | Err(_) => break,
                                     Ok(_) => {
-                                        if line.contains("\"request_id\":11") { pos = extract_number(&line, "\"data\":"); }
-                                        if line.contains("\"request_id\":12") { dur = extract_number(&line, "\"data\":"); }
-                                        if pos.is_some() && dur.is_some() { break; }
+                                        if line.contains("\"request_id\":11") {
+                                            answered_pos = true;
+                                            pos = extract_number(&line, "\"data\":");
+                                        }
+                                        if line.contains("\"request_id\":12") {
+                                            answered_dur = true;
+                                            dur = extract_number(&line, "\"data\":");
+                                        }
+                                        if answered_pos && answered_dur { break; }
                                     }
                                 }
                             }
@@ -278,6 +312,12 @@ mod win {
             }
         }
         pub fn progress(&self) -> (f64, f64) { *self.progress.lock().unwrap() }
+        pub fn is_alive(&mut self) -> bool {
+            match self.child.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            }
+        }
         pub fn set_progress_pos(&self, seconds: f64) {
             let mut p = self.progress.lock().unwrap();
             p.0 = seconds;
@@ -297,6 +337,17 @@ mod win {
             }
         }
         pub fn stop_inner(&mut self) {
+            // Stop both background pollers first. This flag existed but
+            // was never set, so every watched video leaked a progress
+            // poller and a window-position poller for the process
+            // lifetime; the orphaned progress poller then competed for
+            // the (previously shared) IPC pipe and starved the next
+            // video's progress updates — position stuck at 0:00/0:00
+            // and EOF was never detected, leaving the viewer open on a
+            // dead end-frame. Killing mpv below breaks any in-flight
+            // pipe read so the poller can observe the flag and exit.
+            self.stop_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.ipc(r#"{"command":["quit"]}"#);
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();

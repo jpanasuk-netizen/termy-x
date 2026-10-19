@@ -113,6 +113,7 @@ enum InputTarget {
     Compose,
     Search,
     Reply,
+    Quote,
 }
 
 /// Pure predicate behind `XPanel::owns_edit_keys`: does a panel text
@@ -140,6 +141,8 @@ fn edit_keys_owned(
         }
         InputTarget::Search => section == XSection::Search,
         InputTarget::Reply => reply_open,
+        // Quote shares the reply's gate: caller passes reply||quote open.
+        InputTarget::Quote => reply_open,
     }
 }
 
@@ -148,6 +151,7 @@ fn edit_keys_owned(
 enum TextField {
     Search,
     Reply,
+    Quote,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -155,6 +159,7 @@ enum TextField {
 enum PickTarget {
     Compose,
     Reply,
+    Quote,
 }
 
 #[derive(Clone, PartialEq)]
@@ -246,6 +251,25 @@ pub struct XPanel {
     /// Manual refresh asked to land at the top when its content applies
     /// (pull-to-refresh semantics: refresh = newest first).
     pending_top: bool,
+    /// Per-feed bottom cursor from the cursor-paginated timeline path.
+    feed_cursor: [Option<String>; 2],
+    /// Per-feed: the loaded list's depth is backed by `feed_cursor`, so
+    /// Load more can continue strictly older instead of re-fetching.
+    feed_cursor_ok: [bool; 2],
+    /// Tweets this session liked / retweeted from the panel (payloads
+    /// carry no favorited/retweeted flag, so state starts unknown and
+    /// only reflects clicks made here; counts move locally with them).
+    liked_ids: Vec<String>,
+    retweeted_ids: Vec<String>,
+    /// Post ids with a like/retweet/quote call in flight (buttons for
+    /// these are inert until the call lands).
+    engage_pending: Vec<String>,
+    /// Inline quote composer state (quote = retweet with your own words).
+    quote_post_id: Option<String>,
+    quote_author: String,
+    quote_text: String,
+    quote_media: Vec<std::path::PathBuf>,
+    quote_posting: bool,
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
@@ -325,6 +349,9 @@ const FRESH_FOR: Duration = Duration::from_secs(30);
 /// Deep timeline: one OpenCLI call per feed returns this many unique
 /// tweets (verified live; no pagination flag exists or is needed).
 const TIMELINE_LIMIT: usize = 160;
+/// Posts fetched up front per feed (Jeremy's depth ask: land at 420
+/// real posts, then Load more pages older from there).
+const TIMELINE_INITIAL: usize = 420;
 /// Load more grows the OpenCLI limit by one batch (+160) at a time.
 /// The real end is data-driven (a fetch that returns no new tweets);
 /// this is only a high perf safety ceiling.
@@ -379,6 +406,13 @@ enum FetchPayload {
         append: bool,
         /// The OpenCLI limit this batch was requested with.
         requested: usize,
+        /// Bottom cursor for the next older page (cursor path only).
+        next_cursor: Option<String>,
+        /// True when `next_cursor` came from the cursor-paginated path.
+        cursor_ok: bool,
+        /// Live fetch failed: keep the loaded list, surface the error,
+        /// never substitute fixture posts behind the user's back.
+        failed: bool,
     },
     Search {
         posts: Vec<Post>,
@@ -465,11 +499,21 @@ impl XPanel {
             autoscroll_scale: 1.0,
             sb_drag: None,
             feed_offset: [0.0, 0.0],
-            feed_depth: [TIMELINE_LIMIT, TIMELINE_LIMIT],
+            feed_depth: [TIMELINE_INITIAL, TIMELINE_INITIAL],
             next_fetch: None,
             append_inflight: false,
             feed_exhausted: [false, false],
             pending_top: false,
+            feed_cursor: [None, None],
+            feed_cursor_ok: [false, false],
+            liked_ids: Vec::new(),
+            retweeted_ids: Vec::new(),
+            engage_pending: Vec::new(),
+            quote_post_id: None,
+            quote_author: String::new(),
+            quote_text: String::new(),
+            quote_media: Vec::new(),
+            quote_posting: false,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
             search_posts: Vec::new(),
@@ -570,8 +614,10 @@ impl XPanel {
         // Refresh means "newest again": depth resets to one batch.
         if section == XSection::Timeline {
             let idx = Self::feed_index(self.timeline_feed);
-            self.feed_depth[idx] = TIMELINE_LIMIT;
+            self.feed_depth[idx] = TIMELINE_INITIAL;
             self.feed_exhausted[idx] = false;
+            self.feed_cursor[idx] = None;
+            self.feed_cursor_ok[idx] = false;
         }
         // Bypass the 30s freshness cache for this tab only.
         match section {
@@ -814,13 +860,22 @@ impl XPanel {
             cx.notify();
             return;
         }
-        let Some(next) = next_timeline_limit(self.feed_depth[idx]) else {
+        if self.feed_posts().len() >= TIMELINE_MAX {
             self.status = format!(
                 "{} shown \u{b7} safety limit ({TIMELINE_MAX})",
                 self.feed_posts().len()
             );
             cx.notify();
             return;
+        }
+        // Cursor-backed list: fetch just the next older batch from the
+        // stored bottom cursor. Legacy-backed list (cursor path was
+        // unavailable at load): establish the chain by walking from the
+        // top past everything already loaded, once.
+        let next = if self.feed_cursor_ok[idx] {
+            TIMELINE_LIMIT
+        } else {
+            (self.feed_depth[idx] + TIMELINE_LIMIT).min(TIMELINE_MAX)
         };
         self.next_fetch = Some((true, next));
         self.append_inflight = true;
@@ -837,12 +892,12 @@ impl XPanel {
             return hint(format!(
                 "No more older tweets \u{b7} {} shown \u{b7} \u{21bb} refreshes to the newest {}",
                 self.feed_posts().len(),
-                TIMELINE_LIMIT
+                TIMELINE_INITIAL
             ));
         }
-        if next_timeline_limit(self.feed_depth[idx]).is_none() {
+        if self.feed_posts().len() >= TIMELINE_MAX {
             return hint(format!(
-                "{} shown \u{b7} safety limit ({TIMELINE_MAX}) \u{b7} \u{21bb} refreshes to the newest {TIMELINE_LIMIT}",
+                "{} shown \u{b7} safety limit ({TIMELINE_MAX}) \u{b7} \u{21bb} refreshes to the newest {TIMELINE_INITIAL}",
                 self.feed_posts().len()
             ));
         }
@@ -1031,12 +1086,19 @@ impl XPanel {
             false,
             self.feed_depth[Self::feed_index(feed)],
         ));
+        // Continuation fetches resume from the stored bottom cursor;
+        // fresh loads (refresh / first open) always start at the top.
+        let fetch_cursor = if section == XSection::Timeline && append {
+            self.feed_cursor[Self::feed_index(feed)].clone()
+        } else {
+            None
+        };
 
         cx.spawn(async move |this, cx| {
             let payload = cx
                 .background_executor()
                 .spawn(async move {
-                    fetch_section(section, query, lookup, live, feed, append, limit)
+                    fetch_section(section, query, lookup, live, feed, append, limit, fetch_cursor)
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
@@ -1067,12 +1129,20 @@ impl XPanel {
                 status,
                 feed,
                 append,
-                requested,
+                requested: _,
+                next_cursor,
+                cursor_ok,
+                failed,
             } => {
                 let idx = Self::feed_index(feed);
-                self.feed_depth[idx] = requested;
                 self.append_inflight = false;
-                if append {
+                if failed {
+                    // Live Load-more failed (rate limit, dead session):
+                    // keep every loaded tweet, keep the cursor, and say
+                    // so. Never swap in fixture posts, never mark the
+                    // feed exhausted for a transient error.
+                    self.status = status;
+                } else if append {
                     // Load more: existing order untouched, only unseen
                     // ids extend the list downward. Scroll is not moved.
                     let (total, added) = match feed {
@@ -1097,9 +1167,16 @@ impl XPanel {
                             )
                         }
                     };
-                    if added == 0 {
+                    if cursor_ok {
+                        self.feed_cursor[idx] = next_cursor.clone();
+                        self.feed_cursor_ok[idx] = true;
+                        if next_cursor.is_none() {
+                            self.feed_exhausted[idx] = true;
+                        }
+                    } else if added == 0 {
                         self.feed_exhausted[idx] = true;
                     }
+                    self.feed_depth[idx] = total;
                     self.status = if added == 0 {
                         format!("no older tweets came back \u{b7} {total} shown")
                     } else {
@@ -1112,6 +1189,7 @@ impl XPanel {
                         }
                     }
                 } else {
+                    let landed = posts.len();
                     match feed {
                         TimelineFeed::ForYou => {
                             self.posts = posts;
@@ -1121,6 +1199,12 @@ impl XPanel {
                             self.following_posts = posts;
                             self.fetched_at.timeline_following = Some(now);
                         }
+                    }
+                    self.feed_depth[idx] = landed;
+                    if cursor_ok {
+                        self.feed_cursor[idx] = next_cursor.clone();
+                        self.feed_cursor_ok[idx] = true;
+                        self.feed_exhausted[idx] = next_cursor.is_none();
                     }
                     self.status = status;
                 }
@@ -1375,7 +1459,10 @@ impl XPanel {
                 );
                 if self.bearer_mode {
                     let masked = "\u{2022}".repeat(self.bearer_input.chars().count().min(24));
-                    col = col.child(
+                    col = col.child(focus_glow(
+                        "glow-bearer",
+                        true,
+                        false,
                         div()
                             .flex()
                             .flex_row()
@@ -1387,7 +1474,8 @@ impl XPanel {
                             .child(format!(
                                 " ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
                                 self.bearer_input.chars().count()
-                            )),
+                            ))
+                            .into_any_element()),
                     );
                     col = col.child(
                         div()
@@ -1571,6 +1659,12 @@ impl XPanel {
                 cx.notify();
                 return;
             }
+            if self.quote_post_id.is_some() {
+                self.close_quote();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.reply_post_id.is_some() {
                 self.close_reply();
                 cx.stop_propagation();
@@ -1639,6 +1733,10 @@ impl XPanel {
         }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
             self.on_text_input_key(event, TextField::Reply, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Quote && self.quote_post_id.is_some() {
+            self.on_text_input_key(event, TextField::Quote, cx);
             return;
         }
 
@@ -1817,7 +1915,7 @@ impl XPanel {
             self.bearer_mode,
             self.input_target,
             self.section,
-            self.reply_post_id.is_some(),
+            self.reply_post_id.is_some() || self.quote_post_id.is_some(),
             self.compose_focused,
             self.ui_focus == UiFocus::Compose,
         )
@@ -1841,6 +1939,7 @@ impl XPanel {
                 }
                 InputTarget::Search => self.search_input.push_str(clean),
                 InputTarget::Reply => self.reply_text.push_str(clean),
+                InputTarget::Quote => self.quote_text.push_str(clean),
             }
         }
         self.mark_edit_chord();
@@ -1920,6 +2019,8 @@ impl XPanel {
         if key == "enter" && (mods.control || mods.platform) {
             if field == TextField::Reply {
                 self.submit_reply(cx);
+            } else if field == TextField::Quote {
+                self.submit_quote(cx);
             } else {
                 self.run_search(cx);
             }
@@ -1931,6 +2032,7 @@ impl XPanel {
             match field {
                 TextField::Search => self.run_search(cx),
                 TextField::Reply => self.reply_text.push('\n'),
+                TextField::Quote => self.quote_text.push('\n'),
             }
             cx.stop_propagation();
             cx.notify();
@@ -1950,6 +2052,7 @@ impl XPanel {
         let target = match field {
             TextField::Search => &mut self.search_input,
             TextField::Reply => &mut self.reply_text,
+            TextField::Quote => &mut self.quote_text,
         };
         if key == "backspace" {
             target.pop();
@@ -2010,6 +2113,7 @@ impl XPanel {
     fn open_reply_parts(&mut self, post_id: &str, author_handle: &str) {
         self.autoscroll = None;
         self.close_viewer();
+        self.quote_post_id = None;
         if self.reply_post_id.as_deref() != Some(post_id) {
             self.reply_text.clear();
             self.reply_media.clear();
@@ -2038,6 +2142,262 @@ impl XPanel {
             InputTarget::Compose
         };
         self.status = "reply closed \u{b7} nothing was posted".into();
+    }
+
+    /// Optimistically flip a like/retweet, then run the real OpenCLI
+    /// engage in the background. Failure reverts the flip and says why;
+    /// counts move locally with the flip, never via a re-fetch, so the
+    /// scroll position cannot jump.
+    fn toggle_engage(
+        &mut self,
+        action: termy_x::publish::EngageAction,
+        id: &str,
+        url: &str,
+        author: &str,
+        cx: &mut Context<Self>,
+    ) {
+        use termy_x::publish::EngageAction;
+        let id = id.to_string();
+        if self.engage_pending.iter().any(|p| p == &id) {
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never likes or retweets.".into());
+            cx.notify();
+            return;
+        }
+        let url = url.to_string();
+        let author = author.to_string();
+        let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
+        let now_active = match action {
+            EngageAction::Like | EngageAction::Retweet => true,
+            _ => false,
+        };
+        self.set_engage_state(&id, is_like, now_active);
+        self.engage_pending.push(id.clone());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first, then try again."
+                                .to_string(),
+                        );
+                    };
+                    publisher
+                        .engage(action, &url, None, &[])
+                        .map_err(|e| e)
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.engage_pending.retain(|p| p != &id);
+                match result {
+                    Ok(_) => {
+                        panel.status = format!(
+                            "{} @{}",
+                            match action {
+                                termy_x::publish::EngageAction::Like => "liked",
+                                termy_x::publish::EngageAction::Unlike => "unliked",
+                                termy_x::publish::EngageAction::Retweet => "retweeted",
+                                termy_x::publish::EngageAction::Unretweet => "retweet removed from",
+                                termy_x::publish::EngageAction::Quote => "quoted",
+                            },
+                            author
+                        );
+                    }
+                    Err(error) => {
+                        // Revert the optimistic flip.
+                        panel.set_engage_state(&id, is_like, !now_active);
+                        panel.notice = Some(format!(
+                            "That did not go through: {error} Nothing changed on X."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Flip local liked/retweeted state + the visible count for one post
+    /// in every loaded list (no re-fetch, no scroll movement).
+    fn set_engage_state(&mut self, id: &str, is_like: bool, active: bool) {
+        let ids = if is_like {
+            &mut self.liked_ids
+        } else {
+            &mut self.retweeted_ids
+        };
+        let present = ids.iter().any(|p| p == id);
+        if active && !present {
+            ids.push(id.to_string());
+        } else if !active && present {
+            ids.retain(|p| p != id);
+        } else {
+            return;
+        }
+        let delta: i64 = if active { 1 } else { -1 };
+        for list in [
+            &mut self.posts,
+            &mut self.following_posts,
+            &mut self.search_posts,
+        ] {
+            for post in list.iter_mut() {
+                if post.id == id {
+                    if is_like {
+                        post.likes = (post.likes as i64 + delta).max(0) as u64;
+                    } else {
+                        post.reposts = (post.reposts as i64 + delta).max(0) as u64;
+                    }
+                }
+            }
+        }
+    }
+
+    fn open_quote(&mut self, post_id: &str, author_handle: &str) {
+        self.autoscroll = None;
+        self.close_viewer();
+        self.reply_post_id = None;
+        if self.quote_post_id.as_deref() != Some(post_id) {
+            self.quote_text.clear();
+            self.quote_media.clear();
+        }
+        self.quote_post_id = Some(post_id.to_string());
+        self.quote_author = author_handle.to_string();
+        self.input_target = InputTarget::Quote;
+        self.pending_focus = true;
+        self.status = format!(
+            "quote @{} \u{b7} your words on their tweet, then Post",
+            author_handle
+        );
+    }
+
+    fn close_quote(&mut self) {
+        self.quote_post_id = None;
+        self.quote_author.clear();
+        self.quote_text.clear();
+        self.quote_media.clear();
+        self.input_target = if self.section == XSection::Search {
+            InputTarget::Search
+        } else {
+            InputTarget::Compose
+        };
+        self.status = "quote closed \u{b7} nothing was posted".into();
+    }
+
+    /// Post the quote (retweet with your own words) via OpenCLI
+    /// `twitter quote <url> <text>` in the silent background session.
+    fn submit_quote(&mut self, cx: &mut Context<Self>) {
+        if self.quote_posting {
+            self.notice = Some("Already sending that quote \u{2014} wait for it.".into());
+            cx.notify();
+            return;
+        }
+        let Some(target_id) = self.quote_post_id.clone() else {
+            return;
+        };
+        let text = self.quote_text.trim().to_string();
+        if text.is_empty() {
+            self.notice = Some("Write your quote first \u{2014} a quote is your own words on their tweet.".into());
+            cx.notify();
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never posts a quote.".into());
+            cx.notify();
+            return;
+        }
+        // Target URL from the loaded post (any list), like reply uses ids.
+        let target_post = self
+            .posts
+            .iter()
+            .chain(self.following_posts.iter())
+            .chain(self.search_posts.iter())
+            .find(|post| post.id == target_id);
+        let Some(target_post) = target_post else {
+            self.notice = Some("That tweet is no longer loaded \u{2014} nothing was posted.".into());
+            cx.notify();
+            return;
+        };
+        let url = if target_post.url.is_empty() {
+            format!(
+                "https://x.com/{}/status/{}",
+                target_post.author_handle, target_post.id
+            )
+        } else {
+            target_post.url.clone()
+        };
+        if let Err(error) = termy_x::publish::validate_media_paths(&self.quote_media) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        let media = self.quote_media.clone();
+        let author = self.quote_author.clone();
+        self.quote_posting = true;
+        self.notice = Some(format!(
+            "Quoting @{} in-app, silently in the background\u{2026} no browser will open.",
+            author
+        ));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first, then try again."
+                                .to_string(),
+                        );
+                    };
+                    publisher.engage(
+                        termy_x::publish::EngageAction::Quote,
+                        &url,
+                        Some(&text),
+                        &media,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.quote_posting = false;
+                match result {
+                    Ok(_) => {
+                        if !panel.retweeted_ids.contains(&target_id) {
+                            panel.retweeted_ids.push(target_id.clone());
+                        }
+                        panel.quote_post_id = None;
+                        panel.quote_text.clear();
+                        panel.quote_media.clear();
+                        panel.input_target = if panel.section == XSection::Search {
+                            InputTarget::Search
+                        } else {
+                            InputTarget::Compose
+                        };
+                        panel.notice = Some(format!(
+                            "Quoted @{} \u{b7} posted in-app, no browser opened.",
+                            author
+                        ));
+                        panel.status = format!("quoted @{}", author);
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Could not quote: {error} Nothing was posted; no browser opened."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Post the inline reply in-app via the active publisher, threaded to
@@ -2307,19 +2667,60 @@ fn fetch_section(
     feed: TimelineFeed,
     append: bool,
     limit: usize,
+    cursor: Option<String>,
 ) -> FetchPayload {
     if live {
         let service = XPanel::service_free();
         match section {
             XSection::Timeline => {
-                if let Ok(served) = service.timeline_feed(feed, limit) {
-                    return FetchPayload::Timeline {
-                        posts: served.value,
-                        status: live_status(&served.status),
-                        feed,
-                        append,
-                        requested: limit,
-                    };
+                // Cursor-paginated path first: refresh walks from the
+                // top, Load more continues strictly older from the
+                // stored bottom cursor \u{2014} never a bigger re-fetch.
+                match service.timeline_page(feed, cursor.as_deref(), limit) {
+                    Ok(served) => {
+                        return FetchPayload::Timeline {
+                            posts: served.value.posts,
+                            status: live_status(&served.status),
+                            feed,
+                            append,
+                            requested: limit,
+                            next_cursor: served.value.next_cursor,
+                            cursor_ok: true,
+                            failed: false,
+                        };
+                    }
+                    Err(error) => {
+                        if append {
+                            // Honest failure: no fixture substitution,
+                            // no fake "no more tweets".
+                            return FetchPayload::Timeline {
+                                posts: Vec::new(),
+                                status: format!(
+                                    "could not load older tweets \u{2014} {error}"
+                                ),
+                                feed,
+                                append,
+                                requested: limit,
+                                next_cursor: None,
+                                cursor_ok: false,
+                                failed: true,
+                            };
+                        }
+                        // Fresh load: legacy one-shot fetch still works
+                        // when the cursor session cannot start.
+                        if let Ok(served) = service.timeline_feed(feed, limit) {
+                            return FetchPayload::Timeline {
+                                posts: served.value,
+                                status: live_status(&served.status),
+                                feed,
+                                append,
+                                requested: limit,
+                                next_cursor: None,
+                                cursor_ok: false,
+                                failed: false,
+                            };
+                        }
+                    }
                 }
             }
             XSection::Search => {
@@ -2369,6 +2770,9 @@ fn fetch_section(
             status: "mock Â· fixture data Â· no X API credits".into(),
             append,
             requested: limit,
+            next_cursor: None,
+            cursor_ok: false,
+            failed: false,
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
@@ -2408,6 +2812,9 @@ fn fetch_section(
             posts: Vec::new(),
             status: "compose".into(),
             feed,
+            next_cursor: None,
+            cursor_ok: false,
+            failed: false,
             append: false,
             requested: TIMELINE_LIMIT,
         },
@@ -2711,6 +3118,39 @@ fn caret_element(id: &'static str) -> gpui_kit::AnyElement {
             el.opacity(0.12 + 0.88 * v)
         })
         .into_any_element()
+}
+
+/// Red<->blue glow colour at breath phase `v` (0 = warm red, 1 = blue).
+fn glow_rgba(v: f32) -> gpui_kit::Rgba {
+    let mix = |a: f32, b: f32| (a + (b - a) * v).round() as u32;
+    let hex = (mix(255.0, 45.0) << 16) | (mix(45.0, 110.0) << 8) | mix(80.0, 255.0);
+    rgba((hex << 8) | 130)
+}
+
+/// Shared focused-editor glow: a thin ring around the field whose
+/// background breathes red<->blue while the field owns the keyboard.
+/// One implementation for every writing surface (Search, Reply, Quote,
+/// Compose, bearer-key entry). The ring is always mounted (transparent
+/// when unfocused) so focus changes never shift layout; only a tiny
+/// element animates, at the caret's 9fps breath cap.
+fn focus_glow(
+    id: &'static str,
+    focused: bool,
+    grow: bool,
+    child: gpui_kit::AnyElement,
+) -> gpui_kit::AnyElement {
+    let mut ring = div().p(px(2.0)).rounded(px(11.0)).child(child);
+    if grow {
+        ring = ring.flex_1();
+    }
+    if focused {
+        ring.with_animation(id, breath_animation(2_800), |el, v| {
+            el.bg(glow_rgba(v))
+        })
+        .into_any_element()
+    } else {
+        ring.into_any_element()
+    }
 }
 
 /// Small breathing bird shown while any tab loads (shared status line):
@@ -3453,15 +3893,26 @@ impl XPanel {
 
     fn stop_video_player(&mut self) {
         self.player_pending = false;
+        self.player_paused = false;
         if let Some(player) = self.video_player.take() {
             player.stop();
         }
     }
 
+    /// Every viewer exit path funnels here (Esc, \u{2715}, tab switch,
+    /// mpv EOF/death via the sync loop): player killed, viewer cleared,
+    /// and the "Playing video \u{2014} Esc or \u{2715} to stop" notice is
+    /// cleared with it so the status can never stick after playback ends.
     fn close_viewer(&mut self) {
         self.stop_video_player();
         self.viewer = None;
         self.player_error = None;
+        if matches!(
+            self.notice.as_deref(),
+            Some(n) if n.starts_with("Playing video") || n.starts_with("Photo opened")
+        ) {
+            self.notice = None;
+        }
         self.pending_focus = true;
     }
     /// Reserved media area for a tweet, sized from the media's real
@@ -3595,8 +4046,22 @@ impl XPanel {
                             cx.background_executor().timer(Duration::from_millis(600)).await;
                             let alive = this.update(cx, |panel, cx| {
                                 let open = panel.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) && panel.video_player.is_some();
-                                if open { cx.notify(); }
-                                open
+                                if !open { return false; }
+                                // mpv died / its window was closed, or
+                                // playback reached EOF: end the viewer
+                                // cleanly instead of leaving a stuck
+                                // "Playing video" status over a dead frame.
+                                let (pos, dur) = panel.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
+                                let player_gone = panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive());
+                                let at_eof = dur > 0.0 && pos >= dur - 0.25;
+                                if player_gone || at_eof {
+                                    panel.close_viewer();
+                                    panel.notice = Some("Video ended \u{b7} back to the timeline.".into());
+                                    cx.notify();
+                                    return false;
+                                }
+                                cx.notify();
+                                true
                             }).unwrap_or(false);
                             if !alive { break; }
                         }
@@ -4047,6 +4512,7 @@ impl XPanel {
                     .child(post.text.clone()),
             )
             .children(self.media_box(post, cx))
+            .child(self.tweet_actions(post, cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
@@ -4064,7 +4530,264 @@ impl XPanel {
         if selected {
             el = el.child(self.reply_box(post, cx));
         }
+        if self.quote_post_id.as_deref() == Some(post.id.as_str()) {
+            el = el.child(self.quote_box(post, cx));
+        }
         el.into_any_element()
+    }
+
+    /// Like / Retweet / Quote row on every tweet card. Small, distinct
+    /// click targets that stop propagation, so hitting one never opens
+    /// the reply editor (and vice versa). Counts shown are the post's
+    /// own payload counts, moved locally by optimistic flips.
+    fn tweet_actions(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let id = post.id.clone();
+        let url = if post.url.is_empty() {
+            format!("https://x.com/{}/status/{}", post.author_handle, post.id)
+        } else {
+            post.url.clone()
+        };
+        let author = post.author_handle.clone();
+        let liked = self.liked_ids.iter().any(|p| p == &post.id);
+        let retweeted = self.retweeted_ids.iter().any(|p| p == &post.id);
+        let pending = self.engage_pending.iter().any(|p| p == &post.id);
+        let (like_id, rt_id) = (id.clone(), id.clone());
+        let (like_url, rt_url) = (url.clone(), url.clone());
+        let (like_author, rt_author) = (author.clone(), author.clone());
+        let quote_id = post.id.clone();
+        let quote_author = post.author_handle.clone();
+        div()
+            .mt(px(8.0))
+            .flex()
+            .gap(px(8.0))
+            .flex_wrap()
+            .child(x_button!(
+                format!("x-like-{}", post.id),
+                if pending {
+                    "\u{2026}"
+                } else if liked {
+                    "Liked"
+                } else {
+                    "Like"
+                },
+                liked,
+                cx.listener(move |this, _, _, cx| {
+                    let action = if this.liked_ids.iter().any(|p| p == &like_id) {
+                        termy_x::publish::EngageAction::Unlike
+                    } else {
+                        termy_x::publish::EngageAction::Like
+                    };
+                    this.toggle_engage(action, &like_id, &like_url, &like_author, cx);
+                    cx.stop_propagation();
+                })
+            ))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(format!("{} likes \u{b7} {} retweets", post.likes, post.reposts)),
+            )
+            .child(x_button!(
+                format!("x-rt-{}", post.id),
+                if pending {
+                    "\u{2026}"
+                } else if retweeted {
+                    "Retweeted"
+                } else {
+                    "Retweet"
+                },
+                retweeted,
+                cx.listener(move |this, _, _, cx| {
+                    let action = if this.retweeted_ids.iter().any(|p| p == &rt_id) {
+                        termy_x::publish::EngageAction::Unretweet
+                    } else {
+                        termy_x::publish::EngageAction::Retweet
+                    };
+                    this.toggle_engage(action, &rt_id, &rt_url, &rt_author, cx);
+                    cx.stop_propagation();
+                })
+            ))
+            .child(x_button!(
+                format!("x-quote-{}", post.id),
+                "Quote",
+                cx.listener(move |this, _, _, cx| {
+                    this.open_quote(&quote_id, &quote_author);
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ))
+            .into_any_element()
+    }
+
+    /// Inline quote composer under a card: retweet with your own words.
+    /// Same shape as the reply box (fixed height, breathing caret from
+    /// the first focused frame, Post button, Esc/Cancel, 1 image).
+    fn quote_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let char_limit = self.char_limit;
+        let count = weighted_len_limited(&self.quote_text, char_limit);
+        let focused = self.input_target == InputTarget::Quote;
+        let editor = div()
+            .id("x-quote-editor")
+            .h(px(60.0))
+            .flex_none()
+            .overflow_hidden()
+            .p(px(8.0))
+            .rounded(px(8.0))
+            .bg(tint(0x0c1422, 235))
+            .border_1()
+            .border_color(tint(0x7af6ff, 70))
+            .cursor_pointer()
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(if self.quote_text.is_empty() {
+                        rgb(0x93a4c3)
+                    } else {
+                        rgb(0xf8fbff)
+                    })
+                    .child(if self.quote_text.is_empty() {
+                        if focused {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(caret_element("caret-quote"))
+                                .child("Add your words\u{2026} (Ctrl+Enter posts the quote)")
+                        } else {
+                            div().child("Add your words\u{2026} (Ctrl+Enter posts the quote)")
+                        }
+                    } else if focused {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .child(self.quote_text.clone())
+                            .child(caret_element("caret-quote"))
+                    } else {
+                        div().child(self.quote_text.clone())
+                    }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.input_target = InputTarget::Quote;
+                    this.pending_focus = true;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            );
+        let mut box_el = div()
+            .mt(px(8.0))
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .bg(tint(0x0f1c33, 245))
+            .border_1()
+            .border_color(if focused { rgb(0x7af6ff) } else { tint(0x7af6ff, 70) })
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.input_target = InputTarget::Quote;
+                    this.pending_focus = true;
+                    // Must stop here: without this the click bubbles to
+                    // the card's own handler, which clears the quote and
+                    // opens a reply instead (clicking the quote box's
+                    // padding/header used to turn it into a reply).
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child(format!("Quote @{} \u{b7} retweet with your own words", post.author_handle)),
+            )
+            .child(focus_glow("glow-quote", focused, false, editor.into_any_element()))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(if count.weighted > count.limit {
+                        rgb(0xff5d8f)
+                    } else {
+                        rgb(0x9ad7ff)
+                    })
+                    .child(format!(
+                        "{} / {} characters \u{b7} Ctrl+Enter or Post sends \u{b7} quotes attach 1 image",
+                        count.weighted, count.limit
+                    )),
+            );
+        if !self.quote_media.is_empty() {
+            for (index, path) in self.quote_media.iter().enumerate() {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("image")
+                    .to_string();
+                box_el = box_el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7af6ff))
+                                .child(name),
+                        )
+                        .child(x_button!(
+                            format!("x-quote-media-remove-{index}"),
+                            "\u{2715} Remove",
+                            cx.listener(move |this, _, _, cx| {
+                                if index < this.quote_media.len() {
+                                    this.quote_media.remove(index);
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            })
+                        )),
+                );
+            }
+        }
+        box_el = box_el.child(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .flex_wrap()
+                .child(x_button!(
+                    "x-quote-attach",
+                    "Attach image",
+                    cx.listener(|this, _, _, cx| {
+                        this.pick_target = PickTarget::Quote;
+                        this.attach_images(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-quote-send",
+                    if self.quote_posting {
+                        "Posting\u{2026}"
+                    } else {
+                        "Post"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.submit_quote(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-quote-cancel",
+                    "Cancel",
+                    cx.listener(|this, _, _, cx| {
+                        this.close_quote();
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                )),
+        );
+        box_el.into_any_element()
     }
 
     /// The inline reply editor shown under the selected tweet.
@@ -4091,6 +4814,9 @@ impl XPanel {
                     // propagation first, so their own handlers still win.
                     this.input_target = InputTarget::Reply;
                     this.pending_focus = true;
+                    // Same bubble guard as the quote box: clicks inside
+                    // the reply box must never re-trigger the card.
+                    cx.stop_propagation();
                     cx.notify();
                 }),
             )
@@ -4100,7 +4826,10 @@ impl XPanel {
                     .text_color(rgb(0x7af6ff))
                     .child(format!("Reply to @{}", post.author_handle)),
             )
-            .child(
+            .child(focus_glow(
+                "glow-reply",
+                focused,
+                false,
                 div()
                     .id("x-reply-editor")
                     // Fixed height: the box never grows/shrinks as you type
@@ -4121,7 +4850,16 @@ impl XPanel {
                                 rgb(0xf8fbff)
                             })
                             .child(if self.reply_text.is_empty() {
-                                div().child("Write your reply\u{2026} (Ctrl+Enter sends)")
+                                if focused {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .child(caret_element("caret-reply"))
+                                        .child("Write your reply\u{2026} (Ctrl+Enter sends)")
+                                } else {
+                                    div().child("Write your reply\u{2026} (Ctrl+Enter sends)")
+                                }
                             } else if focused {
                                 // Breathing caret in a fixed cell: always
                                 // present, only its opacity pulses, so the
@@ -4143,9 +4881,9 @@ impl XPanel {
                             this.pending_focus = true;
                             cx.stop_propagation();
                             cx.notify();
-                        }),
-                    ),
-            )
+                        }))
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .text_size(px(11.0))
@@ -4254,7 +4992,10 @@ impl XPanel {
                     .flex()
                     .gap(px(8.0))
                     .items_center()
-                    .child(
+                    .child(focus_glow(
+                        "glow-search",
+                        focused,
+                        true,
                         div()
                             .id("x-search-input")
                             .flex_1()
@@ -4281,7 +5022,16 @@ impl XPanel {
                                         rgb(0xf8fbff)
                                     })
                                     .child(if self.search_input.is_empty() {
-                                        div().child("Type a query \u{2014} a word, #tag, or from:someone")
+                                        if focused {
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .child(caret_element("caret-search"))
+                                                .child("Type a query \u{2014} a word, #tag, or from:someone")
+                                        } else {
+                                            div().child("Type a query \u{2014} a word, #tag, or from:someone")
+                                        }
                                     } else if focused {
                                         div()
                                             .flex()
@@ -4300,9 +5050,9 @@ impl XPanel {
                                     this.pending_focus = true;
                                     cx.stop_propagation();
                                     cx.notify();
-                                }),
-                            ),
-                    )
+                                }))
+                            .into_any_element(),
+                    ))
                     .child(x_button!(
                         "x-search-run",
                         if self.loading { "Searching\u{2026}" } else { "Search" },
@@ -4331,6 +5081,7 @@ impl XPanel {
         let attached = match self.pick_target {
             PickTarget::Compose => self.media.len(),
             PickTarget::Reply => self.reply_media.len(),
+            PickTarget::Quote => self.quote_media.len(),
         };
         if attached >= 4 {
             self.notice = Some("Max 4 images — remove one first.".into());
@@ -4369,6 +5120,7 @@ impl XPanel {
         let target = match self.pick_target {
             PickTarget::Compose => &mut self.media,
             PickTarget::Reply => &mut self.reply_media,
+            PickTarget::Quote => &mut self.quote_media,
         };
         let mut added = 0usize;
         let mut rejected: Vec<String> = Vec::new();
@@ -4560,7 +5312,10 @@ impl XPanel {
                         cx.notify();
                     }))),
             )
-            .child(
+            .child(focus_glow(
+                "glow-compose",
+                editor_focused,
+                false,
                 div()
                     .id("x-compose-editor")
                     .p(px(12.0))
@@ -4621,9 +5376,9 @@ impl XPanel {
                             this.pending_focus = false;
                             cx.stop_propagation();
                             cx.notify();
-                        }),
-                    ),
-            )
+                        }))
+                    .into_any_element(),
+            ))
             .child(
                 div()
                     .text_size(px(12.0))

@@ -28,10 +28,47 @@ pub enum GateOutcome {
     Sent { plan: PublishPlan, receipt: String },
 }
 
+/// A like / retweet / quote engagement on one existing tweet, aimed at
+/// its status URL. Quote carries the user's own text (and ≤1 image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngageAction {
+    Like,
+    Unlike,
+    Retweet,
+    Unretweet,
+    Quote,
+}
+
+impl EngageAction {
+    /// The `opencli twitter <verb>` subcommand (verified against
+    /// OpenCLI 1.8.8 `--help`: like/unlike/retweet/unretweet/quote all
+    /// take the tweet URL first; quote takes text second).
+    pub fn opencli_verb(self) -> &'static str {
+        match self {
+            EngageAction::Like => "like",
+            EngageAction::Unlike => "unlike",
+            EngageAction::Retweet => "retweet",
+            EngageAction::Unretweet => "unretweet",
+            EngageAction::Quote => "quote",
+        }
+    }
+}
+
 pub trait Publisher: Send + Sync {
     fn id(&self) -> ProviderId;
     fn available(&self) -> bool;
     fn session_note(&self) -> Option<String>;
+    /// Engage with an existing tweet. Default: this posting path cannot
+    /// (web-intent/mock), and the UI must say so instead of faking it.
+    fn engage(
+        &self,
+        _action: EngageAction,
+        _target_url: &str,
+        _text: Option<&str>,
+        _media: &[PathBuf],
+    ) -> Result<String, String> {
+        Err("this posting path cannot like / retweet / quote".into())
+    }
     fn publish(
         &self,
         parts: &[String],

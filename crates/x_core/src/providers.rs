@@ -85,6 +85,25 @@ pub trait XProvider: Send + Sync {
         Err("this provider does not expose separate For you / Following feeds".into())
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String>;
+    /// One cursor-paginated slice of a home feed: `cursor: None` reads
+    /// from the top; the returned `next_cursor` continues strictly older.
+    /// Providers without a real cursor must Err, never fake it.
+    fn timeline_page(
+        &self,
+        _feed: TimelineFeed,
+        _cursor: Option<&str>,
+        _count: usize,
+    ) -> Result<Served<TimelinePage>, String> {
+        Err("this provider has no cursor pagination".into())
+    }
+}
+
+/// A page of timeline posts plus the opaque bottom cursor that fetches
+/// the next (older) page. `next_cursor: None` means the source is dry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimelinePage {
+    pub posts: Vec<Post>,
+    pub next_cursor: Option<String>,
 }
 
 pub struct Service {
@@ -211,6 +230,17 @@ impl Service {
     ) -> Result<Served<Vec<Post>>, String> {
         let mut served = self.read(|reader| reader.timeline_feed(feed, limit))?;
         served.value = dedupe_posts(served.value);
+        Ok(served)
+    }
+
+    pub fn timeline_page(
+        &self,
+        feed: TimelineFeed,
+        cursor: Option<&str>,
+        count: usize,
+    ) -> Result<Served<TimelinePage>, String> {
+        let mut served = self.read(|reader| reader.timeline_page(feed, cursor, count))?;
+        served.value.posts = dedupe_posts(served.value.posts);
         Ok(served)
     }
 
@@ -547,6 +577,115 @@ impl OpenCliProvider {
         }
         Ok(output.stdout)
     }
+
+    /// Run one `opencli browser termyx …` subcommand with its own budget.
+    fn browser_cmd(
+        &self,
+        args: &[&str],
+        timeout: Duration,
+    ) -> Result<crate::io::CommandOutput, String> {
+        self.pace.wait();
+        let owned: Vec<String> = args.iter().map(ToString::to_string).collect();
+        self.runner.run_timeout(&self.bin, &owned, timeout)
+    }
+
+    /// Cursor-paginated timeline through the user's own logged-in X web
+    /// session: one background OpenCLI browser session, one in-page eval
+    /// that walks HomeTimeline/HomeLatestTimeline GraphQL pages with the
+    /// bottom cursor (the same calls x.com's own infinite scroll makes).
+    /// The CSRF cookie is read and used only inside the page; nothing but
+    /// posts + the next cursor ever leaves it.
+    fn eval_timeline_page(
+        &self,
+        feed: TimelineFeed,
+        cursor: Option<&str>,
+        count: usize,
+    ) -> Result<TimelinePage, String> {
+        let session = "termyx";
+        let open = self.browser_cmd(
+            &["browser", session, "open", "https://x.com/home", "--window", "background"],
+            Duration::from_secs(60),
+        )?;
+        if open.status != 0 {
+            return Err(format!(
+                "could not open the background X session: {}",
+                open.stderr.trim()
+            ));
+        }
+        // Warm-up: wait until the session tab is actually on x.com
+        // (open returns before the page has loaded; an eval that lands
+        // on about:blank can neither read ct0 nor fetch relatively).
+        for _ in 0..15 {
+            match self.browser_cmd(
+                // No '|' here: on Windows this arg travels through
+                // cmd.exe (opencli.cmd shim), which would treat the
+                // pipe as a command separator and break the probe.
+                &["browser", session, "eval", "location.href"],
+                Duration::from_secs(30),
+            ) {
+                Ok(probe)
+                    if probe.stdout.contains("https://x.com")
+                        && !probe.stdout.trim_start().starts_with("loading") =>
+                {
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(800)),
+            }
+        }
+        let js = timeline_eval_js(feed, cursor, count);
+        // Ship the script in chunks: on Windows every arg travels
+        // through `cmd.exe /c opencli.cmd ...`, whose command line is
+        // capped at 8191 chars — one base64 blob for this script is
+        // ~9.4 KB and cmd refuses it ("The command line is too
+        // long"), which is exactly how this path used to die before
+        // evaluating anything. Append <=6000-char pieces to a window
+        // global instead, then decode+run it in one final eval.
+        let b64 = b64_encode(js.as_bytes());
+        let mut shipped: Result<(), String> = Ok(());
+        for (i, chunk) in b64.as_bytes().chunks(6000).enumerate() {
+            let piece = std::str::from_utf8(chunk).expect("base64 ascii");
+            let arg = if i == 0 {
+                format!("window.__tx='{piece}'")
+            } else {
+                format!("window.__tx+='{piece}'")
+            };
+            match self.browser_cmd(
+                &["browser", session, "eval", &arg],
+                Duration::from_secs(30),
+            ) {
+                Ok(out) if out.status == 0 => {}
+                Ok(out) => {
+                    shipped = Err(format!(
+                        "timeline session exited {} while uploading the script: {}",
+                        out.status,
+                        out.stderr.trim()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    shipped = Err(e);
+                    break;
+                }
+            }
+        }
+        let eval = match shipped {
+            Ok(()) => self.browser_cmd(
+                &["browser", session, "eval", "eval(atob(window.__tx))"],
+                Duration::from_secs(150),
+            ),
+            Err(e) => Err(e),
+        };
+        let _ = self.browser_cmd(&["browser", session, "close"], Duration::from_secs(30));
+        let eval = eval?;
+        if eval.status != 0 {
+            return Err(if eval.stderr.trim().is_empty() {
+                format!("timeline session exited {}", eval.status)
+            } else {
+                eval.stderr.trim().to_string()
+            });
+        }
+        parse_timeline_eval(&eval.stdout)
+    }
 }
 
 impl XProvider for OpenCliProvider {
@@ -627,6 +766,22 @@ impl XProvider for OpenCliProvider {
             match feed {
                 TimelineFeed::ForYou => "timeline · for you",
                 TimelineFeed::Following => "timeline · following",
+            },
+        ))
+    }
+    fn timeline_page(
+        &self,
+        feed: TimelineFeed,
+        cursor: Option<&str>,
+        count: usize,
+    ) -> Result<Served<TimelinePage>, String> {
+        let page = self.eval_timeline_page(feed, cursor, count)?;
+        Ok(session_served(
+            ProviderId::OpenCli,
+            page,
+            match feed {
+                TimelineFeed::ForYou => "timeline page · for you",
+                TimelineFeed::Following => "timeline page · following",
             },
         ))
     }
@@ -846,6 +1001,63 @@ impl Publisher for OpenCliPublisher {
             parts.len()
         ))
     }
+
+    fn engage(
+        &self,
+        action: crate::publish::EngageAction,
+        target_url: &str,
+        text: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
+        self.engage_opencli(action, target_url, text, media)
+    }
+}
+
+impl OpenCliPublisher {
+    /// `opencli twitter like|unlike|retweet|unretweet|quote <url> …`
+    /// through the same silent-background shim as posts/replies.
+    fn engage_opencli(
+        &self,
+        action: crate::publish::EngageAction,
+        target_url: &str,
+        text: Option<&str>,
+        media: &[PathBuf],
+    ) -> Result<String, String> {
+        use crate::publish::EngageAction;
+        let mut args: Vec<String> = vec![
+            "twitter".into(),
+            action.opencli_verb().into(),
+            target_url.into(),
+        ];
+        if action == EngageAction::Quote {
+            let text = text.unwrap_or_default().trim();
+            if text.is_empty() {
+                return Err("write your quote first — nothing was posted".into());
+            }
+            crate::publish::validate_media_paths(media)?;
+            if media.len() > 1 {
+                return Err(
+                    "Quotes can attach 1 image (OpenCLI limit) — remove the extra image first. Nothing was posted."
+                        .into(),
+                );
+            }
+            args.push(text.to_string());
+            if let Some(image) = media.first() {
+                args.push("--image".into());
+                args.push(image.display().to_string());
+            }
+        }
+        let args = opencli_json(&args);
+        let output = self.runner.run(&self.bin, &args)?;
+        if output.status != 0 {
+            return Err(if output.stderr.is_empty() {
+                format!("opencli exited {}", output.status)
+            } else {
+                output.stderr
+            });
+        }
+        Ok(output.stdout)
+    }
 }
 
 struct TwitterCliPublisher {
@@ -950,6 +1162,182 @@ pub fn help_lists_command(text: &str, command: &str) -> bool {
         }
     }
     false
+}
+
+/// Standard base64 (with padding) — just enough to hand a JS payload to
+/// `opencli browser … eval eval(atob('…'))` without quoting/newline issues.
+fn b64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
+/// The in-page timeline walker: fetches GraphQL pages of the home feed
+/// starting at `cursor` (null = top) until `count` tweets are collected
+/// or the bottom cursor dries up, then returns
+/// `{posts, nextCursor}` (or `{error, posts, nextCursor}` on a mid-walk
+/// failure so partial older progress is kept). Mirrors OpenCLI's own
+/// timeline parsing; runs entirely inside the user's logged-in x.com
+/// page, so the ct0 cookie never leaves the page.
+fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> String {
+    let feed_js = serde_json::to_string(feed.opencli_value()).expect("feed js");
+    let cursor_js = match cursor {
+        Some(c) => serde_json::to_string(c).expect("cursor js"),
+        None => "null".to_string(),
+    };
+    format!(
+        r##"(async () => {{
+  const FEED = {feed_js};
+  const WANT = {count};
+  let cursor = {cursor_js};
+  // The browser tab may still be loading x.com when this eval lands
+  // (cold session): poll for the csrf cookie instead of failing fast.
+  let ct0 = null;
+  for (let w = 0; w < 24; w++) {{
+    ct0 = (document.cookie.match(/(?:^|; )ct0=([^;]+)/) || [])[1];
+    if (ct0) break;
+    await new Promise(r => setTimeout(r, 500));
+  }}
+  if (!ct0) return JSON.stringify({{error: "not logged into x.com (no ct0 cookie)"}});
+  const FEATURES = {{"rweb_video_screen_enabled":false,"profile_label_improvements_pcf_label_in_post_enabled":true,"rweb_tipjar_consumption_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_grok_analyze_post_followups_enabled":true,"responsive_web_grok_share_attachment_enabled":true,"articles_preview_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"longform_notetweets_inline_media_enabled":true,"responsive_web_grok_image_annotation_enabled":true,"responsive_web_enhance_cards_enabled":false}};
+  const EP = FEED === "following"
+    ? {{name: "HomeLatestTimeline", qid: "BKB7oi212Fi7kQtCBGE4zA", method: "POST"}}
+    : {{name: "HomeTimeline", qid: "c-CzHF1LboFilMpsx4ZCrQ", method: "GET"}};
+  const headers = {{Authorization: "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA", "X-Csrf-Token": decodeURIComponent(ct0), "X-Twitter-Auth-Type": "OAuth2Session", "X-Twitter-Active-User": "yes"}};
+  async function resolveQid(op) {{
+    try {{
+      const srcs = [...document.scripts].map(s => s.src).filter(Boolean);
+      for (const src of srcs) {{
+        const txt = await (await fetch(src)).text();
+        let i = txt.indexOf(op);
+        let hops = 0;
+        while (i >= 0 && hops < 6) {{
+          const seg = txt.slice(Math.max(0, i - 1200), i + 1200);
+          const m = seg.match(/queryId:"([A-Za-z0-9_-]{{10,}})"/);
+          if (m) return m[1];
+          i = txt.indexOf(op, i + 1); hops++;
+        }}
+      }}
+    }} catch (e) {{}}
+    return null;
+  }}
+  function mediaOf(l) {{
+    const media = (l.extended_entities && l.extended_entities.media) || (l.entities && l.entities.media) || [];
+    const urls = [], posters = [], durations = [];
+    for (const m of media) {{
+      if (!m) continue;
+      if (m.type === "video" || m.type === "animated_gif") {{
+        let best = null;
+        for (const v of (m.video_info && m.video_info.variants) || []) {{
+          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+        }}
+        urls.push(best ? best.url : m.media_url_https);
+        posters.push(m.media_url_https);
+        durations.push((m.video_info && m.video_info.duration_millis) || 0);
+      }} else {{
+        urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
+      }}
+    }}
+    return {{has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations}};
+  }}
+  function extract(result, seen) {{
+    if (!result) return null;
+    const tw = result.tweet || result;
+    const l = tw.legacy || {{}};
+    if (!tw.rest_id || seen.has(tw.rest_id)) return null;
+    seen.add(tw.rest_id);
+    const u = tw.core && tw.core.user_results && tw.core.user_results.result;
+    const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
+    const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
+    return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, ...mediaOf(l)}};
+  }}
+  function parsePage(data, seen) {{
+    const tweets = [];
+    let next = null;
+    const instructions = (data && data.data && data.data.home && data.data.home.home_timeline_urt && data.data.home.home_timeline_urt.instructions) || [];
+    for (const inst of instructions) {{
+      for (const entry of inst.entries || []) {{
+        const c = entry.content || {{}};
+        if (c.cursorType === "Bottom" || (entry.entryId || "").startsWith("cursor-bottom-")) {{ if (c.value) next = c.value; continue; }}
+        const tr = c.itemContent && c.itemContent.tweet_results && c.itemContent.tweet_results.result;
+        if (tr) {{ if (!c.itemContent.promotedMetadata) {{ const tw = extract(tr, seen); if (tw) tweets.push(tw); }} continue; }}
+        for (const item of c.items || []) {{
+          const nested = item.item && item.item.itemContent && item.item.itemContent.tweet_results && item.item.itemContent.tweet_results.result;
+          if (nested && !(item.item.itemContent && item.item.itemContent.promotedMetadata)) {{ const tw = extract(nested, seen); if (tw) tweets.push(tw); }}
+        }}
+      }}
+    }}
+    return {{tweets, next}};
+  }}
+  const seen = new Set();
+  const out = [];
+  let resolved = false;
+  for (let page = 0; page < 14 && out.length < WANT; page++) {{
+    const vars = {{count: Math.min(40, WANT - out.length + 5), includePromotedContent: false, latestControlAvailable: true, requestContext: "launch"}};
+    if (FEED === "for-you") vars.withCommunity = true; else vars.seenTweetIds = [];
+    if (cursor) vars.cursor = cursor;
+    let url, opts;
+    if (EP.method === "GET") {{
+      url = "/i/api/graphql/" + EP.qid + "/" + EP.name + "?variables=" + encodeURIComponent(JSON.stringify(vars)) + "&features=" + encodeURIComponent(JSON.stringify(FEATURES));
+      opts = {{method: "GET", headers, credentials: "include"}};
+    }} else {{
+      url = "/i/api/graphql/" + EP.qid + "/" + EP.name;
+      opts = {{method: "POST", headers: {{...headers, "Content-Type": "application/json"}}, credentials: "include", body: JSON.stringify({{variables: vars, features: FEATURES, queryId: EP.qid}})}};
+    }}
+    const r = await fetch(url, opts);
+    if (!r.ok) {{
+      if (r.status === 404 && !resolved) {{
+        const q = await resolveQid(EP.name);
+        if (q && q !== EP.qid) {{ EP.qid = q; resolved = true; page--; continue; }}
+      }}
+      return JSON.stringify({{error: "http-" + r.status, posts: out, nextCursor: cursor}});
+    }}
+    const data = await r.json();
+    const got = parsePage(data, seen);
+    out.push(...got.tweets);
+    if (!got.next || got.next === cursor) {{ cursor = null; break; }}
+    cursor = got.next;
+  }}
+  return JSON.stringify({{posts: out.slice(0, WANT), nextCursor: cursor}});
+}})()"##
+    )
+}
+
+/// Parse one timeline-eval payload. A mid-walk `error` with posts keeps
+/// the older progress instead of throwing the whole batch away; an
+/// error with nothing fetched is a real failure (rate limit, logged
+/// out, dead session) and must surface as one.
+fn parse_timeline_eval(stdout: &str) -> Result<TimelinePage, String> {
+    let value: Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("timeline session returned unreadable output: {e}"))?;
+    let next_cursor = value
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let posts = match value.get("posts") {
+        Some(rows) if rows.is_array() => {
+            parse_posts(&rows.to_string()).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if let Some(error) = value.get("error").and_then(Value::as_str)
+        && posts.is_empty()
+    {
+        return Err(if error == "http-429" {
+            "X rate-limited the session (HTTP 429) — wait a few minutes and try Load more again".into()
+        } else {
+            format!("timeline session: {error}")
+        });
+    }
+    Ok(TimelinePage { posts, next_cursor })
 }
 
 fn opencli_read(args: &[String]) -> Vec<String> {
@@ -1791,6 +2179,81 @@ mod tests {
         // Empty-id posts are always appended (cannot be deduped).
         let with_blank = append_new_posts(merged, vec![mk("")]);
         assert_eq!(with_blank.len(), 6);
+    }
+
+    #[test]
+    fn timeline_eval_parsing_keeps_pages_cursors_and_partial_progress() {
+        // Clean page: posts parsed, cursor carried through.
+        let page = parse_timeline_eval(
+            r#"{"posts":[{"id":"900","author":"ada","text":"hi","likes":3,"retweets":1,"replies":0,"views":10,"created_at":"","url":"https://x.com/ada/status/900"}],"nextCursor":"CUR2"}"#,
+        )
+        .unwrap();
+        assert_eq!(page.posts.len(), 1);
+        assert_eq!(page.posts[0].id, "900");
+        assert_eq!(page.next_cursor.as_deref(), Some("CUR2"));
+        // Exhausted source: no cursor, no error.
+        let dry = parse_timeline_eval(r#"{"posts":[],"nextCursor":null}"#).unwrap();
+        assert!(dry.posts.is_empty());
+        assert_eq!(dry.next_cursor, None);
+        // Mid-walk rate limit with progress: keep the older posts.
+        let partial = parse_timeline_eval(
+            r#"{"error":"http-429","posts":[{"id":"800","author":"ada","text":"old","likes":0,"retweets":0,"replies":0,"views":0,"created_at":"","url":""}],"nextCursor":"CUR1"}"#,
+        )
+        .unwrap();
+        assert_eq!(partial.posts.len(), 1);
+        assert_eq!(partial.next_cursor.as_deref(), Some("CUR1"));
+        // Hard failures with nothing fetched must surface.
+        assert!(parse_timeline_eval(r#"{"error":"http-429","posts":[],"nextCursor":null}"#)
+            .unwrap_err()
+            .contains("429"));
+        assert!(parse_timeline_eval("not json").is_err());
+    }
+
+    #[test]
+    fn b64_and_eval_js_are_well_formed() {
+        assert_eq!(b64_encode(b""), "");
+        assert_eq!(b64_encode(b"f"), "Zg==");
+        assert_eq!(b64_encode(b"fo"), "Zm8=");
+        assert_eq!(b64_encode(b"foo"), "Zm9v");
+        assert_eq!(b64_encode(b"foobarbaz"), "Zm9vYmFyYmF6");
+        let js = timeline_eval_js(TimelineFeed::Following, Some("CUR\"X"), 160);
+        assert!(js.contains("HomeLatestTimeline"));
+        assert!(js.contains("CUR\\\"X") || js.contains("CUR"));
+        assert!(!js.contains("auth_token"));
+        let js_top = timeline_eval_js(TimelineFeed::ForYou, None, 160);
+        assert!(js_top.contains("HomeTimeline"));
+        assert!(js_top.contains("let cursor = null"));
+    }
+
+    #[test]
+    fn eval_script_ships_in_cmd_safe_chunks() {
+        // Regression: the whole base64 script is ~9.4 KB, over the
+        // 8191-char cmd.exe limit that the Windows opencli.cmd shim
+        // imposes; eval_timeline_page must ship it in <=6000-char
+        // window-global pieces that reassemble exactly.
+        let js = timeline_eval_js(TimelineFeed::Following, None, 580);
+        let b64 = b64_encode(js.as_bytes());
+        assert!(b64.len() > 6000, "script should force multi-chunk shipping");
+        let pieces: Vec<&[u8]> = b64.as_bytes().chunks(6000).collect();
+        assert!(pieces.len() >= 2);
+        for piece in &pieces {
+            assert!(piece.len() <= 6000);
+            // cmd metacharacters must never appear in a shipped arg.
+            let text = std::str::from_utf8(piece).unwrap();
+            assert!(!text.contains(['|', '&', '<', '>', '^', '"', '\'']));
+        }
+        let joined: Vec<u8> = pieces.concat();
+        assert_eq!(joined, b64.as_bytes());
+    }
+
+    #[test]
+    fn engage_verbs_match_opencli_help() {
+        use crate::publish::EngageAction;
+        assert_eq!(EngageAction::Like.opencli_verb(), "like");
+        assert_eq!(EngageAction::Unlike.opencli_verb(), "unlike");
+        assert_eq!(EngageAction::Retweet.opencli_verb(), "retweet");
+        assert_eq!(EngageAction::Unretweet.opencli_verb(), "unretweet");
+        assert_eq!(EngageAction::Quote.opencli_verb(), "quote");
     }
 
     fn dedupe_posts_preserves_order_and_drops_later_dupes() {
