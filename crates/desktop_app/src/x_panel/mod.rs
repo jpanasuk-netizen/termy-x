@@ -170,6 +170,40 @@ pub fn edit_action_goes_to_panel(panel_open: bool, panel_focused: bool, owns_edi
     panel_open && panel_focused && owns_edit_keys
 }
 
+/// What Enter means in a panel text field (Jeremy's per-surface rule):
+/// single-line search/filter boxes (Search, Trends filter, Research,
+/// Lookup) run their search on Enter; tweet-writing boxes (Reply,
+/// Quote, and Compose, handled in `on_key`) insert a newline and NEVER
+/// post. Ctrl+Enter is the one deliberate keyboard submit, writers only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnterAction {
+    RunSearch,
+    Newline,
+    Submit,
+}
+
+fn enter_action(field: TextField, ctrl: bool) -> EnterAction {
+    match field {
+        TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
+            EnterAction::RunSearch
+        }
+        TextField::Reply | TextField::Quote => {
+            if ctrl {
+                EnterAction::Submit
+            } else {
+                EnterAction::Newline
+            }
+        }
+    }
+}
+
+/// In the Compose confirm dialog, plain Enter must never post (that's
+/// how a stray Return published a draft); only Ctrl+Enter submits from
+/// the keyboard. The Post button is always available.
+fn confirm_enter_posts(ctrl: bool) -> bool {
+    ctrl
+}
+
 /// The two simple end-caret text fields (Search query, inline reply).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextField {
@@ -307,6 +341,7 @@ pub struct XPanel {
     /// sets it (text stays, plain error shows instead).
     post_burst: Option<PostBurst>,
     burst_seq: u64,
+    submit_seq: u64,
     /// Verified @handles (existence only ever caches positive results),
     /// the single in-flight lookup, and the last-edit stamp driving the
     /// debounce. Hashtags/cashtags have no existence check on X, so only
@@ -578,6 +613,7 @@ impl XPanel {
             compose_scroll: ScrollHandle::new(),
             post_burst: None,
             burst_seq: 0,
+            submit_seq: 0,
             mention_cache: std::collections::HashMap::new(),
             mention_inflight: None,
             mention_dirty_at: None,
@@ -1895,10 +1931,16 @@ impl XPanel {
                     UiFocus::ConfirmCopy => self.copy_current_part(cx),
                     // ONLY the explicit browser button may open Chrome/x.com.
                     UiFocus::ConfirmBrowser => self.open_current_intent(),
-                    // Default/Enter posts IN-APP. It must never fall through
-                    // to a browser intent (that was the reopen-Chrome bug).
-                    _ => self.post_now_async(cx),
+                    // Plain Enter never posts (a stray Return published
+                    // a draft once); the Post button is the send path.
+                    _ => {}
                 }
+                self.pending_focus = true;
+                cx.notify();
+            }
+            if key == "enter" && confirm_enter_posts(mods.control || mods.platform) {
+                // The one deliberate keyboard submit in the dialog.
+                self.post_now_async(cx);
                 self.pending_focus = true;
                 cx.notify();
             }
@@ -2240,14 +2282,25 @@ impl XPanel {
 
         self.mention_dirty_at = Some(std::time::Instant::now());        let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
-        if key == "enter" && (mods.control || mods.platform) {
-            match field {
-                TextField::Reply => self.submit_reply(cx),
-                TextField::Quote => self.submit_quote(cx),
-                TextField::Trends => self.enter_trends_filter(cx),
-                TextField::Research => self.run_research(cx),
-                TextField::Lookup => self.run_lookup(cx),
-                TextField::Search => self.run_search(cx),
+        if key == "enter" {
+            match enter_action(field, mods.control || mods.platform) {
+                EnterAction::RunSearch => match field {
+                    TextField::Trends => self.enter_trends_filter(cx),
+                    TextField::Research => self.run_research(cx),
+                    TextField::Lookup => self.run_lookup(cx),
+                    _ => self.run_search(cx),
+                },
+                EnterAction::Submit => match field {
+                    TextField::Reply => self.submit_reply(cx),
+                    _ => self.submit_quote(cx),
+                },
+                EnterAction::Newline => match field {
+                    TextField::Reply => self.reply_text.push('\n'),
+                    _ => self.quote_text.push('\n'),
+                },
+            }
+            if field != TextField::Search {
+                self.scroll_small_editor_to_end(field);
             }
             cx.stop_propagation();
             cx.notify();
@@ -2259,22 +2312,6 @@ impl XPanel {
             // Esc clears the filter/chip and restores the full list.
             self.trends_filter.clear();
             self.trends_bucket = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "enter" && !mods.modified() {
-            match field {
-                TextField::Search => self.run_search(cx),
-                TextField::Reply => self.reply_text.push('\n'),
-                TextField::Quote => self.quote_text.push('\n'),
-                TextField::Trends => self.enter_trends_filter(cx),
-                TextField::Research => self.run_research(cx),
-                TextField::Lookup => self.run_lookup(cx),
-            }
-            if field != TextField::Search {
-                self.scroll_small_editor_to_end(field);
-            }
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2590,6 +2627,92 @@ impl XPanel {
         .detach();
     }
 
+    /// Belt-and-braces box close after a successful Reply/Quote: the
+    /// burst timer that used to own this close could lose its seq race
+    /// to a newer burst and leave the editor open forever (Jeremy's
+    /// stuck-box bug). This dedicated timer always closes the box if
+    /// it's still open for the same tweet.
+    fn close_box_after_burst(
+        &mut self,
+        target: BurstTarget,
+        id: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BURST_MS + 150))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                let closed = match target {
+                    BurstTarget::Reply if panel.reply_post_id.as_deref() == Some(id.as_str()) => {
+                        panel.reply_post_id = None;
+                        panel.reply_author.clear();
+                        true
+                    }
+                    BurstTarget::Quote if panel.quote_post_id.as_deref() == Some(id.as_str()) => {
+                        panel.quote_post_id = None;
+                        panel.quote_author.clear();
+                        true
+                    }
+                    _ => false,
+                };
+                if closed {
+                    panel.input_target = if panel.section == XSection::Search {
+                        InputTarget::Search
+                    } else {
+                        InputTarget::Compose
+                    };
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// While a submit is in flight, keep an honest elapsed-time status
+    /// alive (OpenCLI writes take 5-20s on a good day; silence read as
+    /// a hang). Stops when the submit resolves or a newer one starts.
+    fn spawn_still_posting_ticker(
+        &self,
+        cx: &mut Context<Self>,
+        kind: SubmitKind,
+        seq: u64,
+        started: Instant,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(5))
+                    .await;
+                let keep_going = cx.update(|cx| {
+                    this.update(cx, |panel, cx| {
+                        if panel.submit_seq != seq {
+                            return false;
+                        }
+                        let active = match kind {
+                            SubmitKind::Post => panel.posting,
+                            SubmitKind::Reply => panel.reply_posting,
+                            SubmitKind::Quote => panel.quote_posting,
+                        };
+                        if active {
+                            panel.notice = Some(format!(
+                                "Still posting\u{2026} {}s in. OpenCLI drives your session in the background (typically 5\u{2013}20s). No need to click again \u{2014} duplicates are blocked while this runs.",
+                                started.elapsed().as_secs()
+                            ));
+                            cx.notify();
+                        }
+                        active
+                    })
+                    .unwrap_or(false)
+                });
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     fn finish_post_burst(&mut self, target: BurstTarget) {
         self.post_burst = None;
         match target {
@@ -2623,7 +2746,11 @@ impl XPanel {
     /// playing on it: centered over the card, grow + explode.
     fn card_burst_overlay(&self, post: &Post) -> Option<gpui_kit::AnyElement> {
         let burst = self.burst_for(BurstTarget::Card)?;
-        if burst.card_id.as_deref() != Some(post.id.as_str()) {
+        // Engage bursts are keyed by the tweet acted on; on a repost
+        // card that's the embedded original, not the repost wrapper.
+        if burst.card_id.as_deref() != Some(post.id.as_str())
+            && burst.card_id.as_deref() != Some(post.engage_target().id.as_str())
+        {
             return None;
         }
         Some(
@@ -2744,6 +2871,7 @@ impl XPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
                     let Some(publisher) =
@@ -2754,6 +2882,10 @@ impl XPanel {
                                 .to_string(),
                         );
                     };
+                    perf_log(&format!(
+                        "engage probe_ms={}",
+                        probe_started.elapsed().as_millis()
+                    ));
                     publisher
                         .engage(action, &url, None, &[])
                         .map_err(|e| e)
@@ -2925,10 +3057,13 @@ impl XPanel {
         ));
         cx.notify();
         let submit_started = Instant::now();
+        self.submit_seq += 1;
+        self.spawn_still_posting_ticker(cx, SubmitKind::Quote, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
                     let Some(publisher) =
@@ -2939,6 +3074,10 @@ impl XPanel {
                                 .to_string(),
                         );
                     };
+                    perf_log(&format!(
+                        "submit quote probe_ms={}",
+                        probe_started.elapsed().as_millis()
+                    ));
                     publisher.engage(
                         termy_x::publish::EngageAction::Quote,
                         &url,
@@ -2963,6 +3102,7 @@ impl XPanel {
                         ));
                         panel.status = format!("quoted @{}", author);
                         panel.begin_post_burst(BurstTarget::Quote, cx);
+                        panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
@@ -3023,10 +3163,13 @@ impl XPanel {
         ));
         cx.notify();
         let submit_started = Instant::now();
+        self.submit_seq += 1;
+        self.spawn_still_posting_ticker(cx, SubmitKind::Reply, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
                     let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
@@ -3036,6 +3179,10 @@ impl XPanel {
                                 .to_string(),
                         );
                     };
+                    perf_log(&format!(
+                        "submit reply probe_ms={}",
+                        probe_started.elapsed().as_millis()
+                    ));
                     let char_limit =
                         termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
                             .char_limit_or_fallback();
@@ -3073,6 +3220,11 @@ impl XPanel {
                         ));
                         panel.status = format!("replied to @{author}");
                         panel.begin_post_burst(BurstTarget::Reply, cx);
+                        panel.close_box_after_burst(
+                            BurstTarget::Reply,
+                            target_id_for_update.clone(),
+                            cx,
+                        );
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
@@ -3880,6 +4032,14 @@ enum BurstTarget {
     Compose,
     /// On a tweet card itself (Like / Retweet confirmations).
     Card,
+}
+
+/// Which editor a submit belongs to (drives the still-posting ticker).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubmitKind {
+    Post,
+    Reply,
+    Quote,
 }
 
 /// A playing "Posted" burst. Pure timing math lives in
@@ -5594,13 +5754,17 @@ impl XPanel {
     }
 
     fn tweet_card(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let selected = self.reply_post_id.as_deref() == Some(post.id.as_str());
-        let replied = self.replied_ids.iter().any(|id| id == &post.id);
+        // A repost renders its embedded original inline (native-X
+        // style) under a "reposted" header; reply/engage target the
+        // original tweet, exactly as on X.
+        let display = post.engage_target();
+        let selected = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let replied = self.replied_ids.iter().any(|id| id == &display.id);
         // Click handlers capture only the two small strings they need:
         // cloning the whole Post (text + media) for every card on every
         // render was measurable with a 160-post list.
-        let click_id = post.id.clone();
-        let click_author = post.author_handle.clone();
+        let click_id = display.id.clone();
+        let click_author = display.author_handle.clone();
         let mut el = div()
             .id(SharedString::from(format!("x-tweet-{}", post.id)))
             .relative()
@@ -5619,14 +5783,21 @@ impl XPanel {
             })
             .cursor_pointer()
             .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+            .children(post.retweeted.as_ref().map(|_| {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(format!("@{} reposted", post.author_handle))
+            }))
             .child(
                 div()
+                    .mt(px(2.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xd7fbff))
                     .child(format!(
                         "@{} \u{b7} {} likes{} \u{b7} click to reply",
-                        post.author_handle,
-                        post.likes,
+                        display.author_handle,
+                        display.likes,
                         if replied {
                             " \u{b7} \u{2713} Replied"
                         } else {
@@ -5639,10 +5810,10 @@ impl XPanel {
                     .mt(px(4.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe7eefc))
-                    .child(post.text.clone()),
+                    .child(display.text.clone()),
             )
-            .children(self.media_box(post, cx))
-            .child(self.tweet_actions(post, cx))
+            .children(self.media_box(display, cx))
+            .child(self.tweet_actions(display, cx))
             .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
@@ -5659,10 +5830,10 @@ impl XPanel {
                 }),
             );
         if selected {
-            el = el.child(self.reply_box(post, cx));
+            el = el.child(self.reply_box(display, cx));
         }
-        if self.quote_post_id.as_deref() == Some(post.id.as_str()) {
-            el = el.child(self.quote_box(post, cx));
+        if self.quote_post_id.as_deref() == Some(display.id.as_str()) {
+            el = el.child(self.quote_box(display, cx));
         }
         el.into_any_element()
     }
@@ -6900,7 +7071,7 @@ impl XPanel {
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Nothing is posted automatically. Post now posts in-app (no browser). Open in browser is optional and only happens if you click it."),
+                            .child("Nothing is posted automatically. Send with the Post now button (or Ctrl+Enter) \u{2014} plain Enter never posts. Open in browser is optional and only happens if you click it."),
                     )
                     .children(part_rows)
                     .child(div().text_size(px(13.0)).child(format!(
@@ -7025,10 +7196,13 @@ impl XPanel {
         });
         cx.notify();
         let submit_started = Instant::now();
+        self.submit_seq += 1;
+        self.spawn_still_posting_ticker(cx, SubmitKind::Post, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
+                    let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
                     let Some(publisher) =
@@ -7039,6 +7213,10 @@ impl XPanel {
                                 .to_string(),
                         );
                     };
+                    perf_log(&format!(
+                        "submit post probe_ms={}",
+                        probe_started.elapsed().as_millis()
+                    ));
                     // A publisher that cannot upload must say so, not fake it:
                     // OpenCLI supports --images; twitter-cli/official reject media.
                     let char_limit =
@@ -7290,11 +7468,29 @@ mod edit_keys_tests {
         assert_eq!(next_timeline_limit(9999), None);
     }
 
-    use super::{InputTarget, XSection, edit_action_goes_to_panel, edit_keys_owned};
+    use super::{
+        EnterAction, InputTarget, TextField, XSection, confirm_enter_posts, edit_action_goes_to_panel,
+        edit_keys_owned, enter_action,
+    };
 
     #[test]
     fn reply_and_search_own_paste_but_terminal_states_do_not() {
         // Inline reply open (any non-Search section): owns edit chords.
+        // Enter per-surface matrix (Jeremy's rule): search/filter
+        // boxes search on Enter; writing boxes newline, never post;
+        // Ctrl+Enter is the only keyboard submit for writers.
+        assert_eq!(enter_action(TextField::Search, false), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Search, true), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Trends, false), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Research, false), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Lookup, false), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Reply, false), EnterAction::Newline);
+        assert_eq!(enter_action(TextField::Quote, false), EnterAction::Newline);
+        assert_eq!(enter_action(TextField::Reply, true), EnterAction::Submit);
+        assert_eq!(enter_action(TextField::Quote, true), EnterAction::Submit);
+        // Confirm dialog: plain Enter never posts, Ctrl+Enter does.
+        assert!(!confirm_enter_posts(false));
+        assert!(confirm_enter_posts(true));
         // Focus routing matrix: panel must actually hold focus before
         // any edit chord is intercepted (the Ctrl+C-in-PowerShell bug).
         assert!(edit_action_goes_to_panel(true, true, true));
