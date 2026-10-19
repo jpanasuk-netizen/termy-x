@@ -358,6 +358,15 @@ pub fn group_trends(trends: &[Trend]) -> Vec<(TrendBucket, Vec<Trend>)> {
 
 /// Case-insensitive instant filter over name, query, category, and
 /// place. A multi-word filter requires every word to match somewhere.
+///
+/// Perf (Lane-1 stack): fields are concatenated into one buffer and
+/// lowercased in a single pass, instead of format! + 4 to_lowercase
+/// allocations per trend (0.084ms -> 0.037-0.047ms per 500 trends). An
+/// Aho-Corasick version was measured and REVERTED: rebuilding the
+/// automaton on every call cost 0.239ms vs 0.084ms for this path on
+/// 500 trends (examples/perf_bench) - it pays off only with a
+/// persistent automaton and many patterns, not a per-keystroke
+/// rebuild. Semantics unchanged; the model tests pin the behavior.
 pub fn filter_trends(trends: &[Trend], filter: &str) -> Vec<Trend> {
     let words: Vec<String> = filter
         .to_lowercase()
@@ -370,13 +379,17 @@ pub fn filter_trends(trends: &[Trend], filter: &str) -> Vec<Trend> {
     sort_trends(trends)
         .into_iter()
         .filter(|t| {
-            let hay = format!(
-                "{} {} {} {}",
-                t.name.to_lowercase(),
-                t.query.to_lowercase(),
-                t.category.as_deref().unwrap_or_default().to_lowercase(),
-                t.place.as_deref().unwrap_or_default().to_lowercase(),
-            );
+            let mut raw = String::with_capacity(t.name.len() + t.query.len() + 24);
+            for field in [
+                t.name.as_str(),
+                t.query.as_str(),
+                t.category.as_deref().unwrap_or_default(),
+                t.place.as_deref().unwrap_or_default(),
+            ] {
+                raw.push_str(field);
+                raw.push(' ');
+            }
+            let hay = raw.to_lowercase();
             words.iter().all(|w| hay.contains(w.as_str()))
         })
         .collect()
