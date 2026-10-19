@@ -32,6 +32,13 @@ mod theme_store;
 mod ui;
 mod workspace_store;
 
+/// Global allocator (Lane-1 perf stack): mimalloc cuts allocation
+/// cost across every thread without touching allocation call sites.
+/// Measured with examples/perf_bench before/after; reverting is
+/// deleting these three lines plus the Cargo dep.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use crate::terminal_ui::TmuxClient;
 use commands::{OpenConfig, OpenSettings};
 use deeplink::{DeepLinkArgument, DeepLinkRoute};

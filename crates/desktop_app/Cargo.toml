@@ -45,6 +45,7 @@ resvg = "0.46.0"
 unicode-width = { workspace = true }
 termy_core = { path = "../core" }
 termy_x = { path = "../x_core" }
+mimalloc = "0.1"
 
 
 [target."cfg(not(target_os = \"windows\"))".dependencies]
