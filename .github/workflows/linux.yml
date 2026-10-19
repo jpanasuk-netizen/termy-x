@@ -1,0 +1,123 @@
+name: Linux
+
+# Focused cross-platform gate for the Linux migration:
+#   * Linux  x86_64-unknown-linux-gnu -- full build, headless tests, binary artifact
+#   * Windows x86_64-pc-windows-msvc  -- build + headless tests (no-regression proof)
+# The broader macOS/release/architecture workflows are untouched and keep running.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (x86_64-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      # GPUI / desktop system dependencies. This list mirrors the set already
+      # proven by architecture-checks.yml (workspace-tests) and release.yml
+      # (build-linux) -- do not trim it without a failing build proving a
+      # package is unused.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            clang \
+            pkg-config \
+            fonts-dejavu-core \
+            libfontconfig-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libasound2-dev \
+            libvulkan1
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: linux-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+
+      # Headless crates only: termy_x (Termy X core), its CLI, and termy_core
+      # need no display/GPU, so they can test on a bare runner. The GPUI
+      # desktop crate is build-checked below but not unit-tested here.
+      - name: Test headless crates (Linux)
+        run: cargo test --locked -p termy_x -p termy_x_cli -p termy_core --target x86_64-unknown-linux-gnu
+
+      - name: Build Linux binaries
+        run: cargo build --locked --release -p termy -p termy_cli -p termy_x_cli --target x86_64-unknown-linux-gnu
+
+      - name: Smoke-check Linux binaries
+        run: |
+          set -euo pipefail
+          file target/x86_64-unknown-linux-gnu/release/termy \
+               target/x86_64-unknown-linux-gnu/release/termy-cli \
+               target/x86_64-unknown-linux-gnu/release/termy-xcli
+          target/x86_64-unknown-linux-gnu/release/termy-xcli --help >/dev/null
+
+      - name: Upload Linux binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-linux-x86_64-unknown-linux-gnu
+          path: |
+            target/x86_64-unknown-linux-gnu/release/termy
+            target/x86_64-unknown-linux-gnu/release/termy-cli
+            target/x86_64-unknown-linux-gnu/release/termy-xcli
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: windows-x86_64-pc-windows-msvc
+          cache-on-failure: true
+
+      # Same headless crates as the Linux job, so a platform-specific break
+      # in the shared Termy X / core code fails on the side that broke.
+      - name: Test headless crates (Windows)
+        run: cargo test --locked -p termy_x -p termy_x_cli -p termy_core --target x86_64-pc-windows-msvc
+
+      # Build (not just check) the desktop + CLI crates: this is the
+      # no-regression proof that the working Windows build still links.
+      - name: Build Windows binaries
+        run: cargo build --locked -p termy -p termy_cli -p termy_x_cli --target x86_64-pc-windows-msvc
