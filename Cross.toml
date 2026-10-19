@@ -1,0 +1,5 @@
+# cargo-cross config for x86_64-unknown-linux-gnu. UNVERIFIED: neither cross
+# nor Docker/Podman is installed on the box where this was written
+# (2026-10-19). See docs/LINUX-BUILD.md Route B.
+[target.x86_64-unknown-linux-gnu]
+dockerfile = "Cross.dockerfile"
