@@ -510,22 +510,27 @@ fn hide_console(command: &mut Command) {
     }
 }
 
+/// After the child exits, its pipes normally close at once. A
+/// grandchild that inherited them (a CLI daemon, a browser helper)
+/// can hold them open forever; joining the reader threads unbounded
+/// turned that into the "posting takes forever" hang even though the
+/// command itself had finished. Drain what arrived, with a grace cap.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<CommandOutput, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_handle = std::thread::spawn(move || read_pipe(stdout));
-    let err_handle = std::thread::spawn(move || read_pipe(stderr));
+    let out_rx = spawn_pipe_reader(child.stdout.take());
+    let err_rx = spawn_pipe_reader(child.stderr.take());
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() > timeout => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 return Err("command timed out".to_string());
             }
@@ -533,8 +538,8 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Comman
             Err(error) => return Err(error.to_string()),
         }
     };
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let stdout = collect_pipe(&out_rx, PIPE_DRAIN_GRACE);
+    let stderr = collect_pipe(&err_rx, PIPE_DRAIN_GRACE);
     Ok(CommandOutput {
         status: status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -542,12 +547,69 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Comman
     })
 }
 
-fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
+/// Stream pipe chunks over a channel so the caller can stop waiting
+/// (and keep what already arrived) when a pipe stays open past exit.
+fn spawn_pipe_reader(
+    pipe: Option<impl Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn collect_pipe(rx: &std::sync::mpsc::Receiver<Vec<u8>>, grace: Duration) -> Vec<u8> {
     let mut buffer = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut buffer);
+    let deadline = Instant::now() + grace;
+    loop {
+        let Some(rest) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(rest) {
+            Ok(chunk) => buffer.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
     }
     buffer
+}
+
+/// Kill the whole process tree on timeout. On Windows the direct
+/// child is usually `cmd.exe` for the `opencli.cmd` shim; killing only
+/// it leaves the node CLI alive in the background, where it can finish
+/// a post minutes later after the UI already reported a timeout
+/// (a duplicate-post trap when the user retries).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let killed = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !killed {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
 }
 
 type ScriptedCallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
@@ -928,6 +990,29 @@ mod tests {
             output.status,
             output.stdout,
             output.stderr
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_child_with_pipe_holding_grandchild_does_not_hang() {
+        // `sh` exits at once; the backgrounded sleep inherits stdout
+        // and holds the pipe open 30s. The old join-the-readers code
+        // blocked for all 30s (or forever for a daemon); the bounded
+        // drain must return quickly, keeping already-written output.
+        use super::output_with_timeout;
+        use std::process::Command;
+        use std::time::Duration;
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo early-marker; (sleep 30 &)"]);
+        let started = std::time::Instant::now();
+        let output = output_with_timeout(command, Duration::from_secs(60)).expect("runs");
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("early-marker"), "{output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "drain took {:?}",
+            started.elapsed()
         );
     }
 }
