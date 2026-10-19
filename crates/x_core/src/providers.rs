@@ -3111,6 +3111,26 @@ mod tests {
     }
 
     #[test]
+    fn write_timeout_error_tells_user_to_check_before_retrying() {
+        let msg = write_timeout_error(
+            "command timed out".to_string(),
+            "posting",
+            POST_TIMEOUT,
+        );
+        assert!(msg.contains("90s"), "{msg}");
+        assert!(msg.contains("check X before retrying"), "{msg}");
+        // Non-timeout failures pass through untouched.
+        assert_eq!(
+            write_timeout_error("boom".to_string(), "posting", POST_TIMEOUT),
+            "boom"
+        );
+        // Budgets stay in the measured healthy band (writes land in
+        // 5-20s live); a 180s blanket timeout reads as an infinite hang.
+        assert_eq!(POST_TIMEOUT.as_secs(), 90);
+        assert_eq!(ENGAGE_TIMEOUT.as_secs(), 60);
+    }
+
+    #[test]
     fn eval_scripts_unwrap_retweeted_status() {
         let timeline = timeline_eval_js(TimelineFeed::ForYou, None, 20);
         assert!(timeline.contains("retweeted_status_result"), "timeline unwraps reposts");
