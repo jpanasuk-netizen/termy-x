@@ -170,6 +170,45 @@ pub fn edit_action_goes_to_panel(panel_open: bool, panel_focused: bool, owns_edi
     panel_open && panel_focused && owns_edit_keys
 }
 
+/// One tweet card's text, selected by dragging across it. GPUI renders
+/// card text as styled blocks, not a native selectable text control,
+/// so selection granularity is the whole tweet text: a drag (past
+/// [`CARD_DRAG_PX`]) highlights the tweet's full text and makes it the
+/// Ctrl+C target; a plain click keeps the old click-to-reply action.
+/// Which selection Ctrl+C takes is decided by focus: the card
+/// selection only wins while `card_copy_focus` is set (set by the
+/// drag, cleared the moment the Compose editor is clicked into).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CardTextSelection {
+    pub post_id: String,
+    pub text: String,
+}
+
+/// Mouse travel (px) that turns a press on tweet text into a drag
+/// selection instead of a click.
+pub const CARD_DRAG_PX: f32 = 6.0;
+
+pub fn card_drag_promotes(start: (f32, f32), now: (f32, f32)) -> bool {
+    let dx = now.0 - start.0;
+    let dy = now.1 - start.1;
+    (dx * dx + dy * dy).sqrt() > CARD_DRAG_PX
+}
+
+/// The text Ctrl+C copies: a focused card selection beats the editor
+/// selection; without card focus, the editor selection is used.
+pub fn copy_text_for_focus(
+    card_copy_focus: bool,
+    card: Option<&CardTextSelection>,
+    editor: Option<String>,
+) -> Option<String> {
+    if card_copy_focus
+        && let Some(card) = card
+    {
+        return Some(card.text.clone());
+    }
+    editor
+}
+
 /// What Enter means in a panel text field (Jeremy's per-surface rule):
 /// single-line search/filter boxes (Search, Trends filter, Research,
 /// Lookup) run their search on Enter; tweet-writing boxes (Reply,
@@ -397,6 +436,13 @@ pub struct XPanel {
     caret: usize,
     /// Selection anchor; range is between anchor and caret when set.
     sel_anchor: Option<usize>,
+    /// Tweet text selected by dragging across a card (see
+    /// [`CardTextSelection`]), plus the in-progress drag start
+    /// `(post_id, text, x, y)` and whether the card currently owns
+    /// Ctrl+C over the Compose editor.
+    card_text_selection: Option<CardTextSelection>,
+    card_drag_start: Option<(String, String, f32, f32)>,
+    card_copy_focus: bool,
     /// Keyboard / Tab focus target for neon chrome.
     ui_focus: UiFocus,
     /// Dedup KeyDown + action Paste within the same chord.
@@ -661,6 +707,9 @@ impl XPanel {
             compose_focused: false,
             caret: 0,
             sel_anchor: None,
+            card_text_selection: None,
+            card_drag_start: None,
+            card_copy_focus: false,
             ui_focus: UiFocus::Compose,
             last_edit_chord_at: None,
             search_input: String::new(),
@@ -2080,6 +2129,20 @@ impl XPanel {
             return;
         }
 
+        // A drag-selected tweet owns Ctrl+C until the editor is
+        // clicked back into (focus decides; see CardTextSelection).
+        if (mods.control || mods.platform)
+            && key.eq_ignore_ascii_case("c")
+            && self.card_copy_focus
+            && let Some(selected) = self.active_copy_text()
+        {
+            cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         // Typing goes to the compose editor.
         if self.ui_focus != UiFocus::Compose {
             self.focus_compose_editor();
@@ -2189,6 +2252,10 @@ impl XPanel {
     }
 
     fn focus_compose_editor(&mut self) {
+        // Editor takes focus: Ctrl+C belongs to the draft again.
+        self.card_copy_focus = false;
+        self.card_text_selection = None;
+        self.card_drag_start = None;
         self.compose_focused = true;
         self.ui_focus = UiFocus::Compose;
         if self.compose.is_empty() {
@@ -2226,6 +2293,9 @@ impl XPanel {
     }
 
     pub fn owns_edit_keys(&self) -> bool {
+        if self.card_copy_focus && self.card_text_selection.is_some() {
+            return true;
+        }
         edit_keys_owned(
             self.confirm,
             self.bearer_mode,
@@ -2275,11 +2345,16 @@ impl XPanel {
     /// so they return None; the action is still swallowed by the caller
     /// so the terminal selection is never copied over the clipboard.
     pub fn active_copy_text(&self) -> Option<String> {
-        if self.input_target == InputTarget::Compose {
+        let editor = if self.input_target == InputTarget::Compose {
             self.compose_selection_text()
         } else {
             None
-        }
+        };
+        copy_text_for_focus(
+            self.card_copy_focus,
+            self.card_text_selection.as_ref(),
+            editor,
+        )
     }
 
     /// SelectAll for the active field. Search/reply fields have no
@@ -5986,6 +6061,17 @@ impl XPanel {
         // render was measurable with a 160-post list.
         let click_id = display.id.clone();
         let click_author = display.author_handle.clone();
+        // Drag-to-select state for this card's text (see
+        // CardTextSelection): each mouse handler gets its own clones.
+        let text_selected = self
+            .card_text_selection
+            .as_ref()
+            .is_some_and(|sel| sel.post_id == display.id);
+        // Selection copies exactly what the card shows (card_text trims a
+        // bare RT's prefix; for an embedded repost it is the original text).
+        let (down_id, down_text) = (display.id.clone(), post.card_text().to_string());
+        let (move_id, move_text) = (display.id.clone(), post.card_text().to_string());
+        let (up_id, up_author) = (display.id.clone(), display.author_handle.clone());
         let mut el = div()
             .id(SharedString::from(format!("x-tweet-{scope}-{}", post.id)))
             .relative()
@@ -6038,17 +6124,96 @@ impl XPanel {
             )
             .child(
                 div()
+                    .id(SharedString::from(format!("x-tweet-text-{scope}-{}", post.id)))
                     .mt(px(4.0))
+                    .px(px(2.0))
+                    .rounded(px(4.0))
                     .text_size(px(13.0))
                     .text_color(rgb(0xe7eefc))
-                    .child(post.card_text().to_string()),
+                    .bg(if text_selected { tint(0xff4fa3, 90) } else { tint(0xff4fa3, 0) })
+                    .child(post.card_text().to_string())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            let y: f32 = event.position.y.into();
+                            this.card_drag_start =
+                                Some((down_id.clone(), down_text.clone(), x, y));
+                            // The card's own click-to-reply now fires on
+                            // mouse-up (below) so a drag can select first.
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        let Some((drag_id, drag_text, start_x, start_y)) =
+                            this.card_drag_start.clone()
+                        else {
+                            return;
+                        };
+                        if drag_id != move_id {
+                            return;
+                        }
+                        let x: f32 = event.position.x.into();
+                        let y: f32 = event.position.y.into();
+                        if card_drag_promotes((start_x, start_y), (x, y)) {
+                            this.card_text_selection = Some(CardTextSelection {
+                                post_id: move_id.clone(),
+                                text: move_text.clone(),
+                            });
+                            this.card_copy_focus = true;
+                            let _ = drag_text;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseUpEvent, _, cx| {
+                            let was_drag = this.card_drag_start.take().is_some();
+                            let selected_here = this
+                                .card_text_selection
+                                .as_ref()
+                                .is_some_and(|sel| sel.post_id == up_id)
+                                && this.card_copy_focus;
+                            if selected_here {
+                                this.notice = Some(
+                                    "Tweet text selected \u{b7} Ctrl+C copies it \u{b7} click your draft to give Ctrl+C back to the editor."
+                                        .into(),
+                                );
+                            } else if was_drag {
+                                // Plain click on the text: same action the
+                                // card click has always done.
+                                if this.reply_post_id.as_deref() == Some(up_id.as_str()) {
+                                    this.input_target = InputTarget::Reply;
+                                    this.pending_focus = true;
+                                } else {
+                                    this.open_reply_parts(&up_id, &up_author);
+                                }
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
             )
+            .children(text_selected.then(|| {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xf0a8d0))
+                    .child("Selected \u{b7} Ctrl+C copies this tweet")
+            }))
             .children(self.media_box_scoped(display, scope, cx))
             .child(self.tweet_actions_scoped(display, scope, cx))
             .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.card_copy_focus = false;
+                    this.card_text_selection = None;
+                    this.card_drag_start = None;
                     if this.reply_post_id.as_deref() == Some(click_id.as_str()) {
                         // Second click on the open tweet just refocuses it.
                         this.input_target = InputTarget::Reply;
@@ -7703,6 +7868,28 @@ mod edit_keys_tests {
         EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel,
         edit_keys_owned, enter_action,
     };
+    use super::{CardTextSelection, card_drag_promotes, copy_text_for_focus};
+
+    #[test]
+    fn card_drag_needs_real_travel_and_focus_decides_the_copy() {
+        assert!(!card_drag_promotes((10.0, 10.0), (12.0, 11.0)), "a click is not a selection");
+        assert!(card_drag_promotes((10.0, 10.0), (40.0, 10.0)), "a drag selects");
+        let card = CardTextSelection {
+            post_id: "1".into(),
+            text: "the tweet".into(),
+        };
+        // Card has focus: Ctrl+C takes the tweet, not the draft.
+        assert_eq!(
+            copy_text_for_focus(true, Some(&card), Some("draft selection".into())).as_deref(),
+            Some("the tweet")
+        );
+        // Editor clicked back into focus: draft selection wins again.
+        assert_eq!(
+            copy_text_for_focus(false, Some(&card), Some("draft selection".into())).as_deref(),
+            Some("draft selection")
+        );
+        assert_eq!(copy_text_for_focus(false, Some(&card), None), None);
+    }
 
     #[test]
     fn reply_and_search_own_paste_but_terminal_states_do_not() {
