@@ -404,25 +404,42 @@ impl XProvider for MockProvider {
         }))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
+        // Fixture set spans the real category shapes the live payload
+        // carries (category + rank), enough to exercise Top-20 + groups.
+        let place = place.map(str::to_string);
+        let mk = |name: &str, category: &str, rank: u64, volume: u64| Trend {
+            name: name.into(),
+            query: name.into(),
+            volume: Some(volume),
+            place: place.clone(),
+            rank: Some(rank),
+            category: Some(category.into()),
+        };
         let mut trends = vec![
-            Trend {
-                name: "#TermyX".into(),
-                query: "Termy X".into(),
-                volume: Some(2400),
-                place: place.map(str::to_string),
-            },
-            Trend {
-                name: "GPUI".into(),
-                query: "GPUI terminal".into(),
-                volume: Some(860),
-                place: place.map(str::to_string),
-            },
-            Trend {
-                name: "weighted counts".into(),
-                query: "twitter text length".into(),
-                volume: Some(140),
-                place: place.map(str::to_string),
-            },
+            mk("Election Night Live", "Politics", 1, 182_000),
+            mk("#TermyX", "Technology", 2, 2_400),
+            mk("Storm Front Hits Coast", "News", 3, 96_500),
+            mk("#NFLSunday", "Sports", 4, 210_300),
+            mk("GPUI", "Technology", 5, 860),
+            mk("Award Show Moments", "Entertainment", 6, 74_200),
+            mk("Senate Vote Watch", "Politics", 7, 41_900),
+            mk("weighted counts", "Technology", 8, 140),
+            mk("Derby Day", "Sports", 9, 58_700),
+            mk("Morning Headlines", "News", 10, 33_100),
+            mk("Indie Game Launch", "Entertainment", 11, 12_400),
+            mk("Rocket Launch Window", "Technology", 12, 27_800),
+            mk("City Marathon", "Sports", 13, 9_300),
+            mk("Policy Town Hall", "Politics", 14, 6_100),
+            mk("Festival Weekend", "Trending in United States", 15, 4_400),
+            mk("Local Bakery Fame", "Trending in United States", 16, 1_150),
+            mk("#RustLang", "Technology", 17, 3_900),
+            mk("Championship Final", "Sports", 18, 88_900),
+            mk("Late Night Interview", "Entertainment", 19, 5_600),
+            mk("Market Open Thread", "Technology", 20, 7_700),
+            mk("School Board Recall", "Politics", 21, 2_050),
+            mk("River Festival", "Trending in United States", 22, 640),
+            mk("Comet Watch Party", "News", 23, 1_480),
+            mk("Esports Grand Final", "Entertainment", 24, 19_600),
         ];
         trends.truncate(limit);
         Ok(served(trends, "fixture trends"))
@@ -1934,11 +1951,27 @@ fn parse_trends(text: &str, place: Option<&str>) -> Result<Vec<Trend>, String> {
                 query: first_str(item, &["query", "name"])
                     .unwrap_or(&name)
                     .to_string(),
+                // The live trending payload has no volume (X dropped
+                // post counts); keep parsing it for payloads that do.
                 volume: item
                     .get("volume")
                     .or_else(|| item.get("tweet_volume"))
-                    .and_then(Value::as_u64),
+                    .or_else(|| item.get("tweets"))
+                    .and_then(|v| {
+                        v.as_u64().or_else(|| {
+                            v.as_str().and_then(|s| {
+                                s.chars()
+                                    .filter(char::is_ascii_digit)
+                                    .collect::<String>()
+                                    .parse()
+                                    .ok()
+                            })
+                        })
+                    }),
                 place: place.map(str::to_string),
+                rank: item.get("rank").and_then(Value::as_u64),
+                category: first_str(item, &["category", "context", "category_name"])
+                    .map(str::to_string),
                 name,
             })
         })
@@ -2623,6 +2656,25 @@ mod tests {
     }
 
     #[test]
+    fn opencli_trending_payload_parses_rank_topic_category() {
+        // Exact shape of `opencli twitter trending -f json` (1.8.8/2.x):
+        // rank/topic/category only — X dropped post counts, so volume
+        // must come out None, never fabricated.
+        let json = r##"[
+          {"rank": 1, "topic": "Election Night", "category": "Politics"},
+          {"rank": 2, "topic": "#NFLSunday", "category": "Sports"},
+          {"rank": 3, "topic": "Local Fest", "category": "Trending in United States"}
+         ]"##;
+        let trends = parse_trends(json, Some("worldwide")).unwrap();
+        assert_eq!(trends.len(), 3);
+        assert_eq!(trends[0].name, "Election Night");
+        assert_eq!(trends[0].rank, Some(1));
+        assert_eq!(trends[0].category.as_deref(), Some("Politics"));
+        assert_eq!(trends[0].volume, None);
+        assert_eq!(trends[2].category.as_deref(), Some("Trending in United States"));
+    }
+
+    #[test]
     fn opencli_array_profile_parses_name_bio_and_counts() {
         let runner = Arc::new(ScriptedRunner::new());
         runner.script(
@@ -2748,6 +2800,26 @@ mod tests {
     }
 
     #[test]
+    fn research_query_reaches_the_rss_search_url() {
+        // The panel's typed query must flow verbatim (percent-encoded)
+        // into the backing searches — no hardcoded topic substitutions.
+        let runner = ScriptedRunner::new();
+        runner.script(
+            "curl",
+            &["-fsSL"],
+            "<rss><item><title>Quantum dots paper</title><link>https://example.com/q</link></item></rss>",
+        );
+        let hits = research_topic("quantum dots", &runner, &quiet_config());
+        assert!(hits.iter().any(|hit| hit.title == "Quantum dots paper"));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls.iter().any(|(_bin, args)| args
+                .iter()
+                .any(|a| a.contains("reddit.com/search.rss?q=quantum%20dots"))),
+            "typed query must reach the RSS search URL: {calls:?}"
+        );
+    }
+
     fn rss_titles_are_research_hits() {
         let runner = ScriptedRunner::new();
         runner.script(

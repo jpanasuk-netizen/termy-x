@@ -218,6 +218,149 @@ pub struct Trend {
     pub query: String,
     pub volume: Option<u64>,
     pub place: Option<String>,
+    /// Provider rank (1-based) when the payload carries one.
+    #[serde(default)]
+    pub rank: Option<u64>,
+    /// Verbatim provider context/category line (e.g. "Sports" or
+    /// "Trending in United States"). Never synthesized: `None` renders
+    /// no category line rather than an invented one.
+    #[serde(default)]
+    pub category: Option<String>,
+}
+
+/// Display buckets trends are grouped under. Derived ONLY from the
+/// provider's real category/context string; anything unrecognized or
+/// missing lands in `Other` — grouping never invents a topic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrendBucket {
+    News,
+    Politics,
+    Sports,
+    Entertainment,
+    Technology,
+    Other,
+}
+
+impl TrendBucket {
+    pub fn label(self) -> &'static str {
+        match self {
+            TrendBucket::News => "News",
+            TrendBucket::Politics => "Politics",
+            TrendBucket::Sports => "Sports",
+            TrendBucket::Entertainment => "Entertainment",
+            TrendBucket::Technology => "Technology",
+            TrendBucket::Other => "Other",
+        }
+    }
+
+    /// Canonical display order for groups and chips.
+    pub fn all() -> [TrendBucket; 6] {
+        [
+            TrendBucket::News,
+            TrendBucket::Politics,
+            TrendBucket::Sports,
+            TrendBucket::Entertainment,
+            TrendBucket::Technology,
+            TrendBucket::Other,
+        ]
+    }
+}
+
+/// Bucket a trend by its real category string. Local/context lines like
+/// "Trending in United States" carry no topic and land in Other.
+pub fn trend_bucket(category: Option<&str>) -> TrendBucket {
+    let Some(raw) = category else {
+        return TrendBucket::Other;
+    };
+    let c = raw.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| c.contains(n));
+    if has(&["politic", "election", "government", "congress", "senate"]) {
+        TrendBucket::Politics
+    } else if has(&[
+        "sport", "nfl", "nba", "mlb", "nhl", "soccer", "football", "baseball",
+        "basketball", "tennis", "golf", "ufc", "wwe", "f1", "racing", "hockey",
+        "olympic", "cricket", "boxing",
+    ]) {
+        TrendBucket::Sports
+    } else if has(&["news", "breaking", "world news", "journalism"]) {
+        TrendBucket::News
+    } else if has(&[
+        "entertainment", "music", "movie", "film", "tv", "television",
+        "celebrity", "gaming", "game", "anime", "comedy", "streaming",
+    ]) {
+        TrendBucket::Entertainment
+    } else if has(&[
+        "tech", "science", "ai", "artificial intelligence", "software",
+        "computing", "space", "crypto", "business", "finance",
+    ]) {
+        TrendBucket::Technology
+    } else {
+        TrendBucket::Other
+    }
+}
+
+/// Trends sorted for display: provider rank order when ranks exist,
+/// otherwise payload order.
+pub fn sort_trends(trends: &[Trend]) -> Vec<Trend> {
+    let mut out = trends.to_vec();
+    out.sort_by_key(|t| t.rank.unwrap_or(u64::MAX));
+    out
+}
+
+/// Group ALL trends by bucket (canonical order, empty groups omitted).
+/// Every trend lands in exactly one group, so group counts sum to the
+/// input length — the Top-20 overlap is presentational, not data loss.
+pub fn group_trends(trends: &[Trend]) -> Vec<(TrendBucket, Vec<Trend>)> {
+    let sorted = sort_trends(trends);
+    TrendBucket::all()
+        .into_iter()
+        .filter_map(|bucket| {
+            let items: Vec<Trend> = sorted
+                .iter()
+                .filter(|t| trend_bucket(t.category.as_deref()) == bucket)
+                .cloned()
+                .collect();
+            (!items.is_empty()).then_some((bucket, items))
+        })
+        .collect()
+}
+
+/// Case-insensitive instant filter over name, query, category, and
+/// place. A multi-word filter requires every word to match somewhere.
+pub fn filter_trends(trends: &[Trend], filter: &str) -> Vec<Trend> {
+    let words: Vec<String> = filter
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    if words.is_empty() {
+        return sort_trends(trends);
+    }
+    sort_trends(trends)
+        .into_iter()
+        .filter(|t| {
+            let hay = format!(
+                "{} {} {} {}",
+                t.name.to_lowercase(),
+                t.query.to_lowercase(),
+                t.category.as_deref().unwrap_or_default().to_lowercase(),
+                t.place.as_deref().unwrap_or_default().to_lowercase(),
+            );
+            words.iter().all(|w| hay.contains(w.as_str()))
+        })
+        .collect()
+}
+
+/// Rank to show for a trend: the provider rank, else its 1-based
+/// position in the full sorted list.
+pub fn trend_rank(trend: &Trend, sorted: &[Trend]) -> u64 {
+    trend.rank.unwrap_or_else(|| {
+        sorted
+            .iter()
+            .position(|t| t.name == trend.name && t.query == trend.query)
+            .map(|i| i as u64 + 1)
+            .unwrap_or(0)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,7 +468,80 @@ pub fn trends_from_posts(posts: &[Post], place: Option<&str>) -> Vec<Trend> {
                 name,
                 volume: Some(post.engagement()),
                 place: place.map(str::to_string),
+                rank: None,
+                category: None,
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod trend_tests {
+    use super::{filter_trends, group_trends, trend_bucket, Trend, TrendBucket};
+
+    fn trend(name: &str, category: Option<&str>, rank: u64) -> Trend {
+        Trend {
+            name: name.into(),
+            query: name.into(),
+            volume: None,
+            place: Some("worldwide".into()),
+            rank: Some(rank),
+            category: category.map(str::to_string),
+        }
+    }
+
+    fn sample() -> Vec<Trend> {
+        vec![
+            trend("#NFLSunday", Some("Sports"), 3),
+            trend("Election Night", Some("Politics"), 1),
+            trend("Breaking: Storm", Some("News"), 2),
+            trend("#AI", Some("Technology"), 5),
+            trend("Local Fest", Some("Trending in United States"), 4),
+            trend("Mystery Topic", None, 6),
+        ]
+    }
+
+    #[test]
+    fn bucketing_uses_real_categories_only() {
+        assert_eq!(trend_bucket(Some("Sports")), TrendBucket::Sports);
+        assert_eq!(trend_bucket(Some("NFL · Trending")), TrendBucket::Sports);
+        assert_eq!(trend_bucket(Some("Politics")), TrendBucket::Politics);
+        assert_eq!(trend_bucket(Some("Technology")), TrendBucket::Technology);
+        // Context lines and missing categories are honestly Other.
+        assert_eq!(
+            trend_bucket(Some("Trending in United States")),
+            TrendBucket::Other
+        );
+        assert_eq!(trend_bucket(None), TrendBucket::Other);
+        assert_eq!(trend_bucket(Some("")), TrendBucket::Other);
+    }
+
+    #[test]
+    fn grouping_drops_nothing_and_orders_canonically() {
+        let groups = group_trends(&sample());
+        let total: usize = groups.iter().map(|(_, items)| items.len()).sum();
+        assert_eq!(total, 6, "every trend lands in exactly one group");
+        let labels: Vec<&str> = groups.iter().map(|(b, _)| b.label()).collect();
+        assert_eq!(
+            labels,
+            vec!["News", "Politics", "Sports", "Technology", "Other"]
+        );
+        // Within a group, provider rank order is kept.
+        let other = &groups.last().unwrap().1;
+        assert_eq!(other[0].name, "Local Fest");
+        assert_eq!(other[1].name, "Mystery Topic");
+    }
+
+    #[test]
+    fn filter_is_case_insensitive_and_multiword() {
+        let all = sample();
+        assert_eq!(filter_trends(&all, "").len(), 6);
+        assert_eq!(filter_trends(&all, "nfl").len(), 1);
+        assert_eq!(filter_trends(&all, "SPORTS").len(), 1);
+        // Matches category text too.
+        assert_eq!(filter_trends(&all, "united states").len(), 1);
+        // Multi-word requires all words.
+        assert_eq!(filter_trends(&all, "breaking storm").len(), 1);
+        assert_eq!(filter_trends(&all, "breaking nfl").len(), 0);
+    }
 }

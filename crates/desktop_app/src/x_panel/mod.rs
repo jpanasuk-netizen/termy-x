@@ -54,7 +54,10 @@ macro_rules! x_button {
 }
 use termy_x::XConfig;
 use termy_x::drafts::new_id;
-use termy_x::model::{Draft, MediaItem, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
+use termy_x::model::{
+    filter_trends, group_trends, sort_trends, trend_rank, Draft, MediaItem, MediaKind, Post,
+    Profile, ResearchHit, Tone, Trend, TrendBucket,
+};
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
 use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
 
@@ -114,6 +117,9 @@ enum InputTarget {
     Search,
     Reply,
     Quote,
+    Trends,
+    Research,
+    Lookup,
 }
 
 /// Pure predicate behind `XPanel::owns_edit_keys`: does a panel text
@@ -143,6 +149,9 @@ fn edit_keys_owned(
         InputTarget::Reply => reply_open,
         // Quote shares the reply's gate: caller passes reply||quote open.
         InputTarget::Quote => reply_open,
+        InputTarget::Trends => section == XSection::Trends,
+        InputTarget::Research => section == XSection::Research,
+        InputTarget::Lookup => section == XSection::Lookup,
     }
 }
 
@@ -152,6 +161,9 @@ enum TextField {
     Search,
     Reply,
     Quote,
+    Trends,
+    Research,
+    Lookup,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -351,6 +363,15 @@ pub struct XPanel {
     /// (empty = never searched yet, so the tab shows a prompt, not posts).
     search_input: String,
     searched_query: String,
+    /// Trends tab: instant local filter text, selected group chip, and
+    /// the honest fetch-error line (live failures never show fixtures).
+    trends_filter: String,
+    trends_bucket: Option<TrendBucket>,
+    trends_error: Option<String>,
+    lookup_error: Option<String>,
+    /// Research tab: typed topic + the topic the shown hits belong to.
+    research_input: String,
+    researched_query: String,
     /// Inline reply: the tweet expanded under the cursor, its draft, and
     /// images attached to that reply (validated like Compose media).
     reply_post_id: Option<String>,
@@ -439,10 +460,15 @@ enum FetchPayload {
     Trends {
         trends: Vec<Trend>,
         status: String,
+        /// Live fetch failed: show the honest error, never fixtures.
+        failed: bool,
     },
     Lookup {
         profile: Option<Profile>,
         status: String,
+        /// Live lookup failed (bad handle / provider error): show the
+        /// plain error, never a fixture profile.
+        failed: bool,
     },
     Research {
         hits: Vec<ResearchHit>,
@@ -594,6 +620,12 @@ impl XPanel {
             last_edit_chord_at: None,
             search_input: String::new(),
             searched_query: String::new(),
+            trends_filter: String::new(),
+            trends_bucket: None,
+            trends_error: None,
+            lookup_error: None,
+            research_input: String::new(),
+            researched_query: String::new(),
             reply_post_id: None,
             reply_author: String::new(),
             reply_text: String::new(),
@@ -668,6 +700,12 @@ impl XPanel {
             cx.notify();
             return;
         }
+        if section == XSection::Research && self.researched_query.is_empty() {
+            self.loading = false;
+            self.status = "research \u{b7} type a topic and press Enter first \u{b7} then \u{21bb} re-runs it".into();
+            cx.notify();
+            return;
+        }
         self.schedule_fetch(section, cx);
         cx.notify();
     }
@@ -680,6 +718,27 @@ impl XPanel {
         self.section = section;
         self.confirm = false;
         self.splash = false;
+        // Every typeable tab owns its field the moment it opens, so the
+        // breathing caret is already there before the first keystroke.
+        match section {
+            XSection::Search => {
+                self.input_target = InputTarget::Search;
+                self.pending_focus = true;
+            }
+            XSection::Trends => {
+                self.input_target = InputTarget::Trends;
+                self.pending_focus = true;
+            }
+            XSection::Research => {
+                self.input_target = InputTarget::Research;
+                self.pending_focus = true;
+            }
+            XSection::Lookup => {
+                self.input_target = InputTarget::Lookup;
+                self.pending_focus = true;
+            }
+            _ => {}
+        }
 
         if self.fill_window || !self.live {
             self.ensure_mock_lists();
@@ -726,6 +785,17 @@ impl XPanel {
                 )
             };
             log_switch(section, started, "search-input");
+            return;
+        }
+
+        if section == XSection::Research && self.researched_query.is_empty() {
+            // Real research is user-driven: focus the topic field and
+            // wait. Never auto-run a hardcoded topic behind their back.
+            self.loading = false;
+            self.status =
+                "research \u{b7} type a topic and press Enter \u{b7} Reddit, YouTube, web + RSS, silently in the background"
+                    .into();
+            log_switch(section, started, "research-input");
             return;
         }
 
@@ -821,7 +891,21 @@ impl XPanel {
                     });
                 }
             }
-            "trends" => self.open_section(XSection::Trends, cx),
+            // Dev-preview only: full mock trend set (Top 20 + topic
+            // groups + filter field with its caret on show).
+            "trends" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Trends, cx);
+            }
+            // Dev-preview only: Research with the topic field focused
+            // (caret proof), and a results variant with a fixture query.
+            "research" => self.open_section(XSection::Research, cx),
+            "researchdemo" => {
+                self.load_mock_dashboard();
+                self.research_input = "gpui".into();
+                self.researched_query = "gpui".into();
+                self.open_section(XSection::Research, cx);
+            }
             _ => self.open_section(XSection::Timeline, cx),
         }
     }
@@ -852,7 +936,7 @@ impl XPanel {
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
-                .trends(Some("worldwide"), 6)
+                .trends(Some("worldwide"), 50)
                 .map(|served| served.value)
                 .unwrap_or_default();
         }
@@ -890,7 +974,7 @@ impl XPanel {
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
-                .trends(Some("worldwide"), 6)
+                .trends(Some("worldwide"), 50)
                 .map(|served| served.value)
                 .unwrap_or_default();
         }
@@ -1284,15 +1368,31 @@ impl XPanel {
                 self.status = status;
                 self.fetched_at.search = Some(now);
             }
-            FetchPayload::Trends { trends, status } => {
-                self.trends = trends;
+            FetchPayload::Trends {
+                trends,
+                status,
+                failed,
+            } => {
+                self.trends_error = failed.then_some(status.clone());
+                if !failed {
+                    self.trends = trends;
+                    self.fetched_at.trends = Some(now);
+                }
                 self.status = status;
-                self.fetched_at.trends = Some(now);
             }
-            FetchPayload::Lookup { profile, status } => {
-                self.profile = profile;
+            FetchPayload::Lookup {
+                profile,
+                status,
+                failed,
+            } => {
+                self.lookup_error = failed.then_some(status.clone());
+                if !failed {
+                    self.profile = profile;
+                    self.fetched_at.lookup = Some(now);
+                } else {
+                    self.profile = None;
+                }
                 self.status = status;
-                self.fetched_at.lookup = Some(now);
             }
             FetchPayload::Research { hits, status } => {
                 self.research = hits;
@@ -1801,6 +1901,18 @@ impl XPanel {
             self.on_text_input_key(event, TextField::Search, cx);
             return;
         }
+        if self.input_target == InputTarget::Trends && self.section == XSection::Trends {
+            self.on_text_input_key(event, TextField::Trends, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Research && self.section == XSection::Research {
+            self.on_text_input_key(event, TextField::Research, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Lookup && self.section == XSection::Lookup {
+            self.on_text_input_key(event, TextField::Lookup, cx);
+            return;
+        }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
             self.on_text_input_key(event, TextField::Reply, cx);
             return;
@@ -2011,6 +2123,9 @@ impl XPanel {
                 InputTarget::Search => self.search_input.push_str(clean),
                 InputTarget::Reply => self.reply_text.push_str(clean),
                 InputTarget::Quote => self.quote_text.push_str(clean),
+                InputTarget::Trends => self.trends_filter.push_str(clean),
+                InputTarget::Research => self.research_input.push_str(clean),
+                InputTarget::Lookup => self.lookup.push_str(clean),
             }
         }
         match self.input_target {
@@ -2094,13 +2209,24 @@ impl XPanel {
         self.mention_dirty_at = Some(std::time::Instant::now());        let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         if key == "enter" && (mods.control || mods.platform) {
-            if field == TextField::Reply {
-                self.submit_reply(cx);
-            } else if field == TextField::Quote {
-                self.submit_quote(cx);
-            } else {
-                self.run_search(cx);
+            match field {
+                TextField::Reply => self.submit_reply(cx),
+                TextField::Quote => self.submit_quote(cx),
+                TextField::Trends => self.enter_trends_filter(cx),
+                TextField::Research => self.run_research(cx),
+                TextField::Lookup => self.run_lookup(cx),
+                TextField::Search => self.run_search(cx),
             }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "escape" && field == TextField::Trends
+            && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
+        {
+            // Esc clears the filter/chip and restores the full list.
+            self.trends_filter.clear();
+            self.trends_bucket = None;
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2110,6 +2236,9 @@ impl XPanel {
                 TextField::Search => self.run_search(cx),
                 TextField::Reply => self.reply_text.push('\n'),
                 TextField::Quote => self.quote_text.push('\n'),
+                TextField::Trends => self.enter_trends_filter(cx),
+                TextField::Research => self.run_research(cx),
+                TextField::Lookup => self.run_lookup(cx),
             }
             if field != TextField::Search {
                 self.scroll_small_editor_to_end(field);
@@ -2133,6 +2262,9 @@ impl XPanel {
             TextField::Search => &mut self.search_input,
             TextField::Reply => &mut self.reply_text,
             TextField::Quote => &mut self.quote_text,
+            TextField::Trends => &mut self.trends_filter,
+            TextField::Research => &mut self.research_input,
+            TextField::Lookup => &mut self.lookup,
         };
         if key == "backspace" {
             target.pop();
@@ -2190,6 +2322,66 @@ impl XPanel {
             "Searching for \u{201c}{query}\u{201d}\u{2026} silently in the background \u{b7} no Chrome window will pop"
         );
         self.schedule_fetch(XSection::Search, cx);
+        cx.notify();
+    }
+
+    /// Enter in the Trends filter: jump to real Search results for the
+    /// typed topic (OpenCLI has no trends-search endpoint; tweet search
+    /// is the honest provider-backed equivalent, and the placeholder
+    /// says exactly that).
+    fn enter_trends_filter(&mut self, cx: &mut Context<Self>) {
+        let query = self.trends_filter.trim().to_string();
+        if !query.is_empty() {
+            self.open_trend_search(&query, cx);
+        }
+    }
+
+    /// Clicking a trend (or Enter in the filter) navigates to Search
+    /// with that topic executed — never a mix into the Trends tab.
+    fn open_trend_search(&mut self, query: &str, cx: &mut Context<Self>) {
+        self.search_input = query.to_string();
+        self.open_section(XSection::Search, cx);
+        self.run_search(cx);
+    }
+
+    /// Run the typed Research topic through the real backing searches
+    /// (OpenCLI reddit/youtube search, web notes, RSS search) — the
+    /// query flows verbatim into `research_topic`.
+    fn run_research(&mut self, cx: &mut Context<Self>) {
+        let query = self.research_input.trim().to_string();
+        if query.is_empty() {
+            self.notice = Some(
+                "Type a topic to research first — Reddit, YouTube, web + RSS run on Enter."
+                    .into(),
+            );
+            self.status = "research · nothing typed yet".into();
+            cx.notify();
+            return;
+        }
+        self.query = query.clone();
+        self.researched_query = query.clone();
+        self.research.clear();
+        self.loading = true;
+        self.status = format!(
+            "Researching \u{201c}{query}\u{201d}\u{2026} silently in the background \u{b7} no Chrome window will pop"
+        );
+        self.schedule_fetch(XSection::Research, cx);
+        cx.notify();
+    }
+
+    /// Enter in the Lookup field: fetch that handle's profile.
+    fn run_lookup(&mut self, cx: &mut Context<Self>) {
+        if self.lookup.trim().is_empty() {
+            self.notice = Some("Type a handle first — @someone — then press Enter.".into());
+            cx.notify();
+            return;
+        }
+        self.loading = true;
+        self.status = format!(
+            "Looking up @{}\u{2026} silently in the background",
+            self.lookup.trim().trim_start_matches('@')
+        );
+        self.schedule_fetch(XSection::Lookup, cx);
         cx.notify();
     }
 
@@ -2437,7 +2629,9 @@ impl XPanel {
         let (text, handle) = match field {
             TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
             TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
-            TextField::Search => return,
+            TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
+                return
+            }
         };
         let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
         let overflow = lines as f32 * 19.0 - 44.0;
@@ -3089,28 +3283,62 @@ fn fetch_section(
                 }
             }
             XSection::Trends => {
-                if let Ok(served) = service.trends(Some("worldwide"), 8) {
-                    return FetchPayload::Trends {
-                        trends: served.value,
-                        status: live_status(&served.status),
-                    };
+                match service.trends(Some("worldwide"), 50) {
+                    Ok(served) => {
+                        return FetchPayload::Trends {
+                            trends: served.value,
+                            status: live_status(&served.status),
+                            failed: false,
+                        };
+                    }
+                    Err(error) => {
+                        // Honest failure: empty list + plain error.
+                        // Fixture substitution in live mode would put
+                        // fake trends in front of the user.
+                        return FetchPayload::Trends {
+                            trends: Vec::new(),
+                            status: format!(
+                                "could not load trends \u{2014} {}",
+                                termy_x::publish::humanize_error(&error)
+                            ),
+                            failed: true,
+                        };
+                    }
                 }
             }
             XSection::Lookup => {
-                if let Ok(served) = service.lookup(&lookup) {
-                    return FetchPayload::Lookup {
-                        profile: Some(served.value),
-                        status: live_status(&served.status),
-                    };
+                match service.lookup(&lookup) {
+                    Ok(served) => {
+                        return FetchPayload::Lookup {
+                            profile: Some(served.value),
+                            status: live_status(&served.status),
+                            failed: false,
+                        };
+                    }
+                    Err(error) => {
+                        return FetchPayload::Lookup {
+                            profile: None,
+                            status: format!(
+                                "could not find @{} \u{2014} {}",
+                                lookup.trim().trim_start_matches('@'),
+                                termy_x::publish::humanize_error(&error)
+                            ),
+                            failed: true,
+                        };
+                    }
                 }
             }
             XSection::Research => {
                 let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
                 let runner = termy_x::io::SystemRunner;
-                let hits = service.research("gpui terminal", &runner, &config);
+                let hits = if query.trim().is_empty() {
+                    Vec::new()
+                } else {
+                    service.research(&query, &runner, &config)
+                };
                 return FetchPayload::Research {
                     hits,
-                    status: "research Â· no X API credits".into(),
+                    status: format!("research \u{b7} \u{201c}{query}\u{201d} \u{b7} no X API credits"),
                 };
             }
             XSection::Compose => {}
@@ -3140,10 +3368,11 @@ fn fetch_section(
         },
         XSection::Trends => FetchPayload::Trends {
             trends: MockProvider
-                .trends(Some("worldwide"), 8)
+                .trends(Some("worldwide"), 50)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             status: "mock Â· trends Â· no X API credits".into(),
+            failed: false,
         },
         XSection::Lookup => FetchPayload::Lookup {
             profile: MockProvider
@@ -3154,6 +3383,7 @@ fn fetch_section(
                 "mock Â· lookup @{} Â· no X API credits",
                 lookup.trim_start_matches('@')
             ),
+            failed: false,
         },
         XSection::Research => FetchPayload::Research {
             hits: vec![ResearchHit {
@@ -3469,13 +3699,68 @@ fn breath_animation(cycle_ms: u64) -> Animation {
 /// Breathing text caret shared by every panel editor. Always rendered
 /// (fixed cell, zero layout shift); only its opacity breathes.
 fn caret_element(id: &'static str) -> gpui_kit::AnyElement {
+    // A real 2px bar (same look as the Compose caret), not a "|" glyph:
+    // the glyph was thin enough to miss at editor font sizes, which read
+    // as "no cursor" in the small fields.
     div()
+        .w(px(2.0))
+        .h(px(14.0))
+        .rounded(px(1.0))
+        .bg(rgb(0x7af6ff))
         .flex_none()
-        .child("|")
         .with_animation(id, breath_animation(2_300), |el, v| {
             el.opacity(0.12 + 0.88 * v)
         })
         .into_any_element()
+}
+
+/// Compact post-count formatting for trend volumes ("182K posts").
+fn fmt_volume(volume: u64) -> String {
+    let (scaled, suffix) = if volume >= 1_000_000 {
+        (volume as f64 / 1_000_000.0, "M")
+    } else if volume >= 1_000 {
+        (volume as f64 / 1_000.0, "K")
+    } else {
+        return volume.to_string();
+    };
+    let mut text = format!("{scaled:.1}");
+    if text.ends_with(".0") {
+        text.truncate(text.len() - 2);
+    }
+    format!("{text}{suffix}")
+}
+
+/// Split `text[a..b]` at entity edges into chunk divs: @mentions,
+/// #hashtags, and $cashtags in X blue, the rest in the default color.
+/// Shared by every editor surface (Compose rows, small editors, and the
+/// single-line fields) so token rendering is identical everywhere.
+fn entity_chunk_divs(
+    text: &str,
+    a: usize,
+    b: usize,
+    entities: &[(usize, usize, termy_x::text::EntityKind)],
+) -> Vec<gpui_kit::AnyElement> {
+    let mut cuts: Vec<usize> = vec![a, b];
+    for (es, ee, _) in entities {
+        for edge in [*es, *ee] {
+            if edge > a && edge < b {
+                cuts.push(edge);
+            }
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|w| {
+            let (cs, ce) = (w[0], w[1]);
+            let in_entity = entities.iter().any(|(es, ee, _)| cs >= *es && ce <= *ee);
+            let mut chunk = div().child(text[cs..ce].to_string());
+            if in_entity {
+                chunk = chunk.text_color(rgb(ENTITY_BLUE));
+            }
+            chunk.into_any_element()
+        })
+        .collect()
 }
 
 /// Red<->blue glow colour at breath phase `v` (0 = warm red, 1 = blue).
@@ -4013,14 +4298,15 @@ impl XPanel {
     fn side_rows(&self) -> Vec<gpui_kit::AnyElement> {
         let mut rows = Vec::new();
         for trend in &self.trends {
-            rows.push(card(
-                trend.name.clone(),
-                format!(
-                    "{} Â· volume {}",
-                    trend.place.as_deref().unwrap_or("worldwide"),
-                    trend.volume.unwrap_or(0)
-                ),
-            ));
+            let mut meta = trend
+                .category
+                .clone()
+                .or_else(|| trend.place.clone())
+                .unwrap_or_else(|| "worldwide".to_string());
+            if let Some(volume) = trend.volume {
+                meta = format!("{} \u{b7} {} posts", meta, fmt_volume(volume));
+            }
+            rows.push(card(trend.name.clone(), meta));
         }
         if let Some(post) = self.posts.iter().max_by_key(|post| post.engagement()) {
             rows.push(card(
@@ -4033,6 +4319,262 @@ impl XPanel {
                 format!("[{}] {}", hit.source, hit.title),
                 format!("{}\n{}", hit.url, hit.excerpt),
             ));
+        }
+        rows
+    }
+
+    /// One clickable trend card: rank + topic on the first line, the
+    /// provider's real category/context under it, volume/place last.
+    /// Fields the payload doesn't carry render NO line — X dropped
+    /// post counts from trends, so volume appears only when present.
+    /// Clicking navigates to Search results for the trend's query.
+    fn trend_card(&self, trend: &Trend, rank: u64, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let query = trend.query.clone();
+        let mut lines = div().flex().flex_col().gap(px(2.0)).child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x7af6ff))
+                        .child(format!("#{rank}")),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xf8fbff))
+                        .child(trend.name.clone()),
+                ),
+        );
+        if let Some(category) = &trend.category
+            && !category.trim().is_empty()
+        {
+            lines = lines.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x9ad7ff))
+                    .child(category.clone()),
+            );
+        }
+        let mut meta: Vec<String> = Vec::new();
+        if let Some(volume) = trend.volume {
+            meta.push(format!("{} posts", fmt_volume(volume)));
+        }
+        if let Some(place) = &trend.place
+            && !place.trim().is_empty()
+        {
+            meta.push(place.clone());
+        }
+        if !meta.is_empty() {
+            lines = lines.child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(meta.join(" \u{b7} ")),
+            );
+        }
+        div()
+            .p(px(12.0))
+            .rounded(px(12.0))
+            .bg(tint(0x0c1422, 225))
+            .border_1()
+            .border_color(tint(0x7af6ff, 40))
+            .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+            .cursor_pointer()
+            .child(lines)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.open_trend_search(&query, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn trend_chip(
+        &self,
+        label: String,
+        selected: bool,
+        bucket: Option<TrendBucket>,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        div()
+            .px(px(9.0))
+            .py(px(3.0))
+            .rounded(px(999.0))
+            .border_1()
+            .border_color(if selected {
+                rgb(0x7af6ff)
+            } else {
+                tint(0x7af6ff, 70)
+            })
+            .bg(if selected {
+                tint(0x1d4ed8, 200)
+            } else {
+                tint(0x0c1422, 200)
+            })
+            .text_size(px(11.0))
+            .text_color(if selected {
+                rgb(0xffffff)
+            } else {
+                rgb(0x9ad7ff)
+            })
+            .cursor_pointer()
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    this.trends_bucket = bucket;
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .into_any_element()
+    }
+
+    /// Trends tab body: filter field, group chips, Top 20, then every
+    /// trend grouped by the category X actually reports. Trends only —
+    /// no timeline tweets in this tab, and a failed live fetch shows
+    /// the honest error instead of fixtures.
+    fn trends_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
+        rows.push(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0x7af6ff))
+                .child("Trends \u{b7} worldwide \u{b7} click any trend to search it on X")
+                .into_any_element(),
+        );
+        rows.push(self.single_line_field(TextField::Trends, cx));
+        let total = self.trends.len();
+        if total == 0 {
+            if let Some(error) = &self.trends_error {
+                rows.push(empty_state("Couldn\u{2019}t load trends", error.clone()));
+            } else if self.loading {
+                rows.push(empty_state(
+                    "Scanning trends\u{2026}",
+                    "Free session path \u{b7} no X API credits. Hang tight.",
+                ));
+            } else {
+                rows.push(empty_state(
+                    "No trends yet",
+                    "Hit \u{21bb} above to retry. If OpenCLI can\u{2019}t read X\u{2019}s trends page right now, you\u{2019}ll see a plain error here instead of made-up trends.",
+                ));
+            }
+            return rows;
+        }
+        if self.loading {
+            rows.push(hint("Refreshing trends\u{2026}".into()));
+        }
+        let sorted = sort_trends(&self.trends);
+        let filtering = !self.trends_filter.trim().is_empty();
+        let visible = filter_trends(&self.trends, &self.trends_filter);
+        if filtering {
+            rows.push(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xf0a8d0))
+                            .child(format!(
+                                "{} of {} trends match \u{201c}{}\u{201d}",
+                                visible.len(),
+                                total,
+                                self.trends_filter.trim()
+                            )),
+                    )
+                    .child(x_button!(
+                        "x-trends-clear",
+                        "\u{2715} Clear",
+                        cx.listener(|this, _, _, cx| {
+                            this.trends_filter.clear();
+                            this.trends_bucket = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        } else {
+            rows.push(hint(format!(
+                "{total} unique trends \u{b7} Top 20 first, then grouped by the category X reports \u{b7} X no longer publishes trend post counts"
+            )));
+        }
+        if visible.is_empty() {
+            rows.push(empty_state(
+                "No matching trends",
+                format!(
+                    "Nothing in the {total} loaded trends matches that filter. Clear \u{2715} to see them all."
+                ),
+            ));
+            return rows;
+        }
+        // Group chips, derived only from groups actually present.
+        let groups = group_trends(&visible);
+        let selected = self
+            .trends_bucket
+            .filter(|b| groups.iter().any(|(g, _)| g == b));
+        let mut chips = div().flex().flex_row().flex_wrap().gap(px(6.0));
+        chips = chips.child(self.trend_chip(
+            format!("All \u{b7} {}", visible.len()),
+            selected.is_none(),
+            None,
+            cx,
+        ));
+        for (bucket, items) in &groups {
+            chips = chips.child(self.trend_chip(
+                format!("{} \u{b7} {}", bucket.label(), items.len()),
+                selected == Some(*bucket),
+                Some(*bucket),
+                cx,
+            ));
+        }
+        rows.push(chips.into_any_element());
+
+        if !filtering && selected.is_none() {
+            rows.push(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(13.0))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xd7fbff))
+                    .child("Top 20 \u{b7} overall")
+                    .into_any_element(),
+            );
+            for trend in visible.iter().take(20) {
+                rows.push(self.trend_card(trend, trend_rank(trend, &sorted), cx));
+            }
+            rows.push(hint(
+                "The Top 20 repeats inside its topic group below \u{2014} expected; nothing is dropped."
+                    .into(),
+            ));
+        }
+        for (bucket, items) in &groups {
+            if let Some(sel) = selected
+                && sel != *bucket
+            {
+                continue;
+            }
+            rows.push(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(13.0))
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xd7fbff))
+                    .child(format!("{} \u{b7} {}", bucket.label(), items.len()))
+                    .into_any_element(),
+            );
+            for trend in items {
+                rows.push(self.trend_card(trend, trend_rank(trend, &sorted), cx));
+            }
         }
         rows
     }
@@ -4121,39 +4663,42 @@ impl XPanel {
                 }
             }
             XSection::Trends => {
-                if self.trends.is_empty() {
-                    if self.loading {
-                        rows.push(empty_state(
-                            "Scanning trends...",
-                            "Free session path · no X API credits. Hang tight.",
-                        ));
-                    } else {
-                        rows.push(empty_state(
-                            "No trends yet",
-                            "Hit Trends again, or check OpenCLI with x doctor. Mock fixtures fill in when offline.",
-                        ));
-                    }
-                } else if self.loading {
-                    rows.push(hint("Refreshing trends...".into()));
-                }
-                for trend in &self.trends {
-                    rows.push(card(
-                        trend.name.clone(),
-                        format!(
-                            "{} · volume {}",
-                            trend.place.as_deref().unwrap_or("worldwide"),
-                            trend.volume.unwrap_or(0)
-                        ),
-                    ));
-                }
-                if !self.posts.is_empty() {
-                    rows.push(hint("Tweets \u{b7} click one to reply in place".into()));
-                }
-                for post in &self.posts {
-                    rows.push(self.tweet_card(post, cx));
-                }
+                rows.extend(self.trends_rows(cx));
             }
             XSection::Lookup => {
+                let me_handle = match &self.connection {
+                    ConnState::Connected { handle, .. } => Some(handle.clone()),
+                    _ => None,
+                };
+                let mut lookup_bar = div()
+                        .flex()
+                        .gap(px(8.0))
+                        .items_center();
+                if let Some(me) = &me_handle {
+                    let me_query = me.clone();
+                    lookup_bar = lookup_bar.child(x_button!(
+                        "x-lookup-me",
+                        "Me",
+                        cx.listener(move |this, _, _, cx| {
+                            this.lookup = me_query.clone();
+                            this.run_lookup(cx);
+                            cx.stop_propagation();
+                        })
+                    ));
+                }
+                rows.push(
+                    lookup_bar
+                        .child(self.single_line_field(TextField::Lookup, cx))
+                        .child(x_button!(
+                            "x-lookup-run",
+                            if self.loading { "Looking\u{2026}" } else { "Lookup" },
+                            cx.listener(|this, _, _, cx| {
+                                this.run_lookup(cx);
+                                cx.stop_propagation();
+                            })
+                        ))
+                        .into_any_element(),
+                );
                 if let Some(profile) = &self.profile {
                     rows.push(card(
                         format!("@{} · {}", profile.handle, profile.name),
@@ -4170,34 +4715,84 @@ impl XPanel {
                         "Looking up...",
                         "Free session profile fetch. No X API credits.",
                     ));
+                } else if let Some(error) = &self.lookup_error {
+                    rows.push(empty_state("Couldn\u{2019}t find that handle", error.clone()));
                 } else {
                     rows.push(empty_state(
                         "Lookup a handle",
-                        "Enter @someone and hit Lookup. Verified / Premium shows in doctor post length.",
+                        "Type any @handle above and press Enter (or Lookup). Me jumps back to your own profile.",
                     ));
                 }
             }
             XSection::Research => {
-                if self.research.is_empty() {
+                rows.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7af6ff))
+                                .child("Research \u{b7} Reddit, YouTube, the web + RSS \u{b7} silent background"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(8.0))
+                                .items_center()
+                                .child(self.single_line_field(TextField::Research, cx))
+                                .child(x_button!(
+                                    "x-research-run",
+                                    if self.loading { "Searching\u{2026}" } else { "Search" },
+                                    cx.listener(|this, _, _, cx| {
+                                        this.run_research(cx);
+                                        cx.stop_propagation();
+                                    })
+                                )),
+                        )
+                        .into_any_element(),
+                );
+                if self.researched_query.is_empty() {
+                    rows.push(empty_state(
+                        "Research a topic",
+                        "Type a topic above and press Enter. It runs Reddit search, YouTube search, web notes, and RSS \u{2014} silently in the background, no Chrome window will pop.",
+                    ));
+                } else if self.loading && self.research.is_empty() {
+                    rows.push(empty_state(
+                        "Researching\u{2026}",
+                        format!(
+                            "Searching for \u{201c}{}\u{201d} across Reddit, YouTube, the web + RSS.",
+                            self.researched_query
+                        ),
+                    ));
+                } else if self.research.is_empty() {
+                    rows.push(empty_state(
+                        "No research results",
+                        format!(
+                            "Nothing came back for \u{201c}{}\u{201d}. Try different words.",
+                            self.researched_query
+                        ),
+                    ));
+                } else {
                     if self.loading {
-                        rows.push(empty_state(
-                            "Researching...",
-                            "RSS + free sources. No X API credits.",
-                        ));
+                        rows.push(hint(format!(
+                            "Refreshing research for \u{201c}{}\u{201d}\u{2026}",
+                            self.researched_query
+                        )));
                     } else {
-                        rows.push(empty_state(
-                            "Research is empty",
-                            "Kick Research to pull free sources for your draft.",
+                        rows.push(hint(format!(
+                            "{} result(s) for \u{201c}{}\u{201d}",
+                            self.research.len(),
+                            self.researched_query
+                        )));
+                    }
+                    for hit in &self.research {
+                        rows.push(card(
+                            format!("[{}] {}", hit.source, hit.title),
+                            format!("{}\n{}", hit.url, hit.excerpt),
                         ));
                     }
-                } else if self.loading {
-                    rows.push(hint("Refreshing research...".into()));
-                }
-                for hit in &self.research {
-                    rows.push(card(
-                        format!("[{}] {}", hit.source, hit.title),
-                        format!("{}\n{}", hit.url, hit.excerpt),
-                    ));
                 }
             }
             XSection::Compose => {
@@ -5145,25 +5740,7 @@ impl XPanel {
             if seg.is_empty() {
                 row = row.child(" ".to_string());
             } else {
-                // Split the visual segment at entity edges: mentions,
-                // hashtags, and cashtags render X-blue, the rest plain.
-                let mut cuts: Vec<usize> = vec![*a, *b];
-                for (es, ee, _) in &entities {
-                    for edge in [*es, *ee] {
-                        if edge > *a && edge < *b {
-                            cuts.push(edge);
-                        }
-                    }
-                }
-                cuts.sort_unstable();
-                cuts.dedup();
-                for w in cuts.windows(2) {
-                    let (cs, ce) = (w[0], w[1]);
-                    let in_entity = entities.iter().any(|(es, ee, _)| cs >= *es && ce <= *ee);
-                    let mut chunk = div().child(text[cs..ce].to_string());
-                    if in_entity {
-                        chunk = chunk.text_color(rgb(ENTITY_BLUE));
-                    }
+                for chunk in entity_chunk_divs(text, *a, *b, &entities) {
                     row = row.child(chunk);
                 }
             }
@@ -5495,8 +6072,118 @@ impl XPanel {
 
     /// Search tab header: the query field + Run button. Focused when the
     /// tab opens; Enter runs the same path as the button.
+    /// The shared single-line editor (Search query, Trends filter,
+    /// Research topic, Lookup handle): glow focus ring, breathing bar
+    /// caret painted the moment the field owns the keyboard — empty or
+    /// not — and blue @/#/$ tokens like every other editor surface.
+    fn single_line_field(&self, field: TextField, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let (text, placeholder, glow_id, element_id, caret_id, target) = match field {
+            TextField::Search => (
+                self.search_input.as_str(),
+                "Type a query \u{2014} a word, #tag, or from:someone",
+                "glow-search",
+                "x-search-input",
+                "caret-search",
+                InputTarget::Search,
+            ),
+            TextField::Trends => (
+                self.trends_filter.as_str(),
+                "Filter trends \u{2014} type to filter \u{b7} Enter searches X for it",
+                "glow-trends",
+                "x-trends-input",
+                "caret-trends",
+                InputTarget::Trends,
+            ),
+            TextField::Research => (
+                self.research_input.as_str(),
+                "Search Reddit, YouTube, the web + RSS \u{2014} Enter runs it",
+                "glow-research",
+                "x-research-input",
+                "caret-research",
+                InputTarget::Research,
+            ),
+            TextField::Lookup => (
+                self.lookup.as_str(),
+                "@someone \u{2014} Enter looks them up",
+                "glow-lookup",
+                "x-lookup-input",
+                "caret-lookup",
+                InputTarget::Lookup,
+            ),
+            TextField::Reply | TextField::Quote => {
+                unreachable!("reply/quote use the multi-line small editor")
+            }
+        };
+        let focused = self.input_target == target;
+        let content = if text.is_empty() {
+            if focused {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .child(caret_element(caret_id))
+                    .child(
+                        div()
+                            .text_color(rgb(0x93a4c3))
+                            .child(placeholder.to_string()),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .text_color(rgb(0x93a4c3))
+                    .child(placeholder.to_string())
+                    .into_any_element()
+            }
+        } else {
+            let entities = entity_spans(text);
+            let mut row = div().flex().flex_row().items_center();
+            for chunk in entity_chunk_divs(text, 0, text.len(), &entities) {
+                row = row.child(chunk);
+            }
+            if focused {
+                row = row.child(caret_element(caret_id));
+            }
+            row.into_any_element()
+        };
+        focus_glow(
+            glow_id,
+            focused,
+            true,
+            div()
+                .id(element_id)
+                .flex_1()
+                .p(px(10.0))
+                .rounded(px(8.0))
+                .bg(if focused {
+                    tint(0x0f1c33, 245)
+                } else {
+                    tint(0x0c1422, 235)
+                })
+                .border_1()
+                .border_color(if focused {
+                    rgb(0x7af6ff)
+                } else {
+                    tint(0x7af6ff, 70)
+                })
+                .cursor_pointer()
+                .text_size(px(13.0))
+                .text_color(rgb(0xf8fbff))
+                .child(content)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        this.input_target = target;
+                        this.pending_focus = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn search_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let focused = self.input_target == InputTarget::Search && self.section == XSection::Search;
         div()
             .flex()
             .flex_col()
@@ -5512,67 +6199,7 @@ impl XPanel {
                     .flex()
                     .gap(px(8.0))
                     .items_center()
-                    .child(focus_glow(
-                        "glow-search",
-                        focused,
-                        true,
-                        div()
-                            .id("x-search-input")
-                            .flex_1()
-                            .p(px(10.0))
-                            .rounded(px(8.0))
-                            .bg(if focused {
-                                tint(0x0f1c33, 245)
-                            } else {
-                                tint(0x0c1422, 235)
-                            })
-                            .border_1()
-                            .border_color(if focused {
-                                rgb(0x7af6ff)
-                            } else {
-                                tint(0x7af6ff, 70)
-                            })
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .text_color(if self.search_input.is_empty() {
-                                        rgb(0x93a4c3)
-                                    } else {
-                                        rgb(0xf8fbff)
-                                    })
-                                    .child(if self.search_input.is_empty() {
-                                        if focused {
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .child(caret_element("caret-search"))
-                                                .child("Type a query \u{2014} a word, #tag, or from:someone")
-                                        } else {
-                                            div().child("Type a query \u{2014} a word, #tag, or from:someone")
-                                        }
-                                    } else if focused {
-                                        div()
-                                            .flex()
-                                            .flex_row()
-                                            .items_center()
-                                            .child(self.search_input.clone())
-                                            .child(caret_element("caret-search"))
-                                    } else {
-                                        div().child(self.search_input.clone())
-                                    }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                                    this.input_target = InputTarget::Search;
-                                    this.pending_focus = true;
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }))
-                            .into_any_element(),
-                    ))
+                    .child(self.single_line_field(TextField::Search, cx))
                     .child(x_button!(
                         "x-search-run",
                         if self.loading { "Searching\u{2026}" } else { "Search" },

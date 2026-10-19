@@ -19,6 +19,10 @@ struct PreviewArgs {
     posted: bool,
     posted_card: bool,
     entities: bool,
+    trends: bool,
+    search: bool,
+    research: bool,
+    researchdemo: bool,
     width: f32,
     height: f32,
 }
@@ -31,6 +35,10 @@ fn preview_args() -> PreviewArgs {
         posted: false,
         posted_card: false,
         entities: false,
+        trends: false,
+        search: false,
+        research: false,
+        researchdemo: false,
         bench_tabs: false,
         width: std::env::var("TERMY_X_PREVIEW_WIDTH")
             .ok()
@@ -50,6 +58,10 @@ fn preview_args() -> PreviewArgs {
             "--posted" | "posted" => args.posted = true,
             "--posted-card" | "posted-card" => args.posted_card = true,
             "--entities" | "entities" => args.entities = true,
+            "--trends" | "trends" => args.trends = true,
+            "--search" | "search" => args.search = true,
+            "--researchdemo" | "researchdemo" => args.researchdemo = true,
+            "--research" | "research" => args.research = true,
             "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
             "--width" => {
                 if let Some(value) = raw.next().and_then(|text| text.parse().ok()) {
@@ -87,14 +99,22 @@ fn main() {
         args.posted,
         args.posted_card,
         args.entities,
+        args.trends,
+        args.search,
+        args.research,
+        args.researchdemo,
         args.compose,
         args.mock,
     ) {
-        (true, _, _, _, _, _) => "splash",
-        (_, true, _, _, _, _) => "posted",
-        (_, _, true, _, _, _) => "posted-card",
-        (_, _, _, true, _, _) => "entities",
-        (_, _, _, _, true, _) => "compose",
+        (true, _, _, _, _, _, _, _, _, _) => "splash",
+        (_, true, _, _, _, _, _, _, _, _) => "posted",
+        (_, _, true, _, _, _, _, _, _, _) => "posted-card",
+        (_, _, _, true, _, _, _, _, _, _) => "entities",
+        (_, _, _, _, true, _, _, _, _, _) => "trends",
+        (_, _, _, _, _, true, _, _, _, _) => "search",
+        (_, _, _, _, _, _, true, _, _, _) => "research",
+        (_, _, _, _, _, _, _, true, _, _) => "researchdemo",
+        (_, _, _, _, _, _, _, _, true, _) => "compose",
         _ => "mock",
     };
     let width = args.width;
