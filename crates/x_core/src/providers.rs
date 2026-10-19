@@ -504,6 +504,31 @@ pub fn sample_posts() -> Vec<Post> {
             9,
             3,
         ),
+        // A repost: outer author is the reposter, the embedded tweet
+        // is the original — cards render the original inline.
+        {
+            let mut repost = post(
+                "1005",
+                "swift_fan",
+                "Swift Fan",
+                "RT @blue_swift: Low-poly swift, navy field, cyan wireframe, magenta heart. Original bird, not a logo. +1",
+                0,
+                0,
+                0,
+                0,
+            );
+            repost.retweeted = Some(Box::new(post(
+                "1002",
+                "blue_swift",
+                "Blue Swift",
+                "Low-poly swift, navy field, cyan wireframe, magenta heart. Original bird, not a logo. +1",
+                86,
+                11,
+                7,
+                4,
+            )));
+            repost
+        },
     ]
 }
 
@@ -542,6 +567,7 @@ fn post(
         bookmarks,
         views: likes.saturating_mul(20),
         media: Vec::new(),
+        retweeted: None,
     }
 }
 
@@ -1102,7 +1128,10 @@ impl Publisher for OpenCliPublisher {
                 }
             }
             let args = opencli_json(&args);
-            let output = self.runner.run(&self.bin, &args)?;
+            let output = self
+                .runner
+                .run_timeout(&self.bin, &args, POST_TIMEOUT)
+                .map_err(|e| write_timeout_error(e, "posting", POST_TIMEOUT))?;
             last = check_opencli_output(&output, "opencli post/reply")?;
             if let Some(next) = status_ref_from_output(&last) {
                 previous = Some(next);
@@ -1125,6 +1154,24 @@ impl Publisher for OpenCliPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         self.engage_opencli(action, target_url, text, media)
+    }
+}
+
+/// Write budgets: a healthy OpenCLI write lands in ~5-20s (measured
+/// live); anything past this is a stuck browser call, and the old
+/// blanket 180s made a hang look infinite. Timing out never retries —
+/// the caller tells the user to check before trying again.
+const POST_TIMEOUT: Duration = Duration::from_secs(90);
+const ENGAGE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
+    if error.contains("timed out") {
+        format!(
+            "{what} timed out after {}s \u{2014} it may or may not have gone through; check X before retrying (nothing was retried automatically)",
+            budget.as_secs()
+        )
+    } else {
+        error
     }
 }
 
@@ -1170,7 +1217,10 @@ impl OpenCliPublisher {
             return self.publish(&[combined], None, media);
         }
         let args = opencli_json(&args);
-        let output = self.runner.run(&self.bin, &args)?;
+        let output = self
+            .runner
+            .run_timeout(&self.bin, &args, ENGAGE_TIMEOUT)
+            .map_err(|e| write_timeout_error(e, "that action", ENGAGE_TIMEOUT))?;
         check_opencli_output(&output, "opencli engage")
     }
 }
@@ -1387,7 +1437,8 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, ...mediaOf(l)}};
+    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)}};
   }}
   function parsePage(data, seen) {{
     const tweets = [];
@@ -1563,7 +1614,8 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || HANDLE;
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, ...mediaOf(l)};
+    const rt = (l.retweeted_status_result && l.retweeted_status_result.result) || null;
+    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
   }
   // Pinned extraction, the mechanism that actually works against the
   // live client: the profile page renders the pinned post first with a
@@ -2392,7 +2444,18 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         text,
         id,
         media: media_from_value(item),
+        retweeted: first_embedded(item, &["retweeted", "retweeted_status", "retweeted_tweet"])
+            .and_then(|inner| post_from_value(inner, &[]))
+            .map(Box::new),
     })
+}
+
+/// First embedded-tweet object among `keys` (GraphQL eval rows emit
+/// `retweeted`; some API-shaped payloads use the other names).
+fn first_embedded<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter()
+        .filter_map(|key| item.get(*key))
+        .find(|value| value.is_object())
 }
 
 /// Media from provider payloads. Verified live against OpenCLI
@@ -2572,6 +2635,7 @@ mod tests {
             bookmarks: 0,
             views: 0,
             media: Vec::new(),
+            retweeted: None,
         };
         let existing = vec![mk("300"), mk("200"), mk("100")];
         // Batch overlaps the loaded tail and extends below it.
@@ -2767,6 +2831,7 @@ mod tests {
             bookmarks: 0,
             views: 0,
             media: Vec::new(),
+            retweeted: None,
         };
         let out = dedupe_posts(vec![
             mk("1", "a"),
@@ -3017,6 +3082,40 @@ mod tests {
         let deduped = crate::model::exclude_pinned(&latest, &pinned);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].id, "30", "pinned renders once, in Pinned only");
+    }
+
+    #[test]
+    fn retweet_rows_parse_the_embedded_original() {
+        // Shape emitted by the GraphQL eval extract for a repost: the
+        // outer row is the repost (author = reposter), `retweeted`
+        // carries the full original tweet.
+        let json = r##"[
+          {"id": "50", "author": "reposter", "text": "RT @orig: hello world https://t.co/x", "likes": 1, "retweets": 2,
+           "retweeted": {"id": "40", "author": "orig", "text": "hello world", "likes": 99, "retweets": 12, "replies": 3, "views": 5000, "media_urls": ["https://pbs.twimg.com/media/abc.jpg"]}},
+          {"id": "51", "author": "plain", "text": "no embed", "likes": 0}
+        ]"##;
+        let posts = parse_posts(json).unwrap();
+        assert_eq!(posts.len(), 2);
+        let repost = &posts[0];
+        assert_eq!(repost.author_handle, "reposter");
+        let inner = repost.retweeted.as_ref().expect("embedded original");
+        assert_eq!(inner.id, "40");
+        assert_eq!(inner.author_handle, "orig");
+        assert_eq!(inner.text, "hello world");
+        assert_eq!(inner.likes, 99);
+        assert_eq!(inner.media.len(), 1);
+        // Actions on a repost target the original; plain posts target themselves.
+        assert_eq!(repost.engage_target().id, "40");
+        assert_eq!(posts[1].engage_target().id, "51");
+        assert!(posts[1].retweeted.is_none());
+    }
+
+    #[test]
+    fn eval_scripts_unwrap_retweeted_status() {
+        let timeline = timeline_eval_js(TimelineFeed::ForYou, None, 20);
+        assert!(timeline.contains("retweeted_status_result"), "timeline unwraps reposts");
+        let profile = profile_eval_js("someone", 30);
+        assert!(profile.contains("retweeted_status_result"), "profile unwraps reposts");
     }
 
     #[test]

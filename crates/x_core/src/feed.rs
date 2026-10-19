@@ -467,6 +467,7 @@ mod tests {
             bookmarks: 0,
             views: 0,
             media: Vec::new(),
+            retweeted: None,
         }
     }
 

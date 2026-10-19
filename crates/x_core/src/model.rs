@@ -185,9 +185,24 @@ pub struct Post {
     /// Attached photos/videos/GIFs (empty for text-only posts).
     #[serde(default)]
     pub media: Vec<MediaItem>,
+    /// The original tweet when this post is a repost/retweet: the
+    /// outer post is the repost (its author is the reposter), and the
+    /// card renders this embedded tweet inline, native-X style.
+    /// Populated only when the provider payload carries the embedded
+    /// tweet (GraphQL `retweeted_status_result`); never invented.
+    #[serde(default)]
+    pub retweeted: Option<Box<Post>>,
 }
 
 impl Post {
+    /// The tweet Like/Retweet/Quote/Reply should act on: for a repost
+    /// that's the original (embedded) tweet, matching native X, where
+    /// engaging a repost engages the original. For a normal post it's
+    /// the post itself.
+    pub fn engage_target(&self) -> &Post {
+        self.retweeted.as_deref().unwrap_or(self)
+    }
+
     pub fn engagement(&self) -> u64 {
         self.likes
             .saturating_add(self.reposts.saturating_mul(3))
@@ -205,9 +220,9 @@ pub struct Profile {
     pub following: u64,
     /// Latest posts (pinned excluded — see `pinned`).
     pub posts: Vec<Post>,
-    /// The account's pinned post(s), proven from the provider payload
-    /// (GraphQL TimelinePinEntry cross-checked against
-    /// pinned_tweet_ids_str). Empty when the payload offers no proof.
+    /// The account's pinned post(s), read from the provider payload
+    /// (profile-page "Pinned" marker + TweetResultByRestId). Empty
+    /// when the account has no pinned post.
     #[serde(default)]
     pub pinned: Vec<Post>,
 }
