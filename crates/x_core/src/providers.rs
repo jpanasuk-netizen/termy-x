@@ -1003,11 +1003,17 @@ fn session_served<T>(provider: ProviderId, value: T, note: &str) -> Served<T> {
 /// %TEMP%/termy-x-perf.txt), never to the panel. The panel only ever
 /// sees `publish::humanize_error` output.
 fn log_raw_provider_error(context: &str, raw: &str) {
+    let flat = raw.replace(['\n', '\r'], " ");
+    write_perf_line(&format!("provider-error {context}: {flat}"));
+}
+
+/// One line in %TEMP%/termy-x-perf.txt (stage timings live here so a
+/// slow write can be split probe / CLI / envelope after the fact).
+fn write_perf_line(line: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("termy-x-perf.txt");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-        let flat = raw.replace(['\n', '\r'], " ");
-        let _ = writeln!(f, "provider-error {context}: {flat}");
+        let _ = writeln!(f, "{line}");
     }
 }
 
@@ -1128,10 +1134,24 @@ impl Publisher for OpenCliPublisher {
                 }
             }
             let args = opencli_json(&args);
-            let output = self
-                .runner
-                .run_timeout(&self.bin, &args, POST_TIMEOUT)
-                .map_err(|e| write_timeout_error(e, "posting", POST_TIMEOUT))?;
+            let call_started = Instant::now();
+            let output = match self.runner.run_timeout(&self.bin, &args, POST_TIMEOUT) {
+                Ok(output) => {
+                    write_perf_line(&format!(
+                        "write post part={index} cli_ms={} status={}",
+                        call_started.elapsed().as_millis(),
+                        output.status
+                    ));
+                    output
+                }
+                Err(error) => {
+                    write_perf_line(&format!(
+                        "write post part={index} cli_ms={} runner-error",
+                        call_started.elapsed().as_millis()
+                    ));
+                    return Err(write_timeout_error(error, "posting", POST_TIMEOUT));
+                }
+            };
             last = check_opencli_output(&output, "opencli post/reply")?;
             if let Some(next) = status_ref_from_output(&last) {
                 previous = Some(next);
@@ -1157,12 +1177,19 @@ impl Publisher for OpenCliPublisher {
     }
 }
 
-/// Write budgets: a healthy OpenCLI write lands in ~5-20s (measured
-/// live); anything past this is a stuck browser call, and the old
-/// blanket 180s made a hang look infinite. Timing out never retries —
-/// the caller tells the user to check before trying again.
-const POST_TIMEOUT: Duration = Duration::from_secs(90);
-const ENGAGE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Write budgets. A healthy OpenCLI write lands in ~5-20s (measured
+/// live), but the budget must cover the CLI's OWN worst case or our
+/// timeout fires first and hides its verdict: post.js spends ~13s in
+/// pre-submit stages (goto settle + composer insert/verify, measured
+/// on the PC with a whitespace probe that cannot submit) and then
+/// polls up to 90s for the success toast before reporting
+/// "unconfirmed — check before retrying". A 90s cap killed cmd.exe at
+/// exactly that point (and, before the process-tree kill, left node
+/// running to post later). 150s lets the CLI deliver its own
+/// check-before-retry answer; engage gets 90s for the same reason
+/// (goto + up-to-10s button poll + verify). Timing out never retries.
+const POST_TIMEOUT: Duration = Duration::from_secs(150);
+const ENGAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
     if error.contains("timed out") {
@@ -1217,10 +1244,26 @@ impl OpenCliPublisher {
             return self.publish(&[combined], None, media);
         }
         let args = opencli_json(&args);
-        let output = self
-            .runner
-            .run_timeout(&self.bin, &args, ENGAGE_TIMEOUT)
-            .map_err(|e| write_timeout_error(e, "that action", ENGAGE_TIMEOUT))?;
+        let call_started = Instant::now();
+        let output = match self.runner.run_timeout(&self.bin, &args, ENGAGE_TIMEOUT) {
+            Ok(output) => {
+                write_perf_line(&format!(
+                    "write engage {} cli_ms={} status={}",
+                    action.opencli_verb(),
+                    call_started.elapsed().as_millis(),
+                    output.status
+                ));
+                output
+            }
+            Err(error) => {
+                write_perf_line(&format!(
+                    "write engage {} cli_ms={} runner-error",
+                    action.opencli_verb(),
+                    call_started.elapsed().as_millis()
+                ));
+                return Err(write_timeout_error(error, "that action", ENGAGE_TIMEOUT));
+            }
+        };
         check_opencli_output(&output, "opencli engage")
     }
 }
@@ -3117,17 +3160,20 @@ mod tests {
             "posting",
             POST_TIMEOUT,
         );
-        assert!(msg.contains("90s"), "{msg}");
+        assert!(msg.contains("150s"), "{msg}");
         assert!(msg.contains("check X before retrying"), "{msg}");
         // Non-timeout failures pass through untouched.
         assert_eq!(
             write_timeout_error("boom".to_string(), "posting", POST_TIMEOUT),
             "boom"
         );
-        // Budgets stay in the measured healthy band (writes land in
-        // 5-20s live); a 180s blanket timeout reads as an infinite hang.
-        assert_eq!(POST_TIMEOUT.as_secs(), 90);
-        assert_eq!(ENGAGE_TIMEOUT.as_secs(), 60);
+        // Budgets cover the CLI's own worst case (post: ~13s pre-submit
+        // + its 90s submit-confirmation poll) so the CLI's
+        // check-before-retry verdict surfaces instead of our kill;
+        // anything tighter truncates it, anything near the old 180s
+        // blanket reads as an infinite hang.
+        assert_eq!(POST_TIMEOUT.as_secs(), 150);
+        assert_eq!(ENGAGE_TIMEOUT.as_secs(), 90);
     }
 
     #[test]
