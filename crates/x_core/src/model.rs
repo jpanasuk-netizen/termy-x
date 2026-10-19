@@ -133,6 +133,40 @@ pub struct MediaItem {
     pub url: String,
     /// Thumbnail/preview image URL; for photos this equals `url`.
     pub poster: Option<String>,
+    /// Pixel dimensions when the provider or URL states them (video
+    /// URLs carry `/480x270/`); photos usually leave this unset and the
+    /// UI falls back to the decoded poster's real size.
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+impl MediaItem {
+    /// Width/height aspect (w/h), when both dimensions are known.
+    pub fn aspect(&self) -> Option<f32> {
+        match (self.width, self.height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some(w as f32 / h as f32),
+            _ => None,
+        }
+    }
+}
+
+/// Dimensions encoded in a media URL path, e.g.
+/// `.../vid/avc1/480x270/clip.mp4` or `.../320x568/...`. Returns None
+/// when no plausible `WxH` segment exists (photo CDN URLs have none).
+pub fn dims_from_media_url(url: &str) -> Option<(u32, u32)> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    for segment in path.split('/') {
+        let Some((w, h)) = segment.split_once('x') else { continue };
+        if w.is_empty() || h.is_empty() || w.len() > 5 || h.len() > 5 { continue; }
+        if !w.bytes().all(|b| b.is_ascii_digit()) || !h.bytes().all(|b| b.is_ascii_digit()) { continue; }
+        if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())
+            && (16..=8192).contains(&w) && (16..=8192).contains(&h) {
+            return Some((w, h));
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

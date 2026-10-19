@@ -2,6 +2,8 @@
 //! `background_opacity` behind lists and at full strength on the empty splash.
 
 pub mod art;
+mod media_fit;
+mod player;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 
 use gpui_kit::{
     Context, FocusHandle, Image, ImageSource, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Render, RenderImage, SharedString,
     StatefulInteractiveElement, Styled, StyledImage, Window, div, img, px, rgb, rgba,
 };
 
@@ -48,7 +50,7 @@ macro_rules! x_button {
 }
 use termy_x::XConfig;
 use termy_x::drafts::new_id;
-use termy_x::model::{Draft, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
+use termy_x::model::{Draft, MediaItem, MediaKind, Post, Profile, ResearchHit, Tone, Trend};
 use termy_x::providers::{MockProvider, XProvider};
 use termy_x::text::{split_thread_limited, weighted_len_limited};
 
@@ -163,8 +165,29 @@ enum ConnState {
 /// this cache, so scrolling/typing never blocks on the network or decode.
 enum MediaState {
     Loading,
-    Ready(Arc<RenderImage>),
+    Ready(CachedImage),
     Failed,
+}
+
+#[derive(Clone)]
+struct CachedImage {
+    image: Arc<RenderImage>,
+    width: u32,
+    height: u32,
+}
+impl CachedImage {
+    fn aspect(&self) -> Option<f32> {
+        if self.width > 0 && self.height > 0 { Some(self.width as f32 / self.height as f32) } else { None }
+    }
+}
+
+/// What the in-app viewer (lightbox / embedded video) is showing.
+#[derive(Clone)]
+struct Viewer {
+    kind: MediaKind,
+    url: String,
+    poster: Option<String>,
+    post_id: String,
 }
 
 pub struct XPanel {
@@ -173,6 +196,18 @@ pub struct XPanel {
     /// every render (and again per reply box) was pure waste on the hot path.
     char_limit: usize,
     media_cache: HashMap<String, MediaState>,
+    viewer: Option<Viewer>,
+    video_player: Option<player::VideoPlayer>,
+    player_pending: bool,
+    player_paused: bool,
+    player_muted: bool,
+    player_error: Option<String>,
+    #[cfg(target_os = "windows")]
+    host_hwnd: isize,
+    /// Last window viewport width (logical px), for seek-bar hit math.
+    viewport_w: f32,
+    /// Wall-clock label of the last manual ↻ refresh, shown in status.
+    last_refresh: Option<String>,
     reply_opened_at: Option<Instant>,
     reply_key_logged: bool,
     last_render_log: Option<Instant>,
@@ -332,6 +367,16 @@ impl XPanel {
             focus: cx.focus_handle(),
             char_limit,
             media_cache: HashMap::new(),
+            viewer: None,
+            video_player: None,
+            player_pending: false,
+            player_paused: false,
+            player_muted: true,
+            player_error: None,
+            #[cfg(target_os = "windows")]
+            host_hwnd: 0,
+            viewport_w: 0.0,
+            last_refresh: None,
             reply_opened_at: None,
             reply_key_logged: false,
             last_render_log: None,
@@ -420,10 +465,48 @@ impl XPanel {
         panel
     }
 
+    /// \u{21bb} button: re-fetch the CURRENT tab on the existing silent
+    /// background path. Single-flight (schedule_fetch queues/guards),
+    /// never wipes a Compose draft, gives instant status feedback.
+    fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        let section = self.section;
+        if section == XSection::Compose {
+            self.notice = Some("Compose draft kept \u{b7} refresh does nothing here.".into());
+            cx.notify();
+            return;
+        }
+        if self.fetching.iter().any(|f| *f) {
+            self.status = "already refreshing \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        // Bypass the 30s freshness cache for this tab only.
+        match section {
+            XSection::Timeline => self.fetched_at.timeline = None,
+            XSection::Search => self.fetched_at.search = None,
+            XSection::Trends => self.fetched_at.trends = None,
+            XSection::Lookup => self.fetched_at.lookup = None,
+            XSection::Research => self.fetched_at.research = None,
+            XSection::Compose => {}
+        }
+        self.last_refresh = Some(local_hms());
+        self.loading = true;
+        self.status = format!("refreshing {}\u{2026} (silent, background)", section.label());
+        if section == XSection::Search && self.searched_query.is_empty() {
+            self.loading = false;
+            self.status = "search \u{b7} type a query and press Enter first \u{b7} then \u{21bb} re-runs it".into();
+            cx.notify();
+            return;
+        }
+        self.schedule_fetch(section, cx);
+        cx.notify();
+    }
+
     /// Tab / command open. Must return in microseconds: swap local state only,
     /// never call OpenCLI / twitter-cli on the UI thread.
     pub fn open_section(&mut self, section: XSection, cx: &mut Context<Self>) {
         let started = Instant::now();
+        self.close_viewer();
         self.section = section;
         self.confirm = false;
         self.splash = false;
@@ -902,24 +985,31 @@ impl XPanel {
                         .text_color(rgb(0x8affc1))
                         .child(format!("\u{25cf} Connected as @{handle} \u{b7} {via}")),
                 )
-                .child(x_button!(
-                    "x-conn-refresh",
-                    "Check again",
-                    cx.listener(|this, _, _, cx| {
-                        this.start_connection_check(cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })
-                ))
-                .child(x_button!(
-                    "x-disconnect",
-                    "Disconnect / switch account",
-                    cx.listener(|this, _, _, cx| {
-                        this.disconnect_x(cx);
-                        cx.stop_propagation();
-                        cx.notify();
-                    })
-                ))
+                .child(
+                    // Small "Switch" chip right beside the account line:
+                    // same disconnect/switch flow, compact label + size.
+                    div()
+                        .id("x-disconnect")
+                        .px(px(7.0))
+                        .py(px(3.0))
+                        .rounded(px(999.0))
+                        .border_1()
+                        .border_color(tint(0x7af6ff, 55))
+                        .bg(tint(0x101826, 170))
+                        .text_size(px(11.0))
+                        .text_color(rgb(0xb7c3dc))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0xff4fa3)).text_color(rgb(0xffd0ea)))
+                        .child("Switch")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                this.disconnect_x(cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .into_any_element(),
             ConnState::NotConnected { reason, next } => {
                 let mut col = div()
@@ -1154,6 +1244,13 @@ impl XPanel {
         }
 
         if key == "escape" {
+            if self.viewer.is_some() {
+                self.close_viewer();
+                self.notice = Some("Viewer closed \u{b7} nothing was posted.".into());
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
             if self.reply_post_id.is_some() {
                 self.close_reply();
                 cx.stop_propagation();
@@ -1199,6 +1296,21 @@ impl XPanel {
             // Confirm modal owns the keyboard; never leak into the terminal.
             cx.stop_propagation();
             return;
+        }
+
+        if self.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) {
+            match key {
+                "space" => { if let Some(pl) = &mut self.video_player { pl.toggle_pause(); self.player_paused = !self.player_paused; } }
+                "left" => { if let Some(pl) = &mut self.video_player { pl.seek_relative(-10); } }
+                "right" => { if let Some(pl) = &mut self.video_player { pl.seek_relative(10); } }
+                "m" => { self.player_muted = !self.player_muted; if let Some(pl) = &mut self.video_player { pl.set_muted(self.player_muted); } }
+                _ => {}
+            }
+            if matches!(key, "space" | "left" | "right" | "m") {
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
         }
 
         if self.input_target == InputTarget::Search && self.section == XSection::Search {
@@ -1619,6 +1731,7 @@ impl XPanel {
     }
 
     fn open_reply(&mut self, post: &Post) {
+        self.close_viewer();
         if self.reply_post_id.as_deref() != Some(post.id.as_str()) {
             self.reply_text.clear();
             self.reply_media.clear();
@@ -2013,8 +2126,16 @@ fn fetch_section(section: XSection, query: String, lookup: String, live: bool) -
     }
 }
 
+impl Drop for XPanel {
+    fn drop(&mut self) {
+        // Never leave an embedded player process/HWND behind Termy.
+        self.stop_video_player();
+    }
+}
+
 impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_video_player(window, cx);
         if self.pending_focus {
             self.focus.focus(window, cx);
             self.pending_focus = false;
@@ -2090,7 +2211,8 @@ impl Render for XPanel {
             )
             .children(self.confirm.then(|| {
                 self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)
-            }));
+            }))
+            .children(self.viewer_overlay(cx));
         let elapsed = render_started.elapsed();
         if elapsed.as_millis() > 12
             && self.last_render_log.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
@@ -2126,6 +2248,24 @@ fn fetch_image_rgba(url: &str) -> Result<image::RgbaImage, String> {
     image::load_from_memory(&bytes)
         .map(|d| d.to_rgba8())
         .map_err(|e| e.to_string())
+}
+
+/// Local wall-clock HH:MM:SS for the refresh status label.
+fn local_hms() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct SystemTime { year: u16, month: u16, dow: u16, day: u16, hour: u16, minute: u16, second: u16, ms: u16 }
+        unsafe extern "system" { fn GetLocalTime(t: *mut SystemTime); }
+        let mut st = SystemTime { year: 0, month: 0, dow: 0, day: 0, hour: 0, minute: 0, second: 0, ms: 0 };
+        unsafe { GetLocalTime(&mut st) };
+        return format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    }
 }
 
 /// Append one line to %TEMP%/termy-x-perf.txt (slow renders + reply timing).
@@ -2265,6 +2405,30 @@ impl XPanel {
 
     fn tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let current = self.section;
+        let refresh_btn = {
+            let refreshing = self.loading;
+        div()
+            .id("x-refresh")
+            .px(px(9.0))
+            .py(px(5.0))
+            .rounded(px(8.0))
+            .text_size(px(13.0))
+            .cursor_pointer()
+            .border_1()
+            .border_color(if refreshing { rgb(0xff4fa3) } else { tint(0x7af6ff, 45) })
+            .bg(if refreshing { rgb(0x2a0f3a) } else { tint(0x101826, 170) })
+            .text_color(if refreshing { rgb(0xffd0ea) } else { rgb(0x7af6ff) })
+            .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0x7af6ff)))
+            .child(if refreshing { "\u{21bb}\u{2026}" } else { "\u{21bb}" })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.refresh_current(cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+        };
         div().flex().gap(px(6.0)).flex_wrap().children(
             [
                 XSection::Timeline,
@@ -2313,13 +2477,14 @@ impl XPanel {
                     )
             }),
         )
+        .child(refresh_btn)
     }
 
     fn status_line(&self) -> impl IntoElement {
         let label = if self.loading {
             format!("â³ {}", self.status)
         } else {
-            self.status.clone()
+            match &self.last_refresh { Some(at) => format!("{} \u{b7} updated {at}", self.status), None => self.status.clone() }
         };
         div()
             .text_size(px(11.0))
@@ -2664,52 +2829,116 @@ impl XPanel {
         urls.sort();
         urls.dedup();
         for url in urls {
-            if self.media_cache.contains_key(&url) {
-                continue;
-            }
-            self.media_cache.insert(url.clone(), MediaState::Loading);
-            let fetch_url = url.clone();
-            let bg = cx.background_executor().spawn(async move {
-                fetch_image_rgba(&fetch_url)
-            });
-            cx.spawn(async move |this, cx| {
-                let result = bg.await;
-                let _ = this.update(cx, |panel, cx| {
-                    let state = match result {
-                        Ok(buffer) => MediaState::Ready(Arc::new(RenderImage::new(vec![
-                            image::Frame::new(buffer),
-                        ]))),
-                        Err(_) => MediaState::Failed,
-                    };
-                    panel.media_cache.insert(url.clone(), state);
-                    cx.notify();
-                });
-            })
-            .detach();
+            self.spawn_media_fetch(url, cx);
         }
     }
 
-    /// Reserved media area for a tweet: a fixed 170px box, so a photo or
-    /// video thumbnail loading in never changes card height or pushes
-    /// neighbours around. Video/GIF show their poster with a play badge;
-    /// clicking media (only) opens it externally and never expands a reply.
+    fn spawn_media_fetch(&mut self, url: String, cx: &mut Context<Self>) {
+        if self.media_cache.contains_key(&url) {
+            return;
+        }
+        self.media_cache.insert(url.clone(), MediaState::Loading);
+        let fetch_url = url.clone();
+        let bg = cx.background_executor().spawn(async move {
+            fetch_image_rgba(&fetch_url)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = bg.await;
+            let _ = this.update(cx, |panel, cx| {
+                let state = match result {
+                    Ok(buffer) => {
+                        let (width, height) = (buffer.width(), buffer.height());
+                        MediaState::Ready(CachedImage {
+                            image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                            width,
+                            height,
+                        })
+                    }
+                    Err(_) => MediaState::Failed,
+                };
+                panel.media_cache.insert(url.clone(), state);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn media_aspect(&self, media: &MediaItem) -> Option<f32> {
+        if let Some(poster) = &media.poster
+            && let Some(MediaState::Ready(cached)) = self.media_cache.get(poster) {
+                return cached.aspect();
+            }
+        if let Some(MediaState::Ready(cached)) = self.media_cache.get(&media.url) {
+            return cached.aspect();
+        }
+        media.aspect()
+    }
+
+    fn open_viewer(&mut self, media: &MediaItem, post_id: &str, cx: &mut Context<Self>) {
+        self.stop_video_player();
+        self.viewer = Some(Viewer {
+            kind: media.kind,
+            url: media.url.clone(),
+            poster: media.poster.clone(),
+            post_id: post_id.to_string(),
+        });
+        self.player_error = None;
+        self.player_paused = false;
+        self.player_muted = true;
+        if media.kind == MediaKind::Photo {
+            let url = media.url.clone();
+            self.spawn_media_fetch(url, cx);
+            self.notice = Some("Photo opened in Termy — Esc or ✕ to close.".into());
+        } else {
+            self.player_pending = true;
+            self.notice = Some("Playing video inside Termy (muted) — Esc or ✕ to stop.".into());
+        }
+        self.pending_focus = true;
+    }
+
+    fn stop_video_player(&mut self) {
+        self.player_pending = false;
+        if let Some(player) = self.video_player.take() {
+            player.stop();
+        }
+    }
+
+    fn close_viewer(&mut self) {
+        self.stop_video_player();
+        self.viewer = None;
+        self.player_error = None;
+        self.pending_focus = true;
+    }
+    /// Reserved media area for a tweet, sized from the media's real
+    /// aspect ratio (decoded poster first, then provider/URL dims, then
+    /// 16:9) and contain-fitted: the WHOLE photo/poster is always shown,
+    /// letterboxed on the dark card, never cropped or squashed. Height is
+    /// reserved before decode, so cards do not jump. Clicking media (only)
+    /// opens the in-app viewer and never expands a reply or a browser.
     fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         let media = post.media.first()?;
         let kind = media.kind;
         let poster = media.poster.clone().unwrap_or_default();
-        let media_url = media.url.clone();
-        let post_url = post.url.clone();
+        let viewer_media = media.clone();
+        let post_id = post.id.clone();
+        let aspect = self.media_aspect(media);
+        // Panel content width: 480 panel - 32 panel padding - 24 card padding.
+        let box_h = media_fit::media_box_height(424.0, aspect);
+        // Shrink-to-fit: the preview element itself is only as big as the
+        // whole frame inside the capped media area (portrait media renders
+        // small and centred-by-width, never a full-width tall box).
+        let (fit_w, fit_h) = media_fit::contain_size(424.0, box_h, aspect);
         let extra = post.media.len().saturating_sub(1);
         let badge = match kind {
-            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play",
-            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play",
-            MediaKind::Photo => "",
+            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play in Termy",
+            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play in Termy",
+            MediaKind::Photo => "\u{1f50d} tap to view",
         };
         let mut area = div()
             .id(SharedString::from(format!("x-media-{}", post.id)))
             .relative()
-            .w_full()
-            .h(px(170.0))
+            .w(px(fit_w))
+            .h(px(box_h))
             .flex_none()
             .mt(px(8.0))
             .rounded(px(10.0))
@@ -2719,9 +2948,9 @@ impl XPanel {
             .border_color(tint(0x7af6ff, 55))
             .cursor_pointer();
         match self.media_cache.get(&poster) {
-            Some(MediaState::Ready(image)) => {
-                let source: ImageSource = ImageSource::Render(image.clone());
-                area = area.child(img(source).w_full().h_full().object_fit(ObjectFit::Cover));
+            Some(MediaState::Ready(cached)) => {
+                let source: ImageSource = ImageSource::Render(cached.image.clone());
+                area = area.child(img(source).w(px(fit_w)).h(px(fit_h)).object_fit(ObjectFit::Contain));
             }
             Some(MediaState::Failed) => {
                 area = area.child(
@@ -2736,12 +2965,8 @@ impl XPanel {
                 );
             }
         }
-        if !badge.is_empty() || extra > 0 {
-            let label = if extra > 0 {
-                format!("{badge}  +{extra} more")
-            } else {
-                badge.to_string()
-            };
+        {
+            let label = if extra > 0 { format!("{badge}  +{extra} more") } else { badge.to_string() };
             area = area.child(
                 div()
                     .absolute()
@@ -2756,25 +2981,240 @@ impl XPanel {
                     .child(label),
             );
         }
-        let open_url = if kind == MediaKind::Photo { media_url } else if !post_url.is_empty() { post_url } else { media_url };
         area = area.on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                // Explicit media click only: open externally, never a reply.
-                let url = open_url.clone();
                 if !this.live {
                     this.notice = Some("Preview does not open media.".into());
                 } else {
-                    std::thread::spawn(move || {
-                        let _ = termy_x::io::Opener::open(&termy_x::io::SystemOpener, &url);
-                    });
-                    this.notice = Some("Opened media in your default player/browser.".into());
+                    this.open_viewer(&viewer_media, &post_id, cx);
                 }
                 cx.stop_propagation();
                 cx.notify();
             }),
         );
         Some(area.into_any_element())
+    }
+
+
+    /// Start/position the embedded mpv surface over the viewer's video
+    /// area. Called from render only when a video viewer is open; the
+    /// rect is derived from the window viewport (panel is the rightmost
+    /// 480px, viewer header 56px + controls 72px), so the native surface
+    /// tracks Termy moves/resizes and never changes Termy's geometry.
+    fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(viewer) = self.viewer.clone() else { return };
+        if viewer.kind == MediaKind::Photo { return; }
+        #[cfg(target_os = "windows")]
+        {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            if let Ok(handle) = HasWindowHandle::window_handle(window)
+                && let RawWindowHandle::Win32(win32) = handle.as_raw() {
+                    self.host_hwnd = win32.hwnd.get() as isize;
+                }
+        }
+        let viewport = window.viewport_size();
+        let vw: f32 = viewport.width.into();
+        self.viewport_w = vw;
+        let vh: f32 = viewport.height.into();
+        let panel_w = if self.fill_window { vw } else { 480.0_f32.min(vw) };
+        let rect: player::Rect = (vw - panel_w, 56.0, panel_w, (vh - 160.0).max(80.0));
+        let scale = window.scale_factor();
+        if let Some(player) = &mut self.video_player {
+            player.reposition(scale, rect);
+        } else if self.player_pending {
+            self.player_pending = false;
+            if !self.live {
+                self.player_error = Some("Preview does not play video.".into());
+                return;
+            }
+            #[cfg(target_os = "windows")]
+            match player::VideoPlayer::start(self.host_hwnd, scale, rect, &viewer.url) {
+                Ok(player) => {
+                    self.video_player = Some(player);
+                    self.player_error = None;
+                    // Keep the seek bar/time readout live: re-render ~2x/sec
+                    // while the video viewer is open (cheap, panel-only).
+                    cx.spawn(async move |this, cx| {
+                        loop {
+                            cx.background_executor().timer(Duration::from_millis(600)).await;
+                            let alive = this.update(cx, |panel, cx| {
+                                let open = panel.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) && panel.video_player.is_some();
+                                if open { cx.notify(); }
+                                open
+                            }).unwrap_or(false);
+                            if !alive { break; }
+                        }
+                    }).detach();
+                }
+                Err(e) => { self.player_error = Some(format!("In-app player unavailable: {e}")); }
+            }
+            #[cfg(not(target_os = "windows"))]
+            { self.player_error = Some("In-app video needs the Windows mpv build.".into()); }
+        }
+    }
+
+    /// Seek-bar click/drag at window-x `x`: fraction from the bar's known
+    /// geometry (panel is the rightmost 480px, bar inset 12px each side).
+    fn seek_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
+        let panel_w = if self.fill_window { self.viewport_w } else { 480.0_f32.min(self.viewport_w) };
+        let bar_x = self.viewport_w - panel_w + 12.0;
+        let bar_w = (panel_w - 24.0).max(1.0);
+        let (_, dur) = self.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
+        if dur > 0.0 {
+            let target = f64::from(media_fit::seek_fraction(x, bar_x, bar_w)) * dur;
+            if let Some(pl) = &mut self.video_player { pl.seek_absolute(target); }
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn viewer_overlay(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let viewer = self.viewer.as_ref()?;
+        let is_video = viewer.kind != MediaKind::Photo;
+        let title = match viewer.kind {
+            MediaKind::Photo => "Photo \u{b7} in Termy",
+            MediaKind::Video => "Video \u{b7} playing in Termy (muted)",
+            MediaKind::Gif => "GIF \u{b7} playing in Termy (muted)",
+        };
+        // Middle: photo image (contain, whole) or the native video host area.
+        let middle: gpui_kit::AnyElement = if is_video {
+            let mut area = div().relative().w_full().h_full().bg(rgb(0x000000));
+            if let Some(error) = &self.player_error {
+                area = area.child(
+                    div().absolute().top(px(12.0)).left(px(12.0)).right(px(12.0))
+                        .p(px(10.0)).rounded(px(8.0)).bg(tint(0x2a0f1a, 235))
+                        .text_size(px(12.0)).text_color(rgb(0xffd0ea))
+                        .child(format!("{error} The poster is shown instead \u{2014} no browser was opened.")),
+                );
+            } else if self.video_player.is_none() {
+                area = area.child(div().p(px(12.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3)).child("Starting in-app player\u{2026}"));
+            }
+            area.into_any_element()
+        } else {
+            let key = if self.media_cache.contains_key(&viewer.url) { viewer.url.clone() } else { viewer.poster.clone().unwrap_or_else(|| viewer.url.clone()) };
+            let mut area = div().relative().w_full().h_full().flex().items_center().justify_center()
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.close_viewer();
+                    cx.stop_propagation();
+                    cx.notify();
+                }));
+            match self.media_cache.get(&key) {
+                Some(MediaState::Ready(cached)) => {
+                    let source: ImageSource = ImageSource::Render(cached.image.clone());
+                    area = area.child(img(source).w_full().h_full().object_fit(ObjectFit::Contain));
+                }
+                Some(MediaState::Failed) => {
+                    area = area.child(div().text_size(px(13.0)).text_color(rgb(0x93a4c3)).child("Photo could not load."));
+                }
+                _ => {
+                    area = area.child(div().text_size(px(13.0)).text_color(rgb(0x93a4c3)).child("Loading photo\u{2026}"));
+                }
+            }
+            area.into_any_element()
+        };
+        let mut controls = div().h(px(104.0)).flex_none().flex().flex_col().justify_center().gap(px(6.0)).px(px(12.0));
+        if is_video {
+            let (pos, dur) = self.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
+            let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
+            let panel_w = if self.fill_window { self.viewport_w } else { 480.0_f32.min(self.viewport_w) };
+            let bar_w = (panel_w - 24.0).max(1.0);
+            controls = controls.child(
+                div()
+                    .id("x-viewer-seek")
+                    .relative()
+                    .w_full()
+                    .h(px(22.0))
+                    .flex_none()
+                    .rounded(px(999.0))
+                    .bg(tint(0x1a2a4a, 255))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(px(bar_w * frac))
+                            .rounded(px(999.0))
+                            .bg(rgb(0x7af6ff))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                let x: f32 = event.position.x.into();
+                                this.seek_bar_click(x, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(3.0))
+                            .right(px(10.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xe9fdff))
+                            .child(format!("{} / {}", media_fit::format_time(pos), media_fit::format_time(dur))),
+                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        let x: f32 = event.position.x.into();
+                        this.seek_bar_click(x, cx);
+                    }))
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            let x: f32 = event.position.x.into();
+                            this.seek_bar_click(x, cx);
+                        }
+                    }))
+                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                        // Drag release lands the seek even if move events
+                        // were coalesced away.
+                        let x: f32 = event.position.x.into();
+                        this.seek_bar_click(x, cx);
+                    })),
+            );
+            controls = controls.child(
+                div().flex().items_center().gap(px(8.0))
+                .child(x_button!("x-viewer-pause", if self.player_paused { "\u{25b6} Play" } else { "\u{23f8} Pause" }, cx.listener(|this, _, _, cx| {
+                    if let Some(pl) = &mut this.video_player { pl.toggle_pause(); this.player_paused = !this.player_paused; }
+                    cx.stop_propagation(); cx.notify();
+                })))
+                .child(x_button!("x-viewer-back", "-10s", cx.listener(|this, _, _, cx| {
+                    if let Some(pl) = &mut this.video_player { pl.seek_relative(-10); }
+                    cx.stop_propagation(); cx.notify();
+                })))
+                .child(x_button!("x-viewer-fwd", "+10s", cx.listener(|this, _, _, cx| {
+                    if let Some(pl) = &mut this.video_player { pl.seek_relative(10); }
+                    cx.stop_propagation(); cx.notify();
+                })))
+                .child(x_button!("x-viewer-mute", if self.player_muted { "Unmute" } else { "Mute" }, cx.listener(|this, _, _, cx| {
+                    this.player_muted = !this.player_muted;
+                    if let Some(pl) = &mut this.video_player { pl.set_muted(this.player_muted); }
+                    cx.stop_propagation(); cx.notify();
+                })))
+                .child(div().text_size(px(11.0)).text_color(rgb(0x93a4c3)).child("Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close")),
+            );
+        } else {
+            controls = controls.child(div().text_size(px(11.0)).text_color(rgb(0x93a4c3)).child("Click image or backdrop, Esc, or \u{2715} to close \u{b7} whole photo, never cropped"));
+        }
+        let el = div()
+            .id("x-viewer")
+            .absolute().top_0().left_0().size_full()
+            .flex().flex_col()
+            .bg(tint(0x02040a, 242))
+            .child(
+                div().h(px(56.0)).flex_none().flex().items_center().justify_between().px(px(12.0))
+                    .child(div().text_size(px(13.0)).text_color(rgb(0xe9fdff)).child(title))
+                    .child(x_button!("x-viewer-close", "\u{2715} Close", cx.listener(|this, _, _, cx| {
+                        this.close_viewer();
+                        cx.stop_propagation(); cx.notify();
+                    }))),
+            )
+            .child(div().flex_1().min_h(px(0.0)).child(middle))
+            .child(controls)
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                // Backdrop clicks are handled by the photo area / Close; keep
+                // clicks in chrome from falling through to tweets underneath.
+                let _ = this;
+                cx.stop_propagation();
+            }));
+        Some(el.into_any_element())
     }
 
     /// One tweet in Timeline / Search / Trends. Clicking it expands an
@@ -2946,7 +3386,7 @@ impl XPanel {
                             img(thumb_source)
                                 .w(px(40.0))
                                 .h(px(40.0))
-                                .object_fit(ObjectFit::Cover)
+                                .object_fit(ObjectFit::Contain)
                                 .rounded_md(),
                         )
                         .child(
@@ -3273,7 +3713,7 @@ impl XPanel {
                                     img(thumb_source)
                                         .w(px(48.0))
                                         .h(px(48.0))
-                                        .object_fit(ObjectFit::Cover)
+                                        .object_fit(ObjectFit::Contain)
                                         .rounded_md(),
                                 )
                                 .child(

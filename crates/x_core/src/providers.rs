@@ -1512,7 +1512,11 @@ fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
                 .filter(|p| !p.is_empty())
                 .map(str::to_string)
                 .or_else(|| (kind == MediaKind::Photo).then(|| url.to_string()));
-            out.push(MediaItem { kind, url: url.to_string(), poster });
+            let (width, height) = match crate::model::dims_from_media_url(url) {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (None, None),
+            };
+            out.push(MediaItem { kind, url: url.to_string(), poster, width, height });
         }
         return out;
     }
@@ -1529,12 +1533,20 @@ fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
                 _ => (String::new(), None),
             };
             if url.is_empty() { continue; }
+            let dims = crate::model::dims_from_media_url(&url);
+            let (width, height) = match (
+                entry.get("width").and_then(Value::as_u64),
+                entry.get("height").and_then(Value::as_u64),
+            ) {
+                (Some(w), Some(h)) => (Some(w as u32), Some(h as u32)),
+                _ => match dims { Some((w, h)) => (Some(w), Some(h)), None => (None, None) },
+            };
             let kind = match first_str(entry, &["type", "kind"]) {
                 Some("video") | Some("animated_gif") => if first_str(entry, &["type"]) == Some("animated_gif") { MediaKind::Gif } else { MediaKind::Video },
                 _ => kind_of(&url),
             };
             let poster = poster.or_else(|| (kind == MediaKind::Photo).then(|| url.clone()));
-            out.push(MediaItem { kind, url, poster });
+            out.push(MediaItem { kind, url, poster, width, height });
         }
     }
     out
@@ -1561,6 +1573,19 @@ mod media_parse_tests {
         assert_eq!(posts[1].media[0].kind, MediaKind::Photo);
         assert_eq!(posts[1].media[0].poster.as_deref(), Some("https://pbs.twimg.com/media/ABC.jpg"));
         assert!(posts[2].media.is_empty());
+        // Video URLs state their size (/480x270/ style segment, here 320x568 in fixture? use parsed below)
+        assert_eq!(posts[0].media[0].width, Some(320));
+        assert_eq!(posts[0].media[0].height, Some(568));
+        assert_eq!(posts[1].media[0].width, None);
+    }
+
+    #[test]
+    fn dims_from_media_url_parses_only_plausible_segments() {
+        use crate::model::dims_from_media_url;
+        assert_eq!(dims_from_media_url("https://video.twimg.com/amplify_video/9/vid/avc1/480x270/a.mp4?tag=29"), Some((480, 270)));
+        assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg"), None);
+        assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg?name=4096x4096"), None);
+        assert_eq!(dims_from_media_url("https://x.com/1x1/a.jpg"), None);
     }
 }
 
