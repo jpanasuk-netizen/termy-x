@@ -54,6 +54,21 @@ libsqlite3-sys = "0.30.1"
 [target."cfg(target_os = \"linux\")".dependencies]
 font-kit = { package = "zed-font-kit", version = "0.14.1-zed", features = ["source-fontconfig-dlopen"] }
 
+# Linux I/O fast-path crates (tokio-uring / glommio) are deliberately NOT
+# added here yet: nothing cfg(linux)-gated calls them, and an unused dep
+# would only add build/link risk. The network/loop #[cfg] refactor must
+# add the exact crate+version in the same commit that first calls it.
+# This section is the designated home for it.
+#
+# NOTE (shared, audited): mimalloc (in [dependencies] above) is the one C-backed direct dep
+# (libmimalloc-sys, cc-built) -- fine for native Linux/Windows builds and
+# measured, but cross builds need a C compiler for the *target*.
+# `sqlx` is used with default-features=false + runtime-tokio and no TLS
+# feature, so it pulls no OpenSSL; the explicit libsqlite3-sys above
+# (cfg(not(windows))) links system sqlite on Linux -- a Linux build host
+# needs libsqlite3-dev, or a follow-up should enable `bundled`. Left
+# untouched here: changing it would alter the working Windows link.
+
 
 [target."cfg(target_os = \"macos\")".dependencies]
 core-text = "=21.0.0"

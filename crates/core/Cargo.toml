@@ -15,7 +15,9 @@ serde = { workspace = true, features = ["derive", "rc"] }
 flume = { workspace = true }
 log = { workspace = true }
 dirs = { workspace = true }
-flate2 = "1.1"
+# rust_backend = miniz_oxide (pure Rust). Pinning it (was the implicit
+# default) keeps zlib-ng/cloudflare C backends out of cross builds.
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
 fontdb = "0.23"
 polling = { workspace = true }
 png = "0.18"
@@ -35,6 +37,12 @@ semver = { workspace = true }
 regex = "1"
 tempfile = { workspace = true }
 
+# Platform layout (audited for Linux migration, agent L1):
+# - unix: PTY/rustix (Linux+macOS), windows: winreg+windows-sys (registry,
+#   console) -- both already correctly gated, do not ungate.
+# - Everything above is shared/pure-Rust; `dirs`/`keyring` select their
+#   per-OS backend internally (keyring: Secret Service/zbus on Linux,
+#   Credential Manager on Windows, Keychain on macOS), so they stay shared.
 [target."cfg(unix)".dependencies]
 rustix-openpty = { version = "0.2" }
 libc = "0.2"

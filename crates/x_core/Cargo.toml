@@ -9,6 +9,11 @@ readme = "README.md"
 [lints]
 workspace = true
 
+# No target-gated deps needed: all deps here are shared/pure-Rust. The
+# Windows-only behaviour in src/io.rs (CREATE_NO_WINDOW, Chrome/OpenCLI
+# window silencer via hand-rolled user32 FFI, PATHEXT/.cmd shim lookup)
+# is #[cfg(windows)] in code with a no-op stub on other OSes; %APPDATA%-
+# style paths go through shared `dirs`, which resolves XDG on Linux.
 [dependencies]
 aho-corasick = "1"
 anyhow = { workspace = true }
