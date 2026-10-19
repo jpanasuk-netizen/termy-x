@@ -254,6 +254,14 @@ pub struct Profile {
     pub bio: String,
     pub followers: u64,
     pub following: u64,
+    /// Avatar image URL when the provider payload carries one
+    /// (`profile_image_url_https` etc). Never invented: `None` renders
+    /// an initials placeholder, not a guessed CDN URL.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    /// Banner/cover image URL when the payload carries one.
+    #[serde(default)]
+    pub banner_url: Option<String>,
     /// Latest posts (pinned excluded — see `pinned`).
     pub posts: Vec<Post>,
     /// The account's pinned post(s), read from the provider payload
@@ -261,6 +269,55 @@ pub struct Profile {
     /// when the account has no pinned post.
     #[serde(default)]
     pub pinned: Vec<Post>,
+}
+
+/// Posts shown in Profile section 1 (Top) and section 2 (All Tweets).
+pub const PROFILE_TOP_N: usize = 20;
+/// Depth cap for Profile's All Tweets section (Jeremy: 120 deep).
+pub const PROFILE_ALL_N: usize = 120;
+
+/// The two Profile sections, derived from one fetched profile.
+/// `top_ranked` is true only when the payload actually carried
+/// engagement counts to rank by; otherwise `top` is simply the
+/// latest posts and the UI must label it that way (no fake ranking).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileSections {
+    pub top: Vec<Post>,
+    pub top_ranked: bool,
+    pub all: Vec<Post>,
+}
+
+fn dedupe_by_id(posts: &[Post]) -> Vec<Post> {
+    let mut seen = std::collections::HashSet::new();
+    posts
+        .iter()
+        .filter(|post| seen.insert(post.id.clone()))
+        .cloned()
+        .collect()
+}
+
+/// Build the two Profile sections: Section 1 is profile info + Top
+/// [`PROFILE_TOP_N`] (pinned excluded — pinned keeps its own card),
+/// Section 2 is All Tweets, chronological as fetched, deduped by id,
+/// capped at [`PROFILE_ALL_N`]. Nothing is padded: fewer fetched
+/// posts simply means shorter sections.
+pub fn profile_sections(profile: &Profile) -> ProfileSections {
+    let all: Vec<Post> = dedupe_by_id(&profile.posts)
+        .into_iter()
+        .take(PROFILE_ALL_N)
+        .collect();
+    let mut top = exclude_pinned(&dedupe_by_id(&profile.posts), &profile.pinned);
+    let top_ranked = top.iter().any(|post| post.engagement() > 0);
+    if top_ranked {
+        // Stable sort: ties keep their fetched (chronological) order.
+        top.sort_by_key(|post| std::cmp::Reverse(post.engagement()));
+    }
+    top.truncate(PROFILE_TOP_N);
+    ProfileSections {
+        top,
+        top_ranked,
+        all,
+    }
 }
 
 /// Latest posts with any pinned duplicates removed, so a pinned post
@@ -623,5 +680,81 @@ mod trend_tests {
         // Multi-word requires all words.
         assert_eq!(filter_trends(&all, "breaking storm").len(), 1);
         assert_eq!(filter_trends(&all, "breaking nfl").len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod profile_section_tests {
+    use super::{profile_sections, Post, Profile, PROFILE_ALL_N, PROFILE_TOP_N};
+
+    fn post(id: &str, likes: u64) -> Post {
+        Post {
+            id: id.into(),
+            url: format!("https://x.com/a/status/{id}"),
+            author_handle: "a".into(),
+            author_name: "A".into(),
+            text: format!("t{id}"),
+            created_at: None,
+            likes,
+            reposts: 0,
+            replies: 0,
+            bookmarks: 0,
+            views: 0,
+            media: Vec::new(),
+            retweeted: None,
+        }
+    }
+
+    fn profile(posts: Vec<Post>, pinned: Vec<Post>) -> Profile {
+        Profile {
+            handle: "a".into(),
+            name: "A".into(),
+            bio: String::new(),
+            followers: 0,
+            following: 0,
+            avatar_url: None,
+            banner_url: None,
+            posts,
+            pinned,
+        }
+    }
+
+    #[test]
+    fn top_ranks_by_engagement_and_keeps_pinned_out() {
+        let posts: Vec<Post> = (0..25).map(|i| post(&i.to_string(), i as u64)).collect();
+        let sections = profile_sections(&profile(posts, vec![post("99", 10_000)]));
+        assert!(sections.top_ranked);
+        assert_eq!(sections.top.len(), PROFILE_TOP_N);
+        assert_eq!(sections.top[0].id, "24", "highest engagement first");
+        assert!(sections.top.iter().all(|p| p.id != "99"), "pinned has its own card");
+        assert_eq!(sections.all.len(), 25);
+    }
+
+    #[test]
+    fn no_engagement_counts_means_latest_not_a_fake_ranking() {
+        let posts = vec![post("1", 0), post("2", 0), post("3", 0)];
+        let sections = profile_sections(&profile(posts, Vec::new()));
+        assert!(!sections.top_ranked);
+        assert_eq!(
+            sections.top.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["1", "2", "3"],
+            "fetched order kept"
+        );
+    }
+
+    #[test]
+    fn all_tweets_dedupes_and_caps_at_120_without_padding() {
+        let mut posts: Vec<Post> = (0..130).map(|i| post(&i.to_string(), 0)).collect();
+        posts.push(post("7", 0)); // duplicate id must not appear twice
+        let sections = profile_sections(&profile(posts, Vec::new()));
+        assert_eq!(sections.all.len(), PROFILE_ALL_N);
+        let mut ids: Vec<&str> = sections.all.iter().map(|p| p.id.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), PROFILE_ALL_N, "no duplicates inside All Tweets");
+        // A short profile stays short: no padding to 20 or 120.
+        let short = profile_sections(&profile(vec![post("1", 0)], Vec::new()));
+        assert_eq!(short.all.len(), 1);
+        assert_eq!(short.top.len(), 1);
     }
 }

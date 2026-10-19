@@ -398,6 +398,8 @@ impl XProvider for MockProvider {
                 bio: "Mock profile. No live session and no X API credits.".to_string(),
                 followers: 128,
                 following: 40,
+                avatar_url: None,
+                banner_url: None,
                 posts: sample_posts()
                     .into_iter()
                     .skip(1)
@@ -594,6 +596,8 @@ fn fixtures() -> Vec<Profile> {
         bio: "Native terminal. The X panel is a fork feature for Jeremy.".into(),
         followers: 4096,
         following: 120,
+        avatar_url: None,
+        banner_url: None,
         posts: sample_posts().into_iter().take(2).collect(),
         pinned: Vec::new(),
     }]
@@ -842,7 +846,7 @@ impl XProvider for OpenCliProvider {
                 "tweets".into(),
                 handle.into(),
                 "--limit".into(),
-                "30".into(),
+                "120".into(),
                 "--page-delay".into(),
                 "1".into(),
             ]))
@@ -2024,7 +2028,7 @@ impl XProvider for OfficialProvider {
     fn lookup(&self, handle: &str) -> Result<Served<Profile>, String> {
         let share = self.share();
         let body = share.get(&format!(
-            "https://api.x.com/2/users/by/username/{handle}?user.fields=description,public_metrics"
+            "https://api.x.com/2/users/by/username/{handle}?user.fields=description,public_metrics,profile_image_url"
         ))?;
         let profile = parse_profile(&body, handle)?;
         Ok(official_served(
@@ -2509,6 +2513,27 @@ fn parse_thread(text: &str, fallback_id: &str) -> Result<Thread, String> {
     })
 }
 
+/// Avatar/banner URLs live at the top level in OpenCLI rows and under
+/// `legacy`/`user` in GraphQL/API shapes. Only real payload values are
+/// returned — never a synthesized CDN URL.
+fn profile_image_str(node: &Value, keys: &[&str]) -> Option<String> {
+    let containers = [
+        Some(node),
+        node.get("legacy"),
+        node.get("user"),
+        node.get("profile"),
+    ];
+    for container in containers.into_iter().flatten() {
+        if let Some(found) = first_str(container, keys) {
+            let found = found.trim();
+            if found.starts_with("http") {
+                return Some(found.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
     let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
     let node = value
@@ -2538,6 +2563,20 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
         bio,
         followers: number(metrics, &["followers_count", "followers"]),
         following: number(metrics, &["following_count", "friends_count", "following"]),
+        avatar_url: profile_image_str(node, &[
+            "profile_image_url_https",
+            "profile_image_url",
+            "avatar_url",
+            "avatarUrl",
+            "avatar",
+        ]),
+        banner_url: profile_image_str(node, &[
+            "profile_banner_url_https",
+            "profile_banner_url",
+            "banner_url",
+            "bannerUrl",
+            "cover_url",
+        ]),
         posts,
         pinned: Vec::new(),
     })
@@ -3569,6 +3608,20 @@ mod tests {
         assert_eq!(trends[0].category.as_deref(), Some("Politics"));
         assert_eq!(trends[0].volume, None);
         assert_eq!(trends[2].category.as_deref(), Some("Trending in United States"));
+    }
+
+    #[test]
+    fn profile_parses_avatar_and_banner_only_from_payload() {
+        let with = parse_profile(
+            r#"[{"screen_name":"ada","name":"Ada","profile_image_url_https":"https://img/a.jpg","legacy":{"profile_banner_url":"https://img/b.jpg"}}]"#,
+            "ada",
+        )
+        .unwrap();
+        assert_eq!(with.avatar_url.as_deref(), Some("https://img/a.jpg"));
+        assert_eq!(with.banner_url.as_deref(), Some("https://img/b.jpg"));
+        let without = parse_profile(r#"[{"screen_name":"ada","name":"Ada"}]"#, "ada").unwrap();
+        assert_eq!(without.avatar_url, None, "no invented avatar URL");
+        assert_eq!(without.banner_url, None);
     }
 
     #[test]
