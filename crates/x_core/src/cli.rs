@@ -209,7 +209,10 @@ fn print_help_guide() {
     println!("                        OpenCLI (with images) when available; else browser intent.");
     println!("  Tab / Esc / Enter     Cycle controls, cancel confirm, activate focused button");
     println!();
+    #[cfg(windows)]
     println!("CLI  (from the termy-x folder: .\\target\\release\\x.exe …)");
+    #[cfg(not(windows))]
+    println!("CLI  (from the termy-x folder: ./target/release/termy-xcli \u{2026})");
     println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
     println!("  x splash              Print the Termy X bird");
     println!("  x search \"query\" [--recent|--top] [--limit N]");
@@ -224,7 +227,10 @@ fn print_help_guide() {
     println!("  x post --dry-run \"text\"          Plan only - never posts");
     println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
     println!("  x post --reply-to ID \"text\"      Reply to a status");
+    #[cfg(windows)]
     println!("  PowerShell long text:  x post --dry-run (Get-Content -Raw .\\post.txt)");
+    #[cfg(not(windows))]
+    println!("  Shell long text:       x post --dry-run \"$(cat ./post.txt)\"");
     println!();
     println!("Nothing posts until you type yes (CLI) or hit Post now after Confirm (GUI).");
     println!("Premium auto-detects (25,000 chars); otherwise 280.");

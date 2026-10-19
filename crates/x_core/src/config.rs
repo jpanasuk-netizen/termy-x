@@ -305,7 +305,12 @@ impl XConfig {
 }
 
 pub fn default_config_dir() -> PathBuf {
+    // Primary source is `dirs` on every platform: %APPDATA% on Windows,
+    // $XDG_CONFIG_HOME (or ~/.config) on Linux, ~/Library on macOS.
+    // Only when that finds nothing do we use the explicit cfg'd
+    // fallback in `platform`, instead of writing config into the CWD.
     dirs::config_dir()
+        .or_else(crate::platform::config_base_fallback)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("termy")
 }

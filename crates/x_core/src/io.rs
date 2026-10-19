@@ -159,10 +159,26 @@ impl OpencliSilence {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux: there is no Win32 window to minimize, and Wayland gives a
+/// client no way to minimize another app's window at all. OpenCLI's
+/// `--window background` flag (already on every call) is the only
+/// silence available, so this is an honest no-op rather than a fake
+/// sweep. The provider loop itself is unchanged.
+#[cfg(target_os = "linux")]
 struct OpencliSilence;
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+impl OpencliSilence {
+    fn begin(_active: bool) -> Self {
+        Self
+    }
+    fn finish(self) {}
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+struct OpencliSilence;
+
+#[cfg(not(any(windows, target_os = "linux")))]
 impl OpencliSilence {
     fn begin(_active: bool) -> Self {
         Self
@@ -390,6 +406,9 @@ fn search_extensions() -> Vec<String> {
             }
         }
     }
+    // Windows shim extensions only make sense on Windows (PATHEXT does
+    // not exist elsewhere); on Linux a program is the bare PATH entry.
+    #[cfg(windows)]
     for required in [".CMD", ".BAT", ".PS1", ".EXE"] {
         if !exts.iter().any(|have| have.eq_ignore_ascii_case(required)) {
             exts.push(required.to_string());
@@ -518,6 +537,14 @@ fn hide_console(command: &mut Command) {
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<CommandOutput, String> {
+    // Linux: run the child in its own process group so a timeout can
+    // kill the whole tree (see kill_process_tree), like taskkill /T
+    // does on Windows. Windows spawning is untouched.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -606,7 +633,22 @@ fn kill_process_tree(child: &mut std::process::Child) {
             let _ = child.kill();
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // Negative PID = the child's process group (set at spawn).
+        let group = format!("-{}", child.id());
+        let killed = Command::new("kill")
+            .args(["-KILL", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !killed {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = child.kill();
     }
@@ -875,10 +917,43 @@ fn copy_text(text: &str) -> Result<(), String> {
             Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // Wayland first (wl-copy), then X11 (xclip / xsel). Each takes
+        // the text on stdin; the first that spawns and exits 0 wins.
+        let helpers: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        for (program, args) in helpers {
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            hide_console(&mut command);
+            let Ok(mut child) = command.spawn() else {
+                continue;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                if stdin.write_all(text.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
+            }
+            if child.wait().is_ok_and(|status| status.success()) {
+                return Ok(());
+            }
+        }
+        Err("clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked".to_string())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = text;
-        Err("clipboard is only wired on Windows in this build".to_string())
+        Err("clipboard is not wired on this platform in this build".to_string())
     }
 }
 

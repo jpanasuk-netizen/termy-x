@@ -14,6 +14,7 @@ pub mod drafts;
 pub mod feed;
 pub mod io;
 pub mod model;
+pub mod platform;
 mod parse_borrowed;
 pub mod premium;
 pub mod providers;

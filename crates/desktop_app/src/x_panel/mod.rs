@@ -3987,7 +3987,18 @@ fn global_cursor_list_y(hwnd: isize, scale: f32, list_top: f32) -> Option<f32> {
     Some(pt.y as f32 / scale.max(0.5) - list_top)
 }
 
-#[cfg(not(target_os = "windows"))]
+/// Linux fallback: Wayland forbids reading the global pointer from
+/// another surface, and X11 would need an XQueryPointer dependency we
+/// do not carry. Returning `None` makes autoscroll track the last
+/// in-window mouse position instead (see `toggle_autoscroll`), so
+/// middle-click autoscroll still works, it just stops tracking once
+/// the pointer leaves the Termy window. Honest degrade, never a panic.
+#[cfg(target_os = "linux")]
+fn global_cursor_list_y(_hwnd: isize, _scale: f32, _list_top: f32) -> Option<f32> {
+    None
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 fn global_cursor_list_y(_hwnd: isize, _scale: f32, _list_top: f32) -> Option<f32> {
     None
 }
@@ -5647,7 +5658,44 @@ impl XPanel {
                 }
                 Err(e) => { self.player_error = Some(format!("In-app player unavailable: {e}")); }
             }
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "linux")]
+            match player::VideoPlayer::start(0, scale, rect, &viewer.url) {
+                Ok(player) => {
+                    self.video_player = Some(player);
+                    // Honest UI note, shown over the viewer area: the
+                    // video is in mpv's own window, not embedded here,
+                    // and the in-panel seek/pause controls do not drive it.
+                    self.player_error = Some(
+                        "Linux: video opened in an external mpv window \u{b7} embedded playback and seek controls are Windows-only. Close the mpv window to end it.".into(),
+                    );
+                    // Poll only liveness: when the external window is
+                    // closed, end the viewer instead of leaving a stuck
+                    // "Starting in-app player" state behind.
+                    cx.spawn(async move |this, cx| {
+                        loop {
+                            cx.background_executor().timer(Duration::from_millis(600)).await;
+                            let alive = this.update(cx, |panel, cx| {
+                                let open = panel.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) && panel.video_player.is_some();
+                                if !open { return false; }
+                                if panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive()) {
+                                    panel.close_viewer();
+                                    panel.notice = Some("Video ended \u{b7} back to the timeline.".into());
+                                    cx.notify();
+                                    return false;
+                                }
+                                true
+                            }).unwrap_or(false);
+                            if !alive { break; }
+                        }
+                    }).detach();
+                }
+                Err(e) => {
+                    self.player_error = Some(format!(
+                        "External mpv unavailable on Linux: {e} Embedded playback is Windows-only \u{2014} the poster is shown instead, no browser was opened."
+                    ));
+                }
+            }
+            #[cfg(not(any(target_os = "windows", target_os = "linux")))]
             { self.player_error = Some("In-app video needs the Windows mpv build.".into()); }
         }
     }

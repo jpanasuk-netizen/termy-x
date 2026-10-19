@@ -102,6 +102,18 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
         ),
         format!("Config directory: {}", config.config_dir.display()),
     ];
+    // Linux-only addition: where a Chrome/Chromium profile would live.
+    // Discovery only — Termy X never reads profile contents; OpenCLI's
+    // Browser Bridge owns the session. Windows output is unchanged.
+    #[cfg(target_os = "linux")]
+    {
+        let found = crate::platform::existing_browser_profile_dirs();
+        lines.push(if found.is_empty() {
+            "Browser profile (Linux): none found under ~/.config, snap, or flatpak paths \u{2014} OpenCLI/Browser Bridge may still use its own profile".into()
+        } else {
+            format!("Browser profile (Linux): {}", found[0].display())
+        });
+    }
     if opencli.0 == Probe::Missing && twitter.0 == Probe::Missing {
         lines.push(
             "Neither free reader is installed. Reads still use mock fixtures, and publish uses the web intent."

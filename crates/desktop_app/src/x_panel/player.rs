@@ -5,32 +5,60 @@
 //! we create and own inside the Termy window, positioned exactly over
 //! the X panel's viewer area — it moves/resizes with Termy, never
 //! resizes Termy, and is destroyed (process killed) on close. Controls
-//! go over mpv's JSON IPC named pipe. Non-Windows builds are inert.
+//! go over mpv's JSON IPC named pipe.
+//!
+//! Linux cannot embed the Win32 surface, so it degrades honestly:
+//! the same mpv binary (from beside the executable or PATH) is opened
+//! as a separate, external mpv window owned by the window manager.
+//! There is no IPC seek/pause/progress on Linux — only alive/stop —
+//! and the panel says so in the viewer instead of pretending the
+//! embedded controls work. Other non-Windows builds stay inert.
 
 use std::path::PathBuf;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::process::{Child, Command, Stdio};
 
 /// Logical rect (x, y, w, h) in the parent window's client area.
 pub type Rect = (f32, f32, f32, f32);
 
 pub fn find_player() -> Option<PathBuf> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent() {
-            candidates.push(dir.join("mpv").join("mpv.exe"));
-            candidates.push(dir.join("mpv.exe"));
-        }
-    candidates.push(PathBuf::from(r"C:\Program Files\MPV Player\mpv.exe"));
-    candidates.push(PathBuf::from("mpv.exe"));
-    candidates.push(PathBuf::from("mpv"));
-    candidates.into_iter().find(|p| p.as_os_str() == "mpv" || p.as_os_str() == "mpv.exe" || p.exists())
+    #[cfg(windows)]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent() {
+                candidates.push(dir.join("mpv").join("mpv.exe"));
+                candidates.push(dir.join("mpv.exe"));
+            }
+        candidates.push(PathBuf::from(r"C:\Program Files\MPV Player\mpv.exe"));
+        candidates.push(PathBuf::from("mpv.exe"));
+        candidates.push(PathBuf::from("mpv"));
+        candidates.into_iter().find(|p| p.as_os_str() == "mpv" || p.as_os_str() == "mpv.exe" || p.exists())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent() {
+                candidates.push(dir.join("mpv").join("mpv"));
+                candidates.push(dir.join("mpv"));
+            }
+        candidates.push(PathBuf::from("mpv"));
+        candidates.into_iter().find(|p| p.as_os_str() == "mpv" || p.exists())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
 }
 
 pub struct VideoPlayer {
     #[cfg(windows)]
     inner: win::Player,
-    #[cfg(not(windows))]
+    /// Linux external-mpv child (no embedded surface, no IPC).
+    #[cfg(target_os = "linux")]
+    child: Option<Child>,
+    #[cfg(not(any(windows, target_os = "linux")))]
     _priv: (),
 }
 
@@ -42,7 +70,26 @@ impl VideoPlayer {
             let inner = win::Player::start(bin, parent_hwnd, scale, rect, url)?;
             Ok(Self { inner })
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            // External window fallback: mpv opens its own window; the
+            // parent hwnd / rect do not apply and are ignored honestly.
+            let _ = (parent_hwnd, scale, rect);
+            let bin = find_player().ok_or_else(|| {
+                "mpv not found on PATH (install mpv for external video playback)".to_string()
+            })?;
+            let child = Command::new(&bin)
+                .args(["--really-quiet", "--keep-open=yes", url])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|e| format!("could not start mpv ({}): {e}", bin.display()))?;
+            Ok(Self {
+                child: Some(child),
+            })
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (parent_hwnd, scale, rect, url);
             Err("in-app video is Windows-only in this build".into())
@@ -82,6 +129,11 @@ impl VideoPlayer {
     pub fn stop(mut self) {
         #[cfg(windows)]
         self.inner.stop_inner();
+        #[cfg(target_os = "linux")]
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
     /// False once the mpv process has exited (EOF quit, crash, or its
     /// window closed) — the panel polls this to clear playing state.
@@ -90,7 +142,14 @@ impl VideoPlayer {
         {
             self.inner.is_alive()
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            match self.child.as_mut() {
+                Some(child) => matches!(child.try_wait(), Ok(None)),
+                None => false,
+            }
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             false
         }
