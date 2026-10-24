@@ -637,7 +637,7 @@ impl XPanel {
             video_player: None,
             player_pending: false,
             player_paused: false,
-            player_muted: true,
+            player_muted: false,
             player_error: None,
             #[cfg(target_os = "windows")]
             host_hwnd: 0,
@@ -5442,14 +5442,14 @@ impl XPanel {
         });
         self.player_error = None;
         self.player_paused = false;
-        self.player_muted = true;
+        self.player_muted = false;
         if media.kind == MediaKind::Photo {
             let url = media.url.clone();
             self.spawn_media_fetch(url, cx);
             self.notice = Some("Photo opened in Termy — Esc or ✕ to close.".into());
         } else {
             self.player_pending = true;
-            self.notice = Some("Playing video inside Termy (muted) — Esc or ✕ to stop.".into());
+            self.notice = Some("Playing video inside Termy — Esc or ✕ to stop.".into());
         }
         self.pending_focus = true;
     }
@@ -5849,7 +5849,7 @@ impl XPanel {
         let is_video = viewer.kind != MediaKind::Photo;
         let title = match viewer.kind {
             MediaKind::Photo => "Photo \u{b7} in Termy",
-            MediaKind::Video => "Video \u{b7} playing in Termy (muted)",
+            MediaKind::Video => "Video \u{b7} playing in Termy",
             MediaKind::Gif => "GIF \u{b7} playing in Termy (muted)",
         };
         // Middle: photo image (contain, whole) or the native video host area.

@@ -119,6 +119,10 @@ impl VideoPlayer {
     }
     pub fn set_muted(&mut self, muted: bool) {
         self.command(&format!(r#"{{"command":["set_property","mute",{}]}}"#, if muted { "true" } else { "false" }));
+        if !muted {
+            // Never unmute into volume 0 (silent "unmuted" playback).
+            self.command(r#"{"command":["set_property","volume",100]}"#);
+        }
     }
     fn command(&mut self, json: &str) {
         #[cfg(windows)]
@@ -271,7 +275,7 @@ mod win {
                 &format!("--wid={}", host as isize),
                 &format!("--input-ipc-server={pipe}"),
                 "--no-terminal", "--really-quiet", "--keep-open=yes",
-                "--osc=yes", "--osd-level=1", "--mute=yes", "--volume=0",
+                "--osc=yes", "--osd-level=1", "--mute=no", "--volume=100",
                 "--cursor-autohide=no", "--hwdec=auto-safe",
                 url,
             ]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
