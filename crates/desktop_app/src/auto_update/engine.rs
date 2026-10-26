@@ -444,7 +444,7 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-pub fn do_install(tarball_path: &PathBuf) -> Result<InstallOutcome> {
+pub fn do_install(tarball_path: &std::path::Path) -> Result<InstallOutcome> {
     let home = std::env::var_os("HOME").context("HOME environment variable not set")?;
     super::linux_install::install_archive(tarball_path, &PathBuf::from(home).join(".local/bin"))?;
     Ok(InstallOutcome::Installed)

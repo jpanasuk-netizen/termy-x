@@ -309,6 +309,7 @@ struct Viewer {
     kind: MediaKind,
     url: String,
     poster: Option<String>,
+    #[allow(dead_code)]
     post_id: String,
 }
 
@@ -516,6 +517,7 @@ const TIMELINE_INITIAL: usize = 420;
 const TIMELINE_MAX: usize = 1600;
 
 /// Next Load-more limit for a feed loaded to `current`, or None at cap.
+#[allow(dead_code)]
 fn next_timeline_limit(current: usize) -> Option<usize> {
     if current >= TIMELINE_MAX {
         None
@@ -563,6 +565,7 @@ enum FetchPayload {
         /// Load-more fetch: append only unseen ids behind the loaded list.
         append: bool,
         /// The OpenCLI limit this batch was requested with.
+        #[allow(dead_code)]
         requested: usize,
         /// Bottom cursor for the next older page (cursor path only).
         next_cursor: Option<String>,
@@ -701,7 +704,7 @@ impl XPanel {
             lookup: if fill_window {
                 "termy".into()
             } else {
-                saved_handle.clone().unwrap_or_default()
+                saved_handle.unwrap_or_default()
             },
             media: Vec::new(),
             posting: false,
@@ -1575,7 +1578,7 @@ impl XPanel {
             return;
         }
         let mut wanted: Vec<String> = Vec::new();
-        let mut scan = |posts: &[Post], wanted: &mut Vec<String>| {
+        let scan = |posts: &[Post], wanted: &mut Vec<String>| {
             for post in posts {
                 if post.bare_repost_handle().is_some()
                     && !self.repost_cache.contains_key(&post.id)
@@ -2664,7 +2667,7 @@ impl XPanel {
         self.reply_opened_at = Some(Instant::now());
         self.reply_key_logged = false;
         perf_log(&format!("open_reply id={post_id} (local only, no fetch)"));
-        self.status = format!("reply to @{} \u{b7} type below, then Post", author_handle);
+        self.status = format!("reply to @{author_handle} \u{b7} type below, then Post");
     }
 
     /// Start the Posted burst in the editor a post just succeeded
@@ -3077,10 +3080,10 @@ impl XPanel {
                 match result {
                     Ok(message) => {
                         panel.follow_overrides.insert(handle.clone(), target);
-                        if let Some(profile) = &mut panel.profile {
-                            if profile.handle.eq_ignore_ascii_case(&handle) {
-                                profile.viewer_following = Some(target);
-                            }
+                        if let Some(profile) = &mut panel.profile
+                            && profile.handle.eq_ignore_ascii_case(&handle)
+                        {
+                            profile.viewer_following = Some(target);
                         }
                         panel.status = message;
                     }
@@ -3119,10 +3122,7 @@ impl XPanel {
         let author = author.to_string();
         let engage_started = Instant::now();
         let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
-        let now_active = match action {
-            EngageAction::Like | EngageAction::Retweet => true,
-            _ => false,
-        };
+        let now_active = matches!(action, EngageAction::Like | EngageAction::Retweet);
         self.set_engage_state(&id, is_like, now_active);
         self.engage_pending.push(id.clone());
         cx.notify();
@@ -3144,7 +3144,7 @@ impl XPanel {
                         "engage probe_ms={}",
                         probe_started.elapsed().as_millis()
                     ));
-                    publisher.engage(action, &url, None, &[]).map_err(|e| e)
+                    publisher.engage(action, &url, None, &[])
                 })
                 .await;
             perf_log(&format!(
@@ -3234,10 +3234,7 @@ impl XPanel {
         self.quote_author = author_handle.to_string();
         self.input_target = InputTarget::Quote;
         self.pending_focus = true;
-        self.status = format!(
-            "quote @{} \u{b7} your words on their tweet, then Post",
-            author_handle
-        );
+        self.status = format!("quote @{author_handle} \u{b7} your words on their tweet, then Post");
     }
 
     fn close_quote(&mut self) {
@@ -3311,8 +3308,7 @@ impl XPanel {
         let author = self.quote_author.clone();
         self.quote_posting = true;
         self.notice = Some(format!(
-            "Quoting @{} in-app, silently in the background\u{2026} no browser will open.",
-            author
+            "Quoting @{author} in-app, silently in the background\u{2026} no browser will open."
         ));
         cx.notify();
         let submit_started = Instant::now();
@@ -3358,10 +3354,9 @@ impl XPanel {
                         panel.quote_text.clear();
                         panel.quote_media.clear();
                         panel.notice = Some(format!(
-                            "Quoted @{} \u{b7} posted in-app, no browser opened.",
-                            author
+                            "Quoted @{author} \u{b7} posted in-app, no browser opened."
                         ));
-                        panel.status = format!("quoted @{}", author);
+                        panel.status = format!("quoted @{author}");
                         panel.begin_post_burst(BurstTarget::Quote, cx);
                         panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
@@ -4359,6 +4354,7 @@ enum SubmitKind {
 struct PostBurst {
     target: BurstTarget,
     seq: u64,
+    #[allow(dead_code)]
     started: Instant,
     /// For BurstTarget::Card: the tweet whose card shows the burst.
     card_id: Option<String>,
@@ -4407,8 +4403,8 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
                     // Break at the last space in this visual line if
                     // there is one past the line start, else hard-break.
                     let mut space_at: Option<usize> = None;
-                    for j in line_start..i {
-                        if chars[j].1 == ' ' {
+                    for (j, ch) in chars.iter().enumerate().take(i).skip(line_start) {
+                        if ch.1 == ' ' {
                             space_at = Some(j);
                         }
                     }
@@ -4436,7 +4432,7 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
 /// Which visual line (0-based) a byte caret lands on, given the wrap.
 fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
     let ranges = soft_wrap_ranges(text, max_chars);
-    for (idx, &(start, end)) in ranges.iter().enumerate() {
+    for (idx, &(_start, end)) in ranges.iter().enumerate() {
         if caret <= end {
             return idx;
         }
@@ -5733,6 +5729,7 @@ impl XPanel {
         card_el.into_any_element()
     }
 
+    #[allow(dead_code)]
     fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         self.media_box_scoped(post, "main", cx)
     }
@@ -6450,7 +6447,7 @@ impl XPanel {
     fn toggle_autoscroll(
         &mut self,
         event: &MouseDownEvent,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) {
         self.autoscroll_gen += 1;
@@ -6752,9 +6749,9 @@ impl XPanel {
         let liked = self.liked_ids.iter().any(|p| p == &post.id);
         let retweeted = self.retweeted_ids.iter().any(|p| p == &post.id);
         let pending = self.engage_pending.iter().any(|p| p == &post.id);
-        let (like_id, rt_id) = (id.clone(), id.clone());
-        let (like_url, rt_url) = (url.clone(), url.clone());
-        let (like_author, rt_author) = (author.clone(), author.clone());
+        let (like_id, rt_id) = (id.clone(), id);
+        let (like_url, rt_url) = (url.clone(), url);
+        let (like_author, rt_author) = (author.clone(), author);
         let quote_id = post.id.clone();
         let quote_author = post.author_handle.clone();
         div()

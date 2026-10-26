@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! In-app video playback via an embedded mpv child window (Windows).
 //!
 //! mpv (free, GPL) is located next to termy.exe (`mpv\mpv.exe` or

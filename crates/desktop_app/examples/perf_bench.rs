@@ -4,6 +4,7 @@
 //! compared before/after. No network, no posting.
 use std::time::Instant;
 
+#[cfg(target_os = "windows")]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

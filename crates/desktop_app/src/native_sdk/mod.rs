@@ -1,3 +1,4 @@
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod file_manager;
 
 pub use file_manager::{OPEN_TAB_HERE_LABEL, register_open_tab_here};
