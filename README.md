@@ -2,6 +2,9 @@
   <img alt="Termy-X logo" src="./assets/termyx-logo.png" width="640" />
 </p>
 
+> **Tip:** Press **Ctrl+Shift+X** to open Termy X.
+
+
 <p align="center">
   <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero.png" width="900" />
 </p>
