@@ -147,6 +147,7 @@ impl VideoPlayer {
         #[cfg(not(windows))]
         let _ = json;
     }
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
     pub fn stop(mut self) {
         #[cfg(windows)]
         self.inner.stop_inner();

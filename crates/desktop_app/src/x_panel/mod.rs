@@ -5848,6 +5848,10 @@ impl XPanel {
     /// rect is derived from the window viewport (panel is the rightmost
     /// 480px, viewer header 56px + controls 72px), so the native surface
     /// tracks Termy moves/resizes and never changes Termy's geometry.
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "linux")),
+        allow(unused_variables)
+    )]
     fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(viewer) = self.viewer.clone() else {
             return;
