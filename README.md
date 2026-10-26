@@ -1,5 +1,5 @@
 <p align="center">
-  <img alt="Termy-X logo" src="./assets/logo.jpg" width="360" />
+  <img alt="Termy-X logo" src="./assets/termyx-logo.png" width="640" />
 </p>
 
 <p align="center">
