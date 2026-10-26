@@ -601,10 +601,7 @@ fn spawn_pipe_reader(
 fn collect_pipe(rx: &std::sync::mpsc::Receiver<Vec<u8>>, grace: Duration) -> Vec<u8> {
     let mut buffer = Vec::new();
     let deadline = Instant::now() + grace;
-    loop {
-        let Some(rest) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
+    while let Some(rest) = deadline.checked_duration_since(Instant::now()) {
         match rx.recv_timeout(rest) {
             Ok(chunk) => buffer.extend_from_slice(&chunk),
             Err(_) => break,
@@ -948,7 +945,10 @@ fn copy_text(text: &str) -> Result<(), String> {
                 return Ok(());
             }
         }
-        Err("clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked".to_string())
+        Err(
+            "clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked"
+                .to_string(),
+        )
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {

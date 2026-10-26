@@ -552,9 +552,7 @@ pub fn entity_spans(text: &str) -> Vec<(usize, usize, EntityKind)> {
             let content = &text[at + c.len_utf8()..content_end];
             let valid = match kind {
                 EntityKind::Mention => !content.is_empty() && content.chars().count() <= 15,
-                EntityKind::Hashtag => {
-                    content.chars().any(|ch| ch.is_alphabetic() || ch == '_')
-                }
+                EntityKind::Hashtag => content.chars().any(|ch| ch.is_alphabetic() || ch == '_'),
                 EntityKind::Cashtag => {
                     let n = content.chars().count();
                     if !(1..=6).contains(&n) {
@@ -599,7 +597,7 @@ pub fn entity_spans(text: &str) -> Vec<(usize, usize, EntityKind)> {
 
 #[cfg(test)]
 mod entity_tests {
-    use super::{entity_spans, EntityKind};
+    use super::{EntityKind, entity_spans};
 
     fn kinds(text: &str) -> Vec<(usize, usize, EntityKind)> {
         entity_spans(text)

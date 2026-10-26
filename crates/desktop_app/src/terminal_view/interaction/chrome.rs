@@ -108,7 +108,10 @@ mod tests {
     #[test]
     fn terminal_content_width_subtracts_docked_x_panel() {
         // Panel closed: terminal keeps the full width.
-        assert_eq!(TerminalView::terminal_content_width(1296.0, 0.0, 0.0, 0.0), 1296.0);
+        assert_eq!(
+            TerminalView::terminal_content_width(1296.0, 0.0, 0.0, 0.0),
+            1296.0
+        );
         // Panel open at the standing outer size: grid gets the rest.
         assert_eq!(
             TerminalView::terminal_content_width(1296.0, 0.0, 0.0, 480.0),
@@ -119,7 +122,10 @@ mod tests {
             TerminalView::terminal_content_width(1296.0, 200.0, 48.0, 480.0),
             568.0
         );
-        assert_eq!(TerminalView::terminal_content_width(300.0, 0.0, 0.0, 480.0), 0.0);
+        assert_eq!(
+            TerminalView::terminal_content_width(300.0, 0.0, 0.0, 480.0),
+            0.0
+        );
     }
 
     #[test]

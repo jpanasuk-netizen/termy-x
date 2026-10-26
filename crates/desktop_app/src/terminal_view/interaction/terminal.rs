@@ -921,7 +921,15 @@ mod tests {
         let other_chrome = 240.0 + 48.0;
         let grid = |total_sidebar: f32| {
             TerminalView::terminal_grid_size_for_pane_count(
-                1, 1296.0, 800.0, total_sidebar, 32.0, 8.0, 8.0, 8.0, 16.0,
+                1,
+                1296.0,
+                800.0,
+                total_sidebar,
+                32.0,
+                8.0,
+                8.0,
+                8.0,
+                16.0,
             )
             .0
         };

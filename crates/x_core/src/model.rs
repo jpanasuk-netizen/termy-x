@@ -158,11 +158,19 @@ impl MediaItem {
 pub fn dims_from_media_url(url: &str) -> Option<(u32, u32)> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     for segment in path.split('/') {
-        let Some((w, h)) = segment.split_once('x') else { continue };
-        if w.is_empty() || h.is_empty() || w.len() > 5 || h.len() > 5 { continue; }
-        if !w.bytes().all(|b| b.is_ascii_digit()) || !h.bytes().all(|b| b.is_ascii_digit()) { continue; }
+        let Some((w, h)) = segment.split_once('x') else {
+            continue;
+        };
+        if w.is_empty() || h.is_empty() || w.len() > 5 || h.len() > 5 {
+            continue;
+        }
+        if !w.bytes().all(|b| b.is_ascii_digit()) || !h.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
         if let (Ok(w), Ok(h)) = (w.parse::<u32>(), h.parse::<u32>())
-            && (16..=8192).contains(&w) && (16..=8192).contains(&h) {
+            && (16..=8192).contains(&w)
+            && (16..=8192).contains(&h)
+        {
             return Some((w, h));
         }
     }
@@ -333,7 +341,11 @@ pub fn exclude_pinned(latest: &[Post], pinned: &[Post]) -> Vec<Post> {
         return latest.to_vec();
     }
     let ids: std::collections::HashSet<&str> = pinned.iter().map(|p| p.id.as_str()).collect();
-    latest.iter().filter(|p| !ids.contains(p.id.as_str())).cloned().collect()
+    latest
+        .iter()
+        .filter(|p| !ids.contains(p.id.as_str()))
+        .cloned()
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,8 +576,7 @@ pub fn trend_rank(trend: &Trend, sorted: &[Trend]) -> u64 {
         sorted
             .iter()
             .position(|t| t.name == trend.name && t.query == trend.query)
-            .map(|i| i as u64 + 1)
-            .unwrap_or(0)
+            .map_or(0, |i| i as u64 + 1)
     })
 }
 
@@ -683,7 +694,7 @@ pub fn trends_from_posts(posts: &[Post], place: Option<&str>) -> Vec<Trend> {
 
 #[cfg(test)]
 mod trend_tests {
-    use super::{filter_trends, group_trends, trend_bucket, Trend, TrendBucket};
+    use super::{Trend, TrendBucket, filter_trends, group_trends, trend_bucket};
 
     fn trend(name: &str, category: Option<&str>, rank: u64) -> Trend {
         Trend {
@@ -753,71 +764,240 @@ mod trend_tests {
 
     // ---- Equivalence oracle: verbatim pre-AC implementations ----
     fn bucket_ref(category: Option<&str>) -> TrendBucket {
-        let Some(raw) = category else { return TrendBucket::Other };
+        let Some(raw) = category else {
+            return TrendBucket::Other;
+        };
         let c = raw.to_lowercase();
         let has = |n: &[&str]| n.iter().any(|x| c.contains(x));
-        if has(&["politic","election","government","congress","senate"]) { TrendBucket::Politics }
-        else if has(&["sport","nfl","nba","mlb","nhl","soccer","football","baseball","basketball","tennis","golf","ufc","wwe","f1","racing","hockey","olympic","cricket","boxing"]) { TrendBucket::Sports }
-        else if has(&["news","breaking","world news","journalism"]) { TrendBucket::News }
-        else if has(&["entertainment","music","movie","film","tv","television","celebrity","gaming","game","anime","comedy","streaming"]) { TrendBucket::Entertainment }
-        else if has(&["tech","science","ai","artificial intelligence","software","computing","space","crypto","business","finance"]) { TrendBucket::Technology }
-        else { TrendBucket::Other }
+        if has(&["politic", "election", "government", "congress", "senate"]) {
+            TrendBucket::Politics
+        } else if has(&[
+            "sport",
+            "nfl",
+            "nba",
+            "mlb",
+            "nhl",
+            "soccer",
+            "football",
+            "baseball",
+            "basketball",
+            "tennis",
+            "golf",
+            "ufc",
+            "wwe",
+            "f1",
+            "racing",
+            "hockey",
+            "olympic",
+            "cricket",
+            "boxing",
+        ]) {
+            TrendBucket::Sports
+        } else if has(&["news", "breaking", "world news", "journalism"]) {
+            TrendBucket::News
+        } else if has(&[
+            "entertainment",
+            "music",
+            "movie",
+            "film",
+            "tv",
+            "television",
+            "celebrity",
+            "gaming",
+            "game",
+            "anime",
+            "comedy",
+            "streaming",
+        ]) {
+            TrendBucket::Entertainment
+        } else if has(&[
+            "tech",
+            "science",
+            "ai",
+            "artificial intelligence",
+            "software",
+            "computing",
+            "space",
+            "crypto",
+            "business",
+            "finance",
+        ]) {
+            TrendBucket::Technology
+        } else {
+            TrendBucket::Other
+        }
     }
     fn filter_ref(trends: &[Trend], filter: &str) -> Vec<Trend> {
-        let words: Vec<String> = filter.to_lowercase().split_whitespace().map(str::to_string).collect();
-        if words.is_empty() { return super::sort_trends(trends); }
-        super::sort_trends(trends).into_iter().filter(|t| {
-            let hay = format!("{} {} {} {}", t.name.to_lowercase(), t.query.to_lowercase(), t.category.as_deref().unwrap_or_default().to_lowercase(), t.place.as_deref().unwrap_or_default().to_lowercase());
-            words.iter().all(|w| hay.contains(w.as_str()))
-        }).collect()
+        let words: Vec<String> = filter
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect();
+        if words.is_empty() {
+            return super::sort_trends(trends);
+        }
+        super::sort_trends(trends)
+            .into_iter()
+            .filter(|t| {
+                let hay = format!(
+                    "{} {} {} {}",
+                    t.name.to_lowercase(),
+                    t.query.to_lowercase(),
+                    t.category.as_deref().unwrap_or_default().to_lowercase(),
+                    t.place.as_deref().unwrap_or_default().to_lowercase()
+                );
+                words.iter().all(|w| hay.contains(w.as_str()))
+            })
+            .collect()
     }
     struct Lcg(u64);
-    impl Lcg { fn next(&mut self) -> u64 { self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1); self.0 >> 11 } }
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0 >> 11
+        }
+    }
 
     #[test]
     fn bucket_matches_reference_on_corpus_and_fuzz() {
-        let corpus = [None, Some(""), Some("Sports"), Some("NFL · Trending"), Some("Politics"), Some("Technology"),
-            Some("Trending in United States"), Some("Entertainment Tonight"), Some("Daily AI News"), Some("BREAKING sports election"),
-            Some("artificial intelligence"), Some("a tv game"), Some("CAFÉ society"), Some("İstanbul news"), Some("ΟΛΥΜΠΙΑΚΟΣ"),
-            Some("world news journalism"), Some("cricket f1 racing"), Some("plain words only"), Some("said the mayor")];
-        for c in corpus { assert_eq!(trend_bucket(c), bucket_ref(c), "bucket {c:?}"); }
+        let corpus = [
+            None,
+            Some(""),
+            Some("Sports"),
+            Some("NFL · Trending"),
+            Some("Politics"),
+            Some("Technology"),
+            Some("Trending in United States"),
+            Some("Entertainment Tonight"),
+            Some("Daily AI News"),
+            Some("BREAKING sports election"),
+            Some("artificial intelligence"),
+            Some("a tv game"),
+            Some("CAFÉ society"),
+            Some("İstanbul news"),
+            Some("ΟΛΥΜΠΙΑΚΟΣ"),
+            Some("world news journalism"),
+            Some("cricket f1 racing"),
+            Some("plain words only"),
+            Some("said the mayor"),
+        ];
+        for c in corpus {
+            assert_eq!(trend_bucket(c), bucket_ref(c), "bucket {c:?}");
+        }
         // Deterministic fuzz from needle fragments (catches overlap/priority diffs).
-        let frags = ["ai","news","sport","nfl","tv","game","tech","election","breaking"," ","x","film","space","golf","f1","music","senate","crypto","olympic","world news"];
+        let frags = [
+            "ai",
+            "news",
+            "sport",
+            "nfl",
+            "tv",
+            "game",
+            "tech",
+            "election",
+            "breaking",
+            " ",
+            "x",
+            "film",
+            "space",
+            "golf",
+            "f1",
+            "music",
+            "senate",
+            "crypto",
+            "olympic",
+            "world news",
+        ];
         let mut rng = Lcg(0x5eed);
         for _ in 0..4000 {
             let n = (rng.next() % 5) as usize;
             let mut s = String::new();
-            for _ in 0..n { s.push_str(frags[(rng.next() % frags.len() as u64) as usize]); }
-            assert_eq!(trend_bucket(Some(&s)), bucket_ref(Some(&s)), "fuzz bucket {s:?}");
+            for _ in 0..n {
+                s.push_str(frags[(rng.next() % frags.len() as u64) as usize]);
+            }
+            assert_eq!(
+                trend_bucket(Some(&s)),
+                bucket_ref(Some(&s)),
+                "fuzz bucket {s:?}"
+            );
         }
     }
 
     #[test]
     fn filter_and_group_match_reference() {
         let mut rng = Lcg(0xcafe);
-        let words = ["nfl","breaking","storm","ai","rust","café","live","ΟΛΥΜΠΙΑΚΟΣ","daily","x"];
-        let cats = [Some("Sports"), Some("News"), Some("Trending in United States"), None, Some("Technology")];
-        let trends: Vec<Trend> = (0..120).map(|i| {
-            let pick = |r: &mut Lcg| words[(r.next() % words.len() as u64) as usize];
-            let (a,b) = (pick(&mut rng), pick(&mut rng));
-            Trend { name: format!("{a} {b}"), query: format!("@u{i}"), volume: None, place: Some("United States".into()), rank: Some((119-i) as u64), category: cats[i % cats.len()].map(str::to_string) }
-        }).collect();
-        for q in ["", " ", "nfl", "NFL", "breaking storm", "breaking nfl", "ai ai", "café live", "İ", "ΟΛΥΜΠΙΑΚΟΣ", "live daily x", "zzz qq"] {
-            assert_eq!(filter_trends(&trends, q), filter_ref(&trends, q), "filter {q:?}");
+        let words = [
+            "nfl",
+            "breaking",
+            "storm",
+            "ai",
+            "rust",
+            "café",
+            "live",
+            "ΟΛΥΜΠΙΑΚΟΣ",
+            "daily",
+            "x",
+        ];
+        let cats = [
+            Some("Sports"),
+            Some("News"),
+            Some("Trending in United States"),
+            None,
+            Some("Technology"),
+        ];
+        let trends: Vec<Trend> = (0..120)
+            .map(|i| {
+                let pick = |r: &mut Lcg| words[(r.next() % words.len() as u64) as usize];
+                let (a, b) = (pick(&mut rng), pick(&mut rng));
+                Trend {
+                    name: format!("{a} {b}"),
+                    query: format!("@u{i}"),
+                    volume: None,
+                    place: Some("United States".into()),
+                    rank: Some((119 - i) as u64),
+                    category: cats[i % cats.len()].map(str::to_string),
+                }
+            })
+            .collect();
+        for q in [
+            "",
+            " ",
+            "nfl",
+            "NFL",
+            "breaking storm",
+            "breaking nfl",
+            "ai ai",
+            "café live",
+            "İ",
+            "ΟΛΥΜΠΙΑΚΟΣ",
+            "live daily x",
+            "zzz qq",
+        ] {
+            assert_eq!(
+                filter_trends(&trends, q),
+                filter_ref(&trends, q),
+                "filter {q:?}"
+            );
         }
         // Group equivalence against old per-bucket re-filtering.
         let sorted = super::sort_trends(&trends);
-        let expected: Vec<(TrendBucket, Vec<Trend>)> = TrendBucket::all().into_iter().filter_map(|b| {
-            let items: Vec<Trend> = sorted.iter().filter(|t| bucket_ref(t.category.as_deref()) == b).cloned().collect();
-            (!items.is_empty()).then_some((b, items))
-        }).collect();
+        let expected: Vec<(TrendBucket, Vec<Trend>)> = TrendBucket::all()
+            .into_iter()
+            .filter_map(|b| {
+                let items: Vec<Trend> = sorted
+                    .iter()
+                    .filter(|t| bucket_ref(t.category.as_deref()) == b)
+                    .cloned()
+                    .collect();
+                (!items.is_empty()).then_some((b, items))
+            })
+            .collect();
         assert_eq!(group_trends(&trends), expected);
     }
 }
 
 #[cfg(test)]
 mod profile_section_tests {
-    use super::{profile_sections, Post, Profile, PROFILE_ALL_N, PROFILE_TOP_N};
+    use super::{PROFILE_ALL_N, PROFILE_TOP_N, Post, Profile, profile_sections};
 
     fn post(id: &str, likes: u64) -> Post {
         Post {
@@ -859,7 +1039,10 @@ mod profile_section_tests {
         assert!(sections.top_ranked);
         assert_eq!(sections.top.len(), PROFILE_TOP_N);
         assert_eq!(sections.top[0].id, "24", "highest engagement first");
-        assert!(sections.top.iter().all(|p| p.id != "99"), "pinned has its own card");
+        assert!(
+            sections.top.iter().all(|p| p.id != "99"),
+            "pinned has its own card"
+        );
         assert_eq!(sections.all.len(), 25);
     }
 
@@ -869,7 +1052,11 @@ mod profile_section_tests {
         let sections = profile_sections(&profile(posts, Vec::new()));
         assert!(!sections.top_ranked);
         assert_eq!(
-            sections.top.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            sections
+                .top
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
             vec!["1", "2", "3"],
             "fetched order kept"
         );

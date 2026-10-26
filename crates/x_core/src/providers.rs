@@ -458,17 +458,16 @@ impl XProvider for MockProvider {
         posts.truncate(limit);
         Ok(served(posts, "fixture timeline"))
     }
-    fn timeline_feed(
-        &self,
-        feed: TimelineFeed,
-        limit: usize,
-    ) -> Result<Served<Vec<Post>>, String> {
+    fn timeline_feed(&self, feed: TimelineFeed, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let mut posts = sample_posts();
         posts.truncate(limit);
-        Ok(served(posts, match feed {
-            TimelineFeed::ForYou => "fixture timeline (for you)",
-            TimelineFeed::Following => "fixture timeline (following)",
-        }))
+        Ok(served(
+            posts,
+            match feed {
+                TimelineFeed::ForYou => "fixture timeline (for you)",
+                TimelineFeed::Following => "fixture timeline (following)",
+            },
+        ))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
         // Fixture set spans the real category shapes the live payload
@@ -726,7 +725,14 @@ impl OpenCliProvider {
     fn eval_js(&self, open_url: &str, js: &str) -> Result<String, String> {
         let session = "termyx";
         let open = self.browser_cmd(
-            &["browser", session, "open", open_url, "--window", "background"],
+            &[
+                "browser",
+                session,
+                "open",
+                open_url,
+                "--window",
+                "background",
+            ],
             Duration::from_secs(60),
         )?;
         if open.status != 0 {
@@ -771,10 +777,7 @@ impl OpenCliProvider {
             } else {
                 format!("window.__tx+='{piece}'")
             };
-            match self.browser_cmd(
-                &["browser", session, "eval", &arg],
-                Duration::from_secs(30),
-            ) {
+            match self.browser_cmd(&["browser", session, "eval", &arg], Duration::from_secs(30)) {
                 Ok(out) if out.status == 0 => {}
                 Ok(out) => {
                     shipped = Err(format!(
@@ -861,7 +864,11 @@ impl XProvider for OpenCliProvider {
         // eval posts are also the fallback when the CLI tweets call
         // came back empty.
         let (eval_latest, pinned) = self.eval_profile_posts(handle, 30);
-        let mut latest = if latest.is_empty() { eval_latest } else { latest };
+        let mut latest = if latest.is_empty() {
+            eval_latest
+        } else {
+            latest
+        };
         latest = crate::model::exclude_pinned(&latest, &pinned);
         profile.posts = dedupe_posts(latest);
         profile.pinned = pinned;
@@ -921,11 +928,7 @@ impl XProvider for OpenCliProvider {
             "timeline",
         ))
     }
-    fn timeline_feed(
-        &self,
-        feed: TimelineFeed,
-        limit: usize,
-    ) -> Result<Served<Vec<Post>>, String> {
+    fn timeline_feed(&self, feed: TimelineFeed, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let stdout = self.call(&opencli_read(&[
             "twitter".into(),
             "timeline".into(),
@@ -1084,7 +1087,11 @@ fn log_raw_provider_error(context: &str, raw: &str) {
 fn write_perf_line(line: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("termy-x-perf.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -1327,7 +1334,7 @@ impl OpenCliPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         use crate::publish::EngageAction;
-        let mut args: Vec<String> = vec![
+        let args: Vec<String> = vec![
             "twitter".into(),
             action.opencli_verb().into(),
             target_url.into(),
@@ -1468,7 +1475,12 @@ fn posting_supported(
         std::sync::OnceLock::new();
     let global = GLOBAL.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     let key = format!("{bin}|{}", help_args.join(" "));
-    if let Some(ok) = global.lock().expect("post support global").get(&key).copied() {
+    if let Some(ok) = global
+        .lock()
+        .expect("post support global")
+        .get(&key)
+        .copied()
+    {
         *cache.lock().expect("post support") = Some(ok);
         return ok;
     }
@@ -1502,12 +1514,24 @@ fn b64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(TABLE[(n >> 18) as usize & 63] as char);
         out.push(TABLE[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -1668,7 +1692,8 @@ fn parse_timeline_eval(stdout: &str) -> Result<TimelinePage, String> {
         && posts.is_empty()
     {
         return Err(if error == "http-429" {
-            "X rate-limited the session (HTTP 429) — wait a few minutes and try Load more again".into()
+            "X rate-limited the session (HTTP 429) — wait a few minutes and try Load more again"
+                .into()
         } else {
             format!("timeline session: {error}")
         });
@@ -1832,7 +1857,6 @@ fn parse_profile_eval(stdout: &str) -> Result<(Vec<Post>, Vec<Post>), String> {
     }
     Ok((posts, pinned))
 }
-
 
 /// Single-tweet fetch for bare-repost resolution: TweetResultByRestId
 /// in the silent session (same GraphQL path the pinned-post fetch
@@ -2127,11 +2151,7 @@ impl XProvider for OfficialProvider {
             &format!("{resources} posts"),
         ))
     }
-    fn timeline_feed(
-        &self,
-        feed: TimelineFeed,
-        limit: usize,
-    ) -> Result<Served<Vec<Post>>, String> {
+    fn timeline_feed(&self, feed: TimelineFeed, limit: usize) -> Result<Served<Vec<Post>>, String> {
         match feed {
             // reverse_chronological is X's Following home timeline.
             TimelineFeed::Following => self.timeline(limit),
@@ -2278,7 +2298,11 @@ pub fn research_topic(
             ]),
         ) && output.status == 0
         {
-            hits.extend(parse_research("pinterest", &output.stdout, Some(SESSION_OWN)));
+            hits.extend(parse_research(
+                "pinterest",
+                &output.stdout,
+                Some(SESSION_OWN),
+            ));
         }
         if let Ok(output) = runner.run(
             &config.opencli_bin,
@@ -2616,20 +2640,26 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
         bio,
         followers: number(metrics, &["followers_count", "followers"]),
         following: number(metrics, &["following_count", "friends_count", "following"]),
-        avatar_url: profile_image_str(node, &[
-            "profile_image_url_https",
-            "profile_image_url",
-            "avatar_url",
-            "avatarUrl",
-            "avatar",
-        ]),
-        banner_url: profile_image_str(node, &[
-            "profile_banner_url_https",
-            "profile_banner_url",
-            "banner_url",
-            "bannerUrl",
-            "cover_url",
-        ]),
+        avatar_url: profile_image_str(
+            node,
+            &[
+                "profile_image_url_https",
+                "profile_image_url",
+                "avatar_url",
+                "avatarUrl",
+                "avatar",
+            ],
+        ),
+        banner_url: profile_image_str(
+            node,
+            &[
+                "profile_banner_url_https",
+                "profile_banner_url",
+                "banner_url",
+                "bannerUrl",
+                "cover_url",
+            ],
+        ),
         viewer_following: viewer_following_from(node),
         posts,
         pinned: Vec::new(),
@@ -2794,7 +2824,9 @@ fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
     if let Some(urls) = item.get("media_urls").and_then(Value::as_array) {
         let posters = item.get("media_posters").and_then(Value::as_array);
         for (i, url) in urls.iter().filter_map(Value::as_str).enumerate() {
-            if url.is_empty() { continue; }
+            if url.is_empty() {
+                continue;
+            }
             let kind = kind_of(url);
             let poster = posters
                 .and_then(|p| p.get(i))
@@ -2806,37 +2838,68 @@ fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
                 Some((w, h)) => (Some(w), Some(h)),
                 None => (None, None),
             };
-            out.push(MediaItem { kind, url: url.to_string(), poster, width, height });
+            out.push(MediaItem {
+                kind,
+                url: url.to_string(),
+                poster,
+                width,
+                height,
+            });
         }
         return out;
     }
-    if let Some(list) = item.get("media").and_then(Value::as_array)
+    if let Some(list) = item
+        .get("media")
+        .and_then(Value::as_array)
         .or_else(|| item.get("images").and_then(Value::as_array))
     {
         for entry in list {
             let (url, poster) = match entry {
                 Value::String(u) => (u.clone(), None),
                 Value::Object(_) => (
-                    first_str(entry, &["url", "media_url", "media_url_https", "preview_image_url"]).unwrap_or("").to_string(),
-                    first_str(entry, &["preview_image_url", "poster", "thumbnail"]).map(str::to_string),
+                    first_str(
+                        entry,
+                        &["url", "media_url", "media_url_https", "preview_image_url"],
+                    )
+                    .unwrap_or("")
+                    .to_string(),
+                    first_str(entry, &["preview_image_url", "poster", "thumbnail"])
+                        .map(str::to_string),
                 ),
                 _ => (String::new(), None),
             };
-            if url.is_empty() { continue; }
+            if url.is_empty() {
+                continue;
+            }
             let dims = crate::model::dims_from_media_url(&url);
             let (width, height) = match (
                 entry.get("width").and_then(Value::as_u64),
                 entry.get("height").and_then(Value::as_u64),
             ) {
                 (Some(w), Some(h)) => (Some(w as u32), Some(h as u32)),
-                _ => match dims { Some((w, h)) => (Some(w), Some(h)), None => (None, None) },
+                _ => match dims {
+                    Some((w, h)) => (Some(w), Some(h)),
+                    None => (None, None),
+                },
             };
             let kind = match first_str(entry, &["type", "kind"]) {
-                Some("video") | Some("animated_gif") => if first_str(entry, &["type"]) == Some("animated_gif") { MediaKind::Gif } else { MediaKind::Video },
+                Some("video" | "animated_gif") => {
+                    if first_str(entry, &["type"]) == Some("animated_gif") {
+                        MediaKind::Gif
+                    } else {
+                        MediaKind::Video
+                    }
+                }
                 _ => kind_of(&url),
             };
             let poster = poster.or_else(|| (kind == MediaKind::Photo).then(|| url.clone()));
-            out.push(MediaItem { kind, url, poster, width, height });
+            out.push(MediaItem {
+                kind,
+                url,
+                poster,
+                width,
+                height,
+            });
         }
     }
     out
@@ -2859,9 +2922,15 @@ mod media_parse_tests {
         let posts = parse_posts(json).unwrap();
         assert_eq!(posts[0].media.len(), 1);
         assert_eq!(posts[0].media[0].kind, MediaKind::Video);
-        assert_eq!(posts[0].media[0].poster.as_deref(), Some("https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg"));
+        assert_eq!(
+            posts[0].media[0].poster.as_deref(),
+            Some("https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg")
+        );
         assert_eq!(posts[1].media[0].kind, MediaKind::Photo);
-        assert_eq!(posts[1].media[0].poster.as_deref(), Some("https://pbs.twimg.com/media/ABC.jpg"));
+        assert_eq!(
+            posts[1].media[0].poster.as_deref(),
+            Some("https://pbs.twimg.com/media/ABC.jpg")
+        );
         assert!(posts[2].media.is_empty());
         // Video URLs state their size (/480x270/ style segment, here 320x568 in fixture? use parsed below)
         assert_eq!(posts[0].media[0].width, Some(320));
@@ -2872,13 +2941,23 @@ mod media_parse_tests {
     #[test]
     fn dims_from_media_url_parses_only_plausible_segments() {
         use crate::model::dims_from_media_url;
-        assert_eq!(dims_from_media_url("https://video.twimg.com/amplify_video/9/vid/avc1/480x270/a.mp4?tag=29"), Some((480, 270)));
-        assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg"), None);
-        assert_eq!(dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg?name=4096x4096"), None);
+        assert_eq!(
+            dims_from_media_url(
+                "https://video.twimg.com/amplify_video/9/vid/avc1/480x270/a.mp4?tag=29"
+            ),
+            Some((480, 270))
+        );
+        assert_eq!(
+            dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg"),
+            None
+        );
+        assert_eq!(
+            dims_from_media_url("https://pbs.twimg.com/media/ABC.jpg?name=4096x4096"),
+            None
+        );
         assert_eq!(dims_from_media_url("https://x.com/1x1/a.jpg"), None);
     }
 }
-
 
 #[cfg(test)]
 mod borrowed_parse_tests {
@@ -3028,9 +3107,11 @@ mod tests {
         assert_eq!(partial.posts.len(), 1);
         assert_eq!(partial.next_cursor.as_deref(), Some("CUR1"));
         // Hard failures with nothing fetched must surface.
-        assert!(parse_timeline_eval(r#"{"error":"http-429","posts":[],"nextCursor":null}"#)
-            .unwrap_err()
-            .contains("429"));
+        assert!(
+            parse_timeline_eval(r#"{"error":"http-429","posts":[],"nextCursor":null}"#)
+                .unwrap_err()
+                .contains("429")
+        );
         assert!(parse_timeline_eval("not json").is_err());
     }
 
@@ -3094,12 +3175,16 @@ mod tests {
                 }
                 Ok(CommandOutput {
                     status: 0,
-                    stdout: r#"[{"status":"success","id":"9","url":"https://x.com/me/status/9"}]"#.into(),
+                    stdout: r#"[{"status":"success","id":"9","url":"https://x.com/me/status/9"}]"#
+                        .into(),
                     stderr: String::new(),
                 })
             }
         }
-        let rec = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: false });
+        let rec = Arc::new(RecRunner {
+            calls: StdMutex::new(Vec::new()),
+            fail: false,
+        });
         let publisher = OpenCliPublisher {
             bin: "opencli".into(),
             runner: rec.clone(),
@@ -3112,12 +3197,21 @@ mod tests {
         let calls = rec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let args = &calls[0];
-        assert_eq!(args[1], "post", "quote must ride the post command: {args:?}");
-        assert!(!args.iter().any(|a| a == "quote"), "old quote verb must not be used: {args:?}");
+        assert_eq!(
+            args[1], "post",
+            "quote must ride the post command: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "quote"),
+            "old quote verb must not be used: {args:?}"
+        );
         assert_eq!(args[2], format!("my words\n{url}"));
         drop(calls);
         // And a failure envelope on a like comes back humanized.
-        let rec2 = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: true });
+        let rec2 = Arc::new(RecRunner {
+            calls: StdMutex::new(Vec::new()),
+            fail: true,
+        });
         let publisher2 = OpenCliPublisher {
             bin: "opencli".into(),
             runner: rec2,
@@ -3137,11 +3231,13 @@ mod tests {
             stderr: stderr.into(),
         };
         // Real success envelope passes.
-        assert!(check_opencli_output(
-            &out(0, r#"[{"status":"success","message":"posted"}]"#, ""),
-            "test"
-        )
-        .is_ok());
+        assert!(
+            check_opencli_output(
+                &out(0, r#"[{"status":"success","message":"posted"}]"#, ""),
+                "test"
+            )
+            .is_ok()
+        );
         // Exit 0 but ok:false (Jeremy's quote failure shape): reject,
         // humanized, with no raw JSON leaking into the message.
         let err = check_opencli_output(
@@ -3155,8 +3251,11 @@ mod tests {
         .unwrap_err();
         assert_eq!(err, "X didn't attach the quoted tweet.");
         // Non-zero exit with a JSON dump on stderr: same treatment.
-        let err = check_opencli_output(&out(1, "", r#"{"ok":false,"error":{"message":"boom"}}"#), "test")
-            .unwrap_err();
+        let err = check_opencli_output(
+            &out(1, "", r#"{"ok":false,"error":{"message":"boom"}}"#),
+            "test",
+        )
+        .unwrap_err();
         assert!(!err.contains("ok:false") && !err.contains('{'));
         // A status:"error" row is a failure too.
         assert!(check_opencli_output(&out(0, r#"[{"status":"error"}]"#, ""), "test").is_err());
@@ -3189,15 +3288,22 @@ mod tests {
                 })
             }
         }
-        let rec = Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: false });
+        let rec = Arc::new(RecRunner {
+            calls: StdMutex::new(Vec::new()),
+            fail: false,
+        });
         let publisher = OpenCliPublisher {
             bin: "opencli".into(),
             runner: rec.clone(),
             post_ok: StdMutex::new(Some(true)),
         };
         // Handle is normalized (@ stripped) and rides the follow verb.
-        publisher.set_follow("@jack", true).expect("follow should succeed");
-        publisher.set_follow("jack", false).expect("unfollow should succeed");
+        publisher
+            .set_follow("@jack", true)
+            .expect("follow should succeed");
+        publisher
+            .set_follow("jack", false)
+            .expect("unfollow should succeed");
         let calls = rec.calls.lock().unwrap();
         assert_eq!(calls[0][1], "follow");
         assert_eq!(calls[0][2], "jack");
@@ -3206,11 +3312,17 @@ mod tests {
         // An ok:false envelope is a failure even with exit 0.
         let failing = OpenCliPublisher {
             bin: "opencli".into(),
-            runner: Arc::new(RecRunner { calls: StdMutex::new(Vec::new()), fail: true }),
+            runner: Arc::new(RecRunner {
+                calls: StdMutex::new(Vec::new()),
+                fail: true,
+            }),
             post_ok: StdMutex::new(Some(true)),
         };
         assert!(failing.set_follow("jack", true).is_err());
-        assert!(failing.set_follow("", true).is_err(), "empty handle must not reach the CLI");
+        assert!(
+            failing.set_follow("", true).is_err(),
+            "empty handle must not reach the CLI"
+        );
     }
 
     #[test]
@@ -3221,7 +3333,11 @@ mod tests {
         let p = parse_profile(r#"{"username":"a","legacy":{"following":false}}"#, "a").unwrap();
         assert_eq!(p.viewer_following, Some(false));
         // The following COUNT (a number) is not the flag.
-        let p = parse_profile(r#"{"username":"a","following":120,"followers_count":5}"#, "a").unwrap();
+        let p = parse_profile(
+            r#"{"username":"a","following":120,"followers_count":5}"#,
+            "a",
+        )
+        .unwrap();
         assert_eq!(p.viewer_following, None);
         assert_eq!(p.following, 120);
         // No flag anywhere -> unknown, never guessed.
@@ -3239,6 +3355,7 @@ mod tests {
         assert_eq!(EngageAction::Quote.opencli_verb(), "quote");
     }
 
+    #[test]
     fn dedupe_posts_preserves_order_and_drops_later_dupes() {
         let mk = |id: &str, text: &str| Post {
             id: id.into(),
@@ -3287,7 +3404,9 @@ mod tests {
         assert_eq!(feed.value[0].text, "from following");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(
-            calls.iter().any(|(_, args)| args.join(" ").contains("--type following")),
+            calls
+                .iter()
+                .any(|(_, args)| args.join(" ").contains("--type following")),
             "calls: {calls:?}"
         );
     }
@@ -3500,7 +3619,11 @@ mod tests {
         let (latest, pinned) = parse_profile_eval(json).unwrap();
         assert_eq!(pinned.len(), 1);
         assert_eq!(pinned[0].id, "20");
-        assert_eq!(latest.len(), 2, "eval keeps both; dedupe happens at assembly");
+        assert_eq!(
+            latest.len(),
+            2,
+            "eval keeps both; dedupe happens at assembly"
+        );
         let deduped = crate::model::exclude_pinned(&latest, &pinned);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].id, "30", "pinned renders once, in Pinned only");
@@ -3534,11 +3657,7 @@ mod tests {
 
     #[test]
     fn write_timeout_error_tells_user_to_check_before_retrying() {
-        let msg = write_timeout_error(
-            "command timed out".to_string(),
-            "posting",
-            POST_TIMEOUT,
-        );
+        let msg = write_timeout_error("command timed out".to_string(), "posting", POST_TIMEOUT);
         assert!(msg.contains("150s"), "{msg}");
         assert!(msg.contains("check X before retrying"), "{msg}");
         // Non-timeout failures pass through untouched.
@@ -3663,7 +3782,10 @@ mod tests {
         let mut fresh = vec![bare()];
         let mut fresh_cache = std::collections::HashMap::new();
         fresh[0].id = "61".into();
-        assert_eq!(service.resolve_bare_reposts(&mut fresh, &mut fresh_cache, 0), 0);
+        assert_eq!(
+            service.resolve_bare_reposts(&mut fresh, &mut fresh_cache, 0),
+            0
+        );
         assert!(fresh[0].retweeted.is_none());
         assert!(fresh_cache.is_empty());
     }
@@ -3672,7 +3794,10 @@ mod tests {
     fn tweet_by_id_eval_uses_rest_id_and_parses_embed() {
         let js = tweet_by_id_eval_js("12345");
         assert!(js.contains("TweetResultByRestId"), "by-id op");
-        assert!(js.contains("retweeted_status_result"), "by-id unwraps reposts");
+        assert!(
+            js.contains("retweeted_status_result"),
+            "by-id unwraps reposts"
+        );
         assert!(js.contains("12345"), "id substituted");
         let stdout = r##"{"post": {"id": "60", "author": "reposter", "text": "RT @orig: hi",
           "retweeted": {"id": "59", "author": "orig", "text": "hi", "likes": 7}}}"##;
@@ -3680,17 +3805,23 @@ mod tests {
         assert_eq!(post.id, "60");
         assert_eq!(post.engage_target().id, "59");
         assert_eq!(post.engage_target().likes, 7);
-        let err = parse_tweet_by_id_eval(r#"{"error": "tweet not found", "post": null}"#)
-            .unwrap_err();
+        let err =
+            parse_tweet_by_id_eval(r#"{"error": "tweet not found", "post": null}"#).unwrap_err();
         assert!(err.contains("not found"), "honest error: {err}");
     }
 
     #[test]
     fn eval_scripts_unwrap_retweeted_status() {
         let timeline = timeline_eval_js(TimelineFeed::ForYou, None, 20);
-        assert!(timeline.contains("tw.retweeted_status_result"), "timeline unwraps reposts from the tweet result (GraphQL carries it there, not on legacy)");
+        assert!(
+            timeline.contains("tw.retweeted_status_result"),
+            "timeline unwraps reposts from the tweet result (GraphQL carries it there, not on legacy)"
+        );
         let profile = profile_eval_js("someone", 30);
-        assert!(profile.contains("tw.retweeted_status_result"), "profile unwraps reposts from the tweet result");
+        assert!(
+            profile.contains("tw.retweeted_status_result"),
+            "profile unwraps reposts from the tweet result"
+        );
     }
 
     #[test]
@@ -3728,7 +3859,10 @@ mod tests {
         assert_eq!(trends[0].rank, Some(1));
         assert_eq!(trends[0].category.as_deref(), Some("Politics"));
         assert_eq!(trends[0].volume, None);
-        assert_eq!(trends[2].category.as_deref(), Some("Trending in United States"));
+        assert_eq!(
+            trends[2].category.as_deref(),
+            Some("Trending in United States")
+        );
     }
 
     #[test]
@@ -3891,6 +4025,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn rss_titles_are_research_hits() {
         let runner = ScriptedRunner::new();
         runner.script(

@@ -235,37 +235,44 @@ pub fn humanize_error(raw: &str) -> String {
     let msg = extracted.as_deref().unwrap_or(raw).trim();
     let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
     let lower = collapsed.to_lowercase();
-    let mapped: &str = if lower.contains("did not render") || lower.contains("deleted or restricted") {
-        "X didn't attach the quoted tweet."
-    } else if lower.contains("could not find the") && lower.contains("button") {
-        "X didn't show that button on the tweet."
-    } else if lower.contains("429") || (lower.contains("rate") && lower.contains("limit")) {
-        "X is rate-limiting right now. Wait a few minutes and try again."
-    } else if lower.contains("not logged") || lower.contains("are you logged in")
-        || lower.contains("login required") || lower.contains("not signed in") {
-        "X isn't signed in right now."
-    } else if lower.contains("timed out") || lower.contains("timeout")
-        || lower.contains("did not complete") || lower.contains("did not confirm") {
-        "X took too long to confirm that. Check your profile before retrying."
-    } else if lower.contains("empty") && lower.contains("text") {
-        "Write something first."
-    } else if collapsed.is_empty()
-        || collapsed.len() > 160
-        || collapsed.contains('{')
-        || collapsed.contains('}')
-        || lower.contains("ok:false")
-        || lower.contains("ok: false")
-        || lower.contains("command_exec")
-        || lower.contains("exitcode")
-        || lower.contains("exit code")
-        || lower.starts_with("opencli exited")
-        || lower.starts_with("twitter exited")
-    {
-        "X couldn't do that right now."
-    } else {
-        // A short plain message from the provider is fine as-is.
-        return ensure_sentence(&collapsed);
-    };
+    let mapped: &str =
+        if lower.contains("did not render") || lower.contains("deleted or restricted") {
+            "X didn't attach the quoted tweet."
+        } else if lower.contains("could not find the") && lower.contains("button") {
+            "X didn't show that button on the tweet."
+        } else if lower.contains("429") || (lower.contains("rate") && lower.contains("limit")) {
+            "X is rate-limiting right now. Wait a few minutes and try again."
+        } else if lower.contains("not logged")
+            || lower.contains("are you logged in")
+            || lower.contains("login required")
+            || lower.contains("not signed in")
+        {
+            "X isn't signed in right now."
+        } else if lower.contains("timed out")
+            || lower.contains("timeout")
+            || lower.contains("did not complete")
+            || lower.contains("did not confirm")
+        {
+            "X took too long to confirm that. Check your profile before retrying."
+        } else if lower.contains("empty") && lower.contains("text") {
+            "Write something first."
+        } else if collapsed.is_empty()
+            || collapsed.len() > 160
+            || collapsed.contains('{')
+            || collapsed.contains('}')
+            || lower.contains("ok:false")
+            || lower.contains("ok: false")
+            || lower.contains("command_exec")
+            || lower.contains("exitcode")
+            || lower.contains("exit code")
+            || lower.starts_with("opencli exited")
+            || lower.starts_with("twitter exited")
+        {
+            "X couldn't do that right now."
+        } else {
+            // A short plain message from the provider is fine as-is.
+            return ensure_sentence(&collapsed);
+        };
     mapped.to_string()
 }
 
@@ -540,7 +547,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let media_calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = RecordingPublisher {
-            calls: calls.clone(),
+            calls,
             media_calls: media_calls.clone(),
         };
         // Dry-run: publisher must not be called at all.
@@ -606,8 +613,14 @@ mod tests {
 
     #[test]
     fn burst_labels_cover_posts_and_likes_but_not_removals() {
-        assert_eq!(engage_burst_label(EngageAction::Like), Some("\u{2713} Liked"));
-        assert_eq!(engage_burst_label(EngageAction::Retweet), Some("\u{2713} Posted"));
+        assert_eq!(
+            engage_burst_label(EngageAction::Like),
+            Some("\u{2713} Liked")
+        );
+        assert_eq!(
+            engage_burst_label(EngageAction::Retweet),
+            Some("\u{2713} Posted")
+        );
         assert_eq!(engage_burst_label(EngageAction::Unlike), None);
         assert_eq!(engage_burst_label(EngageAction::Unretweet), None);
     }
@@ -631,9 +644,14 @@ mod tests {
         for banned in ["ok:false", "command_exec", "exitcode", "{", "}"] {
             assert!(!clean.contains(banned), "leaked {banned}: {clean}");
         }
-        assert_eq!(humanize_error("opencli exited 1"), "X couldn't do that right now.");
         assert_eq!(
-            humanize_error("Could not find the Like button on this tweet after waiting 10 seconds. Nothing changed."),
+            humanize_error("opencli exited 1"),
+            "X couldn't do that right now."
+        );
+        assert_eq!(
+            humanize_error(
+                "Could not find the Like button on this tweet after waiting 10 seconds. Nothing changed."
+            ),
             "X didn't show that button on the tweet."
         );
         assert_eq!(
@@ -641,7 +659,10 @@ mod tests {
             "X is rate-limiting right now. Wait a few minutes and try again."
         );
         // A short plain provider sentence survives (gains its period).
-        assert_eq!(humanize_error("write your quote first"), "write your quote first.");
+        assert_eq!(
+            humanize_error("write your quote first"),
+            "write your quote first."
+        );
     }
 
     #[test]

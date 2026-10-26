@@ -51,30 +51,27 @@ pub fn detect_connection(
         .bearer_token()
         .or_else(|| load_access_token(config).ok())
     {
-        match http.request(HttpRequest {
+        if let Ok(body) = http.request(HttpRequest {
             method: "GET",
             url: "https://api.x.com/2/users/me".into(),
             body: None,
             bearer: Some(token),
             content_type: None,
         }) {
-            Ok(body) => {
-                let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                if let Some(handle) = value.pointer("/data/username").and_then(|v| v.as_str()) {
-                    let handle = handle.trim().trim_start_matches('@').to_string();
-                    let _ = save_connected_handle(config, &handle);
-                    return Connection::Connected {
-                        handle,
-                        via: "your own X developer key".into(),
-                    };
-                }
-                // App-only bearer tokens cannot name a person; fall through
-                // to OpenCLI instead of declaring the user broken.
+            let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+            if let Some(handle) = value.pointer("/data/username").and_then(|v| v.as_str()) {
+                let handle = handle.trim().trim_start_matches('@').to_string();
+                let _ = save_connected_handle(config, &handle);
+                return Connection::Connected {
+                    handle,
+                    via: "your own X developer key".into(),
+                };
             }
-            Err(_) => {
-                // Token did not work; OpenCLI may still be fine. Fall through
-                // and, if that also fails, the reason below names the token.
-            }
+            // App-only bearer tokens cannot name a person; fall through
+            // to OpenCLI instead of declaring the user broken.
+        } else {
+            // Token did not work; OpenCLI may still be fine. Fall through
+            // and, if that also fails, the reason below names the token.
         }
     }
 

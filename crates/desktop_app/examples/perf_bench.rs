@@ -10,7 +10,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 fn synthetic_posts(n: usize) -> String {
     let mut rows = String::from("[");
     for i in 0..n {
-        if i > 0 { rows.push(','); }
+        if i > 0 {
+            rows.push(',');
+        }
         rows.push_str(&format!(
             r#"{{"id":"{}","text":"post {} about rust and termy-x shipping fast, with some longer body text to chew on #rust @someone https://example.com/x","user":{{"username":"user{}","name":"User {}"}},"like_count":{},"retweet_count":{},"reply_count":3,"bookmark_count":1,"views":{},"media_urls":["https://pbs.twimg.com/media/ABC{}?format=jpg&name=900x900"]}}"#,
             2_100_000_000_000_000_000u64 + i as u64, i, i % 97, i % 97, i * 7, i * 3, i * 100, i
@@ -20,7 +22,10 @@ fn synthetic_posts(n: usize) -> String {
     rows
 }
 
-fn median(mut v: Vec<f64>) -> f64 { v.sort_by(|a, b| a.partial_cmp(b).unwrap()); v[v.len() / 2] }
+fn median(mut v: Vec<f64>) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    v[v.len() / 2]
+}
 
 fn main() {
     let payload = synthetic_posts(420);
@@ -35,10 +40,16 @@ fn main() {
     }
     println!("parse_posts_420 median_ms={:.3}", median(times));
     // Filter stage (local trends filter hot path)
-    let trends: Vec<termy_x::model::Trend> = (0..500).map(|i| termy_x::model::Trend {
-        name: format!("Trend {i} rust news"), query: format!("rust {i}"), category: Some("Tech".into()),
-        place: Some("United States".into()), rank: Some(i as u64 + 1), volume: None,
-    }).collect();
+    let trends: Vec<termy_x::model::Trend> = (0..500)
+        .map(|i| termy_x::model::Trend {
+            name: format!("Trend {i} rust news"),
+            query: format!("rust {i}"),
+            category: Some("Tech".into()),
+            place: Some("United States".into()),
+            rank: Some(i as u64 + 1),
+            volume: None,
+        })
+        .collect();
     let mut times = Vec::new();
     for _ in 0..15 {
         let t = Instant::now();
@@ -53,7 +64,10 @@ fn main() {
     for _ in 0..15 {
         let t = Instant::now();
         let mut acc = 0usize;
-        for _ in 0..20 { let c = posts.clone(); acc += c.len(); }
+        for _ in 0..20 {
+            let c = posts.clone();
+            acc += c.len();
+        }
         assert_eq!(acc, 420 * 20);
         times.push(t.elapsed().as_secs_f64() * 1e3);
     }
