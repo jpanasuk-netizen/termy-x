@@ -6448,10 +6448,11 @@ impl XPanel {
     /// while the cursor is held away from the anchor — no further mouse
     /// movement needed — tracking the GLOBAL cursor so leaving the
     /// window neither pauses nor disengages; only a click or Esc exits.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     fn toggle_autoscroll(
         &mut self,
         event: &MouseDownEvent,
-        _window: &Window,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
         self.autoscroll_gen += 1;
