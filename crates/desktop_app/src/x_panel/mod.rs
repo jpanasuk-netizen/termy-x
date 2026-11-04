@@ -3,8 +3,8 @@
 
 pub mod art;
 mod media_fit;
-mod scroll_math;
 mod player;
+mod scroll_math;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,11 +14,10 @@ use std::collections::HashMap;
 
 use gpui_kit::{
     Animation, AnimationExt, Context, FocusHandle, Image, ImageSource, InteractiveElement,
-    IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement,
-    Render, RenderImage, ScrollHandle, ScrollWheelEvent, SharedString,
-    ScrollDelta, StatefulInteractiveElement, Styled,
-    StyledImage, Window, div, img, point, px, rgb, rgba,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement, Render, RenderImage, ScrollDelta, ScrollHandle, ScrollWheelEvent,
+    SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div, img, point, px,
+    rgb, rgba,
 };
 
 macro_rules! x_button {
@@ -55,8 +54,8 @@ macro_rules! x_button {
 use termy_x::XConfig;
 use termy_x::drafts::new_id;
 use termy_x::model::{
-    filter_trends, group_trends, sort_trends, trend_rank, Draft, MediaItem, MediaKind, Post,
-    Profile, ResearchHit, Tone, Trend, TrendBucket, profile_sections,
+    Draft, MediaItem, MediaKind, Post, Profile, ResearchHit, Tone, Trend, TrendBucket,
+    filter_trends, group_trends, profile_sections, sort_trends, trend_rank,
 };
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
 use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
@@ -166,7 +165,11 @@ fn edit_keys_owned(
 /// intercepts Ctrl+C/V/A while the panel itself holds keyboard focus.
 /// Panel open with the terminal focused means the shell owns Ctrl+C
 /// (interrupt), no matter which panel tab or stale editor flag is set.
-pub fn edit_action_goes_to_panel(panel_open: bool, panel_focused: bool, owns_edit_keys: bool) -> bool {
+pub fn edit_action_goes_to_panel(
+    panel_open: bool,
+    panel_focused: bool,
+    owns_edit_keys: bool,
+) -> bool {
     panel_open && panel_focused && owns_edit_keys
 }
 
@@ -223,9 +226,7 @@ pub fn copy_text_for_focus(
     card: Option<&CardTextSelection>,
     editor: Option<String>,
 ) -> Option<String> {
-    if card_copy_focus
-        && let Some(card) = card
-    {
+    if card_copy_focus && let Some(card) = card {
         return Some(card.text.clone());
     }
     editor
@@ -294,7 +295,11 @@ struct CachedImage {
 }
 impl CachedImage {
     fn aspect(&self) -> Option<f32> {
-        if self.width > 0 && self.height > 0 { Some(self.width as f32 / self.height as f32) } else { None }
+        if self.width > 0 && self.height > 0 {
+            Some(self.width as f32 / self.height as f32)
+        } else {
+            None
+        }
     }
 }
 
@@ -815,10 +820,15 @@ impl XPanel {
         self.last_refresh = Some(local_hms());
         self.pending_top = true;
         self.loading = true;
-        self.status = format!("refreshing {}\u{2026} (silent, background)", section.label());
+        self.status = format!(
+            "refreshing {}\u{2026} (silent, background)",
+            section.label()
+        );
         if section == XSection::Search && self.searched_query.is_empty() {
             self.loading = false;
-            self.status = "search \u{b7} type a query and press Enter first \u{b7} then \u{21bb} re-runs it".into();
+            self.status =
+                "search \u{b7} type a query and press Enter first \u{b7} then \u{21bb} re-runs it"
+                    .into();
             cx.notify();
             return;
         }
@@ -1131,8 +1141,7 @@ impl XPanel {
             return;
         }
         if self.loading || self.fetching.iter().any(|f| *f) {
-            self.status =
-                "already loading \u{2014} one X session call at a time".into();
+            self.status = "already loading \u{2014} one X session call at a time".into();
             cx.notify();
             return;
         }
@@ -1250,8 +1259,7 @@ impl XPanel {
             self.close_reply();
         }
         let saved = self.feed_offset[Self::feed_index(feed)];
-        self.list_scroll
-            .set_offset(point(px(0.0), px(saved)));
+        self.list_scroll.set_offset(point(px(0.0), px(saved)));
         if self.is_fresh(XSection::Timeline) {
             self.loading = false;
             self.status = format!("{} \u{b7} cached (<30s)", feed.label());
@@ -1368,10 +1376,10 @@ impl XPanel {
         let lookup = self.lookup.clone();
         let live = self.live;
         let feed = self.timeline_feed;
-        let (append, limit) = self.next_fetch.take().unwrap_or((
-            false,
-            self.feed_depth[Self::feed_index(feed)],
-        ));
+        let (append, limit) = self
+            .next_fetch
+            .take()
+            .unwrap_or((false, self.feed_depth[Self::feed_index(feed)]));
         // Continuation fetches resume from the stored bottom cursor;
         // fresh loads (refresh / first open) always start at the top.
         let fetch_cursor = if section == XSection::Timeline && append {
@@ -1384,7 +1392,16 @@ impl XPanel {
             let payload = cx
                 .background_executor()
                 .spawn(async move {
-                    fetch_section(section, query, lookup, live, feed, append, limit, fetch_cursor)
+                    fetch_section(
+                        section,
+                        query,
+                        lookup,
+                        live,
+                        feed,
+                        append,
+                        limit,
+                        fetch_cursor,
+                    )
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
@@ -1443,11 +1460,10 @@ impl XPanel {
                         }
                         TimelineFeed::Following => {
                             let before = self.following_posts.len();
-                            self.following_posts =
-                                termy_x::providers::append_new_posts(
-                                    std::mem::take(&mut self.following_posts),
-                                    posts,
-                                );
+                            self.following_posts = termy_x::providers::append_new_posts(
+                                std::mem::take(&mut self.following_posts),
+                                posts,
+                            );
                             (
                                 self.following_posts.len(),
                                 self.following_posts.len() - before,
@@ -1471,9 +1487,7 @@ impl XPanel {
                     };
                     match feed {
                         TimelineFeed::ForYou => self.fetched_at.timeline = Some(now),
-                        TimelineFeed::Following => {
-                            self.fetched_at.timeline_following = Some(now)
-                        }
+                        TimelineFeed::Following => self.fetched_at.timeline_following = Some(now),
                     }
                 } else {
                     let landed = posts.len();
@@ -2086,12 +2100,34 @@ impl XPanel {
             return;
         }
 
-        if self.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) {
+        if self
+            .viewer
+            .as_ref()
+            .is_some_and(|v| v.kind != MediaKind::Photo)
+        {
             match key {
-                "space" => { if let Some(pl) = &mut self.video_player { pl.toggle_pause(); self.player_paused = !self.player_paused; } }
-                "left" => { if let Some(pl) = &mut self.video_player { pl.seek_relative(-10); } }
-                "right" => { if let Some(pl) = &mut self.video_player { pl.seek_relative(10); } }
-                "m" => { self.player_muted = !self.player_muted; if let Some(pl) = &mut self.video_player { pl.set_muted(self.player_muted); } }
+                "space" => {
+                    if let Some(pl) = &mut self.video_player {
+                        pl.toggle_pause();
+                        self.player_paused = !self.player_paused;
+                    }
+                }
+                "left" => {
+                    if let Some(pl) = &mut self.video_player {
+                        pl.seek_relative(-10);
+                    }
+                }
+                "right" => {
+                    if let Some(pl) = &mut self.video_player {
+                        pl.seek_relative(10);
+                    }
+                }
+                "m" => {
+                    self.player_muted = !self.player_muted;
+                    if let Some(pl) = &mut self.video_player {
+                        pl.set_muted(self.player_muted);
+                    }
+                }
                 _ => {}
             }
             if matches!(key, "space" | "left" | "right" | "m") {
@@ -2339,8 +2375,8 @@ impl XPanel {
     /// Mirrors the Compose path (chord dedup included) so the KeyDown
     /// handler and the TerminalView action cannot insert twice.
     pub fn paste_active_text(&mut self, text: &str) {
-
-        self.mention_dirty_at = Some(std::time::Instant::now());        if self.chord_already_applied() {
+        self.mention_dirty_at = Some(std::time::Instant::now());
+        if self.chord_already_applied() {
             return;
         }
         let clean = text.trim_end_matches(['\r', '\n']);
@@ -2442,8 +2478,8 @@ impl XPanel {
         field: TextField,
         cx: &mut Context<Self>,
     ) {
-
-        self.mention_dirty_at = Some(std::time::Instant::now());        let key = event.keystroke.key.as_str();
+        self.mention_dirty_at = Some(std::time::Instant::now());
+        let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         if key == "enter" {
             match enter_action(field) {
@@ -2465,7 +2501,8 @@ impl XPanel {
             cx.notify();
             return;
         }
-        if key == "escape" && field == TextField::Trends
+        if key == "escape"
+            && field == TextField::Trends
             && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
         {
             // Esc clears the filter/chip and restores the full list.
@@ -2579,8 +2616,7 @@ impl XPanel {
         let query = self.research_input.trim().to_string();
         if query.is_empty() {
             self.notice = Some(
-                "Type a topic to research first — Reddit, YouTube, web + RSS run on Enter."
-                    .into(),
+                "Type a topic to research first — Reddit, YouTube, web + RSS run on Enter.".into(),
             );
             self.status = "research · nothing typed yet".into();
             cx.notify();
@@ -2628,10 +2664,7 @@ impl XPanel {
         self.reply_opened_at = Some(Instant::now());
         self.reply_key_logged = false;
         perf_log(&format!("open_reply id={post_id} (local only, no fetch)"));
-        self.status = format!(
-            "reply to @{} \u{b7} type below, then Post",
-            author_handle
-        );
+        self.status = format!("reply to @{} \u{b7} type below, then Post", author_handle);
     }
 
     /// Start the Posted burst in the editor a post just succeeded
@@ -2791,12 +2824,7 @@ impl XPanel {
     /// to a newer burst and leave the editor open forever (Jeremy's
     /// stuck-box bug). This dedicated timer always closes the box if
     /// it's still open for the same tweet.
-    fn close_box_after_burst(
-        &mut self,
-        target: BurstTarget,
-        id: String,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_box_after_burst(&mut self, target: BurstTarget, id: String, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(BURST_MS + 150))
@@ -2948,12 +2976,15 @@ impl XPanel {
             TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
             TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
             TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
-                return
+                return;
             }
         };
         let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
         let overflow = lines as f32 * 19.0 - 44.0;
-        handle.set_offset(point(px(0.0), px(if overflow > 0.0 { -overflow } else { 0.0 })));
+        handle.set_offset(point(
+            px(0.0),
+            px(if overflow > 0.0 { -overflow } else { 0.0 }),
+        ));
     }
 
     /// Keep the Compose caret's visual line inside the scroll view.
@@ -3031,8 +3062,7 @@ impl XPanel {
                 .spawn(async move {
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
-                    let Some(publisher) =
-                        termy_x::publish::first_available(publishers.as_slice())
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
                         return Err(
                             "No in-app posting path found. Connect X first, then try again."
@@ -3103,8 +3133,7 @@ impl XPanel {
                     let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
-                    let Some(publisher) =
-                        termy_x::publish::first_available(publishers.as_slice())
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
                         return Err(
                             "No in-app posting path found. Connect X first, then try again."
@@ -3115,9 +3144,7 @@ impl XPanel {
                         "engage probe_ms={}",
                         probe_started.elapsed().as_millis()
                     ));
-                    publisher
-                        .engage(action, &url, None, &[])
-                        .map_err(|e| e)
+                    publisher.engage(action, &url, None, &[]).map_err(|e| e)
                 })
                 .await;
             perf_log(&format!(
@@ -3243,7 +3270,9 @@ impl XPanel {
         };
         let text = self.quote_text.trim().to_string();
         if text.is_empty() {
-            self.notice = Some("Write your quote first \u{2014} a quote is your own words on their tweet.".into());
+            self.notice = Some(
+                "Write your quote first \u{2014} a quote is your own words on their tweet.".into(),
+            );
             cx.notify();
             return;
         }
@@ -3260,7 +3289,8 @@ impl XPanel {
             .chain(self.search_posts.iter())
             .find(|post| post.id == target_id);
         let Some(target_post) = target_post else {
-            self.notice = Some("That tweet is no longer loaded \u{2014} nothing was posted.".into());
+            self.notice =
+                Some("That tweet is no longer loaded \u{2014} nothing was posted.".into());
             cx.notify();
             return;
         };
@@ -3295,8 +3325,7 @@ impl XPanel {
                     let probe_started = Instant::now();
                     let service = XPanel::service_free();
                     let publishers = service.publishers;
-                    let Some(publisher) =
-                        termy_x::publish::first_available(publishers.as_slice())
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
                         return Err(
                             "No in-app posting path found. Connect X first, then try again."
@@ -3315,7 +3344,10 @@ impl XPanel {
                     )
                 })
                 .await;
-            perf_log(&format!("submit quote confirmed_ms={}", submit_started.elapsed().as_millis()));
+            perf_log(&format!(
+                "submit quote confirmed_ms={}",
+                submit_started.elapsed().as_millis()
+            ));
             let _ = this.update(cx, |panel, cx| {
                 panel.quote_posting = false;
                 match result {
@@ -3434,7 +3466,10 @@ impl XPanel {
                     }
                 })
                 .await;
-            perf_log(&format!("submit reply confirmed_ms={}", submit_started.elapsed().as_millis()));
+            perf_log(&format!(
+                "submit reply confirmed_ms={}",
+                submit_started.elapsed().as_millis()
+            ));
             let _ = this.update(cx, |panel, cx| {
                 panel.reply_posting = false;
                 match result {
@@ -3480,8 +3515,8 @@ impl XPanel {
     }
 
     fn insert_text(&mut self, text: &str) {
-
-        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
+        self.mention_dirty_at = Some(std::time::Instant::now());
+        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, text);
             self.caret = a + text.len();
         } else {
@@ -3494,8 +3529,8 @@ impl XPanel {
     }
 
     fn backspace(&mut self) {
-
-        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
+        self.mention_dirty_at = Some(std::time::Instant::now());
+        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
@@ -3512,8 +3547,8 @@ impl XPanel {
     }
 
     fn delete_forward(&mut self) {
-
-        self.mention_dirty_at = Some(std::time::Instant::now());        if let Some((a, b)) = self.selection_range() {
+        self.mention_dirty_at = Some(std::time::Instant::now());
+        if let Some((a, b)) = self.selection_range() {
             self.compose.replace_range(a..b, "");
             self.caret = a;
             self.clear_selection();
@@ -3669,9 +3704,7 @@ fn fetch_section(
                             // no fake "no more tweets".
                             return FetchPayload::Timeline {
                                 posts: Vec::new(),
-                                status: format!(
-                                    "could not load older tweets \u{2014} {error}"
-                                ),
+                                status: format!("could not load older tweets \u{2014} {error}"),
                                 feed,
                                 append,
                                 requested: limit,
@@ -3729,28 +3762,26 @@ fn fetch_section(
                     }
                 }
             }
-            XSection::Lookup => {
-                match service.lookup(&lookup) {
-                    Ok(served) => {
-                        return FetchPayload::Lookup {
-                            profile: Some(served.value),
-                            status: live_status(&served.status),
-                            failed: false,
-                        };
-                    }
-                    Err(error) => {
-                        return FetchPayload::Lookup {
-                            profile: None,
-                            status: format!(
-                                "could not find @{} \u{2014} {}",
-                                lookup.trim().trim_start_matches('@'),
-                                termy_x::publish::humanize_error(&error)
-                            ),
-                            failed: true,
-                        };
-                    }
+            XSection::Lookup => match service.lookup(&lookup) {
+                Ok(served) => {
+                    return FetchPayload::Lookup {
+                        profile: Some(served.value),
+                        status: live_status(&served.status),
+                        failed: false,
+                    };
                 }
-            }
+                Err(error) => {
+                    return FetchPayload::Lookup {
+                        profile: None,
+                        status: format!(
+                            "could not find @{} \u{2014} {}",
+                            lookup.trim().trim_start_matches('@'),
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                        failed: true,
+                    };
+                }
+            },
             XSection::Research => {
                 let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
                 let runner = termy_x::io::SystemRunner;
@@ -3761,7 +3792,9 @@ fn fetch_section(
                 };
                 return FetchPayload::Research {
                     hits,
-                    status: format!("research \u{b7} \u{201c}{query}\u{201d} \u{b7} no X API credits"),
+                    status: format!(
+                        "research \u{b7} \u{201c}{query}\u{201d} \u{b7} no X API credits"
+                    ),
                 };
             }
             XSection::Compose => {}
@@ -3850,16 +3883,14 @@ impl Render for XPanel {
         let char_limit = self.char_limit;
         // Off the Compose tab the thread math is never displayed; skip it
         // so Timeline/Search keystrokes and blink frames stay cheap.
-        let (count, parts) = if self.section == XSection::Compose || self.confirm || self.fill_window {
-            let count = weighted_len_limited(&self.compose, char_limit);
-            let parts = split_thread_limited(&self.compose, char_limit);
-            (count, parts)
-        } else {
-            (
-                weighted_len_limited("", char_limit),
-                Vec::new(),
-            )
-        };
+        let (count, parts) =
+            if self.section == XSection::Compose || self.confirm || self.fill_window {
+                let count = weighted_len_limited(&self.compose, char_limit);
+                let parts = split_thread_limited(&self.compose, char_limit);
+                (count, parts)
+            } else {
+                (weighted_len_limited("", char_limit), Vec::new())
+            };
         let columns = self.column_count(window);
         let art_opacity = self.bird_opacity();
         let dialog_width = if self.fill_window { 600.0 } else { 432.0 };
@@ -3887,7 +3918,8 @@ impl Render for XPanel {
             root = root.w(px(PANEL_DOCKED_WIDTH)).flex_none();
         }
 
-        let root = root.child(self.backdrop(art_opacity))
+        let root = root
+            .child(self.backdrop(art_opacity))
             .child(
                 div()
                     .relative()
@@ -3900,9 +3932,10 @@ impl Render for XPanel {
                     .child(self.tabs(cx))
                     .child(self.connection_bar(cx))
                     .child(self.status_line())
-                    .children((columns == 1 && self.section == XSection::Timeline).then(|| {
-                        self.feed_switch(cx)
-                    }))
+                    .children(
+                        (columns == 1 && self.section == XSection::Timeline)
+                            .then(|| self.feed_switch(cx)),
+                    )
                     .child(if columns == 1 {
                         div()
                             .relative()
@@ -3987,15 +4020,11 @@ impl Render for XPanel {
                                     .text_color(rgb(0x7af6ff))
                                     .child("\u{2195}")
                             }))
-                            .on_mouse_move(cx.listener(
-                                |this, event: &MouseMoveEvent, _, cx| {
-                                    if this.scrollbar_drag_move(event)
-                                        || this.autoscroll_move(event)
-                                    {
-                                        cx.notify();
-                                    }
-                                },
-                            ))
+                            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                                if this.scrollbar_drag_move(event) || this.autoscroll_move(event) {
+                                    cx.notify();
+                                }
+                            }))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseUpEvent, _, cx| {
@@ -4023,10 +4052,16 @@ impl Render for XPanel {
             .children(self.viewer_overlay(cx));
         let elapsed = render_started.elapsed();
         if elapsed.as_millis() > 12
-            && self.last_render_log.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+            && self
+                .last_render_log
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
         {
             self.last_render_log = Some(Instant::now());
-            perf_log(&format!("render slow {}ms section={:?}", elapsed.as_millis(), self.section));
+            perf_log(&format!(
+                "render slow {}ms section={:?}",
+                elapsed.as_millis(),
+                self.section
+            ));
         }
         root
     }
@@ -4106,16 +4141,43 @@ fn local_hms() -> String {
     #[cfg(target_os = "windows")]
     {
         #[repr(C)]
-        struct SystemTime { year: u16, month: u16, dow: u16, day: u16, hour: u16, minute: u16, second: u16, ms: u16 }
-        unsafe extern "system" { fn GetLocalTime(t: *mut SystemTime); }
-        let mut st = SystemTime { year: 0, month: 0, dow: 0, day: 0, hour: 0, minute: 0, second: 0, ms: 0 };
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            dow: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            ms: u16,
+        }
+        unsafe extern "system" {
+            fn GetLocalTime(t: *mut SystemTime);
+        }
+        let mut st = SystemTime {
+            year: 0,
+            month: 0,
+            dow: 0,
+            day: 0,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            ms: 0,
+        };
         unsafe { GetLocalTime(&mut st) };
         return format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        format!(
+            "{:02}:{:02}:{:02}",
+            (secs / 3600) % 24,
+            (secs / 60) % 60,
+            secs % 60
+        )
     }
 }
 
@@ -4221,10 +4283,8 @@ fn focus_glow(
         ring = ring.flex_1();
     }
     if focused {
-        ring.with_animation(id, breath_animation(2_800), |el, v| {
-            el.bg(glow_rgba(v))
-        })
-        .into_any_element()
+        ring.with_animation(id, breath_animation(2_800), |el, v| el.bg(glow_rgba(v)))
+            .into_any_element()
     } else {
         ring.into_any_element()
     }
@@ -4396,15 +4456,14 @@ fn posted_burst_element(seq: u64, label: &'static str) -> gpui_kit::AnyElement {
         .justify_center()
         .w_full()
         .py(px(10.0))
-        .child(
-            div()
-                .text_color(rgb(0x8affc1))
-                .child(label)
-                .with_animation(format!("posted-burst-{seq}"), Animation::new(Duration::from_millis(BURST_MS)), |el, v| {
-                    let (font, opacity) = burst_style_at(v);
-                    el.text_size(px(font)).opacity(opacity)
-                }),
-        )
+        .child(div().text_color(rgb(0x8affc1)).child(label).with_animation(
+            format!("posted-burst-{seq}"),
+            Animation::new(Duration::from_millis(BURST_MS)),
+            |el, v| {
+                let (font, opacity) = burst_style_at(v);
+                el.text_size(px(font)).opacity(opacity)
+            },
+        ))
         .into_any_element()
 }
 
@@ -4412,7 +4471,11 @@ fn posted_burst_element(seq: u64, label: &'static str) -> gpui_kit::AnyElement {
 fn perf_log(line: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("termy-x-perf.txt");
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -4547,77 +4610,97 @@ impl XPanel {
         let current = self.section;
         let refresh_btn = {
             let refreshing = self.loading;
+            div()
+                .id("x-refresh")
+                .px(px(9.0))
+                .py(px(5.0))
+                .rounded(px(8.0))
+                .text_size(px(13.0))
+                .cursor_pointer()
+                .border_1()
+                .border_color(if refreshing {
+                    rgb(0xff4fa3)
+                } else {
+                    tint(0x7af6ff, 45)
+                })
+                .bg(if refreshing {
+                    rgb(0x2a0f3a)
+                } else {
+                    tint(0x101826, 170)
+                })
+                .text_color(if refreshing {
+                    rgb(0xffd0ea)
+                } else {
+                    rgb(0x7af6ff)
+                })
+                .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0x7af6ff)))
+                .child(if refreshing {
+                    "\u{21bb}\u{2026}"
+                } else {
+                    "\u{21bb}"
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.refresh_current(cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+        };
         div()
-            .id("x-refresh")
-            .px(px(9.0))
-            .py(px(5.0))
-            .rounded(px(8.0))
-            .text_size(px(13.0))
-            .cursor_pointer()
-            .border_1()
-            .border_color(if refreshing { rgb(0xff4fa3) } else { tint(0x7af6ff, 45) })
-            .bg(if refreshing { rgb(0x2a0f3a) } else { tint(0x101826, 170) })
-            .text_color(if refreshing { rgb(0xffd0ea) } else { rgb(0x7af6ff) })
-            .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0x7af6ff)))
-            .child(if refreshing { "\u{21bb}\u{2026}" } else { "\u{21bb}" })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.refresh_current(cx);
-                    cx.stop_propagation();
-                    cx.notify();
+            .flex()
+            .gap(px(6.0))
+            .flex_wrap()
+            .children(
+                [
+                    XSection::Timeline,
+                    XSection::Search,
+                    XSection::Trends,
+                    XSection::Lookup,
+                    XSection::Compose,
+                    XSection::Research,
+                ]
+                .into_iter()
+                .map(move |section| {
+                    let active = section == current;
+                    div()
+                        .id(SharedString::from(format!("x-tab-{}", section.label())))
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .rounded(px(8.0))
+                        .text_size(px(12.0))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(if active {
+                            rgb(0x7af6ff)
+                        } else {
+                            tint(0x7af6ff, 25)
+                        })
+                        .bg(if active {
+                            rgb(0x122a55)
+                        } else {
+                            tint(0x101826, 170)
+                        })
+                        .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
+                        .hover(|style| {
+                            style
+                                .bg(rgb(0x1a3050))
+                                .border_color(rgb(0xff4fa3))
+                                .text_color(rgb(0xffd0ea))
+                        })
+                        .child(section.label())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                                this.open_section(section, cx);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
                 }),
             )
-        };
-        div().flex().gap(px(6.0)).flex_wrap().children(
-            [
-                XSection::Timeline,
-                XSection::Search,
-                XSection::Trends,
-                XSection::Lookup,
-                XSection::Compose,
-                XSection::Research,
-            ]
-            .into_iter()
-            .map(move |section| {
-                let active = section == current;
-                div()
-                    .id(SharedString::from(format!("x-tab-{}", section.label())))
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .rounded(px(8.0))
-                    .text_size(px(12.0))
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(if active {
-                        rgb(0x7af6ff)
-                    } else {
-                        tint(0x7af6ff, 25)
-                    })
-                    .bg(if active {
-                        rgb(0x122a55)
-                    } else {
-                        tint(0x101826, 170)
-                    })
-                    .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
-                    .hover(|style| {
-                        style
-                            .bg(rgb(0x1a3050))
-                            .border_color(rgb(0xff4fa3))
-                            .text_color(rgb(0xffd0ea))
-                    })
-                    .child(section.label())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                            this.open_section(section, cx);
-                            cx.stop_propagation();
-                            cx.notify();
-                        }),
-                    )
-            }),
-        )
-        .child(refresh_btn)
+            .child(refresh_btn)
     }
 
     fn status_line(&self) -> impl IntoElement {
@@ -4627,7 +4710,10 @@ impl XPanel {
         let label = if self.loading {
             self.status.clone()
         } else {
-            match &self.last_refresh { Some(at) => format!("{} \u{b7} updated {at}", self.status), None => self.status.clone() }
+            match &self.last_refresh {
+                Some(at) => format!("{} \u{b7} updated {at}", self.status),
+                None => self.status.clone(),
+            }
         };
         let mut row = div()
             .flex()
@@ -5112,10 +5198,7 @@ impl XPanel {
                     ConnState::Connected { handle, .. } => Some(handle.clone()),
                     _ => None,
                 };
-                let mut lookup_bar = div()
-                        .flex()
-                        .gap(px(8.0))
-                        .items_center();
+                let mut lookup_bar = div().flex().gap(px(8.0)).items_center();
                 if let Some(me) = &me_handle {
                     let me_query = me.clone();
                     lookup_bar = lookup_bar.child(x_button!(
@@ -5133,7 +5216,11 @@ impl XPanel {
                         .child(self.single_line_field(TextField::Lookup, cx))
                         .child(x_button!(
                             "x-lookup-run",
-                            if self.loading { "Looking\u{2026}" } else { "Lookup" },
+                            if self.loading {
+                                "Looking\u{2026}"
+                            } else {
+                                "Lookup"
+                            },
                             cx.listener(|this, _, _, cx| {
                                 this.run_lookup(cx);
                                 cx.stop_propagation();
@@ -5191,7 +5278,10 @@ impl XPanel {
                         "Free session profile fetch. No X API credits.",
                     ));
                 } else if let Some(error) = &self.lookup_error {
-                    rows.push(empty_state("Couldn\u{2019}t find that handle", error.clone()));
+                    rows.push(empty_state(
+                        "Couldn\u{2019}t find that handle",
+                        error.clone(),
+                    ));
                 } else {
                     rows.push(empty_state(
                         "Lookup a handle",
@@ -5396,9 +5486,9 @@ impl XPanel {
         }
         self.media_cache.insert(url.clone(), MediaState::Loading);
         let fetch_url = url.clone();
-        let bg = cx.background_executor().spawn(async move {
-            fetch_image_rgba(&fetch_url)
-        });
+        let bg = cx
+            .background_executor()
+            .spawn(async move { fetch_image_rgba(&fetch_url) });
         cx.spawn(async move |this, cx| {
             let result = bg.await;
             let _ = this.update(cx, |panel, cx| {
@@ -5422,9 +5512,10 @@ impl XPanel {
 
     fn media_aspect(&self, media: &MediaItem) -> Option<f32> {
         if let Some(poster) = &media.poster
-            && let Some(MediaState::Ready(cached)) = self.media_cache.get(poster) {
-                return cached.aspect();
-            }
+            && let Some(MediaState::Ready(cached)) = self.media_cache.get(poster)
+        {
+            return cached.aspect();
+        }
         if let Some(MediaState::Ready(cached)) = self.media_cache.get(&media.url) {
             return cached.aspect();
         }
@@ -5495,7 +5586,11 @@ impl XPanel {
             .take(2)
             .collect::<String>()
             .to_uppercase();
-        let initials = if initials.is_empty() { "?".to_string() } else { initials };
+        let initials = if initials.is_empty() {
+            "?".to_string()
+        } else {
+            initials
+        };
         let mut card_el = div()
             .flex()
             .flex_col()
@@ -5513,7 +5608,12 @@ impl XPanel {
                         .h(px(96.0))
                         .rounded(px(8.0))
                         .overflow_hidden()
-                        .child(img(source).w_full().h(px(96.0)).object_fit(ObjectFit::Cover))
+                        .child(
+                            img(source)
+                                .w_full()
+                                .h(px(96.0))
+                                .object_fit(ObjectFit::Cover),
+                        )
                         .into_any_element()
                 }
                 Some(MediaState::Failed) => div()
@@ -5620,17 +5720,15 @@ impl XPanel {
                 .map(|(_, target)| *target);
             let label = follow_button_label(viewer, pending);
             let click_handle = profile.handle.clone();
-            card_el = card_el.child(
-                div().flex().child(x_button!(
-                    "x-follow-toggle",
-                    label,
-                    viewer == Some(true),
-                    cx.listener(move |this, _, _, cx| {
-                        this.toggle_follow(&click_handle, cx);
-                        cx.stop_propagation();
-                    })
-                )),
-            );
+            card_el = card_el.child(div().flex().child(x_button!(
+                "x-follow-toggle",
+                label,
+                viewer == Some(true),
+                cx.listener(move |this, _, _, cx| {
+                    this.toggle_follow(&click_handle, cx);
+                    cx.stop_propagation();
+                })
+            )));
         }
         card_el.into_any_element()
     }
@@ -5639,7 +5737,12 @@ impl XPanel {
         self.media_box_scoped(post, "main", cx)
     }
 
-    fn media_box_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+    fn media_box_scoped(
+        &self,
+        post: &Post,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
         let media = post.media.first()?;
         let kind = media.kind;
         let poster = media.poster.clone().unwrap_or_default();
@@ -5674,23 +5777,46 @@ impl XPanel {
         match self.media_cache.get(&poster) {
             Some(MediaState::Ready(cached)) => {
                 let source: ImageSource = ImageSource::Render(cached.image.clone());
-                area = area.child(img(source).w(px(fit_w)).h(px(fit_h)).object_fit(ObjectFit::Contain));
+                area = area.child(
+                    img(source)
+                        .w(px(fit_w))
+                        .h(px(fit_h))
+                        .object_fit(ObjectFit::Contain),
+                );
             }
             Some(MediaState::Failed) => {
                 area = area.child(
-                    div().p(px(10.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo { "Photo (could not load preview)" } else { "Video (could not load preview)" }),
+                    div()
+                        .p(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x93a4c3))
+                        .child(if kind == MediaKind::Photo {
+                            "Photo (could not load preview)"
+                        } else {
+                            "Video (could not load preview)"
+                        }),
                 );
             }
             _ => {
                 area = area.child(
-                    div().p(px(10.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo { "Loading photo\u{2026}" } else { "Loading video preview\u{2026}" }),
+                    div()
+                        .p(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x93a4c3))
+                        .child(if kind == MediaKind::Photo {
+                            "Loading photo\u{2026}"
+                        } else {
+                            "Loading video preview\u{2026}"
+                        }),
                 );
             }
         }
         {
-            let label = if extra > 0 { format!("{badge}  +{extra} more") } else { badge.to_string() };
+            let label = if extra > 0 {
+                format!("{badge}  +{extra} more")
+            } else {
+                badge.to_string()
+            };
             area = area.child(
                 div()
                     .absolute()
@@ -5720,28 +5846,36 @@ impl XPanel {
         Some(area.into_any_element())
     }
 
-
     /// Start/position the embedded mpv surface over the viewer's video
     /// area. Called from render only when a video viewer is open; the
     /// rect is derived from the window viewport (panel is the rightmost
     /// 480px, viewer header 56px + controls 72px), so the native surface
     /// tracks Termy moves/resizes and never changes Termy's geometry.
     fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
-        let Some(viewer) = self.viewer.clone() else { return };
-        if viewer.kind == MediaKind::Photo { return; }
+        let Some(viewer) = self.viewer.clone() else {
+            return;
+        };
+        if viewer.kind == MediaKind::Photo {
+            return;
+        }
         #[cfg(target_os = "windows")]
         {
             use raw_window_handle::{HasWindowHandle, RawWindowHandle};
             if let Ok(handle) = HasWindowHandle::window_handle(window)
-                && let RawWindowHandle::Win32(win32) = handle.as_raw() {
-                    self.host_hwnd = win32.hwnd.get() as isize;
-                }
+                && let RawWindowHandle::Win32(win32) = handle.as_raw()
+            {
+                self.host_hwnd = win32.hwnd.get() as isize;
+            }
         }
         let viewport = window.viewport_size();
         let vw: f32 = viewport.width.into();
         self.viewport_w = vw;
         let vh: f32 = viewport.height.into();
-        let panel_w = if self.fill_window { vw } else { 480.0_f32.min(vw) };
+        let panel_w = if self.fill_window {
+            vw
+        } else {
+            480.0_f32.min(vw)
+        };
         let rect: player::Rect = (vw - panel_w, 56.0, panel_w, (vh - 160.0).max(80.0));
         let scale = window.scale_factor();
         if let Some(player) = &mut self.video_player {
@@ -5761,31 +5895,53 @@ impl XPanel {
                     // while the video viewer is open (cheap, panel-only).
                     cx.spawn(async move |this, cx| {
                         loop {
-                            cx.background_executor().timer(Duration::from_millis(600)).await;
-                            let alive = this.update(cx, |panel, cx| {
-                                let open = panel.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) && panel.video_player.is_some();
-                                if !open { return false; }
-                                // mpv died / its window was closed, or
-                                // playback reached EOF: end the viewer
-                                // cleanly instead of leaving a stuck
-                                // "Playing video" status over a dead frame.
-                                let (pos, dur) = panel.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
-                                let player_gone = panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive());
-                                let at_eof = dur > 0.0 && pos >= dur - 0.25;
-                                if player_gone || at_eof {
-                                    panel.close_viewer();
-                                    panel.notice = Some("Video ended \u{b7} back to the timeline.".into());
+                            cx.background_executor()
+                                .timer(Duration::from_millis(600))
+                                .await;
+                            let alive = this
+                                .update(cx, |panel, cx| {
+                                    let open = panel
+                                        .viewer
+                                        .as_ref()
+                                        .is_some_and(|v| v.kind != MediaKind::Photo)
+                                        && panel.video_player.is_some();
+                                    if !open {
+                                        return false;
+                                    }
+                                    // mpv died / its window was closed, or
+                                    // playback reached EOF: end the viewer
+                                    // cleanly instead of leaving a stuck
+                                    // "Playing video" status over a dead frame.
+                                    let (pos, dur) = panel
+                                        .video_player
+                                        .as_ref()
+                                        .map_or((0.0, 0.0), |pl| pl.progress());
+                                    let player_gone = panel
+                                        .video_player
+                                        .as_mut()
+                                        .is_some_and(|pl| !pl.is_alive());
+                                    let at_eof = dur > 0.0 && pos >= dur - 0.25;
+                                    if player_gone || at_eof {
+                                        panel.close_viewer();
+                                        panel.notice =
+                                            Some("Video ended \u{b7} back to the timeline.".into());
+                                        cx.notify();
+                                        return false;
+                                    }
                                     cx.notify();
-                                    return false;
-                                }
-                                cx.notify();
-                                true
-                            }).unwrap_or(false);
-                            if !alive { break; }
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if !alive {
+                                break;
+                            }
                         }
-                    }).detach();
+                    })
+                    .detach();
                 }
-                Err(e) => { self.player_error = Some(format!("In-app player unavailable: {e}")); }
+                Err(e) => {
+                    self.player_error = Some(format!("In-app player unavailable: {e}"));
+                }
             }
             #[cfg(target_os = "linux")]
             match player::VideoPlayer::start(0, scale, rect, &viewer.url) {
@@ -5802,21 +5958,36 @@ impl XPanel {
                     // "Starting in-app player" state behind.
                     cx.spawn(async move |this, cx| {
                         loop {
-                            cx.background_executor().timer(Duration::from_millis(600)).await;
-                            let alive = this.update(cx, |panel, cx| {
-                                let open = panel.viewer.as_ref().is_some_and(|v| v.kind != MediaKind::Photo) && panel.video_player.is_some();
-                                if !open { return false; }
-                                if panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive()) {
-                                    panel.close_viewer();
-                                    panel.notice = Some("Video ended \u{b7} back to the timeline.".into());
-                                    cx.notify();
-                                    return false;
-                                }
-                                true
-                            }).unwrap_or(false);
-                            if !alive { break; }
+                            cx.background_executor()
+                                .timer(Duration::from_millis(600))
+                                .await;
+                            let alive = this
+                                .update(cx, |panel, cx| {
+                                    let open = panel
+                                        .viewer
+                                        .as_ref()
+                                        .is_some_and(|v| v.kind != MediaKind::Photo)
+                                        && panel.video_player.is_some();
+                                    if !open {
+                                        return false;
+                                    }
+                                    if panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive())
+                                    {
+                                        panel.close_viewer();
+                                        panel.notice =
+                                            Some("Video ended \u{b7} back to the timeline.".into());
+                                        cx.notify();
+                                        return false;
+                                    }
+                                    true
+                                })
+                                .unwrap_or(false);
+                            if !alive {
+                                break;
+                            }
                         }
-                    }).detach();
+                    })
+                    .detach();
                 }
                 Err(e) => {
                     self.player_error = Some(format!(
@@ -5825,20 +5996,31 @@ impl XPanel {
                 }
             }
             #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-            { self.player_error = Some("In-app video needs the Windows mpv build.".into()); }
+            {
+                self.player_error = Some("In-app video needs the Windows mpv build.".into());
+            }
         }
     }
 
     /// Seek-bar click/drag at window-x `x`: fraction from the bar's known
     /// geometry (panel is the rightmost 480px, bar inset 12px each side).
     fn seek_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
-        let panel_w = if self.fill_window { self.viewport_w } else { 480.0_f32.min(self.viewport_w) };
+        let panel_w = if self.fill_window {
+            self.viewport_w
+        } else {
+            480.0_f32.min(self.viewport_w)
+        };
         let bar_x = self.viewport_w - panel_w + 12.0;
         let bar_w = (panel_w - 24.0).max(1.0);
-        let (_, dur) = self.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
+        let (_, dur) = self
+            .video_player
+            .as_ref()
+            .map_or((0.0, 0.0), |pl| pl.progress());
         if dur > 0.0 {
             let target = f64::from(media_fit::seek_fraction(x, bar_x, bar_w)) * dur;
-            if let Some(pl) = &mut self.video_player { pl.seek_absolute(target); }
+            if let Some(pl) = &mut self.video_player {
+                pl.seek_absolute(target);
+            }
         }
         cx.stop_propagation();
         cx.notify();
@@ -5857,42 +6039,98 @@ impl XPanel {
             let mut area = div().relative().w_full().h_full().bg(rgb(0x000000));
             if let Some(error) = &self.player_error {
                 area = area.child(
-                    div().absolute().top(px(12.0)).left(px(12.0)).right(px(12.0))
-                        .p(px(10.0)).rounded(px(8.0)).bg(tint(0x2a0f1a, 235))
-                        .text_size(px(12.0)).text_color(rgb(0xffd0ea))
-                        .child(format!("{error} The poster is shown instead \u{2014} no browser was opened.")),
+                    div()
+                        .absolute()
+                        .top(px(12.0))
+                        .left(px(12.0))
+                        .right(px(12.0))
+                        .p(px(10.0))
+                        .rounded(px(8.0))
+                        .bg(tint(0x2a0f1a, 235))
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xffd0ea))
+                        .child(format!(
+                            "{error} The poster is shown instead \u{2014} no browser was opened."
+                        )),
                 );
             } else if self.video_player.is_none() {
-                area = area.child(div().p(px(12.0)).text_size(px(12.0)).text_color(rgb(0x93a4c3)).child("Starting in-app player\u{2026}"));
+                area = area.child(
+                    div()
+                        .p(px(12.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x93a4c3))
+                        .child("Starting in-app player\u{2026}"),
+                );
             }
             area.into_any_element()
         } else {
-            let key = if self.media_cache.contains_key(&viewer.url) { viewer.url.clone() } else { viewer.poster.clone().unwrap_or_else(|| viewer.url.clone()) };
-            let mut area = div().relative().w_full().h_full().flex().items_center().justify_center()
-                .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.close_viewer();
-                    cx.stop_propagation();
-                    cx.notify();
-                }));
+            let key = if self.media_cache.contains_key(&viewer.url) {
+                viewer.url.clone()
+            } else {
+                viewer.poster.clone().unwrap_or_else(|| viewer.url.clone())
+            };
+            let mut area = div()
+                .relative()
+                .w_full()
+                .h_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_viewer();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                );
             match self.media_cache.get(&key) {
                 Some(MediaState::Ready(cached)) => {
                     let source: ImageSource = ImageSource::Render(cached.image.clone());
                     area = area.child(img(source).w_full().h_full().object_fit(ObjectFit::Contain));
                 }
                 Some(MediaState::Failed) => {
-                    area = area.child(div().text_size(px(13.0)).text_color(rgb(0x93a4c3)).child("Photo could not load."));
+                    area = area.child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x93a4c3))
+                            .child("Photo could not load."),
+                    );
                 }
                 _ => {
-                    area = area.child(div().text_size(px(13.0)).text_color(rgb(0x93a4c3)).child("Loading photo\u{2026}"));
+                    area = area.child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0x93a4c3))
+                            .child("Loading photo\u{2026}"),
+                    );
                 }
             }
             area.into_any_element()
         };
-        let mut controls = div().h(px(104.0)).flex_none().flex().flex_col().justify_center().gap(px(6.0)).px(px(12.0));
+        let mut controls = div()
+            .h(px(104.0))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .justify_center()
+            .gap(px(6.0))
+            .px(px(12.0));
         if is_video {
-            let (pos, dur) = self.video_player.as_ref().map_or((0.0, 0.0), |pl| pl.progress());
-            let frac = if dur > 0.0 { (pos / dur).clamp(0.0, 1.0) as f32 } else { 0.0 };
-            let panel_w = if self.fill_window { self.viewport_w } else { 480.0_f32.min(self.viewport_w) };
+            let (pos, dur) = self
+                .video_player
+                .as_ref()
+                .map_or((0.0, 0.0), |pl| pl.progress());
+            let frac = if dur > 0.0 {
+                (pos / dur).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            let panel_w = if self.fill_window {
+                self.viewport_w
+            } else {
+                480.0_f32.min(self.viewport_w)
+            };
             let bar_w = (panel_w - 24.0).max(1.0);
             controls = controls.child(
                 div()
@@ -5913,10 +6151,13 @@ impl XPanel {
                             .w(px(bar_w * frac))
                             .rounded(px(999.0))
                             .bg(rgb(0x7af6ff))
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                let x: f32 = event.position.x.into();
-                                this.seek_bar_click(x, cx);
-                            })),
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    let x: f32 = event.position.x.into();
+                                    this.seek_bar_click(x, cx);
+                                }),
+                            ),
                     )
                     .child(
                         div()
@@ -5925,70 +6166,144 @@ impl XPanel {
                             .right(px(10.0))
                             .text_size(px(11.0))
                             .text_color(rgb(0xe9fdff))
-                            .child(format!("{} / {}", media_fit::format_time(pos), media_fit::format_time(dur))),
+                            .child(format!(
+                                "{} / {}",
+                                media_fit::format_time(pos),
+                                media_fit::format_time(dur)
+                            )),
                     )
-                    .on_mouse_down(MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        let x: f32 = event.position.x.into();
-                        this.seek_bar_click(x, cx);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            this.seek_bar_click(x, cx);
+                        }),
+                    )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
                         if event.pressed_button == Some(MouseButton::Left) {
                             let x: f32 = event.position.x.into();
                             this.seek_bar_click(x, cx);
                         }
                     }))
-                    .on_mouse_up(MouseButton::Left, cx.listener(|this, event: &MouseUpEvent, _, cx| {
-                        // Drag release lands the seek even if move events
-                        // were coalesced away.
-                        let x: f32 = event.position.x.into();
-                        this.seek_bar_click(x, cx);
-                    })),
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            // Drag release lands the seek even if move events
+                            // were coalesced away.
+                            let x: f32 = event.position.x.into();
+                            this.seek_bar_click(x, cx);
+                        }),
+                    ),
             );
             controls = controls.child(
-                div().flex().items_center().gap(px(8.0))
-                .child(x_button!("x-viewer-pause", if self.player_paused { "\u{25b6} Play" } else { "\u{23f8} Pause" }, cx.listener(|this, _, _, cx| {
-                    if let Some(pl) = &mut this.video_player { pl.toggle_pause(); this.player_paused = !this.player_paused; }
-                    cx.stop_propagation(); cx.notify();
-                })))
-                .child(x_button!("x-viewer-back", "-10s", cx.listener(|this, _, _, cx| {
-                    if let Some(pl) = &mut this.video_player { pl.seek_relative(-10); }
-                    cx.stop_propagation(); cx.notify();
-                })))
-                .child(x_button!("x-viewer-fwd", "+10s", cx.listener(|this, _, _, cx| {
-                    if let Some(pl) = &mut this.video_player { pl.seek_relative(10); }
-                    cx.stop_propagation(); cx.notify();
-                })))
-                .child(x_button!("x-viewer-mute", if self.player_muted { "Unmute" } else { "Mute" }, cx.listener(|this, _, _, cx| {
-                    this.player_muted = !this.player_muted;
-                    if let Some(pl) = &mut this.video_player { pl.set_muted(this.player_muted); }
-                    cx.stop_propagation(); cx.notify();
-                })))
-                .child(div().text_size(px(11.0)).text_color(rgb(0x93a4c3)).child("Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close")),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(x_button!(
+                        "x-viewer-pause",
+                        if self.player_paused {
+                            "\u{25b6} Play"
+                        } else {
+                            "\u{23f8} Pause"
+                        },
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(pl) = &mut this.video_player {
+                                pl.toggle_pause();
+                                this.player_paused = !this.player_paused;
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        "x-viewer-back",
+                        "-10s",
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(pl) = &mut this.video_player {
+                                pl.seek_relative(-10);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        "x-viewer-fwd",
+                        "+10s",
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(pl) = &mut this.video_player {
+                                pl.seek_relative(10);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        "x-viewer-mute",
+                        if self.player_muted { "Unmute" } else { "Mute" },
+                        cx.listener(|this, _, _, cx| {
+                            this.player_muted = !this.player_muted;
+                            if let Some(pl) = &mut this.video_player {
+                                pl.set_muted(this.player_muted);
+                            }
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x93a4c3))
+                            .child("Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close"),
+                    ),
             );
         } else {
             controls = controls.child(div().text_size(px(11.0)).text_color(rgb(0x93a4c3)).child("Click image or backdrop, Esc, or \u{2715} to close \u{b7} whole photo, never cropped"));
         }
         let el = div()
             .id("x-viewer")
-            .absolute().top_0().left_0().size_full()
-            .flex().flex_col()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .flex()
+            .flex_col()
             .bg(tint(0x02040a, 242))
             .child(
-                div().h(px(56.0)).flex_none().flex().items_center().justify_between().px(px(12.0))
-                    .child(div().text_size(px(13.0)).text_color(rgb(0xe9fdff)).child(title))
-                    .child(x_button!("x-viewer-close", "\u{2715} Close", cx.listener(|this, _, _, cx| {
-                        this.close_viewer();
-                        cx.stop_propagation(); cx.notify();
-                    }))),
+                div()
+                    .h(px(56.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(12.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(0xe9fdff))
+                            .child(title),
+                    )
+                    .child(x_button!(
+                        "x-viewer-close",
+                        "\u{2715} Close",
+                        cx.listener(|this, _, _, cx| {
+                            this.close_viewer();
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    )),
             )
             .child(div().flex_1().min_h(px(0.0)).child(middle))
             .child(controls)
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                // Backdrop clicks are handled by the photo area / Close; keep
-                // clicks in chrome from falling through to tweets underneath.
-                let _ = this;
-                cx.stop_propagation();
-            }));
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    // Backdrop clicks are handled by the photo area / Close; keep
+                    // clicks in chrome from falling through to tweets underneath.
+                    let _ = this;
+                    cx.stop_propagation();
+                }),
+            );
         Some(el.into_any_element())
     }
 
@@ -6093,7 +6408,8 @@ impl XPanel {
         if (f32::from(current.y) - new_offset).abs() < 0.5 {
             return false;
         }
-        self.list_scroll.set_offset(point(current.x, px(new_offset)));
+        self.list_scroll
+            .set_offset(point(current.x, px(new_offset)));
         true
     }
 
@@ -6187,8 +6503,8 @@ impl XPanel {
                         if velocity.abs() > 0.0 {
                             let cur = panel.list_scroll.offset();
                             let max_y: f32 = panel.list_scroll.max_offset().y.into();
-                            let new_y = (f32::from(cur.y) + velocity * 0.03)
-                                .clamp(-max_y.max(0.0), 0.0);
+                            let new_y =
+                                (f32::from(cur.y) + velocity * 0.03).clamp(-max_y.max(0.0), 0.0);
                             if (f32::from(cur.y) - new_y).abs() > 0.01 {
                                 panel.list_scroll.set_offset(point(cur.x, px(new_y)));
                                 cx.notify();
@@ -6226,7 +6542,12 @@ impl XPanel {
     /// Same card with a section-scoped element-id prefix, so one post
     /// can appear in two Profile sections (Top 20 and All Tweets)
     /// without duplicate GPUI element ids.
-    fn tweet_card_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn tweet_card_scoped(
+        &self,
+        post: &Post,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         // A repost renders its embedded original inline (native-X
         // style) under a "reposted" header; reply/engage target the
         // original tweet, exactly as on X.
@@ -6415,7 +6736,12 @@ impl XPanel {
     /// click targets that stop propagation, so hitting one never opens
     /// the reply editor (and vice versa). Counts shown are the post's
     /// own payload counts, moved locally by optimistic flips.
-    fn tweet_actions_scoped(&self, post: &Post, scope: &str, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn tweet_actions_scoped(
+        &self,
+        post: &Post,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
         let id = post.id.clone();
         let url = if post.url.is_empty() {
             format!("https://x.com/{}/status/{}", post.author_handle, post.id)
@@ -6460,7 +6786,10 @@ impl XPanel {
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0x93a4c3))
-                    .child(format!("{} likes \u{b7} {} retweets", post.likes, post.reposts)),
+                    .child(format!(
+                        "{} likes \u{b7} {} retweets",
+                        post.likes, post.reposts
+                    )),
             )
             .child(x_button!(
                 format!("x-rt-{scope}-{}", post.id),
@@ -6527,7 +6856,11 @@ impl XPanel {
         let ranges = soft_wrap_ranges(text, self.editor_max_chars());
         let entities = entity_spans(text);
         let last = ranges.len() - 1;
-        let mut col = div().flex().flex_col().text_size(px(13.0)).text_color(rgb(0xf8fbff));
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .text_size(px(13.0))
+            .text_color(rgb(0xf8fbff));
         for (idx, (a, b)) in ranges.iter().enumerate() {
             let seg = &text[*a..*b];
             let mut row = div().flex().flex_row().items_center().min_h(px(19.0));
@@ -6587,7 +6920,11 @@ impl XPanel {
             .rounded(px(10.0))
             .bg(tint(0x0f1c33, 245))
             .border_1()
-            .border_color(if focused { rgb(0x7af6ff) } else { tint(0x7af6ff, 70) })
+            .border_color(if focused {
+                rgb(0x7af6ff)
+            } else {
+                tint(0x7af6ff, 70)
+            })
             .flex()
             .flex_col()
             .gap(px(6.0))
@@ -6608,9 +6945,17 @@ impl XPanel {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(0x7af6ff))
-                    .child(format!("Quote @{} \u{b7} retweet with your own words", post.author_handle)),
+                    .child(format!(
+                        "Quote @{} \u{b7} retweet with your own words",
+                        post.author_handle
+                    )),
             )
-            .child(focus_glow("glow-quote", focused, false, editor.into_any_element()))
+            .child(focus_glow(
+                "glow-quote",
+                focused,
+                false,
+                editor.into_any_element(),
+            ))
             .child(
                 div()
                     .text_size(px(11.0))
@@ -6709,7 +7054,11 @@ impl XPanel {
             .rounded(px(10.0))
             .bg(tint(0x0f1c33, 245))
             .border_1()
-            .border_color(if focused { rgb(0x7af6ff) } else { tint(0x7af6ff, 70) })
+            .border_color(if focused {
+                rgb(0x7af6ff)
+            } else {
+                tint(0x7af6ff, 70)
+            })
             .flex()
             .flex_col()
             .gap(px(6.0))
@@ -6769,7 +7118,8 @@ impl XPanel {
                             this.pending_focus = true;
                             cx.stop_propagation();
                             cx.notify();
-                        }))
+                        }),
+                    )
                     .into_any_element(),
             ))
             .child(
@@ -7424,81 +7774,81 @@ impl XPanel {
         let parts: Vec<&str> = text.split('\n').collect();
         let max_chars = self.editor_max_chars();
         for (idx, hard_line) in parts.iter().enumerate() {
-          for (sub_start, sub_end) in soft_wrap_ranges(hard_line, max_chars) {
-            let line = &hard_line[sub_start..sub_end];
-            let line_start = offset + sub_start;
-            let line_end = line_start + line.len();
-            let caret_on_line = caret >= line_start && caret <= line_end;
-            let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
+            for (sub_start, sub_end) in soft_wrap_ranges(hard_line, max_chars) {
+                let line = &hard_line[sub_start..sub_end];
+                let line_start = offset + sub_start;
+                let line_end = line_start + line.len();
+                let caret_on_line = caret >= line_start && caret <= line_end;
+                let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
 
-            // Build character runs: [start, end, selected]
-            let mut marks = vec![0usize, line.len()];
-            if caret_on_line {
-                marks.push((caret - line_start).min(line.len()));
-            }
-            if let Some((sa, sb)) = sel {
-                marks.push(sa.saturating_sub(line_start).min(line.len()));
-                marks.push(sb.saturating_sub(line_start).min(line.len()));
-            }
-            // Entity edges split chunks so mentions/tags render blue.
-            for (es, ee, _) in &entities {
-                for edge in [*es, *ee] {
-                    if edge > line_start && edge < line_end {
-                        marks.push(edge - line_start);
+                // Build character runs: [start, end, selected]
+                let mut marks = vec![0usize, line.len()];
+                if caret_on_line {
+                    marks.push((caret - line_start).min(line.len()));
+                }
+                if let Some((sa, sb)) = sel {
+                    marks.push(sa.saturating_sub(line_start).min(line.len()));
+                    marks.push(sb.saturating_sub(line_start).min(line.len()));
+                }
+                // Entity edges split chunks so mentions/tags render blue.
+                for (es, ee, _) in &entities {
+                    for edge in [*es, *ee] {
+                        if edge > line_start && edge < line_end {
+                            marks.push(edge - line_start);
+                        }
                     }
                 }
-            }
-            marks.sort_unstable();
-            marks.dedup();
+                marks.sort_unstable();
+                marks.dedup();
 
-            let mut caret_drawn = false;
-            for window in marks.windows(2) {
-                let (s, e) = (window[0], window[1]);
-                if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == s {
-                    row = row.child(self.caret_bar());
-                    caret_drawn = true;
-                }
-                if s < e {
-                    let abs_s = line_start + s;
-                    let abs_e = line_start + e;
-                    let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
-                    let in_entity = entities
-                        .iter()
-                        .any(|(es, ee, _)| abs_s >= *es && abs_e <= *ee);
-                    let chunk = &line[s..e];
-                    let mut el = div().text_size(px(14.0));
-                    if selected {
-                        el = el
-                            .px(px(1.0))
-                            .rounded(px(3.0))
-                            .bg(tint(0xff4fa3, 130))
-                            .text_color(rgb(0xffe8f5));
-                    } else if in_entity {
-                        el = el.text_color(rgb(ENTITY_BLUE));
-                    } else {
-                        el = el.text_color(rgb(0xf8fbff));
+                let mut caret_drawn = false;
+                for window in marks.windows(2) {
+                    let (s, e) = (window[0], window[1]);
+                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == s {
+                        row = row.child(self.caret_bar());
+                        caret_drawn = true;
                     }
-                    row = row.child(el.child(chunk.to_string()));
+                    if s < e {
+                        let abs_s = line_start + s;
+                        let abs_e = line_start + e;
+                        let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
+                        let in_entity = entities
+                            .iter()
+                            .any(|(es, ee, _)| abs_s >= *es && abs_e <= *ee);
+                        let chunk = &line[s..e];
+                        let mut el = div().text_size(px(14.0));
+                        if selected {
+                            el = el
+                                .px(px(1.0))
+                                .rounded(px(3.0))
+                                .bg(tint(0xff4fa3, 130))
+                                .text_color(rgb(0xffe8f5));
+                        } else if in_entity {
+                            el = el.text_color(rgb(ENTITY_BLUE));
+                        } else {
+                            el = el.text_color(rgb(0xf8fbff));
+                        }
+                        row = row.child(el.child(chunk.to_string()));
+                    }
+                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == e {
+                        row = row.child(self.caret_bar());
+                        caret_drawn = true;
+                    }
                 }
-                if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == e {
+                if show_caret && caret_on_line && !caret_drawn {
                     row = row.child(self.caret_bar());
-                    caret_drawn = true;
                 }
-            }
-            if show_caret && caret_on_line && !caret_drawn {
-                row = row.child(self.caret_bar());
-            }
-            if line.is_empty() && !(show_caret && caret_on_line) {
-                row = row.child(
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(rgb(0xf8fbff))
-                        .child(" "),
-                );
-            }
+                if line.is_empty() && !(show_caret && caret_on_line) {
+                    row = row.child(
+                        div()
+                            .text_size(px(14.0))
+                            .text_color(rgb(0xf8fbff))
+                            .child(" "),
+                    );
+                }
 
-            rows.push(row.into_any_element());
-          }
+                rows.push(row.into_any_element());
+            }
             offset += hard_line.len() + if idx + 1 < parts.len() { 1 } else { 0 };
         }
 
@@ -7986,17 +8336,26 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 #[cfg(test)]
 mod edit_keys_tests {
     use super::next_timeline_limit;
-    use super::{BURST_MS, burst_style_at, caret_visual_line, follow_button_label, is_own_profile, soft_wrap_ranges};
+    use super::{
+        BURST_MS, burst_style_at, caret_visual_line, follow_button_label, is_own_profile,
+        soft_wrap_ranges,
+    };
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
         // Payload silent: honest Follow (no invented Following state).
         assert_eq!(follow_button_label(None, None), "Follow");
         assert_eq!(follow_button_label(Some(false), None), "Follow");
-        assert_eq!(follow_button_label(Some(true), None), "Following \u{b7} Unfollow");
+        assert_eq!(
+            follow_button_label(Some(true), None),
+            "Following \u{b7} Unfollow"
+        );
         // In flight: progress label wins; the click guard ignores clicks.
         assert_eq!(follow_button_label(None, Some(true)), "Following\u{2026}");
-        assert_eq!(follow_button_label(Some(true), Some(false)), "Unfollowing\u{2026}");
+        assert_eq!(
+            follow_button_label(Some(true), Some(false)),
+            "Unfollowing\u{2026}"
+        );
     }
 
     #[test]
@@ -8013,11 +8372,19 @@ mod edit_keys_tests {
         let ranges = soft_wrap_ranges(text, 10);
         assert!(ranges.len() > 1);
         for (a, b) in &ranges {
-            assert!(text[*a..*b].chars().count() <= 10, "range too wide: {:?}", &text[*a..*b]);
+            assert!(
+                text[*a..*b].chars().count() <= 10,
+                "range too wide: {:?}",
+                &text[*a..*b]
+            );
             assert!(!text[*a..*b].starts_with(' '));
         }
         // No non-space character is lost by wrapping.
-        let kept: String = ranges.iter().map(|(a, b)| &text[*a..*b]).collect::<Vec<_>>().join("");
+        let kept: String = ranges
+            .iter()
+            .map(|(a, b)| &text[*a..*b])
+            .collect::<Vec<_>>()
+            .join("");
         assert_eq!(kept.replace(' ', ""), text.replace(' ', ""));
     }
 
@@ -8026,7 +8393,11 @@ mod edit_keys_tests {
         let word = "abcdefghijklmnopqrstuvwxyz";
         let ranges = soft_wrap_ranges(word, 10);
         assert_eq!(ranges.len(), 3);
-        let kept: String = ranges.iter().map(|(a, b)| &word[*a..*b]).collect::<Vec<_>>().join("");
+        let kept: String = ranges
+            .iter()
+            .map(|(a, b)| &word[*a..*b])
+            .collect::<Vec<_>>()
+            .join("");
         assert_eq!(kept, word);
         assert_eq!(soft_wrap_ranges("ab\ncd", 10), vec![(0, 2), (3, 5)]);
         assert_eq!(soft_wrap_ranges("", 10), vec![(0, 0)]);
@@ -8060,16 +8431,22 @@ mod edit_keys_tests {
         assert_eq!(next_timeline_limit(9999), None);
     }
 
-    use super::{
-        EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel,
-        edit_keys_owned, enter_action,
-    };
     use super::{CardTextSelection, card_drag_promotes, copy_text_for_focus};
+    use super::{
+        EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel, edit_keys_owned,
+        enter_action,
+    };
 
     #[test]
     fn card_drag_needs_real_travel_and_focus_decides_the_copy() {
-        assert!(!card_drag_promotes((10.0, 10.0), (12.0, 11.0)), "a click is not a selection");
-        assert!(card_drag_promotes((10.0, 10.0), (40.0, 10.0)), "a drag selects");
+        assert!(
+            !card_drag_promotes((10.0, 10.0), (12.0, 11.0)),
+            "a click is not a selection"
+        );
+        assert!(
+            card_drag_promotes((10.0, 10.0), (40.0, 10.0)),
+            "a drag selects"
+        );
         let card = CardTextSelection {
             post_id: "1".into(),
             text: "the tweet".into(),

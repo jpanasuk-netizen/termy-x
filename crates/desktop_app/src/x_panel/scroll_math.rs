@@ -18,11 +18,7 @@ pub fn autoscroll_velocity(anchor_y: f32, mouse_y: f32) -> f32 {
         return 0.0;
     }
     let speed = ((dy.abs() - dead) * 3.0).min(600.0);
-    if dy > 0.0 {
-        -speed
-    } else {
-        speed
-    }
+    if dy > 0.0 { -speed } else { speed }
 }
 
 /// Chrome wheel feel for line-based wheels. GPUI's Windows platform

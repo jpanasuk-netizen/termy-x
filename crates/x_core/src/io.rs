@@ -948,7 +948,10 @@ fn copy_text(text: &str) -> Result<(), String> {
                 return Ok(());
             }
         }
-        Err("clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked".to_string())
+        Err(
+            "clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked"
+                .to_string(),
+        )
     }
     #[cfg(not(any(windows, target_os = "linux")))]
     {

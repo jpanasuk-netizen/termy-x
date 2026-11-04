@@ -4,7 +4,7 @@
 //! text/handle are screened through the same Trend-shaped haystacks.
 //! Run: cargo run --release -p termy_x --example filter_bench
 use std::time::Instant;
-use termy_x::model::{filter_trends, group_trends, sort_trends, trend_bucket, Trend, TrendBucket};
+use termy_x::model::{Trend, TrendBucket, filter_trends, group_trends, sort_trends, trend_bucket};
 
 // ---- verbatim pre-change implementations (the BEFORE / oracle) ----
 fn bucket_old(category: Option<&str>) -> TrendBucket {

@@ -10,14 +10,22 @@ pub const MEDIA_DEFAULT_ASPECT: f32 = 16.0 / 9.0;
 /// portrait clip reserves a bounded box instead of eating the timeline;
 /// the image itself is contain-fitted inside, never cropped.
 pub fn media_box_height(container_w: f32, aspect: Option<f32>) -> f32 {
-    let a = aspect.filter(|a| a.is_finite() && *a > 0.05 && *a < 20.0).unwrap_or(MEDIA_DEFAULT_ASPECT);
+    let a = aspect
+        .filter(|a| a.is_finite() && *a > 0.05 && *a < 20.0)
+        .unwrap_or(MEDIA_DEFAULT_ASPECT);
     (container_w / a).clamp(MEDIA_MIN_H, MEDIA_MAX_H)
 }
 
 /// Exact (w, h) of an image contain-fitted inside `box_w x box_h`.
 pub fn contain_size(box_w: f32, box_h: f32, aspect: Option<f32>) -> (f32, f32) {
-    let a = aspect.filter(|a| a.is_finite() && *a > 0.05 && *a < 20.0).unwrap_or(MEDIA_DEFAULT_ASPECT);
-    if box_w / box_h > a { (box_h * a, box_h) } else { (box_w, box_w / a) }
+    let a = aspect
+        .filter(|a| a.is_finite() && *a > 0.05 && *a < 20.0)
+        .unwrap_or(MEDIA_DEFAULT_ASPECT);
+    if box_w / box_h > a {
+        (box_h * a, box_h)
+    } else {
+        (box_w, box_w / a)
+    }
 }
 
 #[cfg(test)]
@@ -25,14 +33,14 @@ mod tests {
     use super::*;
     #[test]
     fn landscape_uses_full_width() {
-        assert_eq!(media_box_height(424.0, Some(16.0/9.0)), 238.5);
-        assert_eq!(contain_size(424.0, 238.5, Some(16.0/9.0)), (424.0, 238.5));
+        assert_eq!(media_box_height(424.0, Some(16.0 / 9.0)), 238.5);
+        assert_eq!(contain_size(424.0, 238.5, Some(16.0 / 9.0)), (424.0, 238.5));
     }
     #[test]
     fn portrait_is_capped_and_letterboxed_not_cropped() {
         // 9:16 portrait in a 424-wide card: uncapped height would be 753px.
-        assert_eq!(media_box_height(424.0, Some(9.0/16.0)), MEDIA_MAX_H);
-        let (w, h) = contain_size(424.0, MEDIA_MAX_H, Some(9.0/16.0));
+        assert_eq!(media_box_height(424.0, Some(9.0 / 16.0)), MEDIA_MAX_H);
+        let (w, h) = contain_size(424.0, MEDIA_MAX_H, Some(9.0 / 16.0));
         assert_eq!((w, h), (135.0, 240.0)); // whole frame, shrunk to fit the capped area
     }
     #[test]
@@ -46,13 +54,19 @@ mod tests {
 /// Fraction 0..=1 of a seek bar click at window-x `click_x`, where the
 /// bar starts at `bar_x` and is `bar_w` wide.
 pub fn seek_fraction(click_x: f32, bar_x: f32, bar_w: f32) -> f32 {
-    if bar_w <= 1.0 { return 0.0; }
+    if bar_w <= 1.0 {
+        return 0.0;
+    }
     ((click_x - bar_x) / bar_w).clamp(0.0, 1.0)
 }
 
 /// "1:23" / "12:05" for a seconds position (negatives/NaN clamp to 0).
 pub fn format_time(seconds: f64) -> String {
-    let total = if seconds.is_finite() && seconds > 0.0 { seconds as u64 } else { 0 };
+    let total = if seconds.is_finite() && seconds > 0.0 {
+        seconds as u64
+    } else {
+        0
+    };
     format!("{}:{:02}", total / 60, total % 60)
 }
 
