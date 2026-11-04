@@ -145,6 +145,15 @@ impl TerminalView {
                             }
                             Some(notes.markdown)
                         }
+                        Err(error)
+                            if error == termy_core::release_core::notes::RELEASE_NOT_PUBLISHED =>
+                        {
+                            // No release for this version (fork releases lag the
+                            // version): treat as up to date, log only, no dialog.
+                            log::info!("release notes: {error}");
+                            view.release_notes = None;
+                            None
+                        }
                         Err(error) => {
                             if let Some(dialog) = view.release_notes.as_mut() {
                                 dialog.status = ReleaseNotesStatus::Error { message: error };
