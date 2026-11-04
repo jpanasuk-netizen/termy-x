@@ -13,9 +13,7 @@ use crate::io::{
 };
 use crate::model::{ProviderId, Tone};
 use crate::providers::Service;
-use crate::publish::{
-    ConfirmDecision, GateOutcome, IntentPublisher, confirm_and_publish, first_available,
-};
+use crate::publish::{ConfirmDecision, GateOutcome, IntentPublisher, first_available};
 use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
@@ -23,6 +21,7 @@ use crate::splash::{render_splash, splash_ansi};
     name = "x",
     version,
     about = "Termy X - read and post without X API credits",
+    after_help = "Examples:\n  x doctor                 Check what is connected (free, read-only)\n  x connect --check        Show which of YOUR X accounts is connected\n  x search \"rust\" --recent  Search posts\n  x post --dry-run \"hi\"    Preview a post, never posts\n  x timeline               Your home timeline (or fixtures if not connected)",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -57,7 +56,7 @@ enum Cmd {
         #[arg(long)]
         reply_to: Option<String>,
         /// Image paths to attach (jpg/png/gif/webp). Repeatable. Max 4.
-        #[arg(long = "media", value_name = "PATH")]
+        #[arg(long = "media", alias = "image", value_name = "PATH")]
         media: Vec<PathBuf>,
     },
     /// Unicode bird
@@ -91,6 +90,26 @@ enum Cmd {
     Timeline {
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+    /// One list of hot or upcoming posts, with an inline reply box. Nothing posts until y.
+    Feed {
+        /// Subject to search. Omit for the home timeline.
+        #[arg(long)]
+        topic: Option<String>,
+        /// Rank by engagement, then newer posts
+        #[arg(long)]
+        hot: bool,
+        /// Rank by recency, then engagement (the default)
+        #[arg(long)]
+        upcoming: bool,
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Semicolon-separated keys, for example j;r;type:hello;p;y
+        #[arg(long)]
+        keys: Option<String>,
+        /// Print the reply plan and never post
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Ask the configured free model for draft variants. Never posts.
     Draft {
@@ -127,6 +146,19 @@ enum Cmd {
     Config,
     /// Start the optional official API login. Off unless you enable it.
     Auth,
+    /// Connect your own X account (OpenCLI session, or your own X developer token)
+    Connect {
+        /// Check the connection with a read-only who-are-you call. Never posts.
+        #[arg(long)]
+        check: bool,
+        /// Forget the saved developer key and remembered account on this machine.
+        #[arg(long)]
+        disconnect: bool,
+        /// Paste your own X developer token (read from stdin, never echoed
+        /// back or written to a config file; stored in your OS keychain).
+        #[arg(long)]
+        save_token: bool,
+    },
 }
 
 pub struct CliIo {
@@ -177,10 +209,17 @@ fn print_help_guide() {
     println!("                        OpenCLI (with images) when available; else browser intent.");
     println!("  Tab / Esc / Enter     Cycle controls, cancel confirm, activate focused button");
     println!();
+    #[cfg(windows)]
     println!("CLI  (from the termy-x folder: .\\target\\release\\x.exe …)");
+    #[cfg(not(windows))]
+    println!("CLI  (from the termy-x folder: ./target/release/termy-xcli \u{2026})");
     println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
     println!("  x splash              Print the Termy X bird");
     println!("  x search \"query\" [--recent|--top] [--limit N]");
+    println!("  x feed [--topic \"subject\"] [--hot|--upcoming] [--limit N]");
+    println!("    j/k move  h hot  u upcoming  /subject search");
+    println!("    r reply box  type a line  p preview  y post  esc cancel  q quit");
+    println!("  x feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
     println!("  x timeline [--limit N]");
     println!("  x trends [--place NAME] [--limit N]");
     println!("  x lookup handle");
@@ -188,7 +227,10 @@ fn print_help_guide() {
     println!("  x post --dry-run \"text\"          Plan only - never posts");
     println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
     println!("  x post --reply-to ID \"text\"      Reply to a status");
+    #[cfg(windows)]
     println!("  PowerShell long text:  x post --dry-run (Get-Content -Raw .\\post.txt)");
+    #[cfg(not(windows))]
+    println!("  Shell long text:       x post --dry-run \"$(cat ./post.txt)\"");
     println!();
     println!("Nothing posts until you type yes (CLI) or hit Post now after Confirm (GUI).");
     println!("Premium auto-detects (25,000 chars); otherwise 280.");
@@ -202,9 +244,7 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
                 if error.kind() == clap::error::ErrorKind::DisplayHelp
                     || error.kind() == clap::error::ErrorKind::DisplayVersion
                 {
-                    if io.config.background_art {
-                        let _ = writeln!(io_stdout(), "{}", splash_ansi());
-                    }
+                    // Keep --help/--version clean and script-friendly: no splash.
                     let _ = write!(io_stdout(), "{error}");
                     return 0;
                 }
@@ -216,6 +256,12 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
         io.config = XConfig::load(dir);
     }
     if let Some(provider) = &cli.provider {
+        if !provider.eq_ignore_ascii_case("auto") && ProviderId::parse(provider).is_none() {
+            eprintln!(
+                "unknown provider `{provider}`. Use auto, opencli, twitter, mock, or official. Example: x --provider mock timeline"
+            );
+            return 2;
+        }
         io.config.provider = if provider.eq_ignore_ascii_case("auto") {
             None
         } else {
@@ -254,6 +300,11 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
             println!("{}", example_config());
             0
         }
+        Some(Cmd::Connect {
+            check,
+            disconnect,
+            save_token,
+        }) => connect(check, disconnect, save_token, io),
         Some(Cmd::Auth) => {
             if !io.config.official_enabled {
                 eprintln!(
@@ -289,6 +340,10 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
+        Cmd::Lookup { handle } if handle.trim().is_empty() => {
+            eprintln!("give a username. Example: x lookup yourname");
+            2
+        }
         Cmd::Lookup { handle } => emit(
             json,
             service
@@ -346,6 +401,58 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                 .timeline(clamp_limit(limit, io.config.default_limit))
                 .map(|served| (served.status.render(), json_value(served))),
         ),
+        Cmd::Feed {
+            topic,
+            hot,
+            upcoming: _,
+            limit,
+            keys,
+            dry_run,
+        } => {
+            let mode = if hot {
+                crate::feed::RankMode::Hot
+            } else {
+                crate::feed::RankMode::Upcoming
+            };
+            let limit = clamp_limit(limit, io.config.default_limit);
+            let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
+            crate::feed::run(
+                crate::feed::RunInput {
+                    topic,
+                    mode,
+                    limit,
+                    keys,
+                    dry_run,
+                    interactive,
+                },
+                |topic, recent, limit| {
+                    if let Some(topic) = topic {
+                        service
+                            .search(topic, recent, limit)
+                            .map(|served| (served.value, served.status))
+                    } else {
+                        let _ = recent;
+                        service
+                            .timeline(limit)
+                            .map(|served| (served.value, served.status))
+                    }
+                },
+                |text, reply_to, dry| {
+                    if !dry {
+                        io.confirm = crate::publish::ConfirmDecision::Yes;
+                    }
+                    publish_text(
+                        text,
+                        dry,
+                        Some(reply_to.to_string()),
+                        Vec::new(),
+                        json,
+                        io,
+                        false,
+                    )
+                },
+            )
+        }
         Cmd::Research { topic } => {
             let hits = service.research(&topic, io.runner.as_ref(), &io.config);
             if json {
@@ -454,7 +561,90 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             dry_run,
             reply_to,
         } => publish_draft(&draft_id, dry_run, reply_to, json, io, interactive),
-        Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth => 0,
+        Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth | Cmd::Connect { .. } => 0,
+    }
+}
+
+pub fn parse_whoami(text: &str) -> Result<String, String> {
+    crate::connect::parse_whoami(text)
+}
+
+fn connect(check: bool, disconnect: bool, save_token: bool, io: &CliIo) -> i32 {
+    if disconnect {
+        return match crate::connect::disconnect(&io.config) {
+            Ok(()) => {
+                println!(
+                    "Disconnected on this machine: forgot the saved developer key and remembered account."
+                );
+                println!(
+                    "To switch accounts: log in to X in Chrome as the other account, then run `x connect --check`."
+                );
+                println!(
+                    "(Termy X cannot log Chrome out for you, and never asks for your password.)"
+                );
+                0
+            }
+            Err(error) => {
+                eprintln!("could not disconnect: {error}");
+                1
+            }
+        };
+    }
+    if save_token {
+        println!("Paste YOUR OWN X developer token, then press Enter.");
+        println!(
+            "It is stored in your OS keychain (or a private 0600 file) — never in x.toml, never printed."
+        );
+        print!("Token: ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line).is_err() {
+            eprintln!("could not read the token. Nothing was saved.");
+            return 1;
+        }
+        return match crate::connect::store_bearer_token(&io.config, &line) {
+            Ok(()) => {
+                println!("Saved. Now run `x connect --check` to prove it works.");
+                0
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                1
+            }
+        };
+    }
+    if !check {
+        println!("Connect YOUR X account — pick one way:");
+        println!();
+        println!("Easiest (no developer key, recommended):");
+        println!("  1. Open Chrome.");
+        println!("  2. Go to x.com and log in as yourself.");
+        println!("  3. Run: x connect --check");
+        println!("  You should see: Connected as @yourname");
+        println!();
+        println!("Your own X developer token (optional, only if you have one):");
+        println!("  1. Create an app at developer.x.com (your account, your keys).");
+        println!("  2. Run: x connect --save-token   and paste the token there");
+        println!("     (or set TERMY_X_BEARER_TOKEN in your shell only — never in a file or chat)");
+        println!("  3. Run: x connect --check");
+        println!();
+        println!("Switch or forget this machine: x connect --disconnect");
+        println!("Termy X never stores your password and never prints your token.");
+        return 0;
+    }
+    match crate::connect::detect_connection(&io.config, io.runner.as_ref(), io.http.as_ref()) {
+        crate::connect::Connection::Connected { handle, via } => {
+            println!("Connected as @{handle} via {via}.");
+            0
+        }
+        crate::connect::Connection::NotConnected { reason, next } => {
+            eprintln!("Not connected — {reason}.");
+            eprintln!("Next steps:");
+            for line in next.lines() {
+                eprintln!("  {line}");
+            }
+            1
+        }
     }
 }
 
@@ -492,6 +682,10 @@ fn publish_text(
     io: &mut CliIo,
     interactive: bool,
 ) -> i32 {
+    if text.trim().is_empty() {
+        eprintln!("nothing to post: the text is empty. Example: x post --dry-run \"hello world\"");
+        return 2;
+    }
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     let mut publishers = service.publishers;
     publishers.push(Box::new(IntentPublisher {
@@ -539,7 +733,16 @@ fn publish_text(
     if publisher.id() == crate::model::ProviderId::WebIntent {
         return deliver_intent(&plan, io, interactive);
     }
-    let outcome = confirm_and_publish(text, reply_to.as_deref(), decision, false, publisher);
+    // MUST use the media-aware path: confirm_and_publish drops attachments.
+    let outcome = crate::publish::confirm_and_publish_with_media(
+        text,
+        reply_to.as_deref(),
+        decision,
+        false,
+        publisher,
+        resolved.limit,
+        &media,
+    );
     match outcome {
         GateOutcome::Rejected { plan } => {
             if let Some(error) = &plan.session {
@@ -630,6 +833,16 @@ fn deliver_intent(plan: &crate::publish::PublishPlan, io: &CliIo, interactive: b
                 return 1;
             }
         }
+    }
+    if !plan.media.is_empty() {
+        println!(
+            "images cannot go through a web intent — attach them in the browser compose box: {}",
+            plan.media
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     println!(
         "opened {} web intent(s). Each part is on the clipboard when its window opens. Click Post yourself.",
@@ -723,7 +936,7 @@ fn edit_with_editor(initial: &str) -> Result<String, String> {
     let status = std::process::Command::new(&editor)
         .arg(&path)
         .status()
-        .map_err(|error| format!("failed to launch {editor}: {error}"))?;
+        .map_err(|error| format!("could not open an editor ({editor}: {error}). Use x compose --text \"your draft\" instead, or set EDITOR to an editor you have."))?;
     if !status.success() {
         return Err(format!("{editor} exited {status}"));
     }
@@ -739,26 +952,7 @@ fn io_stderr() -> io::Stderr {
 }
 
 fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
-    if media.len() > 4 {
-        return Err("at most 4 images per post".into());
-    }
-    for path in media {
-        if !path.is_file() {
-            return Err(format!("media not found: {}", path.display()));
-        }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
-            return Err(format!(
-                "unsupported media {}: use jpg/png/gif/webp",
-                path.display()
-            ));
-        }
-    }
-    Ok(())
+    crate::publish::validate_media_paths(media)
 }
 
 #[cfg(test)]
@@ -781,6 +975,57 @@ mod tests {
             confirm: ConfirmDecision::Yes,
             editor_text: None,
         }
+    }
+
+    #[test]
+    fn dummy_mistakes_are_friendly_errors_not_crashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut io = test_io(dir.path());
+        // Bad provider must not silently fall back to mock.
+        assert_eq!(
+            execute(
+                &["--provider".into(), "bogus".into(), "timeline".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        // Empty post must not create an empty browser intent.
+        assert_eq!(
+            execute(
+                &["post".into(), "--dry-run".into(), "   ".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        assert_eq!(
+            execute(
+                &["post".into(), "--dry-run".into(), "".into()],
+                &mut io,
+                false
+            ),
+            2
+        );
+        // Empty lookup.
+        assert_eq!(execute(&["lookup".into(), "".into()], &mut io, false), 2);
+        // Connect instructions are printable with no account set up.
+        assert_eq!(execute(&["connect".into()], &mut io, false), 0);
+    }
+
+    #[test]
+    fn whoami_parses_v1_and_v2_opencli_shapes() {
+        assert_eq!(
+            parse_whoami(r#"[{"logged_in":true,"username":"ada"}]"#).unwrap(),
+            "ada"
+        );
+        assert_eq!(
+            parse_whoami(r#"{"ok":true,"data":[{"logged_in":true,"username":"@ada"}]}"#).unwrap(),
+            "ada"
+        );
+        assert!(parse_whoami(r#"{"logged_in":false}"#).is_err());
+        assert!(parse_whoami(r#"{"ok":false,"error":{"message":"nope"}}"#).is_err());
+        assert!(parse_whoami("not json").is_err());
     }
 
     #[test]
@@ -838,6 +1083,34 @@ mod tests {
         );
         assert_eq!(
             execute(&["popular".into(), "gpui".into()], &mut io, false),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "feed".into(),
+                    "--topic".into(),
+                    "generator sizing".into(),
+                    "--dry-run".into(),
+                    "--keys".into(),
+                    "j;r;type:hello from the terminal;p;y".into(),
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "feed".into(),
+                    "--dry-run".into(),
+                    "--keys".into(),
+                    "r;type:not yet;y".into(),
+                ],
+                &mut io,
+                false
+            ),
             0
         );
         assert_eq!(

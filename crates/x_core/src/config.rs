@@ -24,6 +24,7 @@ pub struct XConfig {
     pub provider: Option<ProviderId>,
     pub official_enabled: bool,
     pub client_id_env: String,
+    pub bearer_token_env: String,
     pub redirect_uri: String,
     pub token_store: String,
     pub ai_base_url_env: String,
@@ -57,6 +58,7 @@ impl Default for XConfig {
             provider: None,
             official_enabled: false,
             client_id_env: "TERMY_X_CLIENT_ID".to_string(),
+            bearer_token_env: "TERMY_X_BEARER_TOKEN".to_string(),
             redirect_uri: "http://127.0.0.1:8737/callback".to_string(),
             token_store: "keychain".to_string(),
             ai_base_url_env: "TERMY_X_AI_BASE_URL".to_string(),
@@ -142,6 +144,7 @@ impl XConfig {
             }
             "official_api.enabled" => self.official_enabled = parse_bool(value),
             "official_api.client_id_env" => self.client_id_env = value.to_string(),
+            "official_api.bearer_token_env" => self.bearer_token_env = value.to_string(),
             "official_api.redirect_uri" => self.redirect_uri = value.to_string(),
             "official_api.token_store" => self.token_store = value.to_string(),
             "official_api.post_read_usd" | "official_api.prices_usd.post_read" => {
@@ -255,6 +258,12 @@ impl XConfig {
         nonempty_var(&self.ai_key_env).or_else(|| nonempty_var("OPENAI_API_KEY"))
     }
 
+    /// The user's own X developer bearer token, from their shell env only.
+    /// Never read from x.toml, never logged.
+    pub fn bearer_token(&self) -> Option<String> {
+        nonempty_var(&self.bearer_token_env)
+    }
+
     pub fn client_id(&self) -> Option<String> {
         std::env::var(&self.client_id_env)
             .ok()
@@ -296,7 +305,12 @@ impl XConfig {
 }
 
 pub fn default_config_dir() -> PathBuf {
+    // Primary source is `dirs` on every platform: %APPDATA% on Windows,
+    // $XDG_CONFIG_HOME (or ~/.config) on Linux, ~/Library on macOS.
+    // Only when that finds nothing do we use the explicit cfg'd
+    // fallback in `platform`, instead of writing config into the CWD.
     dirs::config_dir()
+        .or_else(crate::platform::config_base_fallback)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("termy")
 }
@@ -368,6 +382,8 @@ enabled = false
 client_id_env = "TERMY_X_CLIENT_ID"
 redirect_uri = "http://127.0.0.1:8737/callback"
 token_store = "keychain"
+# Your own developer bearer token: set TERMY_X_BEARER_TOKEN in your shell env only.
+# Never paste a real token into this file.
 post_read_usd = 0.005
 user_read_usd = 0.010
 post_write_usd = 0.010

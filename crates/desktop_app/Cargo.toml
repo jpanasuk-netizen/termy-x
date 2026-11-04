@@ -17,6 +17,7 @@ icon = ["../../assets/termy.icns"]
 workspace = true
 
 [dependencies]
+raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 gpui-kit = { workspace = true }
 flume = { workspace = true }

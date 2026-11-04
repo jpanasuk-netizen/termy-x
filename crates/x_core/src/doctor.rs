@@ -47,11 +47,15 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
         &config.opencli_bin,
         &[
             "twitter".into(),
-            "whoami".into(),
+            "profile".into(),
             "-f".into(),
             "json".into(),
             "--window".into(),
             "background".into(),
+            "--site-session".into(),
+            "ephemeral".into(),
+            "--keep-tab".into(),
+            "false".into(),
         ],
         &["twitter".into(), "--help".into()],
     );
@@ -98,6 +102,18 @@ pub fn doctor(config: &XConfig, runner: &dyn CommandRunner, http: &dyn Http) -> 
         ),
         format!("Config directory: {}", config.config_dir.display()),
     ];
+    // Linux-only addition: where a Chrome/Chromium profile would live.
+    // Discovery only — Termy X never reads profile contents; OpenCLI's
+    // Browser Bridge owns the session. Windows output is unchanged.
+    #[cfg(target_os = "linux")]
+    {
+        let found = crate::platform::existing_browser_profile_dirs();
+        lines.push(if found.is_empty() {
+            "Browser profile (Linux): none found under ~/.config, snap, or flatpak paths \u{2014} OpenCLI/Browser Bridge may still use its own profile".into()
+        } else {
+            format!("Browser profile (Linux): {}", found[0].display())
+        });
+    }
     if opencli.0 == Probe::Missing && twitter.0 == Probe::Missing {
         lines.push(
             "Neither free reader is installed. Reads still use mock fixtures, and publish uses the web intent."
@@ -120,7 +136,7 @@ fn shell_probe(
     if !runner.exists(bin) {
         return (Probe::Missing, "not on PATH".into());
     }
-    let posting = match runner.run(bin, help_args) {
+    let posting = match runner.run_timeout(bin, help_args, std::time::Duration::from_secs(35)) {
         Ok(output)
             if help_lists_command(&format!("{}\n{}", output.stdout, output.stderr), "post") =>
         {
@@ -128,7 +144,7 @@ fn shell_probe(
         }
         _ => "posting not supported",
     };
-    let session = match runner.run(bin, session_args) {
+    let session = match runner.run_timeout(bin, session_args, std::time::Duration::from_secs(35)) {
         Ok(output) if output.status == 0 && looks_logged_in(&output.stdout) => Probe::Working,
         _ => Probe::NotLoggedIn,
     };
@@ -145,7 +161,9 @@ fn looks_logged_in(stdout: &str) -> bool {
     {
         return false;
     }
-    compact.contains("\"logged_in\":true") || compact.contains("\"authenticated\":true")
+    compact.contains("\"logged_in\":true")
+        || compact.contains("\"authenticated\":true")
+        || compact.contains("\"screen_name\":")
 }
 
 fn ai_line(config: &XConfig, http: &dyn Http) -> String {
@@ -207,8 +225,8 @@ mod tests {
         );
         runner.script(
             "opencli",
-            &["twitter", "whoami"],
-            r#"{"logged_in": true, "username": "ada"}"#,
+            &["twitter", "profile"],
+            r#"[{"screen_name": "ada", "name": "Ada"}]"#,
         );
         runner.script("twitter", &["--help"], "  post        Post a new tweet.\n");
         runner.script(

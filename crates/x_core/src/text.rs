@@ -144,12 +144,31 @@ fn weighted_normalized(text: &str) -> WeightedCount {
 }
 
 fn longest_fit(text: &str, limit: usize) -> usize {
+    // One incremental pass. The old version re-weighed text[..end] for every
+    // unit (O(n^2)): a 12.5k-char post took ~1s to split. Units already align
+    // with grapheme clusters for counting, and split_thread snaps the final cut.
+    let spans = url_spans(text);
     let mut last_ok = 0usize;
     let mut end = 0usize;
+    let mut sum: u32 = 0;
+    let mut urls = 0usize;
+    let mut counted_url: Option<usize> = None;
     for unit in split_units(text) {
+        let start = end;
         end += unit.len();
-        end = snap_grapheme(text, end);
-        if weighted_normalized(&text[..end]).weighted > limit {
+        if let Some((idx, _)) = spans
+            .iter()
+            .enumerate()
+            .find(|(_, (s, e))| start >= *s && start < *e)
+        {
+            if counted_url != Some(idx) {
+                counted_url = Some(idx);
+                urls += 1;
+            }
+        } else {
+            sum += unit_weight(unit);
+        }
+        if (sum / SCALE) as usize + urls * URL_WEIGHT > limit {
             return last_ok;
         }
         last_ok = end;
@@ -266,11 +285,11 @@ fn is_emoji_pict(ch: char) -> bool {
 
 fn url_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
+    let lower_full = text.to_ascii_lowercase();
     let mut spans = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        let rest = &text[index..];
-        let lower = rest.to_ascii_lowercase();
+        let lower = &lower_full[index..];
         let start_rel = ["https://", "http://", "www."]
             .iter()
             .filter_map(|prefix| lower.find(prefix))
@@ -479,5 +498,166 @@ mod tests {
         assert!(!url.contains('+'), "{url}");
         let raw_ampersands = url.matches('&').count();
         assert_eq!(raw_ampersands, 1, "{url}");
+    }
+}
+
+/// Kinds of inline entities highlighted in editors (visual only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityKind {
+    Mention,
+    Hashtag,
+    Cashtag,
+}
+
+/// Byte spans of @mentions, #hashtags, and $cashtags, using X's shape
+/// rules. A marker must sit on a word boundary (so `a@b` e-mail text is
+/// not a mention, `x#tag` is not a tag), handles are `[A-Za-z0-9_]{1,15}`,
+/// hashtags are unicode alphanumeric/underscore with at least one letter
+/// or underscore (so `#123` is not a tag), and cashtags are 1–6 ASCII
+/// letters with an optional `.X` suffix. Purely a display concern; the
+/// text itself is never altered.
+pub fn entity_spans(text: &str) -> Vec<(usize, usize, EntityKind)> {
+    let mut spans = Vec::new();
+    let mut prev: Option<char> = None;
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let (at, c) = chars[i];
+        let boundary = match prev {
+            None => true,
+            Some(p) => !p.is_alphanumeric() && p != '_' && p != '@',
+        };
+        if boundary && (c == '@' || c == '#' || c == '$') {
+            let kind = match c {
+                '@' => EntityKind::Mention,
+                '#' => EntityKind::Hashtag,
+                _ => EntityKind::Cashtag,
+            };
+            // Collect the content run after the marker.
+            let mut j = i + 1;
+            let mut content_end = at + c.len_utf8();
+            while j < chars.len() {
+                let (ci, cc) = chars[j];
+                let ok = match kind {
+                    EntityKind::Mention => cc.is_ascii_alphanumeric() || cc == '_',
+                    EntityKind::Hashtag => cc.is_alphanumeric() || cc == '_',
+                    EntityKind::Cashtag => cc.is_ascii_alphabetic(),
+                };
+                if !ok {
+                    break;
+                }
+                content_end = ci + cc.len_utf8();
+                j += 1;
+            }
+            let content = &text[at + c.len_utf8()..content_end];
+            let valid = match kind {
+                EntityKind::Mention => !content.is_empty() && content.chars().count() <= 15,
+                EntityKind::Hashtag => {
+                    content.chars().any(|ch| ch.is_alphabetic() || ch == '_')
+                }
+                EntityKind::Cashtag => {
+                    let n = content.chars().count();
+                    if !(1..=6).contains(&n) {
+                        false
+                    } else {
+                        // Optional .X / .XX suffix like $BRK.B.
+                        if j < chars.len() && chars[j].1 == '.' {
+                            let mut k = j + 1;
+                            let mut suffix_end = content_end;
+                            let mut suffix_len = 0;
+                            while k < chars.len()
+                                && chars[k].1.is_ascii_alphabetic()
+                                && suffix_len < 2
+                            {
+                                suffix_end = chars[k].0 + 1;
+                                suffix_len += 1;
+                                k += 1;
+                            }
+                            if suffix_len > 0 {
+                                content_end = suffix_end;
+                                j = k;
+                            }
+                        }
+                        true
+                    }
+                }
+            };
+            if valid {
+                spans.push((at, content_end, kind));
+                if j > i + 1 {
+                    i = j;
+                    prev = text[..content_end].chars().next_back();
+                    continue;
+                }
+            }
+        }
+        prev = Some(c);
+        i += 1;
+    }
+    spans
+}
+
+#[cfg(test)]
+mod entity_tests {
+    use super::{entity_spans, EntityKind};
+
+    fn kinds(text: &str) -> Vec<(usize, usize, EntityKind)> {
+        entity_spans(text)
+    }
+
+    #[test]
+    fn mentions_need_boundaries_and_valid_handles() {
+        assert_eq!(kinds("@jack hi"), vec![(0, 5, EntityKind::Mention)]);
+        // E-mail text is not a mention.
+        assert!(kinds("mail a@b.com end").is_empty());
+        // Over-long handles are not mentions.
+        assert!(kinds("@toolonghandle123456").is_empty());
+        assert_eq!(kinds("hi (@jack)!"), vec![(4, 9, EntityKind::Mention)]);
+        assert!(kinds("@").is_empty());
+        assert!(kinds("@ jack").is_empty());
+    }
+
+    #[test]
+    fn hashtags_need_a_letter() {
+        assert_eq!(kinds("#rust lang"), vec![(0, 5, EntityKind::Hashtag)]);
+        assert!(kinds("##").is_empty());
+        // The second # starts a real tag.
+        assert_eq!(kinds("##tag"), vec![(1, 5, EntityKind::Hashtag)]);
+        // All-numeric is not a hashtag.
+        assert!(kinds("#123 go").is_empty());
+        assert_eq!(kinds("#a1 go"), vec![(0, 3, EntityKind::Hashtag)]);
+        assert!(kinds("x#tag").is_empty());
+        // Unicode letters count, and byte spans cover the whole tag.
+        let text = "#café time";
+        assert_eq!(kinds(text), vec![(0, 6, EntityKind::Hashtag)]);
+        assert_eq!(&text[0..6], "#café");
+    }
+
+    #[test]
+    fn cashtags_are_short_letter_runs() {
+        assert_eq!(kinds("$AAPL up"), vec![(0, 5, EntityKind::Cashtag)]);
+        assert!(kinds("$").is_empty());
+        assert!(kinds("$1").is_empty());
+        assert!(kinds("cost $ 5").is_empty());
+        // Seven letters is not a ticker.
+        assert!(kinds("$ABCDEFG").is_empty());
+        assert_eq!(kinds("$BRK.B x"), vec![(0, 6, EntityKind::Cashtag)]);
+        assert_eq!(
+            kinds("buy $tsla, sell $MSFT."),
+            vec![(4, 9, EntityKind::Cashtag), (16, 21, EntityKind::Cashtag)]
+        );
+    }
+
+    #[test]
+    fn mixed_text_finds_all_three() {
+        let text = "hey @jack see #rust and $AAPL!";
+        assert_eq!(
+            kinds(text),
+            vec![
+                (4, 9, EntityKind::Mention),
+                (14, 19, EntityKind::Hashtag),
+                (24, 29, EntityKind::Cashtag),
+            ]
+        );
     }
 }

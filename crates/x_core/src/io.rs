@@ -27,6 +27,16 @@ pub struct CommandOutput {
 pub trait CommandRunner: Send + Sync {
     fn exists(&self, program: &str) -> bool;
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String>;
+    /// Bounded variant for probes (doctor / connect) that must never hang
+    /// waiting on a browser bridge. Test doubles just run normally.
+    fn run_timeout(
+        &self,
+        program: &str,
+        args: &[String],
+        _timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.run(program, args)
+    }
 }
 
 pub struct SystemRunner;
@@ -37,11 +47,264 @@ impl CommandRunner for SystemRunner {
     }
 
     fn run(&self, program: &str, args: &[String]) -> Result<CommandOutput, String> {
+        self.run_timeout(program, args, COMMAND_TIMEOUT)
+    }
+
+    fn run_timeout(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
         let resolved =
             resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
         let mut command = command_for(&resolved, args);
         hide_console(&mut command);
-        output_with_timeout(command, COMMAND_TIMEOUT)
+        // OpenCLI drives Chrome through a separate, visible "automation"
+        // window that cycles x.com pages and parks on about:blank. Keep
+        // that window minimized for the whole call so it runs silently.
+        let silence = OpencliSilence::begin(
+            is_opencli_program(program)
+                || resolved
+                    .path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(is_opencli_program),
+        );
+        let result = output_with_timeout(command, timeout);
+        silence.finish();
+        result
+    }
+}
+
+/// True for the OpenCLI binary/shim under any of its installed names
+/// (`opencli`, `opencli.cmd`, a full path to either, ...).
+fn is_opencli_program(program: &str) -> bool {
+    let name = program.rsplit(['/', '\\']).next().unwrap_or(program);
+    let stem = name.split('.').next().unwrap_or(name);
+    stem.eq_ignore_ascii_case("opencli")
+}
+
+/// Titles the OpenCLI automation window shows while it works: it parks on
+/// about:blank when idle, then cycles x.com pages during a call. A user's
+/// own X window has these titles too, so callers only auto-track windows
+/// that were *not* open when the call started (plus the parked
+/// about:blank placeholder, which is the automation window's idle state).
+#[allow(dead_code)] // used by the Windows sweep + tests
+fn is_automation_title(title: &str) -> bool {
+    title == "about:blank - Google Chrome"
+        || title == "about:blank"
+        || title == "X - Google Chrome"
+        || title == "Home / X - Google Chrome"
+        || title.ends_with(" / X - Google Chrome")
+        || (title.starts_with("x.com") && title.ends_with("- Google Chrome"))
+}
+
+/// Keeps OpenCLI's Chrome automation window minimized while a command
+/// runs. OpenCLI's Browser Bridge creates that window unfocused but fully
+/// visible (`--window background` stops focus theft, not visibility), and
+/// leaves it parked on about:blank between calls. Verified live on
+/// Windows: once minimized, the window stays minimized while OpenCLI
+/// navigates it, and returns to about:blank still minimized.
+#[cfg(windows)]
+struct OpencliSilence {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+    tracked: Arc<Mutex<Vec<isize>>>,
+}
+
+#[cfg(windows)]
+impl OpencliSilence {
+    fn begin(active: bool) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if !active {
+            return Self {
+                stop,
+                watcher: None,
+                tracked: Arc::new(Mutex::new(Vec::new())),
+            };
+        }
+        let baseline: Vec<isize> = chrome_windows().into_iter().map(|(hwnd, _)| hwnd).collect();
+        let tracked = Arc::new(Mutex::new(Vec::new()));
+        silence_sweep(&baseline, &tracked);
+        let watcher = {
+            let stop = stop.clone();
+            let tracked = tracked.clone();
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    silence_sweep(&baseline, &tracked);
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+            })
+        };
+        Self {
+            stop,
+            watcher: Some(watcher),
+            tracked,
+        }
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
+        // Final sweep: park whatever the call left behind, minimized.
+        let tracked = self.tracked.lock().expect("tracked").clone();
+        for (hwnd, title) in chrome_windows() {
+            if tracked.contains(&hwnd) || title == "about:blank - Google Chrome" {
+                minimize_window(hwnd);
+            }
+        }
+    }
+}
+
+/// Linux: there is no Win32 window to minimize, and Wayland gives a
+/// client no way to minimize another app's window at all. OpenCLI's
+/// `--window background` flag (already on every call) is the only
+/// silence available, so this is an honest no-op rather than a fake
+/// sweep. The provider loop itself is unchanged.
+#[cfg(target_os = "linux")]
+struct OpencliSilence;
+
+#[cfg(target_os = "linux")]
+impl OpencliSilence {
+    fn begin(_active: bool) -> Self {
+        Self
+    }
+    fn finish(self) {}
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+struct OpencliSilence;
+
+#[cfg(not(any(windows, target_os = "linux")))]
+impl OpencliSilence {
+    fn begin(_active: bool) -> Self {
+        Self
+    }
+    fn finish(self) {}
+}
+
+/// One sweep: minimize the parked placeholder and any *new* Chrome
+/// window showing an automation title (a window the call itself created).
+#[cfg(windows)]
+fn silence_sweep(baseline: &[isize], tracked: &Arc<Mutex<Vec<isize>>>) {
+    for (hwnd, title) in chrome_windows() {
+        let mut tracked = tracked.lock().expect("tracked");
+        let known = tracked.contains(&hwnd);
+        if known
+            || title == "about:blank - Google Chrome"
+            || (!baseline.contains(&hwnd) && is_automation_title(&title))
+        {
+            if !known {
+                tracked.push(hwnd);
+            }
+            drop(tracked);
+            minimize_window(hwnd);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn minimize_window(hwnd: isize) {
+    // SW_MINIMIZE (6). Never touches focus or the window's contents.
+    unsafe {
+        win32::show_window(hwnd as win32::Hwnd, 6);
+    }
+}
+
+/// (hwnd, title) for every visible top-level Chrome window.
+#[cfg(windows)]
+fn chrome_windows() -> Vec<(isize, String)> {
+    let mut found: Vec<(isize, String)> = Vec::new();
+    unsafe {
+        win32::enum_windows(&mut found);
+    }
+    found
+}
+
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub type Hwnd = *mut c_void;
+    type Bool = i32;
+    type Lparam = isize;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumWindows(cb: Option<EnumProc>, lparam: Lparam) -> Bool;
+        fn IsWindowVisible(hwnd: Hwnd) -> Bool;
+        fn IsIconic(hwnd: Hwnd) -> Bool;
+        fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+        fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+        fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
+        fn OpenProcess(access: u32, inherit: Bool, pid: u32) -> Hwnd;
+        fn CloseHandle(handle: Hwnd) -> Bool;
+        fn QueryFullProcessImageNameW(
+            handle: Hwnd,
+            flags: u32,
+            text: *mut u16,
+            size: *mut u32,
+        ) -> Bool;
+    }
+
+    type EnumProc = unsafe extern "system" fn(Hwnd, Lparam) -> Bool;
+
+    pub unsafe fn show_window(hwnd: Hwnd, cmd: i32) {
+        unsafe {
+            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                ShowWindow(hwnd, cmd);
+            }
+        }
+    }
+
+    pub unsafe fn enum_windows(found: &mut Vec<(isize, String)>) {
+        unsafe extern "system" fn callback(hwnd: Hwnd, lparam: Lparam) -> Bool {
+            unsafe {
+                let found = &mut *(lparam as *mut Vec<(isize, String)>);
+                if IsWindowVisible(hwnd) == 0 {
+                    return 1;
+                }
+                let mut pid: u32 = 0;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                if pid == 0 || !process_is_chrome(pid) {
+                    return 1;
+                }
+                let mut buffer = [0u16; 512];
+                let len = GetWindowTextW(hwnd, buffer.as_mut_ptr(), buffer.len() as i32);
+                if len > 0 {
+                    let title = String::from_utf16_lossy(&buffer[..len as usize]);
+                    if !title.is_empty() {
+                        found.push((hwnd as isize, title));
+                    }
+                }
+                1
+            }
+        }
+        unsafe {
+            EnumWindows(Some(callback), found as *mut Vec<(isize, String)> as Lparam);
+        }
+    }
+
+    unsafe fn process_is_chrome(pid: u32) -> bool {
+        // PROCESS_QUERY_LIMITED_INFORMATION
+        let handle = unsafe { OpenProcess(0x1000, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut buffer = [0u16; 512];
+        let mut size = buffer.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buffer[..size as usize]);
+        path.rsplit(['\\', '/'])
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("chrome.exe"))
     }
 }
 
@@ -143,6 +406,9 @@ fn search_extensions() -> Vec<String> {
             }
         }
     }
+    // Windows shim extensions only make sense on Windows (PATHEXT does
+    // not exist elsewhere); on Linux a program is the bare PATH entry.
+    #[cfg(windows)]
     for required in [".CMD", ".BAT", ".PS1", ".EXE"] {
         if !exts.iter().any(|have| have.eq_ignore_ascii_case(required)) {
             exts.push(required.to_string());
@@ -263,22 +529,35 @@ fn hide_console(command: &mut Command) {
     }
 }
 
+/// After the child exits, its pipes normally close at once. A
+/// grandchild that inherited them (a CLI daemon, a browser helper)
+/// can hold them open forever; joining the reader threads unbounded
+/// turned that into the "posting takes forever" hang even though the
+/// command itself had finished. Drain what arrived, with a grace cap.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
 fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<CommandOutput, String> {
+    // Linux: run the child in its own process group so a timeout can
+    // kill the whole tree (see kill_process_tree), like taskkill /T
+    // does on Windows. Windows spawning is untouched.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let out_handle = std::thread::spawn(move || read_pipe(stdout));
-    let err_handle = std::thread::spawn(move || read_pipe(stderr));
+    let out_rx = spawn_pipe_reader(child.stdout.take());
+    let err_rx = spawn_pipe_reader(child.stderr.take());
     let started = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() > timeout => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 let _ = child.wait();
                 return Err("command timed out".to_string());
             }
@@ -286,8 +565,8 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Comman
             Err(error) => return Err(error.to_string()),
         }
     };
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let stdout = collect_pipe(&out_rx, PIPE_DRAIN_GRACE);
+    let stderr = collect_pipe(&err_rx, PIPE_DRAIN_GRACE);
     Ok(CommandOutput {
         status: status.code().unwrap_or(1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -295,12 +574,84 @@ fn output_with_timeout(mut command: Command, timeout: Duration) -> Result<Comman
     })
 }
 
-fn read_pipe(pipe: Option<impl Read>) -> Vec<u8> {
+/// Stream pipe chunks over a channel so the caller can stop waiting
+/// (and keep what already arrived) when a pipe stays open past exit.
+fn spawn_pipe_reader(
+    pipe: Option<impl Read + Send + 'static>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        if let Some(mut pipe) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    rx
+}
+
+fn collect_pipe(rx: &std::sync::mpsc::Receiver<Vec<u8>>, grace: Duration) -> Vec<u8> {
     let mut buffer = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut buffer);
+    let deadline = Instant::now() + grace;
+    loop {
+        let Some(rest) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
+        match rx.recv_timeout(rest) {
+            Ok(chunk) => buffer.extend_from_slice(&chunk),
+            Err(_) => break,
+        }
     }
     buffer
+}
+
+/// Kill the whole process tree on timeout. On Windows the direct
+/// child is usually `cmd.exe` for the `opencli.cmd` shim; killing only
+/// it leaves the node CLI alive in the background, where it can finish
+/// a post minutes later after the UI already reported a timeout
+/// (a duplicate-post trap when the user retries).
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let pid = child.id().to_string();
+        let killed = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !killed {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Negative PID = the child's process group (set at spawn).
+        let group = format!("-{}", child.id());
+        let killed = Command::new("kill")
+            .args(["-KILL", &group])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !killed {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = child.kill();
+    }
 }
 
 type ScriptedCallLog = Arc<Mutex<Vec<(String, Vec<String>)>>>;
@@ -566,10 +917,43 @@ fn copy_text(text: &str) -> Result<(), String> {
             Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
         }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        // Wayland first (wl-copy), then X11 (xclip / xsel). Each takes
+        // the text on stdin; the first that spawns and exits 0 wins.
+        let helpers: [(&str, &[&str]); 3] = [
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ];
+        for (program, args) in helpers {
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            hide_console(&mut command);
+            let Ok(mut child) = command.spawn() else {
+                continue;
+            };
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write as _;
+                if stdin.write_all(text.as_bytes()).is_err() {
+                    let _ = child.kill();
+                    continue;
+                }
+            }
+            if child.wait().is_ok_and(|status| status.success()) {
+                return Ok(());
+            }
+        }
+        Err("clipboard on Linux needs wl-copy (Wayland) or xclip/xsel (X11) \u{2014} none worked".to_string())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = text;
-        Err("clipboard is only wired on Windows in this build".to_string())
+        Err("clipboard is not wired on this platform in this build".to_string())
     }
 }
 
@@ -577,6 +961,25 @@ fn copy_text(text: &str) -> Result<(), String> {
 mod tests {
     #[cfg(windows)]
     use super::*;
+    use super::{is_automation_title, is_opencli_program};
+
+    #[test]
+    fn opencli_silence_matchers_recognise_only_the_automation_window() {
+        assert!(is_opencli_program("opencli"));
+        assert!(is_opencli_program("opencli.cmd"));
+        assert!(is_opencli_program(r"C:\tools\opencli.ps1"));
+        assert!(!is_opencli_program("twitter"));
+        assert!(!is_opencli_program("opencli-extra"));
+        assert!(is_automation_title("about:blank - Google Chrome"));
+        assert!(is_automation_title("Home / X - Google Chrome"));
+        assert!(is_automation_title("MAGABRO (@ada) / X - Google Chrome"));
+        assert!(is_automation_title("x.com/ada - Google Chrome"));
+        assert!(!is_automation_title("New Tab - Google Chrome"));
+        assert!(!is_automation_title(
+            "Kalshi - Prediction Market - Google Chrome"
+        ));
+        assert!(!is_automation_title("Billing - Google Chrome"));
+    }
 
     #[test]
     #[cfg(windows)]
@@ -662,6 +1065,29 @@ mod tests {
             output.status,
             output.stdout,
             output.stderr
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exited_child_with_pipe_holding_grandchild_does_not_hang() {
+        // `sh` exits at once; the backgrounded sleep inherits stdout
+        // and holds the pipe open 30s. The old join-the-readers code
+        // blocked for all 30s (or forever for a daemon); the bounded
+        // drain must return quickly, keeping already-written output.
+        use super::output_with_timeout;
+        use std::process::Command;
+        use std::time::Duration;
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo early-marker; (sleep 30 &)"]);
+        let started = std::time::Instant::now();
+        let output = output_with_timeout(command, Duration::from_secs(60)).expect("runs");
+        assert_eq!(output.status, 0);
+        assert!(output.stdout.contains("early-marker"), "{output:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "drain took {:?}",
+            started.elapsed()
         );
     }
 }
