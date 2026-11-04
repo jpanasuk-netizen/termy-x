@@ -48,6 +48,14 @@ pub struct XConfig {
     pub twitter_bin: String,
     pub agent_reach_bin: String,
     pub youtube_bin: String,
+    /// Ask here: per-agent launch commands (x.toml `[agents]`). `None` = auto-detect.
+    pub agent_agy: Option<String>,
+    pub agent_hermes: Option<String>,
+    pub agent_grok: Option<String>,
+    pub agent_muse: Option<String>,
+    /// WSL distro/user tried when an agent is not on the Windows PATH.
+    pub wsl_distro: String,
+    pub wsl_user: String,
     pub config_dir: PathBuf,
 }
 
@@ -82,6 +90,12 @@ impl Default for XConfig {
             twitter_bin: "twitter".to_string(),
             agent_reach_bin: "agent-reach".to_string(),
             youtube_bin: "yt-dlp".to_string(),
+            agent_agy: None,
+            agent_hermes: None,
+            agent_grok: None,
+            agent_muse: None,
+            wsl_distro: "Ubuntu".to_string(),
+            wsl_user: String::new(),
             config_dir: default_config_dir(),
         }
     }
@@ -204,6 +218,12 @@ impl XConfig {
             "shell.twitter_bin" => self.twitter_bin = value.to_string(),
             "shell.agent_reach_bin" => self.agent_reach_bin = value.to_string(),
             "research.youtube_bin" => self.youtube_bin = value.to_string(),
+            "agents.agy" | "agent_agy" => self.agent_agy = nonempty_owned(value),
+            "agents.hermes" | "agent_hermes" => self.agent_hermes = nonempty_owned(value),
+            "agents.grok" | "agent_grok" => self.agent_grok = nonempty_owned(value),
+            "agents.muse" | "agent_muse" => self.agent_muse = nonempty_owned(value),
+            "agents.wsl_distro" => self.wsl_distro = value.to_string(),
+            "agents.wsl_user" => self.wsl_user = value.to_string(),
             _ => {}
         }
     }
@@ -300,6 +320,17 @@ impl XConfig {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
+    }
+
+    /// x.toml override for an Ask here agent, if any.
+    pub fn agent_command(&self, agent: crate::agents::Agent) -> Option<&str> {
+        use crate::agents::Agent;
+        match agent {
+            Agent::Agy => self.agent_agy.as_deref(),
+            Agent::Hermes => self.agent_hermes.as_deref(),
+            Agent::Grok => self.agent_grok.as_deref(),
+            Agent::Muse => self.agent_muse.as_deref(),
+        }
     }
 
     pub fn save_background_art(&self) -> Result<(), String> {
@@ -403,6 +434,11 @@ fn parse_bool(value: &str) -> bool {
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
     )
+}
+
+fn nonempty_owned(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 fn upsert_assignment(text: &mut String, key: &str, line: &str) {

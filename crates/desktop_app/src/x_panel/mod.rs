@@ -1051,6 +1051,7 @@ impl XPanel {
                 self.input_target = InputTarget::RgTopic;
                 self.pending_focus = true;
                 self.rg_refresh_keys();
+                self.rg_start_agents(cx);
             }
             _ => {}
         }
@@ -10689,3 +10690,4 @@ mod edit_keys_tests {
 }
 
 mod reply_guy_ui;
+pub use reply_guy_ui::XAskEvent;

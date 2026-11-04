@@ -159,3 +159,17 @@ pub mod terminal_engine;
 
 #[cfg(feature = "native")]
 pub mod tmux_control_core;
+
+/// Newest foreground descendant of a pane's child process (`grok.exe`).
+/// Windows only; other platforms return `None`.
+pub fn foreground_process_name_of_pid(pid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        terminal_engine::transport::foreground_name_of_pid(pid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
+    }
+}

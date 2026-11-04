@@ -1481,3 +1481,8 @@ include!("windows/launch.rs");
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod tests;
+
+/// Foreground program of the console tree rooted at `pid` (for Ask here).
+pub(crate) fn foreground_name_of_pid(pid: u32) -> Option<String> {
+    foreground_descendant_name(pid)
+}

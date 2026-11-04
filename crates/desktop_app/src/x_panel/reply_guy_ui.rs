@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use termy_x::agents::{self, Agent, AgentCommand};
 use termy_x::handoff::{self, Subject, Target};
 use termy_x::reply_guy::{self as rg, Secret, Sort};
 
@@ -23,11 +24,42 @@ pub struct RgState {
     pub checked: bool,
     /// Draft key the next pasted replies belong to (post id or `trend:<topic>`).
     pub paste_for: Option<String>,
+    /// Ask here: detected agent commands (empty until detection finishes).
+    pub agents: Vec<AgentCommand>,
+    pub detecting: bool,
+    /// Last picked agent (remembered in x-ask-agent.txt).
+    pub agent: Agent,
+    /// Agent already running in the active tab, from the host's probe.
+    pub running: Option<Agent>,
+    /// User clicked "change": show the picker even when one is running.
+    pub picking: bool,
+    pub probing: bool,
+    /// Current ask: (draft key, marker line).
+    pub ask: Option<(String, String)>,
+    /// Consecutive auto-grabs that returned the same options.
+    pub grab_stable: u8,
 }
+
+/// Panel -> terminal host requests for Ask here. The host owns the panes.
+#[derive(Debug, Clone)]
+pub enum XAskEvent {
+    /// Report which agent (if any) runs in the active tab.
+    Probe,
+    /// Paste `prompt` into the agent's pane (or start `command` in a new one).
+    Ask {
+        agent: Agent,
+        command: Option<String>,
+        prompt: String,
+    },
+    /// Read the ask pane's scrollback after `marker`.
+    Grab { marker: String, quiet: bool },
+}
+
+impl gpui_kit::EventEmitter<XAskEvent> for XPanel {}
 
 impl RgState {
     /// Cheap: does not touch the keychain. Keys are read when the tab opens.
-    pub fn new(_config: &XConfig) -> Self {
+    pub fn new(config: &XConfig) -> Self {
         Self {
             key_for: Secret::Treg,
             grok_mask: None,
@@ -42,6 +74,14 @@ impl RgState {
             busy: false,
             checked: false,
             paste_for: None,
+            agents: Vec::new(),
+            detecting: false,
+            agent: agents::load_last(config),
+            running: None,
+            picking: false,
+            probing: false,
+            ask: None,
+            grab_stable: 0,
         }
     }
 
@@ -328,6 +368,283 @@ impl XPanel {
         cx.notify();
     }
 
+    /// Detect agent CLIs once (off the UI thread) and start the 2 s probe
+    /// that asks the host which agent runs in the active tab.
+    pub(super) fn rg_start_agents(&mut self, cx: &mut Context<Self>) {
+        if self.desk.rg.agents.is_empty() && !self.desk.rg.detecting {
+            self.desk.rg.detecting = true;
+            let config = self.live_config();
+            cx.spawn(async move |this, cx| {
+                let found = cx
+                    .background_executor()
+                    .spawn(async move { agents::detect_all(&config) })
+                    .await;
+                for command in &found {
+                    log::info!(
+                        "ask here: {} -> {} ({})",
+                        command.agent.tag(),
+                        command.command.as_deref().unwrap_or("-"),
+                        command.source
+                    );
+                }
+                let _ = this.update(cx, |panel, cx| {
+                    panel.desk.rg.detecting = false;
+                    panel.desk.rg.agents = found;
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
+        if !self.desk.rg.probing {
+            self.desk.rg.probing = true;
+            cx.spawn(async move |this, cx| {
+                loop {
+                    let keep = this
+                        .update(cx, |panel, cx| {
+                            let on = panel.section == XSection::ReplyGuy;
+                            if on {
+                                cx.emit(XAskEvent::Probe);
+                            } else {
+                                panel.desk.rg.probing = false;
+                            }
+                            on
+                        })
+                        .unwrap_or(false);
+                    if !keep {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_secs(2))
+                        .await;
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Host probe result: the agent running in the active tab, if any.
+    pub fn rg_set_running(&mut self, running: Option<Agent>, cx: &mut Context<Self>) {
+        if self.desk.rg.running != running {
+            self.desk.rg.running = running;
+            cx.notify();
+        }
+    }
+
+    /// Host status line for Ask here ("Sent to Grok in its pane").
+    pub fn rg_ask_notice(&mut self, message: String, cx: &mut Context<Self>) {
+        self.notice = Some(message);
+        cx.notify();
+    }
+
+    fn rg_agent_command(&self, agent: Agent) -> Option<&AgentCommand> {
+        self.desk
+            .rg
+            .agents
+            .iter()
+            .find(|found| found.agent == agent)
+    }
+
+    /// Agent Ask here uses with no picker step: the running one, else the
+    /// last choice.
+    fn rg_ask_agent(&self) -> Agent {
+        self.desk.rg.running.unwrap_or(self.desk.rg.agent)
+    }
+
+    /// Send the prompt to an agent CLI in a Termy pane. Never posts.
+    fn rg_ask(&mut self, key: String, prompt: String, pick: Option<Agent>, cx: &mut Context<Self>) {
+        if let Some(agent) = pick {
+            self.desk.rg.agent = agent;
+            self.desk.rg.picking = false;
+            let _ = agents::save_last(&self.live_config(), agent);
+        }
+        let agent = pick.unwrap_or_else(|| self.rg_ask_agent());
+        let found = self.rg_agent_command(agent).cloned();
+        if found.as_ref().is_some_and(|found| !found.installed())
+            && self.desk.rg.running != Some(agent)
+        {
+            self.notice = Some(agent.install_hint().into());
+            cx.notify();
+            return;
+        }
+        let command = found
+            .and_then(|found| found.command)
+            .or_else(|| Some(agent.tag().to_string()));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |elapsed| elapsed.as_nanos() as u64);
+        let marker = agents::prompt_marker(nonce);
+        self.desk.rg.ask = Some((key.clone(), marker.clone()));
+        self.desk.rg.paste_for = Some(key);
+        self.desk.rg.grab_stable = 0;
+        self.notice = Some(format!("Sending to {}\u{2026}", agent.label()));
+        cx.emit(XAskEvent::Ask {
+            agent,
+            command,
+            prompt: agents::marked_prompt(&prompt, nonce),
+        });
+        cx.notify();
+        // Auto-capture: poll the pane until the options stop changing
+        // (about 2 minutes max). Grab replies does the same on demand.
+        cx.spawn(async move |this, cx| {
+            for _ in 0..40 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(3))
+                    .await;
+                let keep = this
+                    .update(cx, |panel, cx| {
+                        let current = panel.desk.rg.ask.as_ref().map(|(_, m)| m.as_str())
+                            == Some(marker.as_str());
+                        if current && panel.desk.rg.grab_stable < 2 {
+                            cx.emit(XAskEvent::Grab {
+                                marker: marker.clone(),
+                                quiet: true,
+                            });
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn rg_grab(&mut self, cx: &mut Context<Self>) {
+        let Some((_, marker)) = self.desk.rg.ask.clone() else {
+            self.notice = Some("Click Ask here on a post or trend first.".into());
+            cx.notify();
+            return;
+        };
+        cx.emit(XAskEvent::Grab {
+            marker,
+            quiet: false,
+        });
+    }
+
+    /// Host read the ask pane: parse replies after the marker into drafts.
+    pub fn rg_grabbed(
+        &mut self,
+        scrollback: &str,
+        marker: &str,
+        quiet: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((key, current)) = self.desk.rg.ask.clone() else {
+            return;
+        };
+        if current != marker {
+            return;
+        }
+        let options = agents::grab_options(scrollback, marker);
+        if options.is_empty() {
+            if !quiet {
+                self.notice = Some(
+                    "No replies in that pane yet \u{2014} wait for the agent, then Grab replies."
+                        .into(),
+                );
+                cx.notify();
+            }
+            return;
+        }
+        if self.desk.rg.drafts.get(&key) == Some(&options) {
+            self.desk.rg.grab_stable = self.desk.rg.grab_stable.saturating_add(1);
+            if quiet {
+                return;
+            }
+        } else {
+            self.desk.rg.grab_stable = 0;
+        }
+        self.notice = Some(format!(
+            "Got {} replies. Edit in Compose, then Reply\u{2026} opens Confirm.",
+            options.len()
+        ));
+        self.desk.rg.drafts.insert(key, options);
+        cx.notify();
+    }
+
+    fn rg_ask_controls(
+        &self,
+        id_prefix: &str,
+        key: &str,
+        prompt: impl Fn(&Self) -> String + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Div {
+        let mut row = div().flex().gap(px(6.0)).flex_wrap();
+        let running = self.desk.rg.running.filter(|_| !self.desk.rg.picking);
+        if let Some(agent) = running {
+            let (key, prompt) = (key.to_string(), prompt);
+            row = row
+                .child(x_button!(
+                    SharedString::from(format!("{id_prefix}-ask")),
+                    "Ask here",
+                    true,
+                    cx.listener(move |this, _, _, cx| {
+                        let text = prompt(this);
+                        this.rg_ask(key.clone(), text, None, cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(hint(format!("using: {}", agent.label())))
+                .child(x_button!(
+                    SharedString::from(format!("{id_prefix}-ask-change")),
+                    "change",
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.rg.picking = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ));
+        } else {
+            row = row.child(hint("Ask here with".into()));
+            for agent in Agent::ALL {
+                let missing = self
+                    .rg_agent_command(agent)
+                    .is_some_and(|found| !found.installed());
+                let id = SharedString::from(format!("{id_prefix}-ask-{}", agent.tag()));
+                if missing {
+                    row = row.child(
+                        div()
+                            .id(id)
+                            .opacity(0.4)
+                            .px(px(6.0))
+                            .child(format!("{} \u{2715}", agent.label()))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.notice = Some(agent.install_hint().into());
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    );
+                    continue;
+                }
+                let (key, prompt) = (key.to_string(), prompt.clone());
+                row = row.child(x_button!(
+                    id,
+                    agent.label(),
+                    agent == self.desk.rg.agent,
+                    cx.listener(move |this, _, _, cx| {
+                        let text = prompt(this);
+                        this.rg_ask(key.clone(), text, Some(agent), cx);
+                        cx.stop_propagation();
+                    })
+                ));
+            }
+        }
+        let asked_here = self.desk.rg.ask.as_ref().map(|(k, _)| k.as_str()) == Some(key);
+        row.child(x_button!(
+            SharedString::from(format!("{id_prefix}-grab")),
+            "Grab replies",
+            asked_here,
+            cx.listener(|this, _, _, cx| {
+                this.rg_grab(cx);
+                cx.stop_propagation();
+            })
+        ))
+    }
+
     fn rg_prompt_for_post(&self, post: &Post) -> String {
         let limit = self.live_config().char_limit_or_fallback();
         handoff::build_prompt(
@@ -375,11 +692,9 @@ impl XPanel {
         prompt: impl Fn(&Self) -> String + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let mut row = div()
-            .flex()
-            .gap(px(6.0))
-            .flex_wrap()
-            .child(hint("Draft with\u{2026}".into()));
+        let mut row = self
+            .rg_ask_controls(&id_prefix, &key, prompt.clone(), cx)
+            .child(hint("or draft with\u{2026}".into()));
         for target in Target::ALL {
             let key = key.clone();
             let prompt = prompt.clone();

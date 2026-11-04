@@ -227,3 +227,6 @@ pub(crate) fn belongs_to_parent_terminal(name: &std::ffi::OsStr) -> bool {
         NAMES.contains(&name) || name.starts_with(PREFIX)
     }
 }
+
+#[cfg(windows)]
+pub(crate) use windows::foreground_name_of_pid;
