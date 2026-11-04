@@ -16,6 +16,7 @@ pub mod drafts;
 pub mod feed;
 pub mod feeds;
 pub mod followers;
+pub mod handoff;
 pub mod inbox;
 pub mod io;
 pub mod model;

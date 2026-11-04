@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use super::*;
+use termy_x::handoff::{self, Subject, Target};
 use termy_x::reply_guy::{self as rg, Secret, Sort};
 
 pub struct RgState {
@@ -20,6 +21,8 @@ pub struct RgState {
     pub reply_to: Option<String>,
     pub busy: bool,
     pub checked: bool,
+    /// Draft key the next pasted replies belong to (post id or `trend:<topic>`).
+    pub paste_for: Option<String>,
 }
 
 impl RgState {
@@ -38,11 +41,21 @@ impl RgState {
             reply_to: None,
             busy: false,
             checked: false,
+            paste_for: None,
         }
     }
 
     pub fn ready(&self) -> Result<(), String> {
-        rg::ready(self.grok_mask.as_deref(), self.treg_mask.as_deref())
+        // Only Treg is required: Grok is optional (in-app drafts); the
+        // Draft with… buttons work with no xAI key at all.
+        if self.treg_mask.is_some() {
+            Ok(())
+        } else {
+            Err(
+                "Reply Guy is off. Add your Treg API key to turn it on (Grok key is optional)."
+                    .into(),
+            )
+        }
     }
 }
 
@@ -237,6 +250,13 @@ impl XPanel {
     }
 
     fn rg_draft(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if self.live && self.desk.rg.grok_mask.is_none() {
+            self.notice = Some(
+                "In-app Grok drafts need a Grok key. Or use Draft with\u{2026} and paste replies back.".into(),
+            );
+            cx.notify();
+            return;
+        }
         if self.desk.rg.drafting.is_some() {
             self.notice = Some("Already drafting \u{2014} wait for it.".into());
             cx.notify();
@@ -292,6 +312,98 @@ impl XPanel {
             });
         })
         .detach();
+    }
+
+    /// Copy a prompt for `subject` and open `target`. Replies come back
+    /// through Paste replies. Never posts.
+    fn rg_handoff(&mut self, target: Target, key: String, prompt: String, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(prompt.clone()));
+        self.desk.rg.paste_for = Some(key);
+        let opened = launch_target(target, &prompt);
+        let message = match opened {
+            Ok(extra) => format!("Prompt copied \u{2014} paste replies back here. {extra}"),
+            Err(error) => format!("Prompt copied \u{2014} paste replies back here. ({error})"),
+        };
+        self.notice = Some(message);
+        cx.notify();
+    }
+
+    fn rg_prompt_for_post(&self, post: &Post) -> String {
+        let limit = self.live_config().char_limit_or_fallback();
+        handoff::build_prompt(
+            Subject::Post(post.engage_target()),
+            &self.desk.rg_topic,
+            limit,
+        )
+    }
+
+    fn rg_prompt_for_trend(&self, trend: &str) -> String {
+        let limit = self.live_config().char_limit_or_fallback();
+        handoff::build_prompt(Subject::Trend(trend), &self.desk.rg_topic, limit)
+    }
+
+    /// Parse numbered/bulleted options from the clipboard into drafts.
+    fn rg_paste_replies(&mut self, key: Option<String>, cx: &mut Context<Self>) {
+        let Some(key) = key.or_else(|| self.desk.rg.paste_for.clone()) else {
+            self.notice = Some("Click Draft with\u{2026} on a post or trend first.".into());
+            cx.notify();
+            return;
+        };
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        let options = handoff::parse_options(&text);
+        if options.is_empty() {
+            self.notice = Some(
+                "Clipboard has no replies yet \u{2014} copy them from Grok/Cursor first.".into(),
+            );
+        } else {
+            self.notice = Some(format!(
+                "Pasted {} options. Edit in Compose, then Reply\u{2026} opens Confirm.",
+                options.len()
+            ));
+            self.desk.rg.drafts.insert(key, options);
+        }
+        cx.notify();
+    }
+
+    fn rg_handoff_row(
+        &self,
+        id_prefix: String,
+        key: String,
+        prompt: impl Fn(&Self) -> String + Clone + 'static,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let mut row = div()
+            .flex()
+            .gap(px(6.0))
+            .flex_wrap()
+            .child(hint("Draft with\u{2026}".into()));
+        for target in Target::ALL {
+            let key = key.clone();
+            let prompt = prompt.clone();
+            row = row.child(x_button!(
+                SharedString::from(format!("{id_prefix}-{}", target.tag())),
+                target.label(),
+                cx.listener(move |this, _, _, cx| {
+                    let text = prompt(this);
+                    this.rg_handoff(target, key.clone(), text, cx);
+                    cx.stop_propagation();
+                })
+            ));
+        }
+        let paste_key = key.clone();
+        row = row.child(x_button!(
+            SharedString::from(format!("{id_prefix}-paste")),
+            "Paste replies",
+            self.desk.rg.paste_for.as_deref() == Some(key.as_str()),
+            cx.listener(move |this, _, _, cx| {
+                this.rg_paste_replies(Some(paste_key.clone()), cx);
+                cx.stop_propagation();
+            })
+        ));
+        row.into_any_element()
     }
 
     fn rg_key_row(&self, which: Secret, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -471,6 +583,43 @@ impl XPanel {
             }
             rows.push(chips.into_any_element());
         }
+        let topic = self.desk.rg_topic.trim().to_string();
+        if !topic.is_empty() {
+            let trend_key = format!("trend:{topic}");
+            let for_prompt = topic;
+            rows.push(self.rg_handoff_row(
+                "x-rg-trend-to".into(),
+                trend_key.clone(),
+                move |panel: &Self| panel.rg_prompt_for_trend(&for_prompt),
+                cx,
+            ));
+            if let Some(options) = self.desk.rg.drafts.get(&trend_key) {
+                for (index, option) in options.iter().enumerate() {
+                    rows.push(card(format!("Post option {}", index + 1), option.clone()));
+                    let text_use = option.clone();
+                    rows.push(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                SharedString::from(format!("x-rg-trend-use-{index}")),
+                                "Edit in Compose",
+                                cx.listener(move |this, _, _, cx| {
+                                    this.compose = text_use.clone();
+                                    this.caret = this.compose.len();
+                                    this.desk.rg.reply_to = None;
+                                    this.notice = Some(
+                                        "Edit it in Compose; Post opens Confirm before anything posts.".into(),
+                                    );
+                                    this.open_section(XSection::Compose, cx);
+                                    cx.stop_propagation();
+                                })
+                            ))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
         if let Some(error) = &self.desk.rg.error {
             rows.push(hint(error.clone()));
         }
@@ -504,6 +653,13 @@ impl XPanel {
                     ))
                     .into_any_element(),
             );
+            let post_prompt = post.clone();
+            rows.push(self.rg_handoff_row(
+                format!("x-rg-to-{}", post.id),
+                post.engage_target().id.clone(),
+                move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
+                cx,
+            ));
             let target = post.engage_target().id.clone();
             if let Some(options) = self.desk.rg.drafts.get(&post.engage_target().id) {
                 for (index, option) in options.iter().enumerate() {
@@ -558,6 +714,98 @@ impl XPanel {
     }
 }
 
+/// grok.com prefill URL, or plain grok.com when the prompt is too long
+/// for a URL (the prompt is on the clipboard either way).
+fn grok_web_target_url(prompt: &str) -> String {
+    let url = handoff::grok_web_url(prompt);
+    if url.len() > 7000 {
+        "https://grok.com/".to_string()
+    } else {
+        url
+    }
+}
+
+fn find_on_path(names: &[&str]) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+fn local_programs(rel: &str) -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    let path = std::path::PathBuf::from(base).join("Programs").join(rel);
+    path.is_file().then_some(path)
+}
+
+fn spawn_detached(
+    program: &std::path::Path,
+    args: &[&str],
+    new_console: bool,
+) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NEW_CONSOLE for the CLI, DETACHED_PROCESS for GUI apps.
+        command.creation_flags(if new_console {
+            0x0000_0010
+        } else {
+            0x0000_0008
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = new_console;
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Open the chosen assistant. The prompt is already on the clipboard.
+/// Uses only public launch paths (app exe, URL, CLI binary); never reads
+/// another app's tokens or sessions. Returns a short hint for the user.
+fn launch_target(target: Target, prompt: &str) -> Result<String, String> {
+    let opener = termy_x::io::SystemOpener;
+    match target {
+        Target::GrokBot => {
+            if let Some(exe) = local_programs("Grok Bot\\Grok Bot.exe") {
+                spawn_detached(&exe, &[], false)?;
+                Ok("Grok Bot opened \u{2014} paste into a new chat.".into())
+            } else {
+                Err("Grok Bot app not found".into())
+            }
+        }
+        Target::GrokWeb => {
+            termy_x::io::Opener::open(&opener, &grok_web_target_url(prompt))?;
+            Ok("grok.com opened with the prompt.".into())
+        }
+        Target::GrokCli => {
+            let home_bin = std::env::var_os("USERPROFILE")
+                .map(|home| std::path::PathBuf::from(home).join(".grok\\bin\\grok.exe"))
+                .filter(|path| path.is_file());
+            match find_on_path(&["grok.exe", "grok"]).or(home_bin) {
+                Some(grok) => {
+                    spawn_detached(&grok, &[prompt], true)?;
+                    Ok("Grok CLI opened in a new terminal with the prompt.".into())
+                }
+                None => {
+                    Err("Grok CLI not on PATH \u{2014} paste the prompt into it yourself".into())
+                }
+            }
+        }
+        Target::Cursor => {
+            if let Some(exe) = local_programs("cursor\\Cursor.exe") {
+                spawn_detached(&exe, &[], false)?;
+                Ok("Cursor opened \u{2014} paste into a chat.".into())
+            } else {
+                Err("Cursor not found".into())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,13 +823,20 @@ mod tests {
     }
 
     #[test]
-    fn off_until_both_keys() {
+    fn on_with_treg_only_grok_optional() {
         let mut state = RgState::new(&XConfig::default());
         assert!(state.ready().is_err());
-        state.treg_mask = Some("x".into());
-        assert!(state.ready().is_err());
         state.grok_mask = Some("y".into());
+        assert!(state.ready().is_err());
+        state.grok_mask = None;
+        state.treg_mask = Some("x".into());
         assert!(state.ready().is_ok());
+    }
+
+    #[test]
+    fn grok_web_launch_url_fallback_for_huge_prompts() {
+        assert!(grok_web_target_url("hi").contains("?q="));
+        assert_eq!(grok_web_target_url(&"x".repeat(9000)), "https://grok.com/");
     }
 
     #[test]
