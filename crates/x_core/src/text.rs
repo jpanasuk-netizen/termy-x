@@ -1,7 +1,7 @@
 //! Twitter-text v3 weighted length and thread splitting.
 //!
 //! Config (v3): scale 100, default weight 200, transformed URL length 23,
-//! max 280. Code points U+0000..=U+10FF, U+2000..=U+200D, U+2010..=U+201F,
+//! max 280 (standard) or 25000 (Premium). Code points U+0000..=U+10FF, U+2000..=U+200D, U+2010..=U+201F,
 //! and U+2032..=U+2037 weigh 100 (one visible character). Everything else
 //! weighs 200. An emoji, including a ZWJ sequence, skin-tone modifier, or
 //! regional-indicator flag, weighs 200 once. Text is NFC-normalized first.
@@ -10,7 +10,12 @@
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
 
-pub const WEIGHTED_LIMIT: usize = 280;
+/// Free / non-Premium post cap (Twitter-text v3 default).
+pub const STANDARD_CHAR_LIMIT: usize = 280;
+/// X Premium / Premium+ long-form cap.
+pub const PREMIUM_CHAR_LIMIT: usize = 25_000;
+/// Back-compat alias for the free-tier limit used by unit tests.
+pub const WEIGHTED_LIMIT: usize = STANDARD_CHAR_LIMIT;
 pub const URL_WEIGHT: usize = 23;
 const SCALE: u32 = 100;
 
@@ -32,35 +37,48 @@ impl WeightedCount {
 }
 
 pub fn weighted_len(text: &str) -> WeightedCount {
-    weighted_normalized(&normalize(text))
+    weighted_len_limited(text, STANDARD_CHAR_LIMIT)
+}
+
+pub fn weighted_len_limited(text: &str, limit: usize) -> WeightedCount {
+    let mut count = weighted_normalized(&normalize(text));
+    count.limit = limit.max(1);
+    count
 }
 
 pub fn split_thread(text: &str) -> Vec<String> {
+    split_thread_limited(text, STANDARD_CHAR_LIMIT)
+}
+
+pub fn split_thread_limited(text: &str, limit: usize) -> Vec<String> {
+    let limit = limit.max(1);
     let trimmed = normalize(text.trim());
     if trimmed.is_empty() {
         return Vec::new();
     }
-    if weighted_normalized(&trimmed).weighted <= WEIGHTED_LIMIT {
+    if weighted_normalized(&trimmed).weighted <= limit {
         return vec![trimmed];
     }
 
     let mut parts = Vec::new();
     let mut rest = trimmed.as_str();
     while !rest.is_empty() {
-        if weighted_normalized(rest).weighted <= WEIGHTED_LIMIT {
+        if weighted_normalized(rest).weighted <= limit {
             parts.push(rest.to_string());
             break;
         }
-        let mut cut = longest_fit(rest);
+        let mut cut = longest_fit(rest, limit);
         if cut == 0 {
-            cut = split_units(rest).first().map(|unit| unit.len()).unwrap_or(rest.len());
+            cut = split_units(rest)
+                .first()
+                .map_or(rest.len(), |unit| unit.len());
         }
         cut = snap_grapheme(rest, cut);
         let mut boundary = cut;
-        if let Some(space) = rest[..cut].rfind(char::is_whitespace) {
-            if space > 0 {
-                boundary = snap_grapheme(rest, space);
-            }
+        if let Some(space) = rest[..cut].rfind(char::is_whitespace)
+            && space > 0
+        {
+            boundary = snap_grapheme(rest, space);
         }
         if boundary == 0 {
             boundary = cut;
@@ -120,18 +138,18 @@ fn weighted_normalized(text: &str) -> WeightedCount {
     sum += weight_text(&text[index..]);
     WeightedCount {
         weighted: (sum / SCALE) as usize + urls * URL_WEIGHT,
-        limit: WEIGHTED_LIMIT,
+        limit: STANDARD_CHAR_LIMIT,
         urls,
     }
 }
 
-fn longest_fit(text: &str) -> usize {
+fn longest_fit(text: &str, limit: usize) -> usize {
     let mut last_ok = 0usize;
     let mut end = 0usize;
     for unit in split_units(text) {
         end += unit.len();
         end = snap_grapheme(text, end);
-        if weighted_normalized(&text[..end]).weighted > WEIGHTED_LIMIT {
+        if weighted_normalized(&text[..end]).weighted > limit {
             return last_ok;
         }
         last_ok = end;
@@ -183,7 +201,8 @@ fn split_units(text: &str) -> Vec<&str> {
             }
         } else if is_emoji_pict(ch) {
             loop {
-                if index < chars.len() && (is_variation(chars[index].1) || is_skin(chars[index].1)) {
+                if index < chars.len() && (is_variation(chars[index].1) || is_skin(chars[index].1))
+                {
                     index += 1;
                     continue;
                 }
@@ -315,7 +334,11 @@ mod tests {
             "family zwj"
         );
         assert_eq!(weighted_len("\u{1F1FA}\u{1F1F8}").weighted, 2, "flag");
-        assert_eq!(weighted_len("❤️").weighted, 2, "heart plus variation selector");
+        assert_eq!(
+            weighted_len("❤️").weighted,
+            2,
+            "heart plus variation selector"
+        );
         assert_eq!(weighted_len("a\u{1F44D}\u{1F3FD}b").weighted, 4);
     }
 
@@ -361,7 +384,11 @@ mod tests {
         }
         assert!(parts.iter().any(|part| part.contains("extra")));
 
-        let boundary = format!("{}{}", "a".repeat(279), "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}");
+        let boundary = format!(
+            "{}{}",
+            "a".repeat(279),
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}"
+        );
         assert_eq!(weighted_len(&boundary).weighted, 281);
         let split = split_thread(&boundary);
         assert!(split.len() >= 2);
@@ -369,9 +396,12 @@ mod tests {
             assert!(weighted_len(part).weighted <= WEIGHTED_LIMIT, "{part}");
         }
         assert!(split.iter().any(|part| part.contains('\u{1F468}')));
-        assert!(split
-            .iter()
-            .any(|part| part.contains('\u{200D}') && weighted_len(part).weighted <= WEIGHTED_LIMIT));
+        assert!(
+            split
+                .iter()
+                .any(|part| part.contains('\u{200D}')
+                    && weighted_len(part).weighted <= WEIGHTED_LIMIT)
+        );
     }
 
     #[test]
@@ -391,6 +421,48 @@ mod tests {
         assert_eq!(snap_grapheme("hi", 2), 2);
         let flag = "\u{1F1FA}\u{1F1F8}";
         assert_eq!(snap_grapheme(flag, 1), flag.len());
+    }
+
+    #[test]
+    fn premium_limit_keeps_long_posts_as_one_part() {
+        let text = "a".repeat(500);
+        let count = weighted_len_limited(&text, PREMIUM_CHAR_LIMIT);
+        assert_eq!(count.weighted, 500);
+        assert_eq!(count.limit, PREMIUM_CHAR_LIMIT);
+        assert!(!count.over_limit());
+        assert_eq!(split_thread_limited(&text, PREMIUM_CHAR_LIMIT).len(), 1);
+
+        // ~2k weighted: over free tier, under Premium, stays one part.
+        let mid = "word ".repeat(400);
+        let mid_count = weighted_len_limited(&mid, PREMIUM_CHAR_LIMIT);
+        assert!(mid_count.weighted > STANDARD_CHAR_LIMIT);
+        assert!(mid_count.weighted < PREMIUM_CHAR_LIMIT);
+        assert_eq!(split_thread_limited(&mid, PREMIUM_CHAR_LIMIT).len(), 1);
+        assert!(split_thread_limited(&mid, STANDARD_CHAR_LIMIT).len() > 1);
+
+        assert!(
+            weighted_len_limited(&"a".repeat(PREMIUM_CHAR_LIMIT + 1), PREMIUM_CHAR_LIMIT)
+                .over_limit()
+        );
+        // Split path at a modest Premium-style cap (avoid O(n^2) on 25k in unit tests).
+        let over = "a".repeat(600);
+        let parts = split_thread_limited(&over, 500);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            assert!(weighted_len_limited(part, 500).weighted <= 500);
+        }
+    }
+
+    #[test]
+    fn standard_mode_still_splits_at_280() {
+        let long = format!("{} extra", "word ".repeat(100));
+        let parts = split_thread_limited(&long, STANDARD_CHAR_LIMIT);
+        assert!(parts.len() > 1);
+        for part in &parts {
+            assert!(
+                weighted_len_limited(part, STANDARD_CHAR_LIMIT).weighted <= STANDARD_CHAR_LIMIT
+            );
+        }
     }
 
     #[test]

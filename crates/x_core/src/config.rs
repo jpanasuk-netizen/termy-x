@@ -1,3 +1,5 @@
+use crate::text::{PREMIUM_CHAR_LIMIT, STANDARD_CHAR_LIMIT};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,9 @@ pub struct XConfig {
     /// always shows it at full strength.
     pub background_opacity: f32,
     pub default_limit: usize,
+    /// Explicit post character limit. `None` means auto-detect Premium via
+    /// OpenCLI (or fall back to [`Self::fallback_char_limit`]).
+    pub char_limit: Option<usize>,
     pub provider: Option<ProviderId>,
     pub official_enabled: bool,
     pub client_id_env: String,
@@ -46,6 +51,9 @@ impl Default for XConfig {
             background_art: true,
             background_opacity: DEFAULT_BACKGROUND_OPACITY,
             default_limit: 10,
+            // Auto: detect Premium from the OpenCLI session. Jeremy's install
+            // also writes char_limit=25000 into x.toml as a hard override.
+            char_limit: None,
             provider: None,
             official_enabled: false,
             client_id_env: "TERMY_X_CLIENT_ID".to_string(),
@@ -122,6 +130,9 @@ impl XConfig {
                     self.default_limit = limit.clamp(1, 100);
                 }
             }
+            "char_limit" => {
+                self.char_limit = parse_char_limit(value);
+            }
             "provider" => {
                 self.provider = if value.eq_ignore_ascii_case("auto") {
                     None
@@ -178,10 +189,38 @@ impl XConfig {
             openai_base.as_deref(),
             termy_model.as_deref(),
         );
+        if let Some(limit) = nonempty_var("TERMY_X_CHAR_LIMIT").and_then(|v| parse_char_limit(&v)) {
+            self.char_limit = Some(limit);
+        }
+    }
+
+    /// `TERMY_X_CHAR_LIMIT` when set (also folded into `char_limit` by resolve_env).
+    pub fn env_char_limit(&self) -> Option<usize> {
+        nonempty_var("TERMY_X_CHAR_LIMIT").and_then(|v| parse_char_limit(&v))
+    }
+
+    /// Explicit `char_limit` from x.toml (or env already applied).
+    pub fn explicit_char_limit(&self) -> Option<usize> {
+        self.char_limit
+    }
+
+    /// Used when OpenCLI detection cannot run and no override is set.
+    pub fn fallback_char_limit(&self) -> usize {
+        self.char_limit.unwrap_or(STANDARD_CHAR_LIMIT)
+    }
+
+    /// Best-effort limit without spawning OpenCLI (env/config/cache/fallback).
+    pub fn char_limit_or_fallback(&self) -> usize {
+        crate::premium::resolve_char_limit_simple(self)
     }
 
     /// `TERMY_X_AI_BASE_URL` wins, then `OPENAI_BASE_URL`.
-    pub fn apply_ai_sources(&mut self, termy_base: Option<&str>, openai_base: Option<&str>, termy_model: Option<&str>) {
+    pub fn apply_ai_sources(
+        &mut self,
+        termy_base: Option<&str>,
+        openai_base: Option<&str>,
+        termy_model: Option<&str>,
+    ) {
         if let Some(value) = nonempty(termy_base).or_else(|| nonempty(openai_base)) {
             self.ai_base_url = value.to_string();
             self.ai_explicit = true;
@@ -235,8 +274,7 @@ impl XConfig {
         if let Some(start) = text.find("background_art") {
             let end = text[start..]
                 .find('\n')
-                .map(|index| start + index)
-                .unwrap_or(text.len());
+                .map_or(text.len(), |index| start + index);
             text.replace_range(start..end, &line);
         } else {
             if !text.is_empty() && !text.ends_with('\n') {
@@ -274,6 +312,29 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
 }
 
+fn parse_char_limit(value: &str) -> Option<usize> {
+    let trimmed = value.trim().trim_matches('"').trim_matches('\'');
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("premium")
+        || trimmed.eq_ignore_ascii_case("premium+")
+        || trimmed.eq_ignore_ascii_case("long")
+    {
+        return Some(PREMIUM_CHAR_LIMIT);
+    }
+    if trimmed.eq_ignore_ascii_case("standard")
+        || trimmed.eq_ignore_ascii_case("free")
+        || trimmed.eq_ignore_ascii_case("basic")
+    {
+        return Some(STANDARD_CHAR_LIMIT);
+    }
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.clamp(1, PREMIUM_CHAR_LIMIT))
+}
+
 fn parse_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
@@ -298,6 +359,8 @@ pub fn example_config() -> &'static str {
 background_art = true       # set false to hide the bird entirely
 background_opacity = 0.18   # bird strength behind lists (splash is always 1.0)
 default_limit = 10
+# Post length: 280 (standard), 25000 (Premium), or "auto" to detect from OpenCLI.
+char_limit = 25000
 provider = "auto"
 
 [official_api]
@@ -385,5 +448,19 @@ mod tests {
         assert!(!config.background_art);
         assert_eq!(config.provider, Some(ProviderId::Mock));
         assert!(config.official_enabled);
+    }
+
+    #[test]
+    fn char_limit_parses_premium_aliases() {
+        assert_eq!(parse_char_limit("25000"), Some(PREMIUM_CHAR_LIMIT));
+        assert_eq!(parse_char_limit("premium"), Some(PREMIUM_CHAR_LIMIT));
+        assert_eq!(parse_char_limit("280"), Some(STANDARD_CHAR_LIMIT));
+        assert_eq!(parse_char_limit("standard"), Some(STANDARD_CHAR_LIMIT));
+        assert_eq!(parse_char_limit("auto"), None);
+        let mut config = XConfig::default();
+        config.apply_text("char_limit = 25000\n");
+        assert_eq!(config.char_limit, Some(PREMIUM_CHAR_LIMIT));
+        config.apply_text("char_limit = auto\n");
+        assert_eq!(config.char_limit, None);
     }
 }
