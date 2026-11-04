@@ -104,6 +104,26 @@ pub trait XProvider: Send + Sync {
         Err("this provider does not expose separate For you / Following feeds".into())
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String>;
+    /// Mentions / reply notifications for the connected account.
+    fn notifications(&self, _limit: usize) -> Result<Served<Vec<Post>>, String> {
+        Err("this provider has no notifications feed".into())
+    }
+    /// Chronological tweets for a handle (`opencli twitter tweets`).
+    fn tweets(&self, handle: &str, _limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let served = self.lookup(handle)?;
+        Ok(Served {
+            value: served.value.posts,
+            status: served.status,
+        })
+    }
+    /// Follower list for a handle. Snapshot callers persist locally.
+    fn followers(
+        &self,
+        _handle: &str,
+        _limit: usize,
+    ) -> Result<Served<Vec<crate::followers::Follower>>, String> {
+        Err("this provider has no followers list".into())
+    }
     /// One cursor-paginated slice of a home feed: `cursor: None` reads
     /// from the top; the returned `next_cursor` continues strictly older.
     /// Providers without a real cursor must Err, never fake it.
@@ -294,6 +314,57 @@ impl Service {
 
     pub fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         self.read(|reader| reader.timeline(limit))
+    }
+
+    pub fn notifications(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        self.read(|reader| reader.notifications(limit))
+    }
+
+    pub fn tweets(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let handle = strip_handle(handle).to_string();
+        self.read(|reader| reader.tweets(&handle, limit))
+    }
+
+    pub fn followers(
+        &self,
+        handle: &str,
+        limit: usize,
+    ) -> Result<Served<Vec<crate::followers::Follower>>, String> {
+        let handle = strip_handle(handle).to_string();
+        self.read(|reader| reader.followers(&handle, limit))
+    }
+
+    /// Inbox rows: notifications when the provider has them, else
+    /// `to:<me>` search. Errors stay errors; empty is a valid result.
+    pub fn inbox_posts(&self, me: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let limit = limit.clamp(1, 50);
+        let notes = self.notifications(limit);
+        let directed = self.search(&crate::inbox::to_me_query(me), true, limit);
+        match (notes, directed) {
+            (Ok(mut notes), Ok(directed)) => {
+                notes.value = crate::inbox::merge_inbox_posts(notes.value, directed.value);
+                if notes.value.is_empty() && directed.status.note.is_empty() {
+                    return Ok(notes);
+                }
+                Ok(notes)
+            }
+            (Ok(mut notes), Err(_)) => {
+                notes.value = crate::inbox::merge_inbox_posts(notes.value, Vec::new());
+                Ok(notes)
+            }
+            (Err(_), Ok(mut directed)) => {
+                directed.value = crate::inbox::merge_inbox_posts(Vec::new(), directed.value);
+                Ok(directed)
+            }
+            (Err(a), Err(b)) => Err(format!("{a}; {b}")),
+        }
+    }
+
+    pub fn mentions_posts(&self, me: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let limit = limit.clamp(1, 50);
+        let mut served = self.search(&crate::inbox::mentions_query(me), true, limit)?;
+        crate::time::sort_newest(&mut served.value, |post| post.created_at.as_deref());
+        Ok(served)
     }
 
     pub fn timeline_feed(
@@ -493,6 +564,48 @@ impl XProvider for MockProvider {
                 TimelineFeed::Following => "fixture timeline (following)",
             },
         ))
+    }
+    fn notifications(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let mut posts = sample_posts();
+        posts.truncate(limit.max(1));
+        Ok(served(posts, "fixture notifications"))
+    }
+    fn tweets(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let handle = strip_handle(handle);
+        let mut posts = sample_posts();
+        let now = crate::time::unix_now();
+        for (i, post) in posts.iter_mut().enumerate() {
+            post.author_handle = handle.to_string();
+            if post.created_at.is_none() {
+                let ts = now.saturating_sub((i as i64) * 86_400);
+                post.created_at = Some(format!("{}T12:00:00Z", crate::time::ymd(ts)));
+            }
+        }
+        posts.truncate(limit.max(1));
+        Ok(served(posts, "fixture tweets"))
+    }
+    fn followers(
+        &self,
+        handle: &str,
+        limit: usize,
+    ) -> Result<Served<Vec<crate::followers::Follower>>, String> {
+        let _ = handle;
+        let mut rows = vec![
+            crate::followers::Follower {
+                handle: "ada".into(),
+                name: "Ada Lovelace".into(),
+            },
+            crate::followers::Follower {
+                handle: "blue_swift".into(),
+                name: "Blue Swift".into(),
+            },
+            crate::followers::Follower {
+                handle: "panel_notes".into(),
+                name: "Panel Notes".into(),
+            },
+        ];
+        rows.truncate(limit.max(1));
+        Ok(served(rows, "fixture followers"))
     }
     fn trends(&self, place: Option<&str>, limit: usize) -> Result<Served<Vec<Trend>>, String> {
         // Fixture set spans the real category shapes the live payload
@@ -1215,6 +1328,52 @@ impl XProvider for OpenCliProvider {
             return Err("opencli trending returned no rows".into());
         }
         Ok(session_served(ProviderId::OpenCli, trends, "trending"))
+    }
+    fn notifications(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let stdout = self.call(&opencli_read(&[
+            "twitter".into(),
+            "notifications".into(),
+            "--limit".into(),
+            limit.max(1).to_string(),
+        ]))?;
+        let posts = parse_posts(&stdout).unwrap_or_default();
+        Ok(session_served(ProviderId::OpenCli, posts, "notifications"))
+    }
+    fn tweets(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let handle = strip_handle(handle);
+        let stdout = self.call(&opencli_read(&[
+            "twitter".into(),
+            "tweets".into(),
+            handle.into(),
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+            "--page-delay".into(),
+            "1".into(),
+        ]))?;
+        Ok(session_served(
+            ProviderId::OpenCli,
+            parse_posts(&stdout).unwrap_or_default(),
+            "tweets",
+        ))
+    }
+    fn followers(
+        &self,
+        handle: &str,
+        limit: usize,
+    ) -> Result<Served<Vec<crate::followers::Follower>>, String> {
+        let handle = strip_handle(handle);
+        let stdout = self.call(&opencli_read(&[
+            "twitter".into(),
+            "followers".into(),
+            handle.into(),
+            "--limit".into(),
+            limit.clamp(1, 200).to_string(),
+        ]))?;
+        Ok(session_served(
+            ProviderId::OpenCli,
+            crate::followers::parse_followers(&stdout).unwrap_or_default(),
+            "followers",
+        ))
     }
 }
 

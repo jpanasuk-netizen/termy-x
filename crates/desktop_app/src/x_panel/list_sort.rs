@@ -115,6 +115,7 @@ impl XPanel {
         refs
     }
 
+    #[allow(dead_code)]
     pub(super) fn named_post_list(
         &self,
         title: &str,
@@ -160,6 +161,9 @@ pub(super) fn shows_sort_for(thread_open: bool, section: XSection) -> bool {
                 | XSection::Inbox
                 | XSection::Lookup
                 | XSection::Trends
+                | XSection::Feeds
+                | XSection::Stats
+                | XSection::Analyze
         )
 }
 
@@ -184,7 +188,11 @@ mod tests {
         assert!(shows_sort_for(false, XSection::Inbox));
         assert!(shows_sort_for(false, XSection::Lookup));
         assert!(shows_sort_for(false, XSection::Trends));
+        assert!(shows_sort_for(false, XSection::Feeds));
+        assert!(shows_sort_for(false, XSection::Stats));
+        assert!(shows_sort_for(false, XSection::Analyze));
         assert!(!shows_sort_for(false, XSection::Compose));
         assert!(!shows_sort_for(false, XSection::Help));
+        assert!(!shows_sort_for(false, XSection::Queue));
     }
 }

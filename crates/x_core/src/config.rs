@@ -318,6 +318,22 @@ impl XConfig {
         self.config_dir.join("x-drafts.json")
     }
 
+    pub fn inbox_path(&self) -> PathBuf {
+        self.config_dir.join("x-inbox.json")
+    }
+
+    pub fn feeds_path(&self) -> PathBuf {
+        self.config_dir.join("x-feeds.json")
+    }
+
+    pub fn followers_path(&self) -> PathBuf {
+        self.config_dir.join("x-followers.json")
+    }
+
+    pub fn queue_path(&self) -> PathBuf {
+        self.config_dir.join("x-reply-queue.json")
+    }
+
     pub fn token_path(&self) -> PathBuf {
         self.config_dir.join("x-tokens.json")
     }

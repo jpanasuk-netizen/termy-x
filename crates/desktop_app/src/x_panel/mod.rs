@@ -2,6 +2,7 @@
 //! `background_opacity` behind lists and at full strength on the empty splash.
 
 pub mod art;
+mod desk;
 mod list_sort;
 mod media_fit;
 mod player;
@@ -74,6 +75,11 @@ pub enum XSection {
     Compose,
     Research,
     Help,
+    Feeds,
+    Stats,
+    Followers,
+    Queue,
+    Analyze,
 }
 
 impl XSection {
@@ -88,7 +94,44 @@ impl XSection {
             Self::Compose => "Compose",
             Self::Research => "Research",
             Self::Help => "Help",
+            Self::Feeds => "Feeds",
+            Self::Stats => "Stats",
+            Self::Followers => "Followers",
+            Self::Queue => "Queue",
+            Self::Analyze => "Analyze",
         }
+    }
+
+    fn all() -> [XSection; 14] {
+        [
+            Self::Timeline,
+            Self::Search,
+            Self::Mentions,
+            Self::Inbox,
+            Self::Trends,
+            Self::Lookup,
+            Self::Compose,
+            Self::Research,
+            Self::Feeds,
+            Self::Stats,
+            Self::Followers,
+            Self::Queue,
+            Self::Analyze,
+            Self::Help,
+        ]
+    }
+
+    fn is_desk(self) -> bool {
+        matches!(
+            self,
+            Self::Inbox
+                | Self::Mentions
+                | Self::Feeds
+                | Self::Stats
+                | Self::Followers
+                | Self::Queue
+                | Self::Analyze
+        )
     }
 
     pub fn from_command(name: &str) -> Self {
@@ -101,6 +144,11 @@ impl XSection {
             "compose" => Self::Compose,
             "research" => Self::Research,
             "help" => Self::Help,
+            "feeds" => Self::Feeds,
+            "stats" | "analytics" => Self::Stats,
+            "followers" => Self::Followers,
+            "queue" => Self::Queue,
+            "analyze" => Self::Analyze,
             _ => Self::Timeline,
         }
     }
@@ -131,6 +179,11 @@ enum InputTarget {
     Trends,
     Research,
     Lookup,
+    FeedQuery,
+    FeedFilter,
+    QueueText,
+    QueueReplyTo,
+    Analyze,
 }
 
 /// Width of the panel when docked beside the terminal (as opposed to
@@ -170,6 +223,9 @@ fn edit_keys_owned(
         InputTarget::Trends => section == XSection::Trends,
         InputTarget::Research => section == XSection::Research,
         InputTarget::Lookup => section == XSection::Lookup,
+        InputTarget::FeedQuery | InputTarget::FeedFilter => section == XSection::Feeds,
+        InputTarget::QueueText | InputTarget::QueueReplyTo => section == XSection::Queue,
+        InputTarget::Analyze => section == XSection::Analyze,
     }
 }
 
@@ -257,9 +313,15 @@ enum EnterAction {
 
 fn enter_action(field: TextField) -> EnterAction {
     match field {
-        TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
-            EnterAction::RunSearch
-        }
+        TextField::Search
+        | TextField::Trends
+        | TextField::Research
+        | TextField::Lookup
+        | TextField::FeedQuery
+        | TextField::FeedFilter
+        | TextField::QueueText
+        | TextField::QueueReplyTo
+        | TextField::Analyze => EnterAction::RunSearch,
         TextField::Reply | TextField::Quote => EnterAction::Newline,
     }
 }
@@ -273,6 +335,11 @@ enum TextField {
     Trends,
     Research,
     Lookup,
+    FeedQuery,
+    FeedFilter,
+    QueueText,
+    QueueReplyTo,
+    Analyze,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -533,6 +600,8 @@ pub struct XPanel {
     mock_writes: termy_x::bulk::MockWriteLog,
     bulk: Option<thread_view::BulkUi>,
     bulk_seq: u64,
+    confirm_queue_id: Option<String>,
+    desk: desk::DeskState,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -590,6 +659,7 @@ struct SectionTimes {
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum FetchPayload {
     Timeline {
         posts: Vec<Post>,
@@ -648,7 +718,13 @@ fn section_slot(section: XSection) -> Option<usize> {
         XSection::Research => Some(4),
         XSection::Mentions => Some(5),
         XSection::Inbox => Some(6),
-        XSection::Compose | XSection::Help => None,
+        XSection::Compose
+        | XSection::Help
+        | XSection::Feeds
+        | XSection::Stats
+        | XSection::Followers
+        | XSection::Queue
+        | XSection::Analyze => None,
     }
 }
 
@@ -820,6 +896,8 @@ impl XPanel {
             mock_writes: termy_x::bulk::MockWriteLog::default(),
             bulk: None,
             bulk_seq: 0,
+            confirm_queue_id: None,
+            desk: desk::DeskState::load(&config),
         };
         if fill_window {
             // Preview path fills via load_scene / open_section.
@@ -851,6 +929,10 @@ impl XPanel {
             cx.notify();
             return;
         }
+        if section.is_desk() {
+            self.refresh_desk(section, cx);
+            return;
+        }
         if self.fetching.iter().any(|f| *f) {
             self.status = "already refreshing \u{2014} one X session call at a time".into();
             cx.notify();
@@ -876,7 +958,13 @@ impl XPanel {
             XSection::Trends => self.fetched_at.trends = None,
             XSection::Lookup => self.fetched_at.lookup = None,
             XSection::Research => self.fetched_at.research = None,
-            XSection::Compose | XSection::Help => {}
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze => {}
         }
         self.last_refresh = Some(local_hms());
         self.pending_top = true;
@@ -933,6 +1021,18 @@ impl XPanel {
                 self.input_target = InputTarget::Lookup;
                 self.pending_focus = true;
             }
+            XSection::Feeds => {
+                self.input_target = InputTarget::FeedQuery;
+                self.pending_focus = true;
+            }
+            XSection::Queue => {
+                self.input_target = InputTarget::QueueText;
+                self.pending_focus = true;
+            }
+            XSection::Analyze => {
+                self.input_target = InputTarget::Analyze;
+                self.pending_focus = true;
+            }
             _ => {}
         }
 
@@ -953,6 +1053,9 @@ impl XPanel {
                     .search(&self.query, false, 10)
                     .map(|served| served.value)
                     .unwrap_or_default();
+            }
+            if section.is_desk() {
+                self.refresh_desk(section, cx);
             }
             log_switch(section, started, "local");
             return;
@@ -1004,6 +1107,17 @@ impl XPanel {
             self.status =
                 "compose · click the box · caret blinks · Publish opens confirm instantly".into();
             log_switch(section, started, "compose");
+            return;
+        }
+
+        if section.is_desk() {
+            self.loading = false;
+            self.status = format!(
+                "{} \u{b7} local + OpenCLI reads \u{b7} nothing posts until Confirm",
+                section.label()
+            );
+            self.refresh_desk(section, cx);
+            log_switch(section, started, "desk");
             return;
         }
 
@@ -1068,10 +1182,12 @@ impl XPanel {
                 self.load_mock_dashboard();
                 self.list_sort = termy_x::sort::ResultSort::Popular;
                 self.open_section(XSection::Mentions, cx);
-                self.mentions_posts = MockProvider
+                let posts = MockProvider
                     .mentions("termy", 10)
                     .map(|served| served.value)
                     .unwrap_or_default();
+                self.mentions_posts = posts.clone();
+                self.desk.mentions_posts = posts;
                 self.status = "mentions \u{b7} Popular".into();
             }
             "compose" => self.open_section(XSection::Compose, cx),
@@ -1190,6 +1306,30 @@ impl XPanel {
                     stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 });
             }
+            "inbox" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Inbox, cx);
+            }
+            "feeds" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Feeds, cx);
+            }
+            "analytics" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Stats, cx);
+            }
+            "followers" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Followers, cx);
+            }
+            "queue" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Queue, cx);
+            }
+            "analyze" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Analyze, cx);
+            }
             _ => self.open_section(XSection::Timeline, cx),
         }
     }
@@ -1229,6 +1369,12 @@ impl XPanel {
                 .inbox_replies("termy", 10)
                 .map(|served| served.value)
                 .unwrap_or_default();
+        }
+        if self.desk.mentions_posts.is_empty() {
+            self.desk.mentions_posts = self.mentions_posts.clone();
+        }
+        if self.desk.inbox_posts.is_empty() {
+            self.desk.inbox_posts = self.inbox_posts.clone();
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
@@ -1279,6 +1425,12 @@ impl XPanel {
                 .inbox_replies("termy", 10)
                 .map(|served| served.value)
                 .unwrap_or_default();
+        }
+        if self.desk.mentions_posts.is_empty() {
+            self.desk.mentions_posts = self.mentions_posts.clone();
+        }
+        if self.desk.inbox_posts.is_empty() {
+            self.desk.inbox_posts = self.inbox_posts.clone();
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
@@ -1452,7 +1604,13 @@ impl XPanel {
             XSection::Trends => self.fetched_at.trends,
             XSection::Lookup => self.fetched_at.lookup,
             XSection::Research => self.fetched_at.research,
-            XSection::Compose | XSection::Help => return true,
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze => return true,
         };
         matches!(
             at,
@@ -1464,12 +1622,19 @@ impl XPanel {
         match section {
             XSection::Timeline => !self.feed_posts().is_empty(),
             XSection::Search => !self.search_posts.is_empty(),
-            XSection::Mentions => !self.mentions_posts.is_empty(),
-            XSection::Inbox => !self.inbox_posts.is_empty(),
+            XSection::Mentions => !self.desk.mentions_posts.is_empty(),
+            XSection::Inbox => !self.desk.inbox_posts.is_empty(),
             XSection::Trends => !self.trends.is_empty(),
             XSection::Lookup => self.profile.is_some(),
             XSection::Research => !self.research.is_empty(),
             XSection::Compose | XSection::Help => true,
+            XSection::Feeds => {
+                !self.desk.feed_posts.is_empty() || !self.desk.feed_store.feeds.is_empty()
+            }
+            XSection::Stats => self.desk.stats.is_some(),
+            XSection::Followers => self.desk.follower_diff.is_some(),
+            XSection::Queue => !self.desk.queue.is_empty(),
+            XSection::Analyze => self.desk.analyze.is_some(),
         }
     }
 
@@ -1485,6 +1650,11 @@ impl XPanel {
             XSection::Compose,
             XSection::Research,
             XSection::Help,
+            XSection::Feeds,
+            XSection::Stats,
+            XSection::Followers,
+            XSection::Queue,
+            XSection::Analyze,
             XSection::Timeline,
         ] {
             self.open_section(section, cx);
@@ -2150,11 +2320,13 @@ impl XPanel {
             self.confirm = false;
             return;
         }
-        self.confirm_reply_to = None;
-        self.confirm_reply_author.clear();
-        self.intent_urls = termy_x::publish::intent_urls(&parts, None);
+        self.intent_urls = termy_x::publish::intent_urls(&parts, self.confirm_reply_to.as_deref());
         self.intent_index = 0;
-        if self.media.is_empty() {
+        if self.confirm_reply_to.is_some() {
+            self.notice = Some(
+                "Confirm this reply. Nothing posts until Post now. Dry run never sends.".into(),
+            );
+        } else if self.media.is_empty() {
             self.notice = Some("Confirm exact text before anything posts.".into());
         } else {
             let names: Vec<String> = self
@@ -2211,6 +2383,569 @@ impl XPanel {
         self.compose_focused = false;
         self.ui_focus = UiFocus::ConfirmNext;
         self.pending_focus = true;
+    }
+
+    fn me_handle(&self) -> Option<String> {
+        match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.clone()),
+            _ => {
+                if !self.live {
+                    Some("termy".into())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn live_config(&self) -> XConfig {
+        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+    }
+
+    fn arm_confirm_reply(&mut self, text: &str, reply_to: &str, queue_id: Option<String>) {
+        self.compose = text.to_string();
+        self.caret = self.compose.len();
+        self.sel_anchor = None;
+        self.confirm_reply_to = Some(reply_to.to_string());
+        self.confirm_queue_id = queue_id;
+        self.arm_confirm();
+    }
+
+    fn refresh_desk(&mut self, section: XSection, cx: &mut Context<Self>) {
+        match section {
+            XSection::Inbox => self.load_inbox(cx),
+            XSection::Mentions => self.load_mentions(cx),
+            XSection::Feeds => {
+                self.status = "feeds \u{b7} add a topic, then Run \u{b7} nothing posts".into();
+                cx.notify();
+            }
+            XSection::Stats => {
+                self.status = "stats \u{b7} Load reads your tweets \u{b7} never posts".into();
+                cx.notify();
+            }
+            XSection::Followers => {
+                self.desk.follower_diff = termy_x::followers::diff_latest(&self.desk.follower_log);
+                self.status = "followers \u{b7} snapshot only when you click Snapshot".into();
+                cx.notify();
+            }
+            XSection::Queue => {
+                self.status = "queue \u{b7} Send opens Confirm \u{b7} nothing auto-posts".into();
+                cx.notify();
+            }
+            XSection::Analyze => {
+                self.status = "analyze \u{b7} type a handle and press Enter".into();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn load_inbox(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.inbox_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading inbox for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().inbox_posts(&me, 20)
+                    } else {
+                        MockProvider
+                            .search(&termy_x::inbox::to_me_query(&me), true, 8)
+                            .map(|s| termy_x::model::Served {
+                                value: s.value,
+                                status: s.status,
+                            })
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        panel.desk.inbox_posts = served.value;
+                        panel.desk.inbox_error = None;
+                        panel.status = format!(
+                            "inbox \u{b7} {} item(s) \u{b7} {}",
+                            panel.desk.inbox_posts.len(),
+                            served.status.render()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.inbox_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("inbox \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_mentions(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.mentions_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading mentions of @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().mentions_posts(&me, 20)
+                    } else {
+                        MockProvider.search(&format!("@{me}"), true, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        panel.desk.mentions_posts = served.value;
+                        panel.desk.mentions_error = None;
+                        panel.status = format!(
+                            "mentions \u{b7} {} \u{b7} {}",
+                            panel.desk.mentions_posts.len(),
+                            panel.list_sort.label()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.mentions_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "mentions \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inbox_mark(&mut self, id: &str, done: bool, cx: &mut Context<Self>) {
+        let state = if done {
+            termy_x::inbox::InboxState::Done
+        } else {
+            termy_x::inbox::InboxState::Waiting
+        };
+        termy_x::inbox::mark(&mut self.desk.inbox_store, id, state);
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_inbox(&config) {
+            self.notice = Some(error);
+        } else {
+            self.status = format!("inbox {id} \u{b7} {}", state.as_str());
+        }
+        cx.notify();
+    }
+
+    fn inbox_ai_draft(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if self.desk.loading {
+            self.notice = Some("Already drafting \u{2014} wait for it.".into());
+            cx.notify();
+            return;
+        }
+        let idea = termy_x::inbox::draft_idea(post);
+        let reply_to = post.id.clone();
+        self.desk.loading = true;
+        self.desk.drafts_for = Some(reply_to.clone());
+        self.notice = Some("Drafting a reply \u{2014} nothing will be posted.".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let config =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let http = termy_x::io::UreqHttp::default();
+                    termy_x::ai::draft_variants(
+                        &config,
+                        &http,
+                        &idea,
+                        termy_x::model::Tone::Reply,
+                        3,
+                    )
+                    .map(|mut drafts| {
+                        for draft in &mut drafts {
+                            draft.reply_to = Some(reply_to.clone());
+                        }
+                        let _ =
+                            termy_x::drafts::upsert_drafts(&config.drafts_path(), drafts.clone());
+                        drafts
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                match result {
+                    Ok(drafts) => {
+                        panel.variants = drafts.clone();
+                        if let Some(first) = drafts.first() {
+                            panel.compose = first.text.clone();
+                            panel.caret = panel.compose.len();
+                        }
+                        panel.notice =
+                            Some("Draft ready. Reply opens Confirm. Nothing was posted.".into());
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "AI draft failed ({error}). Templates still work from Compose."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_feed_from_fields(&mut self, cx: &mut Context<Self>) {
+        let query = self.desk.feed_query.trim().to_string();
+        if query.is_empty() {
+            self.notice = Some("Type a topic first, then Add.".into());
+            cx.notify();
+            return;
+        }
+        let (lang, age, words, accounts) =
+            termy_x::feeds::parse_filter_line(&self.desk.feed_filter);
+        let feed = termy_x::feeds::add_feed(
+            &mut self.desk.feed_store,
+            termy_x::feeds::EngageFeed {
+                id: String::new(),
+                query,
+                lang,
+                max_age_hours: age,
+                muted_words: words,
+                muted_accounts: accounts,
+            },
+        );
+        self.desk.feed_selected = Some(feed.id.clone());
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_feeds(&config) {
+            self.notice = Some(error);
+        } else {
+            self.notice = Some(format!("Saved feed {} \u{b7} {}", feed.id, feed.query));
+            self.desk.feed_query.clear();
+        }
+        cx.notify();
+    }
+
+    fn run_selected_feed(&mut self, cx: &mut Context<Self>) {
+        let Some(feed) = self.desk.selected_feed().cloned() else {
+            self.notice = Some("Add or select a feed first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        let query = termy_x::feeds::search_query(&feed);
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("searching {query}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().search(&query, true, 20)
+                    } else {
+                        MockProvider.search(&query, true, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        let now = termy_x::time::unix_now();
+                        if let Some(feed) = panel.desk.selected_feed().cloned() {
+                            panel.desk.feed_posts =
+                                termy_x::feeds::filter_posts(&served.value, &feed, now);
+                        } else {
+                            panel.desk.feed_posts = served.value;
+                        }
+                        panel.desk.feed_error = None;
+                        panel.status = format!(
+                            "feed \u{b7} {} shown after filters",
+                            panel.desk.feed_posts.len()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.feed_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("feed \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_stats(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.stats_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            return;
+        }
+        let days = self.desk.stats_days;
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading stats for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().tweets(&me, 80)
+                    } else {
+                        MockProvider.tweets(&me, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        let now = termy_x::time::unix_now();
+                        panel.desk.stats = Some(termy_x::analytics_stats::compare_periods(
+                            &served.value,
+                            now,
+                            days,
+                        ));
+                        panel.desk.stats_heat =
+                            Some(termy_x::analytics_stats::heatmap(&served.value));
+                        panel.desk.stats_top =
+                            termy_x::analytics_stats::top_posts(&served.value, 5);
+                        panel.desk.stats_error = None;
+                        panel.status = format!("stats \u{b7} {} tweets", served.value.len());
+                    }
+                    Err(error) => {
+                        panel.desk.stats_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("stats \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn snapshot_followers(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.follower_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("snapshotting followers for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        let me_fetch = me.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().followers(&me_fetch, 200)
+                    } else {
+                        MockProvider.followers(&me_fetch, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        termy_x::followers::append_snapshot(
+                            &mut panel.desk.follower_log,
+                            termy_x::followers::make_snapshot(&me, served.value, None),
+                        );
+                        let config =
+                            termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                        if let Err(error) = panel.desk.persist_followers(&config) {
+                            panel.desk.follower_error = Some(error);
+                        } else {
+                            panel.desk.follower_error = None;
+                        }
+                        panel.desk.follower_diff =
+                            termy_x::followers::diff_latest(&panel.desk.follower_log);
+                        panel.status = "followers \u{b7} snapshot saved".into();
+                    }
+                    Err(error) => {
+                        panel.desk.follower_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "followers \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn queue_add_from_fields(&mut self, cx: &mut Context<Self>) {
+        let item =
+            termy_x::queue::make_item(&self.desk.queue_text, &self.desk.queue_reply_to, "", None);
+        if let Err(error) = termy_x::queue::enqueue(&mut self.desk.queue, item) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_queue(&config) {
+            self.notice = Some(error);
+        } else {
+            self.desk.queue_text.clear();
+            self.notice = Some("Queued. Send opens Confirm \u{2014} nothing posted.".into());
+        }
+        cx.notify();
+    }
+
+    fn queue_from_post(&mut self, post: &Post, cx: &mut Context<Self>) {
+        let text = if self.compose.trim().is_empty() {
+            String::new()
+        } else {
+            self.compose.trim().to_string()
+        };
+        if text.is_empty() {
+            self.notice =
+                Some("Write a draft first (AI draft or type in Compose), then Queue.".into());
+            cx.notify();
+            return;
+        }
+        let item = termy_x::queue::make_item(
+            &text,
+            &post.id,
+            &post.author_handle,
+            Some(post.card_text().to_string()),
+        );
+        if let Err(error) = termy_x::queue::enqueue(&mut self.desk.queue, item) {
+            self.notice = Some(error);
+        } else {
+            let config = self.live_config();
+            let _ = self.desk.persist_queue(&config);
+            self.notice = Some("Queued. Open Queue and click Send to confirm.".into());
+        }
+        cx.notify();
+    }
+
+    fn run_analyze(&mut self, cx: &mut Context<Self>) {
+        let handle = termy_x::model::strip_handle(&self.desk.analyze_handle).to_string();
+        if handle.is_empty() {
+            self.notice = Some("Type a handle first.".into());
+            cx.notify();
+            return;
+        }
+        if self.desk.loading {
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("analyzing @{handle}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        let handle_fetch = handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        let service = XPanel::service_free();
+                        let profile = service.lookup(&handle_fetch).ok().map(|s| s.value);
+                        let posts = match service.tweets(&handle_fetch, 80) {
+                            Ok(served) if !served.value.is_empty() => served.value,
+                            _ => profile
+                                .as_ref()
+                                .map(|p| p.posts.clone())
+                                .unwrap_or_default(),
+                        };
+                        Ok::<_, String>((profile, posts))
+                    } else {
+                        let profile = MockProvider.lookup(&handle_fetch).ok().map(|s| s.value);
+                        let posts = MockProvider
+                            .tweets(&handle_fetch, 8)
+                            .map(|s| s.value)
+                            .unwrap_or_default();
+                        Ok::<_, String>((profile, posts))
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok((profile, posts)) => {
+                        panel.desk.analyze = Some(termy_x::analytics_stats::account_report(
+                            &handle,
+                            profile.as_ref(),
+                            &posts,
+                            termy_x::time::unix_now(),
+                            14,
+                        ));
+                        panel.desk.analyze_error = None;
+                        panel.status = format!("analyze \u{b7} @{handle} \u{b7} 14 days");
+                    }
+                    Err(error) => {
+                        panel.desk.analyze_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "analyze \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn accept_variant(&mut self, index: usize) {
@@ -2408,6 +3143,26 @@ impl XPanel {
         }
         if self.input_target == InputTarget::Lookup && self.section == XSection::Lookup {
             self.on_text_input_key(event, TextField::Lookup, cx);
+            return;
+        }
+        if self.input_target == InputTarget::FeedQuery && self.section == XSection::Feeds {
+            self.on_text_input_key(event, TextField::FeedQuery, cx);
+            return;
+        }
+        if self.input_target == InputTarget::FeedFilter && self.section == XSection::Feeds {
+            self.on_text_input_key(event, TextField::FeedFilter, cx);
+            return;
+        }
+        if self.input_target == InputTarget::QueueText && self.section == XSection::Queue {
+            self.on_text_input_key(event, TextField::QueueText, cx);
+            return;
+        }
+        if self.input_target == InputTarget::QueueReplyTo && self.section == XSection::Queue {
+            self.on_text_input_key(event, TextField::QueueReplyTo, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Analyze && self.section == XSection::Analyze {
+            self.on_text_input_key(event, TextField::Analyze, cx);
             return;
         }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
@@ -2660,6 +3415,11 @@ impl XPanel {
                 InputTarget::Trends => self.trends_filter.push_str(clean),
                 InputTarget::Research => self.research_input.push_str(clean),
                 InputTarget::Lookup => self.lookup.push_str(clean),
+                InputTarget::FeedQuery => self.desk.feed_query.push_str(clean),
+                InputTarget::FeedFilter => self.desk.feed_filter.push_str(clean),
+                InputTarget::QueueText => self.desk.queue_text.push_str(clean),
+                InputTarget::QueueReplyTo => self.desk.queue_reply_to.push_str(clean),
+                InputTarget::Analyze => self.desk.analyze_handle.push_str(clean),
             }
         }
         match self.input_target {
@@ -2753,6 +3513,11 @@ impl XPanel {
                     TextField::Trends => self.enter_trends_filter(cx),
                     TextField::Research => self.run_research(cx),
                     TextField::Lookup => self.run_lookup(cx),
+                    TextField::FeedQuery | TextField::FeedFilter => self.add_feed_from_fields(cx),
+                    TextField::Analyze => self.run_analyze(cx),
+                    TextField::QueueText | TextField::QueueReplyTo => {
+                        self.queue_add_from_fields(cx);
+                    }
                     _ => self.run_search(cx),
                 },
                 EnterAction::Newline => match field {
@@ -2796,6 +3561,11 @@ impl XPanel {
             TextField::Trends => &mut self.trends_filter,
             TextField::Research => &mut self.research_input,
             TextField::Lookup => &mut self.lookup,
+            TextField::FeedQuery => &mut self.desk.feed_query,
+            TextField::FeedFilter => &mut self.desk.feed_filter,
+            TextField::QueueText => &mut self.desk.queue_text,
+            TextField::QueueReplyTo => &mut self.desk.queue_reply_to,
+            TextField::Analyze => &mut self.desk.analyze_handle,
         };
         if key == "backspace" {
             target.pop();
@@ -3241,9 +4011,15 @@ impl XPanel {
         let (text, handle) = match field {
             TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
             TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
-            TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
-                return;
-            }
+            TextField::Search
+            | TextField::Trends
+            | TextField::Research
+            | TextField::Lookup
+            | TextField::FeedQuery
+            | TextField::FeedFilter
+            | TextField::QueueText
+            | TextField::QueueReplyTo
+            | TextField::Analyze => return,
         };
         let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
         let overflow = lines as f32 * 19.0 - 44.0;
@@ -3489,6 +4265,10 @@ impl XPanel {
             &mut self.search_posts,
             &mut self.mentions_posts,
             &mut self.inbox_posts,
+            &mut self.desk.inbox_posts,
+            &mut self.desk.mentions_posts,
+            &mut self.desk.feed_posts,
+            &mut self.desk.stats_top,
         ] {
             for post in list.iter_mut() {
                 apply(post);
@@ -4126,7 +4906,13 @@ fn fetch_section(
                     ),
                 };
             }
-            XSection::Compose | XSection::Help => {}
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze => {}
         }
     }
 
@@ -4208,7 +4994,13 @@ fn fetch_section(
             }],
             status: "research Â· fixture Â· no X API credits".into(),
         },
-        XSection::Compose | XSection::Help => FetchPayload::Timeline {
+        XSection::Compose
+        | XSection::Help
+        | XSection::Feeds
+        | XSection::Stats
+        | XSection::Followers
+        | XSection::Queue
+        | XSection::Analyze => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
             feed,
@@ -4240,7 +5032,8 @@ impl Render for XPanel {
         let char_limit = self.char_limit;
         // Off the Compose tab the thread math is never displayed; skip it
         // so Timeline/Search keystrokes and blink frames stay cheap.
-        let confirm_text = if self.confirm_reply_to.is_some() {
+        let confirm_text = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty()
+        {
             self.reply_text.as_str()
         } else {
             self.compose.as_str()
@@ -4531,6 +5324,7 @@ fn local_hms() -> String {
             ms: 0,
         };
         unsafe { GetLocalTime(&mut st) };
+        #[allow(clippy::needless_return)]
         return format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second);
     }
     #[cfg(not(target_os = "windows"))]
@@ -4849,7 +5643,7 @@ fn perf_log(line: &str) {
 
 impl XPanel {
     fn column_count(&self, window: &Window) -> usize {
-        if self.splash || !self.fill_window {
+        if self.splash || !self.fill_window || self.section.is_desk() {
             return 1;
         }
         let width: f32 = window.viewport_size().width.into();
@@ -5019,57 +5813,43 @@ impl XPanel {
             .flex()
             .gap(px(6.0))
             .flex_wrap()
-            .children(
-                [
-                    XSection::Timeline,
-                    XSection::Search,
-                    XSection::Mentions,
-                    XSection::Inbox,
-                    XSection::Trends,
-                    XSection::Lookup,
-                    XSection::Compose,
-                    XSection::Research,
-                    XSection::Help,
-                ]
-                .into_iter()
-                .map(move |section| {
-                    let active = section == current;
-                    div()
-                        .id(SharedString::from(format!("x-tab-{}", section.label())))
-                        .px(px(10.0))
-                        .py(px(5.0))
-                        .rounded(px(8.0))
-                        .text_size(px(12.0))
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(if active {
-                            rgb(0x7af6ff)
-                        } else {
-                            tint(0x7af6ff, 25)
-                        })
-                        .bg(if active {
-                            rgb(0x122a55)
-                        } else {
-                            tint(0x101826, 170)
-                        })
-                        .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
-                        .hover(|style| {
-                            style
-                                .bg(rgb(0x1a3050))
-                                .border_color(rgb(0xff4fa3))
-                                .text_color(rgb(0xffd0ea))
-                        })
-                        .child(section.label())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                this.open_section(section, cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )
-                }),
-            )
+            .children(XSection::all().into_iter().map(move |section| {
+                let active = section == current;
+                div()
+                    .id(SharedString::from(format!("x-tab-{}", section.label())))
+                    .px(px(10.0))
+                    .py(px(5.0))
+                    .rounded(px(8.0))
+                    .text_size(px(12.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 25)
+                    })
+                    .bg(if active {
+                        rgb(0x122a55)
+                    } else {
+                        tint(0x101826, 170)
+                    })
+                    .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0x1a3050))
+                            .border_color(rgb(0xff4fa3))
+                            .text_color(rgb(0xffd0ea))
+                    })
+                    .child(section.label())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.open_section(section, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            }))
             .child(refresh_btn)
     }
 
@@ -5487,6 +6267,591 @@ impl XPanel {
         rows
     }
 
+    fn desk_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        match self.section {
+            XSection::Inbox => self.inbox_rows(cx),
+            XSection::Mentions => self.mentions_rows(cx),
+            XSection::Feeds => self.feeds_rows(cx),
+            XSection::Stats => self.stats_rows(cx),
+            XSection::Followers => self.followers_rows(cx),
+            XSection::Queue => self.queue_rows(cx),
+            XSection::Analyze => self.analyze_rows(cx),
+            _ => Vec::new(),
+        }
+    }
+
+    fn inbox_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Replies and mentions that still need a response. Waiting/Done is local. Reply opens Confirm. Nothing auto-posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(6.0))
+                .flex_wrap()
+                .child(x_button!(
+                    "x-inbox-load",
+                    if self.desk.loading {
+                        "Loading\u{2026}"
+                    } else {
+                        "Load inbox"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.load_inbox(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-waiting",
+                    "Waiting",
+                    self.desk.inbox_filter == desk::InboxFilter::Waiting,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::Waiting;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-done",
+                    "Done",
+                    self.desk.inbox_filter == desk::InboxFilter::Done,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::Done;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-all",
+                    "All",
+                    self.desk.inbox_filter == desk::InboxFilter::All,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::All;
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.inbox_error {
+            rows.push(hint(error.clone()));
+        }
+        let mut items = self.desk.visible_inbox();
+        items
+            .sort_by(|(left, _), (right, _)| termy_x::sort::cmp_posts(left, right, self.list_sort));
+        if items.is_empty() && !self.desk.loading {
+            rows.push(empty_state(
+                "Inbox is empty",
+                "Load inbox to pull notifications and to:you search. Empty is not an error.",
+            ));
+        }
+        for (post, state) in items {
+            rows.push(self.tweet_card(&post, cx));
+            let id = post.id.clone();
+            let id_done = id.clone();
+            let post_ai = post.clone();
+            let post_reply = post.clone();
+            let post_q = post.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .flex_wrap()
+                    .child(hint(format!("state \u{b7} {}", state.as_str())))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-mark-{id_done}")),
+                        if state == termy_x::inbox::InboxState::Done {
+                            "Waiting"
+                        } else {
+                            "Done"
+                        },
+                        cx.listener(move |this, _, _, cx| {
+                            this.inbox_mark(&id, state != termy_x::inbox::InboxState::Done, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-ai-{}", post_ai.id)),
+                        "AI draft",
+                        cx.listener(move |this, _, _, cx| {
+                            this.inbox_ai_draft(&post_ai, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-reply-{}", post_reply.id)),
+                        "Reply",
+                        cx.listener(move |this, _, _, cx| {
+                            let text = this.compose.clone();
+                            this.arm_confirm_reply(&text, &post_reply.id, None);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-queue-{}", post_q.id)),
+                        "Queue",
+                        cx.listener(move |this, _, _, cx| {
+                            this.queue_from_post(&post_q, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn mentions_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(format!(
+            "Posts that mention you. Sort: {} (key {}).",
+            self.list_sort.label(),
+            termy_x::LIST_SORT_KEY
+        )));
+        rows.push(
+            x_button!(
+                "x-mentions-load",
+                if self.desk.loading {
+                    "Loading\u{2026}"
+                } else {
+                    "Load mentions"
+                },
+                cx.listener(|this, _, _, cx| {
+                    this.load_mentions(cx);
+                    cx.stop_propagation();
+                })
+            )
+            .into_any_element(),
+        );
+        if let Some(error) = &self.desk.mentions_error {
+            rows.push(hint(error.clone()));
+        }
+        if self.desk.mentions_posts.is_empty() && !self.desk.loading {
+            rows.push(empty_state(
+                "No mentions yet",
+                "Load mentions runs search @you. Empty is not an error.",
+            ));
+        }
+        for post in self.sorted_posts(&self.desk.mentions_posts) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn feeds_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Keyword feeds with local filters (language, max age, muted words/accounts). Filters persist. Nothing posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::FeedQuery, cx))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::FeedFilter, cx))
+                .child(x_button!(
+                    "x-feed-add",
+                    "Add",
+                    cx.listener(|this, _, _, cx| {
+                        this.add_feed_from_fields(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-feed-run",
+                    if self.desk.loading {
+                        "Running\u{2026}"
+                    } else {
+                        "Run"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.run_selected_feed(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if self.desk.feed_store.feeds.is_empty() {
+            rows.push(empty_state(
+                "No feeds yet",
+                "Type a topic, optional lang:en age:24 mute:spam @acct, then Add.",
+            ));
+        }
+        for feed in &self.desk.feed_store.feeds {
+            let id = feed.id.clone();
+            let id_sel = id.clone();
+            let id_rm = id.clone();
+            let selected = self.desk.feed_selected.as_deref() == Some(id.as_str());
+            rows.push(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .flex_wrap()
+                    .items_center()
+                    .child(x_button!(
+                        SharedString::from(format!("x-feed-sel-{id_sel}")),
+                        format!("{} \u{b7} {}", feed.query, feed.id),
+                        selected,
+                        cx.listener(move |this, _, _, cx| {
+                            this.desk.feed_selected = Some(id_sel.clone());
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-feed-rm-{id_rm}")),
+                        "Remove",
+                        cx.listener(move |this, _, _, cx| {
+                            termy_x::feeds::remove_feed(&mut this.desk.feed_store, &id_rm);
+                            let config = this.live_config();
+                            let _ = this.desk.persist_feeds(&config);
+                            cx.notify();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = &self.desk.feed_error {
+            rows.push(hint(error.clone()));
+        }
+        for post in self.sorted_posts(&self.desk.feed_posts) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn stats_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Per-day posts/likes/replies/reposts/views vs the prior window. Best-hour heatmap. Top posts. Read-only.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(6.0))
+                .child(x_button!(
+                    "x-stats-7",
+                    "7 days",
+                    self.desk.stats_days == 7,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 7;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-14",
+                    "14 days",
+                    self.desk.stats_days == 14,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 14;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-30",
+                    "30 days",
+                    self.desk.stats_days == 30,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 30;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-load",
+                    if self.desk.loading {
+                        "Loading\u{2026}"
+                    } else {
+                        "Load stats"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.load_stats(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.stats_error {
+            rows.push(hint(error.clone()));
+        }
+        if let Some(cmp) = &self.desk.stats {
+            rows.push(card(
+                format!("Last {}d vs prior {}d", cmp.days, cmp.days),
+                format!(
+                    "posts {} ({:+.1}%)\nlikes {} ({:+.1}%)\nreplies {} ({:+.1}%)\nreposts {} ({:+.1}%)\nviews {} ({:+.1}%)",
+                    cmp.current.posts,
+                    cmp.delta_pct.posts,
+                    cmp.current.likes,
+                    cmp.delta_pct.likes,
+                    cmp.current.replies,
+                    cmp.delta_pct.replies,
+                    cmp.current.reposts,
+                    cmp.delta_pct.reposts,
+                    cmp.current.views,
+                    cmp.delta_pct.views
+                ),
+            ));
+            for day in &cmp.current.days {
+                if day.posts == 0 {
+                    continue;
+                }
+                rows.push(hint(format!(
+                    "{} \u{b7} {} posts \u{b7} {} likes \u{b7} {} replies \u{b7} {} reposts \u{b7} {} views",
+                    day.day, day.posts, day.likes, day.replies, day.reposts, day.views
+                )));
+            }
+        }
+        if let Some(heat) = &self.desk.stats_heat {
+            if let Some(best) = &heat.best {
+                rows.push(hint(format!(
+                    "best hour \u{b7} {} \u{b7} engagement {}",
+                    best.label(),
+                    best.engagement
+                )));
+            }
+            rows.push(self.heatmap_grid(heat));
+        }
+        if self.desk.stats_top.is_empty() && self.desk.stats.is_none() && !self.desk.loading {
+            rows.push(empty_state(
+                "No stats yet",
+                "Load stats reads your tweets via OpenCLI. Empty is not an error.",
+            ));
+        }
+        for post in self.sorted_posts(&self.desk.stats_top) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn heatmap_grid(&self, heat: &termy_x::analytics_stats::Heatmap) -> gpui_kit::AnyElement {
+        let max = heat
+            .cells
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        const DAYS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
+        let mut col = div().flex().flex_col().gap(px(2.0));
+        for (wd, row) in heat.cells.iter().enumerate() {
+            let mut line = div().flex().gap(px(2.0)).items_center().child(
+                div()
+                    .w(px(12.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(DAYS[wd]),
+            );
+            for value in row {
+                let t = (*value as f32 / max as f32).clamp(0.0, 1.0);
+                let alpha = (40.0 + t * 200.0) as u8;
+                line = line.child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(10.0))
+                        .rounded(px(2.0))
+                        .bg(tint(0x7af6ff, alpha)),
+                );
+            }
+            col = col.child(line);
+        }
+        col.into_any_element()
+    }
+
+    fn followers_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Snapshot writes a local JSON copy. Diff is latest vs previous. Never follows or unfollows.".into(),
+        ));
+        rows.push(
+            x_button!(
+                "x-followers-snap",
+                if self.desk.loading {
+                    "Snapshot\u{2026}"
+                } else {
+                    "Snapshot"
+                },
+                cx.listener(|this, _, _, cx| {
+                    this.snapshot_followers(cx);
+                    cx.stop_propagation();
+                })
+            )
+            .into_any_element(),
+        );
+        if let Some(error) = &self.desk.follower_error {
+            rows.push(hint(error.clone()));
+        }
+        match &self.desk.follower_diff {
+            None => rows.push(empty_state(
+                "No snapshot yet",
+                "Click Snapshot. A snapshot is never taken automatically.",
+            )),
+            Some(diff) => {
+                rows.push(card(
+                    format!(
+                        "@{} \u{b7} {} now \u{b7} {} before",
+                        diff.handle, diff.latest_count, diff.previous_count
+                    ),
+                    format!(
+                        "taken {} \u{b7} previous {}",
+                        diff.latest_at,
+                        diff.previous_at.as_deref().unwrap_or("none")
+                    ),
+                ));
+                rows.push(hint(format!("new ({})", diff.new.len())));
+                for row in &diff.new {
+                    rows.push(hint(format!("+ @{} {}", row.handle, row.name)));
+                }
+                rows.push(hint(format!("unfollowed ({})", diff.gone.len())));
+                for row in &diff.gone {
+                    rows.push(hint(format!("- @{} {}", row.handle, row.name)));
+                }
+            }
+        }
+        rows
+    }
+
+    fn queue_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Drafted replies wait here. Send opens Confirm. Remove drops the item. Nothing auto-posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::QueueReplyTo, cx))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::QueueText, cx))
+                .child(x_button!(
+                    "x-queue-add",
+                    "Add",
+                    cx.listener(|this, _, _, cx| {
+                        this.queue_add_from_fields(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if self.desk.queue.is_empty() {
+            rows.push(empty_state(
+                "Queue is empty",
+                "Add a reply id + text, or Queue from Inbox after an AI draft.",
+            ));
+        }
+        for item in &self.desk.queue {
+            let id_send = item.id.clone();
+            let id_rm = item.id.clone();
+            let send_item = item.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(card(
+                        format!(
+                            "{} \u{b7} reply to {} @{}",
+                            item.id, item.reply_to, item.author
+                        ),
+                        item.text.clone(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                SharedString::from(format!("x-queue-send-{id_send}")),
+                                "Send",
+                                cx.listener(move |this, _, _, cx| {
+                                    this.arm_confirm_reply(
+                                        &send_item.text,
+                                        &send_item.reply_to,
+                                        Some(send_item.id.clone()),
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                SharedString::from(format!("x-queue-rm-{id_rm}")),
+                                "Remove",
+                                cx.listener(move |this, _, _, cx| {
+                                    termy_x::queue::remove_item(&mut this.desk.queue, &id_rm);
+                                    let config = this.live_config();
+                                    let _ = this.desk.persist_queue(&config);
+                                    cx.notify();
+                                })
+                            )),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn analyze_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Enter any handle for a 14-day read: posts/day, avg engagement, best hours, top posts, reply ratio.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::Analyze, cx))
+                .child(x_button!(
+                    "x-analyze-run",
+                    if self.desk.loading {
+                        "Reading\u{2026}"
+                    } else {
+                        "Analyze"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.run_analyze(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.analyze_error {
+            rows.push(hint(error.clone()));
+        }
+        if let Some(report) = &self.desk.analyze {
+            rows.push(card(
+                format!("@{} \u{b7} {}d", report.handle, report.days),
+                format!(
+                    "{} posts ({:.2}/day)\navg engagement {:.1}\nreply ratio {:.0}%",
+                    report.posts,
+                    report.posts_per_day,
+                    report.avg_engagement,
+                    report.reply_ratio * 100.0
+                ),
+            ));
+            if !report.best_hours.is_empty() {
+                let hours: Vec<String> = report.best_hours.iter().map(|h| h.label()).collect();
+                rows.push(hint(format!("best hours \u{b7} {}", hours.join(", "))));
+            }
+            rows.push(self.heatmap_grid(&report.heatmap));
+            for post in &report.top_posts {
+                rows.push(self.tweet_card(post, cx));
+            }
+        } else if !self.desk.loading {
+            rows.push(empty_state(
+                "No report yet",
+                "Type a handle and press Enter. Empty tweets are shown as an empty report, not a crash.",
+            ));
+        }
+        rows
+    }
+
     fn body(
         &self,
         weighted: usize,
@@ -5576,24 +6941,17 @@ impl XPanel {
                     }
                 }
             }
-            XSection::Mentions => {
-                rows.extend(self.named_post_list(
-                    "Mentions",
-                    "Tweets that mention you. OpenCLI search @you \u{b7} nothing posts.",
-                    &self.mentions_posts,
-                    cx,
-                ));
-            }
-            XSection::Inbox => {
-                rows.extend(self.named_post_list(
-                    "Inbox",
-                    "Replies directed at you. OpenCLI search to:you \u{b7} nothing posts.",
-                    &self.inbox_posts,
-                    cx,
-                ));
-            }
             XSection::Trends => {
                 rows.extend(self.trends_rows(cx));
+            }
+            XSection::Inbox
+            | XSection::Mentions
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze => {
+                rows.extend(self.desk_rows(cx));
             }
             XSection::Lookup => {
                 let me_handle = match &self.connection {
@@ -5766,7 +7124,7 @@ impl XPanel {
                 rows.push(card(
                     "Keys".into(),
                     format!(
-                        "{key}  Popular / Newest sort (every list, including nested replies)\nEsc  Back / close overlay / cancel confirm\nTab  Cycle compose controls\nEnter  Run Search / Lookup / Research\nCtrl+Shift+X  Open / close this panel",
+                        "{key}  Popular / Newest sort (every list, including nested replies and desk lists)\nEsc  Back / close overlay / cancel confirm\nTab  Cycle compose controls\nEnter  Run Search / Lookup / Research / desk fields\nCtrl+Shift+X  Open / close this panel",
                         key = termy_x::LIST_SORT_KEY
                     ),
                 ));
@@ -5776,11 +7134,15 @@ impl XPanel {
                 ));
                 rows.push(card(
                     "Writes".into(),
-                    "Nothing posts, likes, or follows until you Confirm. Preview/mock never writes.".into(),
+                    "Nothing posts, likes, or follows until you Confirm. Preview/mock never writes. Inbox Reply and Queue Send open the same confirm screen.".into(),
+                ));
+                rows.push(card(
+                    "Desk".into(),
+                    "Inbox has Waiting/Done, AI draft, Reply (confirm), and Queue. Feeds filter by language, age, and mute. Followers snapshot is click-only. Analyze is a 14-day read of any handle.".into(),
                 ));
                 rows.push(card(
                     "Stats".into(),
-                    "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. Follower count is the profile payload, never len() of a capped followers page.".into(),
+                    "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. The Stats tab compares per-day engagement vs the prior window with a best-hour heatmap. Follower count is the profile payload, never len() of a capped followers page.".into(),
                 ));
             }
         }
@@ -6283,7 +7645,7 @@ impl XPanel {
             if let Ok(handle) = HasWindowHandle::window_handle(window)
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
-                self.host_hwnd = win32.hwnd.get() as isize;
+                self.host_hwnd = win32.hwnd.get();
             }
         }
         let viewport = window.viewport_size();
@@ -6883,7 +8245,7 @@ impl XPanel {
             if let Ok(handle) = HasWindowHandle::window_handle(window)
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
-                self.autoscroll_hwnd = win32.hwnd.get() as isize;
+                self.autoscroll_hwnd = win32.hwnd.get();
             }
             self.autoscroll_scale = window.scale_factor();
         }
@@ -7724,6 +9086,46 @@ impl XPanel {
                 "caret-lookup",
                 InputTarget::Lookup,
             ),
+            TextField::FeedQuery => (
+                self.desk.feed_query.as_str(),
+                "Topic or keyword \u{2014} Add saves the feed",
+                "glow-feed-query",
+                "x-feed-query",
+                "caret-feed-query",
+                InputTarget::FeedQuery,
+            ),
+            TextField::FeedFilter => (
+                self.desk.feed_filter.as_str(),
+                "lang:en age:24 mute:spam @acct",
+                "glow-feed-filter",
+                "x-feed-filter",
+                "caret-feed-filter",
+                InputTarget::FeedFilter,
+            ),
+            TextField::QueueText => (
+                self.desk.queue_text.as_str(),
+                "Draft reply text \u{2014} never sent until Send",
+                "glow-queue-text",
+                "x-queue-text",
+                "caret-queue-text",
+                InputTarget::QueueText,
+            ),
+            TextField::QueueReplyTo => (
+                self.desk.queue_reply_to.as_str(),
+                "Tweet id or URL to reply to",
+                "glow-queue-reply",
+                "x-queue-reply",
+                "caret-queue-reply",
+                InputTarget::QueueReplyTo,
+            ),
+            TextField::Analyze => (
+                self.desk.analyze_handle.as_str(),
+                "@handle \u{2014} Enter runs a 14-day read",
+                "glow-analyze",
+                "x-analyze-input",
+                "caret-analyze",
+                InputTarget::Analyze,
+            ),
             TextField::Reply | TextField::Quote => {
                 unreachable!("reply/quote use the multi-line small editor")
             }
@@ -8501,6 +9903,7 @@ impl XPanel {
                                     this.confirm = false;
                                     this.confirm_reply_to = None;
                                     this.confirm_reply_author.clear();
+                                    this.confirm_queue_id = None;
                                     this.focus_compose_editor();
                                     this.pending_focus = true;
                                     cx.stop_propagation();
@@ -8514,6 +9917,16 @@ impl XPanel {
                                 cx.listener(|this, _, _, cx| {
                                     this.ui_focus = UiFocus::ConfirmCopy;
                                     this.copy_current_part(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-dry-run",
+                                "Dry run",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.dry_run_async(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 })
@@ -8549,7 +9962,7 @@ impl XPanel {
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
         let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
             .char_limit_or_fallback();
-        let source = if self.confirm_reply_to.is_some() {
+        let source = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
             self.reply_text.as_str()
         } else {
             self.compose.as_str()
@@ -8581,7 +9994,8 @@ impl XPanel {
             return;
         }
         let reply_to = self.confirm_reply_to.clone();
-        let media = if reply_to.is_some() {
+        let thread_reply = reply_to.is_some() && !self.reply_text.trim().is_empty();
+        let media = if thread_reply {
             self.reply_media.clone()
         } else {
             self.media.clone()
@@ -8591,7 +10005,7 @@ impl XPanel {
             cx.notify();
             return;
         }
-        let text = if reply_to.is_some() {
+        let text = if thread_reply {
             self.reply_text.trim().to_string()
         } else {
             self.compose.trim().to_string()
@@ -8601,6 +10015,7 @@ impl XPanel {
             cx.notify();
             return;
         }
+        let queue_id = self.confirm_queue_id.clone();
         self.posting = true;
         self.notice = Some(if media.is_empty() {
             "Posting in-app via your X session… no browser will open.".into()
@@ -8687,12 +10102,87 @@ impl XPanel {
                             panel.pending_focus = true;
                             panel.begin_post_burst(BurstTarget::Compose, cx);
                         }
+                        if let Some(id) = &queue_id {
+                            termy_x::queue::remove_item(&mut panel.desk.queue, id);
+                            let config = termy_x::config::XConfig::load(
+                                &termy_x::config::default_config_dir(),
+                            );
+                            let _ = panel.desk.persist_queue(&config);
+                        }
+                        panel.confirm_queue_id = None;
                     }
                     Err(error) => {
                         // Stay on confirm so the user can retry or explicitly
                         // choose 'Open in browser'. Nothing auto-opens.
                         panel.notice = Some(format!(
                             "Could not post in-app: {} Nothing was posted; no browser opened.",
+                            termy_x::publish::humanize_error(&error)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn dry_run_async(&mut self, cx: &mut Context<Self>) {
+        let text = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
+            self.reply_text.trim().to_string()
+        } else {
+            self.compose.trim().to_string()
+        };
+        if text.is_empty() {
+            self.notice = Some("Type something before Dry run.".into());
+            cx.notify();
+            return;
+        }
+        let reply_to = self.confirm_reply_to.clone();
+        let media = self.media.clone();
+        self.notice = Some("Dry run \u{2014} building the plan. Nothing will be posted.".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err("No publish path to plan against.".to_string());
+                    };
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        reply_to.as_deref(),
+                        termy_x::publish::ConfirmDecision::Yes,
+                        true,
+                        publisher,
+                        char_limit,
+                        &media,
+                    ) {
+                        termy_x::publish::GateOutcome::DryRun { plan } => Ok(plan),
+                        other => Err(format!("expected dry-run, got {other:?}")),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                match result {
+                    Ok(plan) => {
+                        panel.notice = Some(format!(
+                            "Dry run \u{2014} {} part(s), {} weighted, provider {}. Nothing was posted.",
+                            plan.parts.len(),
+                            plan.count.weighted,
+                            plan.provider.label()
+                        ));
+                        panel.status = "dry run \u{b7} nothing posted".into();
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Dry run failed: {} Nothing was posted.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
@@ -9033,6 +10523,9 @@ mod edit_keys_tests {
         assert_eq!(enter_action(TextField::Trends), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Research), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Lookup), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::FeedQuery), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::QueueText), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Analyze), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Reply), EnterAction::Newline);
         assert_eq!(enter_action(TextField::Quote), EnterAction::Newline);
         // Focus routing matrix: panel must actually hold focus before

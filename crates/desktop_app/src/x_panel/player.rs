@@ -297,6 +297,7 @@ mod win {
         stop_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         progress: std::sync::Arc<std::sync::Mutex<(f64, f64)>>,
         shared_rect: std::sync::Arc<std::sync::Mutex<(i32, i32, i32, i32)>>,
+        #[allow(dead_code)]
         poll: Option<std::thread::JoinHandle<()>>,
     }
     // HWND is owned by this (UI-spawned) player; Termy drives it from the UI thread.

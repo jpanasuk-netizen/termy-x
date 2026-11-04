@@ -5,6 +5,7 @@
 //! Publishing falls through OpenCLI, twitter-cli, then an X web intent.
 
 pub mod ai;
+pub mod analytics_stats;
 pub mod auth;
 pub mod bulk;
 pub mod cli;
@@ -13,6 +14,9 @@ pub mod connect;
 pub mod doctor;
 pub mod drafts;
 pub mod feed;
+pub mod feeds;
+pub mod followers;
+pub mod inbox;
 pub mod io;
 pub mod model;
 mod parse_borrowed;
@@ -20,11 +24,13 @@ pub mod platform;
 pub mod premium;
 pub mod providers;
 pub mod publish;
+pub mod queue;
 pub mod sort;
 pub mod splash;
 pub mod stats;
 pub mod text;
 pub mod thread;
+pub mod time;
 
 pub use bulk::{
     BulkKind, BulkPlan, BulkTarget, DEFAULT_BULK_CAP, MAX_BULK_CAP, MIN_BULK_CAP, clamp_bulk_cap,
