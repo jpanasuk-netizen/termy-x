@@ -942,6 +942,7 @@ impl TerminalView {
     pub(in super::super) fn execute_input_command_action(
         &mut self,
         action: CommandAction,
+        window: Option<&Window>,
         cx: &mut Context<Self>,
     ) -> bool {
         if self.forward_edit_command_to_native_search(action) {
@@ -952,7 +953,7 @@ impl TerminalView {
         if matches!(
             action,
             CommandAction::Copy | CommandAction::Paste | CommandAction::SelectAll
-        ) && self.x_panel_handle_edit_action(action, cx)
+        ) && window.is_some_and(|w| self.x_panel_handle_edit_action(action, w, cx))
         {
             return true;
         }

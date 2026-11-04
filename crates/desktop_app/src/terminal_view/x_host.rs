@@ -1,5 +1,5 @@
 use super::*;
-use termy::x_panel::{XPanel, XSection};
+use termy::x_panel::{XPanel, XSection, edit_action_goes_to_panel};
 
 impl TerminalView {
     pub(super) fn toggle_x_panel(&mut self, cx: &mut Context<Self>) {
@@ -26,11 +26,13 @@ impl TerminalView {
         }
     }
 
-    /// Compose has focus: route Paste/Copy/SelectAll into the X panel, never the shell.
+    /// A panel text field (Compose, Search, inline reply, bearer key)
+    /// has focus: route Paste/Copy/SelectAll into the X panel, never the shell.
     /// Returns true when the action was handled (or intentionally swallowed).
     pub(super) fn x_panel_handle_edit_action(
         &mut self,
         action: CommandAction,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> bool {
         if !self.x_panel_open {
@@ -39,7 +41,14 @@ impl TerminalView {
         let Some(panel) = self.x_panel.clone() else {
             return false;
         };
-        if !panel.read(cx).owns_compose_keys() {
+        // Focus decides (Jeremy's rule): with the terminal focused the
+        // shell owns Ctrl+C (interrupt) even while the panel is open;
+        // only a focused panel's editors may intercept edit chords.
+        let (focused, owns) = {
+            let panel = panel.read(cx);
+            (panel.is_focused(window), panel.owns_edit_keys())
+        };
+        if !edit_action_goes_to_panel(self.x_panel_open, focused, owns) {
             return false;
         }
         match action {
@@ -48,9 +57,10 @@ impl TerminalView {
                 if let Some(text) = clip {
                     panel.update(cx, |panel, cx| {
                         // Idempotent with KeyDown path: insert once here if the
-                        // panel did not already receive the chord.
-                        panel.focus_compose_editor_public();
-                        panel.insert_compose_text(&text);
+                        // panel did not already receive the chord. Routes to
+                        // Compose, Search, or the open inline reply ΓÇö never
+                        // the shell behind the panel.
+                        panel.paste_active_text(&text);
                         cx.notify();
                     });
                 }
@@ -58,7 +68,7 @@ impl TerminalView {
             }
             CommandAction::Copy => {
                 panel.update(cx, |panel, cx| {
-                    if let Some(selected) = panel.compose_selection_text() {
+                    if let Some(selected) = panel.active_copy_text() {
                         cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
                     }
                 });
@@ -66,7 +76,7 @@ impl TerminalView {
             }
             CommandAction::SelectAll => {
                 panel.update(cx, |panel, cx| {
-                    panel.select_all_compose();
+                    panel.select_all_active();
                     cx.notify();
                 });
                 true
