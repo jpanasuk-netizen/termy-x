@@ -2475,6 +2475,7 @@ impl OfficialShare {
             body: None,
             bearer: Some(token),
             content_type: None,
+            headers: Vec::new(),
         })
     }
 }
@@ -2609,6 +2610,7 @@ impl Publisher for OfficialPublisher {
                 body: Some(body.to_string()),
                 bearer: Some(token.clone()),
                 content_type: Some("application/json".into()),
+                headers: Vec::new(),
             })?;
             if let Some(id) = serde_json::from_str::<Value>(&response)
                 .ok()

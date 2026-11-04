@@ -773,6 +773,8 @@ pub struct HttpRequest {
     pub body: Option<String>,
     pub bearer: Option<String>,
     pub content_type: Option<String>,
+    /// Extra request headers (e.g. Treg's `X-Treg-Token`). Never logged.
+    pub headers: Vec<(String, String)>,
 }
 
 pub trait Http: Send + Sync {
@@ -802,6 +804,9 @@ impl Http for UreqHttp {
         };
         if let Some(token) = &request.bearer {
             call = call.set("Authorization", &format!("Bearer {token}"));
+        }
+        for (name, value) in &request.headers {
+            call = call.set(name, value);
         }
         if let Some(content_type) = &request.content_type {
             call = call.set("Content-Type", content_type);

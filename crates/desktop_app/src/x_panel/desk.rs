@@ -44,6 +44,10 @@ pub struct DeskState {
     pub analyze_error: Option<String>,
     pub loading: bool,
     pub drafts_for: Option<String>,
+    pub rg: super::reply_guy_ui::RgState,
+    pub rg_topic: String,
+    pub rg_key_input: String,
+    pub rg_posts: Vec<Post>,
 }
 
 impl DeskState {
@@ -82,6 +86,10 @@ impl DeskState {
             analyze_error: None,
             loading: false,
             drafts_for: None,
+            rg: super::reply_guy_ui::RgState::new(config),
+            rg_topic: String::new(),
+            rg_key_input: String::new(),
+            rg_posts: Vec::new(),
         }
     }
 

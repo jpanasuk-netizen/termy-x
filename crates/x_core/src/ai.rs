@@ -51,6 +51,7 @@ fn model_variants(
         body: Some(body),
         bearer: config.api_key(),
         content_type: Some("application/json".into()),
+        headers: Vec::new(),
     })?;
     let text = completion_text(&response)?;
     let variants = split_variants(&text);

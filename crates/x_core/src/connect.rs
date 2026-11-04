@@ -57,6 +57,7 @@ pub fn detect_connection(
             body: None,
             bearer: Some(token),
             content_type: None,
+            headers: Vec::new(),
         }) {
             let value: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
             if let Some(handle) = value.pointer("/data/username").and_then(|v| v.as_str()) {

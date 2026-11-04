@@ -25,6 +25,7 @@ pub mod premium;
 pub mod providers;
 pub mod publish;
 pub mod queue;
+pub mod reply_guy;
 pub mod sort;
 pub mod splash;
 pub mod stats;

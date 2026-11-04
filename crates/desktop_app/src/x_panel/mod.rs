@@ -80,6 +80,7 @@ pub enum XSection {
     Followers,
     Queue,
     Analyze,
+    ReplyGuy,
 }
 
 impl XSection {
@@ -99,10 +100,11 @@ impl XSection {
             Self::Followers => "Followers",
             Self::Queue => "Queue",
             Self::Analyze => "Analyze",
+            Self::ReplyGuy => "Reply Guy",
         }
     }
 
-    fn all() -> [XSection; 14] {
+    fn all() -> [XSection; 15] {
         [
             Self::Timeline,
             Self::Search,
@@ -117,6 +119,7 @@ impl XSection {
             Self::Followers,
             Self::Queue,
             Self::Analyze,
+            Self::ReplyGuy,
             Self::Help,
         ]
     }
@@ -131,6 +134,7 @@ impl XSection {
                 | Self::Followers
                 | Self::Queue
                 | Self::Analyze
+                | Self::ReplyGuy
         )
     }
 
@@ -149,6 +153,7 @@ impl XSection {
             "followers" => Self::Followers,
             "queue" => Self::Queue,
             "analyze" => Self::Analyze,
+            "replyguy" | "reply-guy" => Self::ReplyGuy,
             _ => Self::Timeline,
         }
     }
@@ -184,6 +189,8 @@ enum InputTarget {
     QueueText,
     QueueReplyTo,
     Analyze,
+    RgTopic,
+    RgKey,
 }
 
 /// Width of the panel when docked beside the terminal (as opposed to
@@ -226,6 +233,7 @@ fn edit_keys_owned(
         InputTarget::FeedQuery | InputTarget::FeedFilter => section == XSection::Feeds,
         InputTarget::QueueText | InputTarget::QueueReplyTo => section == XSection::Queue,
         InputTarget::Analyze => section == XSection::Analyze,
+        InputTarget::RgTopic | InputTarget::RgKey => section == XSection::ReplyGuy,
     }
 }
 
@@ -321,7 +329,9 @@ fn enter_action(field: TextField) -> EnterAction {
         | TextField::FeedFilter
         | TextField::QueueText
         | TextField::QueueReplyTo
-        | TextField::Analyze => EnterAction::RunSearch,
+        | TextField::Analyze
+        | TextField::RgTopic
+        | TextField::RgKey => EnterAction::RunSearch,
         TextField::Reply | TextField::Quote => EnterAction::Newline,
     }
 }
@@ -340,6 +350,8 @@ enum TextField {
     QueueText,
     QueueReplyTo,
     Analyze,
+    RgTopic,
+    RgKey,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -724,7 +736,8 @@ fn section_slot(section: XSection) -> Option<usize> {
         | XSection::Stats
         | XSection::Followers
         | XSection::Queue
-        | XSection::Analyze => None,
+        | XSection::Analyze
+        | XSection::ReplyGuy => None,
     }
 }
 
@@ -964,7 +977,8 @@ impl XPanel {
             | XSection::Stats
             | XSection::Followers
             | XSection::Queue
-            | XSection::Analyze => {}
+            | XSection::Analyze
+            | XSection::ReplyGuy => {}
         }
         self.last_refresh = Some(local_hms());
         self.pending_top = true;
@@ -1032,6 +1046,11 @@ impl XPanel {
             XSection::Analyze => {
                 self.input_target = InputTarget::Analyze;
                 self.pending_focus = true;
+            }
+            XSection::ReplyGuy => {
+                self.input_target = InputTarget::RgTopic;
+                self.pending_focus = true;
+                self.rg_refresh_keys();
             }
             _ => {}
         }
@@ -1610,7 +1629,8 @@ impl XPanel {
             | XSection::Stats
             | XSection::Followers
             | XSection::Queue
-            | XSection::Analyze => return true,
+            | XSection::Analyze
+            | XSection::ReplyGuy => return true,
         };
         matches!(
             at,
@@ -1635,6 +1655,7 @@ impl XPanel {
             XSection::Followers => self.desk.follower_diff.is_some(),
             XSection::Queue => !self.desk.queue.is_empty(),
             XSection::Analyze => self.desk.analyze.is_some(),
+            XSection::ReplyGuy => !self.desk.rg_posts.is_empty(),
         }
     }
 
@@ -1655,6 +1676,7 @@ impl XPanel {
             XSection::Followers,
             XSection::Queue,
             XSection::Analyze,
+            XSection::ReplyGuy,
             XSection::Timeline,
         ] {
             self.open_section(section, cx);
@@ -2436,6 +2458,12 @@ impl XPanel {
                 self.status = "analyze \u{b7} type a handle and press Enter".into();
                 cx.notify();
             }
+            XSection::ReplyGuy => {
+                self.status =
+                    "reply guy \u{b7} Treg finds posts, Grok drafts \u{b7} Reply opens Confirm"
+                        .into();
+                cx.notify();
+            }
             _ => {}
         }
     }
@@ -3165,6 +3193,14 @@ impl XPanel {
             self.on_text_input_key(event, TextField::Analyze, cx);
             return;
         }
+        if self.section == XSection::ReplyGuy && self.input_target == InputTarget::RgTopic {
+            self.on_text_input_key(event, TextField::RgTopic, cx);
+            return;
+        }
+        if self.section == XSection::ReplyGuy && self.input_target == InputTarget::RgKey {
+            self.on_text_input_key(event, TextField::RgKey, cx);
+            return;
+        }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
             self.on_text_input_key(event, TextField::Reply, cx);
             return;
@@ -3420,6 +3456,8 @@ impl XPanel {
                 InputTarget::QueueText => self.desk.queue_text.push_str(clean),
                 InputTarget::QueueReplyTo => self.desk.queue_reply_to.push_str(clean),
                 InputTarget::Analyze => self.desk.analyze_handle.push_str(clean),
+                InputTarget::RgTopic => self.desk.rg_topic.push_str(clean),
+                InputTarget::RgKey => self.desk.rg_key_input.push_str(clean.trim()),
             }
         }
         match self.input_target {
@@ -3515,6 +3553,8 @@ impl XPanel {
                     TextField::Lookup => self.run_lookup(cx),
                     TextField::FeedQuery | TextField::FeedFilter => self.add_feed_from_fields(cx),
                     TextField::Analyze => self.run_analyze(cx),
+                    TextField::RgTopic => self.rg_fetch(cx),
+                    TextField::RgKey => self.rg_save_key(cx),
                     TextField::QueueText | TextField::QueueReplyTo => {
                         self.queue_add_from_fields(cx);
                     }
@@ -3566,6 +3606,8 @@ impl XPanel {
             TextField::QueueText => &mut self.desk.queue_text,
             TextField::QueueReplyTo => &mut self.desk.queue_reply_to,
             TextField::Analyze => &mut self.desk.analyze_handle,
+            TextField::RgTopic => &mut self.desk.rg_topic,
+            TextField::RgKey => &mut self.desk.rg_key_input,
         };
         if key == "backspace" {
             target.pop();
@@ -4019,7 +4061,9 @@ impl XPanel {
             | TextField::FeedFilter
             | TextField::QueueText
             | TextField::QueueReplyTo
-            | TextField::Analyze => return,
+            | TextField::Analyze
+            | TextField::RgTopic
+            | TextField::RgKey => return,
         };
         let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
         let overflow = lines as f32 * 19.0 - 44.0;
@@ -4912,7 +4956,8 @@ fn fetch_section(
             | XSection::Stats
             | XSection::Followers
             | XSection::Queue
-            | XSection::Analyze => {}
+            | XSection::Analyze
+            | XSection::ReplyGuy => {}
         }
     }
 
@@ -5000,7 +5045,8 @@ fn fetch_section(
         | XSection::Stats
         | XSection::Followers
         | XSection::Queue
-        | XSection::Analyze => FetchPayload::Timeline {
+        | XSection::Analyze
+        | XSection::ReplyGuy => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
             feed,
@@ -6276,6 +6322,7 @@ impl XPanel {
             XSection::Followers => self.followers_rows(cx),
             XSection::Queue => self.queue_rows(cx),
             XSection::Analyze => self.analyze_rows(cx),
+            XSection::ReplyGuy => self.reply_guy_rows(cx),
             _ => Vec::new(),
         }
     }
@@ -6950,7 +6997,8 @@ impl XPanel {
             | XSection::Stats
             | XSection::Followers
             | XSection::Queue
-            | XSection::Analyze => {
+            | XSection::Analyze
+            | XSection::ReplyGuy => {
                 rows.extend(self.desk_rows(cx));
             }
             XSection::Lookup => {
@@ -9126,9 +9174,33 @@ impl XPanel {
                 "caret-analyze",
                 InputTarget::Analyze,
             ),
+            TextField::RgTopic => (
+                self.desk.rg_topic.as_str(),
+                "Topic or niche \u{2014} Enter fetches fresh posts via Treg",
+                "glow-rg-topic",
+                "x-rg-topic",
+                "caret-rg-topic",
+                InputTarget::RgTopic,
+            ),
+            TextField::RgKey => (
+                self.desk.rg_key_input.as_str(),
+                "Paste your key \u{2014} Enter saves it (stored in the keychain)",
+                "glow-rg-key",
+                "x-rg-key",
+                "caret-rg-key",
+                InputTarget::RgKey,
+            ),
             TextField::Reply | TextField::Quote => {
                 unreachable!("reply/quote use the multi-line small editor")
             }
+        };
+        // Never render a secret: the key field shows bullets only.
+        let masked;
+        let text = if field == TextField::RgKey {
+            masked = "\u{2022}".repeat(text.chars().count());
+            masked.as_str()
+        } else {
+            text
         };
         let focused = self.input_target == target;
         let content = if text.is_empty() {
@@ -10615,3 +10687,5 @@ mod edit_keys_tests {
         ));
     }
 }
+
+mod reply_guy_ui;

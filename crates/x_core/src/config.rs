@@ -177,6 +177,14 @@ impl XConfig {
                 self.ai_explicit = true;
             }
             "ai.model" => self.ai_model = value.to_string(),
+            // `ai.preset = "xai"` (or "grok"): Grok via xAI's OpenAI-compatible API.
+            "ai.preset" if matches!(value.trim(), "xai" | "grok") => {
+                self.ai_base_url = crate::reply_guy::XAI_BASE_URL.to_string();
+                self.ai_explicit = true;
+                if self.ai_model.trim().is_empty() {
+                    self.ai_model = crate::reply_guy::DEFAULT_GROK_MODEL.to_string();
+                }
+            }
             "shell.min_interval_ms" => {
                 if let Ok(ms) = value.parse() {
                     self.min_interval_ms = ms;
@@ -272,7 +280,13 @@ impl XConfig {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        nonempty_var(&self.ai_key_env).or_else(|| nonempty_var("OPENAI_API_KEY"))
+        nonempty_var(&self.ai_key_env).or_else(|| {
+            if self.ai_base_url.contains("api.x.ai") {
+                crate::reply_guy::load_secret(self, crate::reply_guy::Secret::Grok)
+            } else {
+                nonempty_var("OPENAI_API_KEY")
+            }
+        })
     }
 
     /// The user's own X developer bearer token, from their shell env only.
