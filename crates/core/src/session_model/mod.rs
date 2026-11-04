@@ -1,10 +1,13 @@
 //! Persistent workspace, tab, and pane structures shared by desktop and CLI.
 use serde::{Deserialize, Serialize};
 mod merge;
+mod prune;
+mod rebase;
 mod tab_edit;
 mod tab_layout;
 mod window_edit;
 pub use merge::merge_session;
+pub use rebase::{match_workspaces, rebase_session};
 pub use tab_edit::TabEdit;
 pub use window_edit::WindowEdit;
 
@@ -66,6 +69,9 @@ pub struct StoredPane {
     pub width: u16,
     pub height: u16,
     pub buffer: Option<String>,
+    /// Live multiplexer layout only: pane-local font zoom relative to the base size.
+    #[serde(default)]
+    pub zoom_steps: i16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -95,6 +101,9 @@ pub struct StoredWorkspace {
 pub struct StoredSession {
     pub workspaces: Vec<StoredWorkspace>,
     pub active_workspace: usize,
+    /// Live multiplexer layout only: window font zoom relative to the base size.
+    #[serde(default)]
+    pub zoom_steps: i16,
 }
 
 /// UI title/status snapshot for live sessions; terminal events refresh it on attach.
@@ -119,6 +128,27 @@ pub struct StoredWindow {
 pub struct StoredMultiplexer {
     pub version: u32,
     pub windows: Vec<StoredWindow>,
+}
+
+/// The only [`StoredMultiplexer::version`] this build reads and writes.
+pub const STORED_MULTIPLEXER_VERSION: u32 = 1;
+
+impl StoredMultiplexer {
+    /// Decodes a layout as the host stores it: no layout is an empty one.
+    pub fn parse(json: Option<&str>) -> Result<Self, String> {
+        let Some(json) = json else {
+            return Ok(Self::empty());
+        };
+        let layout: Self = serde_json::from_str(json)
+            .map_err(|error| format!("Invalid session layout: {error}"))?;
+        if layout.version != STORED_MULTIPLEXER_VERSION {
+            return Err(format!(
+                "Unsupported session layout version {}",
+                layout.version
+            ));
+        }
+        Ok(layout)
+    }
 }
 
 mod layout;

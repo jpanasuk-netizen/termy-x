@@ -83,7 +83,7 @@ enum Action {
     #[command(name = "-validate-config")]
     ValidateConfig,
 
-    /// Prettify configuration file (removes comments, formats consistently)
+    /// Prettify configuration file (removes comments, formats consistently; keeps a .bak copy)
     #[command(name = "-prettify-config")]
     PrettifyConfig,
 
@@ -95,42 +95,11 @@ enum Action {
     #[command(name = "-update")]
     Update,
 
-    /// Export the current resolved theme into a Termy themes repo checkout
-    #[command(name = "-export-theme")]
-    ExportTheme {
-        /// Local path to the termy-org/themes checkout
-        #[arg(long)]
-        repo: PathBuf,
-        /// Theme slug, normalized to Termy's theme id format
-        #[arg(long)]
-        slug: String,
-        /// Display name for the theme
-        #[arg(long)]
-        name: String,
-        /// Semver version, for example 1.0.0
-        #[arg(long)]
-        version: String,
-        /// Theme description
-        #[arg(long, default_value = "")]
-        description: String,
-        /// Overwrite an existing files/<version>.json
-        #[arg(long)]
-        force: bool,
-    },
-
     /// Termy X commands. Free paths by default; no X API credits required.
     X {
         /// Arguments forwarded to the `x` command set
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-    },
-
-    /// Validate a Termy themes repo checkout
-    #[command(name = "-validate-theme-repo")]
-    ValidateThemeRepo {
-        /// Local path to the termy-org/themes checkout
-        #[arg(long)]
-        repo: PathBuf,
     },
 }
 
@@ -219,14 +188,23 @@ fn main() {
         let result = std::env::args_os()
             .nth(2)
             .ok_or_else(|| anyhow::anyhow!("session directory required"))
-            .and_then(|root| termy_core::multiplexer::serve(std::path::Path::new(&root)));
+            .and_then(|root| termy_core::multiplexer::run_host(std::path::Path::new(&root)));
         if let Err(error) = result {
-            eprintln!("{error}");
+            eprintln!("session host failed: {error:#}");
             std::process::exit(1);
         }
         return;
     }
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        // Scripts read `termy mux` failures as JSON, argument errors too.
+        Err(error)
+            if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("mux")) =>
+        {
+            commands::mux::parse_error(error)
+        }
+        Err(error) => error.exit(),
+    };
 
     let path = cli.working_directory.or(cli.path);
     if path.is_some() || cli.new_window || cli.new_tab {
@@ -255,15 +233,6 @@ fn main() {
         Some(Action::PrettifyConfig) => commands::prettify_config::run(),
         Some(Action::Tui) => commands::tui::run(),
         Some(Action::Update) => commands::update::run(),
-        Some(Action::ExportTheme {
-            repo,
-            slug,
-            name,
-            version,
-            description,
-            force,
-        }) => commands::theme_repo::export_theme(repo, slug, name, version, description, force),
-        Some(Action::ValidateThemeRepo { repo }) => commands::theme_repo::validate_theme_repo(repo),
         Some(Action::X { args }) => {
             let code = termy_x::cli::execute(&args, &mut termy_x::cli::CliIo::live(), true);
             std::process::exit(code);

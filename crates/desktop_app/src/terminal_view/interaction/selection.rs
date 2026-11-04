@@ -158,6 +158,20 @@ fn topmost_kitty_graphics_placement_at_point(
         })
 }
 
+/// Rows output scrolled the pane's content up between two observations of
+/// the same pane. History growth counts them at any scroll position. Once
+/// history is full it stops growing, but the engine still raises the display
+/// offset to keep a scrolled viewport still; user scrolls resync the baseline,
+/// so offset changes left here come from output (or clearing history).
+fn content_rows_scrolled(previous: &ContentScrollBaseline, current: &ContentScrollBaseline) -> i32 {
+    let delta = |previous: usize, current: usize| {
+        i32::try_from(current as i64 - previous as i64).unwrap_or(0)
+    };
+    let grown = delta(previous.history_size, current.history_size);
+    let offset = delta(previous.display_offset, current.display_offset);
+    if grown > 0 { grown.max(offset) } else { offset }
+}
+
 fn cell_has_visible_foreground_text(line: &[Option<char>], col: usize) -> bool {
     match line.get(col).copied().flatten() {
         Some(c) => !c.is_whitespace(),
@@ -725,32 +739,54 @@ impl TerminalView {
         Some((pane_id, selection_pos))
     }
 
-    /// Sync content_scroll_baseline to the current display_offset after a user-initiated
-    /// scroll action, so that the next content-driven change is detected correctly.
-    pub(in super::super) fn sync_content_scroll_baseline(&mut self) {
-        self.content_scroll_baseline = self
-            .active_terminal()
-            .map_or(self.content_scroll_baseline, |t| t.scroll_state().0);
+    fn current_content_scroll_baseline(&self) -> ContentScrollBaseline {
+        let Some(tab) = self.session.tabs.get(self.session.active_tab) else {
+            return ContentScrollBaseline::default();
+        };
+        let Some(pane) = tab
+            .active_pane_index()
+            .and_then(|index| tab.panes.get(index))
+        else {
+            return ContentScrollBaseline::default();
+        };
+        let (display_offset, history_size) = pane.terminal().scroll_state();
+        ContentScrollBaseline {
+            pane: Some((tab.id, pane.id.clone())),
+            display_offset,
+            history_size,
+        }
     }
 
-    /// Adjust selection positions to compensate for display_offset changes caused by
-    /// new terminal content arriving while the user is scrolled into history.
-    /// Prevents the selection from visually drifting when the terminal engine auto-adjusts the
-    /// scroll offset to keep the viewport stable.
-    pub(in super::super) fn adjust_selection_for_display_offset_change(
-        &mut self,
-        old_offset: usize,
-        new_offset: usize,
-    ) {
-        let delta = new_offset as i32 - old_offset as i32;
-        if delta == 0 {
+    /// Sync content_scroll_baseline to the current scroll state after a user-initiated
+    /// scroll action, so that the next content-driven change is detected correctly.
+    pub(in super::super) fn sync_content_scroll_baseline(&mut self) {
+        self.content_scroll_baseline = self.current_content_scroll_baseline();
+    }
+
+    /// Move the selection with content that output scrolled since the last
+    /// observation, so it keeps covering the same text at any scroll position.
+    pub(in super::super) fn follow_content_scroll_with_selection(&mut self) {
+        let current = self.current_content_scroll_baseline();
+        let previous = std::mem::replace(&mut self.content_scroll_baseline, current);
+        // Another pane's scroll state says nothing about this selection.
+        if previous.pane != self.content_scroll_baseline.pane {
+            return;
+        }
+        let rows = content_rows_scrolled(&previous, &self.content_scroll_baseline);
+        self.adjust_selection_for_content_scroll(rows);
+    }
+
+    /// Shift selection positions up by `rows` lines of content that output
+    /// scrolled, keeping them on the text they covered.
+    fn adjust_selection_for_content_scroll(&mut self, rows: i32) {
+        if rows == 0 {
             return;
         }
         if let Some(anchor) = &mut self.selection_anchor {
-            anchor.line -= delta;
+            anchor.line -= rows;
         }
         if let Some(head) = &mut self.selection_head {
-            head.line -= delta;
+            head.line -= rows;
         }
     }
 
@@ -920,28 +956,38 @@ impl TerminalView {
         }
         #[cfg(target_os = "macos")]
         {
+            let Some(target) = unix_link_open_target(url) else {
+                return false;
+            };
             Command::new("open")
-                .arg(url)
+                .arg(&target)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .is_ok_and(|_| true)
+                .is_ok()
         }
         #[cfg(target_os = "linux")]
         {
-            return Command::new("xdg-open")
-                .arg(url)
+            let Some(target) = unix_link_open_target(url) else {
+                return false;
+            };
+            Command::new("xdg-open")
+                .arg(&target)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
-                .map(|_| true)
-                .unwrap_or(false);
+                .is_ok()
         }
         #[cfg(target_os = "windows")]
         {
-            webbrowser::open(url).is_ok()
+            // ShellExecuteW starts the registered handler directly; no shell
+            // parses the target, so cmd metacharacters need no filtering.
+            let Some(target) = windows_link_open_target(url) else {
+                return false;
+            };
+            crate::config::shell_execute_open(std::ffi::OsStr::new(&target)).is_ok()
         }
     }
 
@@ -951,16 +997,156 @@ impl TerminalView {
 }
 
 fn is_safe_url_for_system_opener(url: &str) -> bool {
-    if url.bytes().any(|byte| byte.is_ascii_control()) {
-        return false;
+    !url.bytes().any(|byte| byte.is_ascii_control())
+}
+
+/// What the macOS/Linux system opener (`open` / `xdg-open`) should receive for a
+/// link: web and mail URLs as they are, and `file:` URLs only when they resolve
+/// to a path that already exists on disk. Every other scheme is refused.
+///
+/// OSC 8 hyperlink targets are attacker-controlled (any program writing to the
+/// terminal picks the URI, and its displayed text can be spoofed), and they
+/// otherwise bypass the scheme validation that the heuristic link detector
+/// applies. Handing an unvalidated URI to `open`/`xdg-open` would let a single
+/// click launch arbitrary registered scheme handlers (`smb:` auto-mounting and
+/// leaking credentials, `vscode:`/custom app schemes, …). This mirrors the
+/// `windows_link_open_target` allowlist so every platform vets the scheme.
+///
+/// Every accepted target begins with an alphabetic scheme (`http`/`https`/
+/// `mailto`/`file`), so a validated URL can never start with `-` and be misread
+/// as an `open`/`xdg-open` option.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn unix_link_open_target(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
+        return Some(url.to_string());
     }
 
-    #[cfg(target_os = "windows")]
-    if url.bytes().any(|byte| b"&|<>^".contains(&byte)) {
-        return false;
+    if lower.starts_with("file:") {
+        let path = unix_file_url_to_path(&url["file:".len()..])?;
+        // Only forward `file:` links that point at an existing local file, the
+        // same bar the heuristic detector applies; the original URL is handed to
+        // the opener once the path is confirmed.
+        if std::path::Path::new(&path).exists() {
+            return Some(url.to_string());
+        }
+        return None;
     }
 
-    true
+    None
+}
+
+/// The local filesystem path a `file:` URL refers to, given the text after the
+/// `file:` scheme. Accepts `file:///path`, `file://localhost/path`, and
+/// `file:/path`; refuses a remote authority (`file://host/path`), which is a
+/// network location rather than a local file. Returns an absolute path.
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
+fn unix_file_url_to_path(rest: &str) -> Option<String> {
+    let after_authority = if let Some(rest) = rest.strip_prefix("//") {
+        // `//authority/path` — the path starts at the first slash.
+        let slash = rest.find('/')?;
+        let authority = &rest[..slash];
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        &rest[slash..]
+    } else {
+        // `file:/path` with no authority component.
+        rest
+    };
+
+    let path_part = after_authority
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(after_authority);
+    let decoded = percent_decode(path_part)?;
+    decoded.starts_with('/').then_some(decoded)
+}
+
+/// What the Windows shell should open for a link: web and mail URLs as they
+/// are, `file:` URLs and absolute paths (`C:\...`, `\\server\share\...`) as
+/// paths. Other schemes would reach arbitrary protocol handlers, and `\\?\` or
+/// `\\.\` device paths are not documents, so both are refused.
+#[cfg(any(target_os = "windows", test))]
+fn windows_link_open_target(url: &str) -> Option<String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")
+    {
+        return Some(url.to_string());
+    }
+
+    let path = if lower.starts_with("file:") {
+        windows_file_url_to_path(&url["file:".len()..])?
+    } else {
+        url.replace('/', "\\")
+    };
+    (is_windows_absolute_drive_path(&path) || is_windows_unc_share_path(&path)).then_some(path)
+}
+
+/// The path of a `file:` URL, given without its scheme: a drive path, or a
+/// UNC path for `file://server/share`. Termy's own link detection builds
+/// these without percent-encoding, so a local path that exists as written
+/// wins over its decoded form.
+#[cfg(any(target_os = "windows", test))]
+fn windows_file_url_to_path(rest: &str) -> Option<String> {
+    let local = if rest
+        .get(..12)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("//localhost/"))
+    {
+        &rest[12..]
+    } else if let Some(local) = rest.strip_prefix("///") {
+        local
+    } else if rest.starts_with("//") {
+        // `file://server/share/...` keeps its leading slashes as `\\server`.
+        rest
+    } else {
+        rest.strip_prefix('/').unwrap_or(rest)
+    };
+
+    let raw = local.replace('/', "\\");
+    if is_windows_absolute_drive_path(&raw) && std::path::Path::new(&raw).exists() {
+        return Some(raw);
+    }
+
+    let without_suffix = local.split(['?', '#']).next().unwrap_or(local);
+    Some(percent_decode(without_suffix)?.replace('/', "\\"))
+}
+
+/// `\\server\share...` with a real server name, not a `\\?\` or `\\.\` path.
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_unc_share_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix(r"\\") else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    !server.is_empty() && server != "?" && server != "." && !share.is_empty()
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn is_windows_absolute_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+}
+
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", test))]
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = value.get(index + 1..index + 3)?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 #[cfg(test)]
@@ -968,6 +1154,128 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use termy_core::TerminalSize;
+
+    fn selection_test_window(cx: &mut App, tabs: usize) -> gpui_kit::WindowHandle<TerminalView> {
+        use gpui_kit::AppContext as _;
+        cx.open_window(gpui_kit::WindowOptions::default(), |window, cx| {
+            cx.new(|cx| {
+                let config = crate::config::AppConfig {
+                    tmux_enabled: false,
+                    native_tab_persistence: false,
+                    sidebar_enabled: false,
+                    ..Default::default()
+                };
+                let mut view = TerminalView::new_for_window(window, cx, config, true);
+                view.owns_persisted_session = false;
+                let size = TerminalSize {
+                    cols: 12,
+                    rows: 4,
+                    ..TerminalSize::default()
+                };
+                for _ in 0..tabs {
+                    let id = view.allocate_tab_id();
+                    let tab = TerminalView::create_native_tab(
+                        id,
+                        Terminal::new_test_display(size),
+                        size.cols,
+                        size.rows,
+                        None,
+                    );
+                    view.session.tabs.push(tab);
+                }
+                view
+            })
+        })
+        .unwrap()
+    }
+
+    fn select_on_line(view: &mut TerminalView, line: i32, last_col: usize) {
+        view.selection_anchor = Some(SelectionPos { col: 0, line });
+        view.selection_head = Some(SelectionPos {
+            col: last_col,
+            line,
+        });
+        view.selection_moved = true;
+    }
+
+    #[gpui_kit::test]
+    fn selection_follows_text_that_output_scrolls_at_the_live_bottom(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let window = selection_test_window(cx, 1);
+            window
+                .update(cx, |view, _, _| {
+                    view.session.active_tab = 0;
+                    let terminal = view.active_terminal().unwrap();
+                    terminal.hydrate_output(b"zero\r\none\r\ntwo");
+                    assert_eq!(terminal.scroll_state().0, 0);
+                    view.sync_content_scroll_baseline();
+                    select_on_line(view, 1, 2);
+                    assert_eq!(view.selected_text().as_deref(), Some("one"));
+
+                    // Output scrolls "one" into history without moving the viewport.
+                    let terminal = view.active_terminal().unwrap();
+                    let rows = usize::from(terminal.size().rows);
+                    terminal.hydrate_output("\r\nmore".repeat(rows).as_bytes());
+                    let (display_offset, history_size) = terminal.scroll_state();
+                    assert_eq!(display_offset, 0);
+                    assert!(history_size >= 2, "\"one\" must reach history");
+                    view.follow_content_scroll_with_selection();
+                    assert_eq!(view.selected_text().as_deref(), Some("one"));
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn selection_ignores_scroll_offset_left_by_the_previous_pane(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let window = selection_test_window(cx, 2);
+            window
+                .update(cx, |view, _, _| {
+                    for tab in &view.session.tabs {
+                        tab.active_terminal()
+                            .unwrap()
+                            .hydrate_output(b"a\r\nb\r\nc\r\nd\r\ne\r\nf\r\ng");
+                    }
+                    assert!(
+                        view.session.tabs[1]
+                            .active_terminal()
+                            .unwrap()
+                            .scroll_display(2)
+                    );
+                    view.session.active_tab = 0;
+                    view.sync_content_scroll_baseline();
+
+                    view.session.active_tab = 1;
+                    select_on_line(view, 1, 0);
+                    let selected = view.selected_text();
+                    assert_eq!(selected.as_deref(), Some("e"));
+                    view.follow_content_scroll_with_selection();
+                    assert_eq!(view.selected_text(), selected);
+                })
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn content_scroll_counts_history_growth_and_scrolled_viewport_shifts() {
+        let state = |display_offset, history_size| ContentScrollBaseline {
+            pane: Some((1, "%1".into())),
+            display_offset,
+            history_size,
+        };
+        // At the live bottom only history grows.
+        assert_eq!(content_rows_scrolled(&state(0, 10), &state(0, 13)), 3);
+        // Scrolled into history the engine also raises the offset.
+        assert_eq!(content_rows_scrolled(&state(4, 10), &state(7, 13)), 3);
+        // Full history: only the offset shows the scroll.
+        assert_eq!(content_rows_scrolled(&state(4, 100), &state(6, 100)), 2);
+        assert_eq!(content_rows_scrolled(&state(0, 100), &state(0, 100)), 0);
+    }
 
     #[test]
     fn select_all_copies_history_and_viewport_even_while_scrolled() {
@@ -1332,6 +1640,125 @@ mod tests {
             function: true,
             ..gpui_kit::Modifiers::secondary_key()
         }));
+    }
+
+    #[test]
+    fn system_opener_rejects_only_control_characters() {
+        assert!(is_safe_url_for_system_opener(
+            "https://example.com/?a=1&b=<2>|^"
+        ));
+        assert!(!is_safe_url_for_system_opener("https://example.com/\n"));
+    }
+
+    #[test]
+    fn windows_link_targets_keep_web_urls_and_map_file_urls_to_paths() {
+        assert_eq!(
+            windows_link_open_target("https://example.com/?a=1&b=2").as_deref(),
+            Some("https://example.com/?a=1&b=2")
+        );
+        assert_eq!(
+            windows_link_open_target("file:///C:/Users/me/My%20Notes.txt").as_deref(),
+            Some(r"C:\Users\me\My Notes.txt")
+        );
+        assert_eq!(
+            windows_link_open_target("file://localhost/D:/a.txt").as_deref(),
+            Some(r"D:\a.txt")
+        );
+        assert_eq!(
+            windows_link_open_target(r"C:\work\a & b.txt").as_deref(),
+            Some(r"C:\work\a & b.txt")
+        );
+    }
+
+    #[test]
+    fn windows_link_targets_open_unc_shares() {
+        for target in [
+            "file://server/share/x.txt",
+            "file://///server/share/x.txt",
+            r"\\server\share\x.txt",
+        ] {
+            assert_eq!(
+                windows_link_open_target(target).as_deref(),
+                Some(r"\\server\share\x.txt"),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_link_targets_refuse_device_paths_and_other_schemes() {
+        for target in [
+            r"\\?\UNC\server\share",
+            r"\\.\pipe\name",
+            "file://./pipe/name",
+            "ms-settings:display",
+            "search-ms:query=x",
+            "relative/path.txt",
+        ] {
+            assert_eq!(windows_link_open_target(target), None, "{target}");
+        }
+    }
+
+    #[test]
+    fn unix_link_targets_keep_web_and_mail_urls() {
+        for target in [
+            "http://example.com/a?b=1&c=2",
+            "https://example.com/path#frag",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(
+                unix_link_open_target(target).as_deref(),
+                Some(target),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_link_targets_refuse_dangerous_schemes() {
+        // The OSC 8 escape-attack vector: spoofed link text, hostile target.
+        for target in [
+            "smb://attacker.example/share",
+            "file://attacker.example/share/x.txt",
+            "vscode://ms-vscode.remote/x",
+            "javascript:alert(1)",
+            "x-apple.systempreferences:com.apple.preference",
+            "shortcuts://run-shortcut?name=x",
+            "ftp://host/x",
+            "relative/path.txt",
+            "-R",
+            "file:///no/such/termy/file/should/exist",
+        ] {
+            assert_eq!(unix_link_open_target(target), None, "{target}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_link_targets_allow_file_urls_only_for_existing_paths() {
+        let file = tempfile::NamedTempFile::new().expect("temp file");
+        let path = file.path().to_str().expect("utf-8 path");
+        let url = format!("file://{path}");
+
+        assert_eq!(
+            unix_link_open_target(&url).as_deref(),
+            Some(url.as_str()),
+            "existing file should be opened"
+        );
+
+        let localhost_url = format!("file://localhost{path}");
+        assert_eq!(
+            unix_link_open_target(&localhost_url).as_deref(),
+            Some(localhost_url.as_str()),
+            "file://localhost should map to the same local path"
+        );
+
+        drop(file);
+        assert_eq!(
+            unix_link_open_target(&url),
+            None,
+            "a file that no longer exists must not be opened"
+        );
     }
 
     #[test]
@@ -1791,6 +2218,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1806,6 +2234,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1876,6 +2305,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1891,6 +2321,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -1975,6 +2406,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -2062,6 +2494,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: left_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),
@@ -2077,6 +2510,7 @@ mod tests {
                 degraded: false,
                 tmux_mouse_mode: None,
                 progress_state: ProgressState::default(),
+                program_status: Vec::new(),
                 terminal: right_terminal,
                 render_cache: std::cell::RefCell::new(TerminalPaneRenderCache::default()),
                 last_alternate_screen: std::cell::Cell::new(false),

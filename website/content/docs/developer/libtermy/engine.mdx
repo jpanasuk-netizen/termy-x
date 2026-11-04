@@ -1,0 +1,263 @@
+---
+title: Engine C library
+description: Link libtermy_engine, Termy's terminal engine without PTY or config code, to mirror remote terminals with snapshots and replica mode.
+---
+
+`libtermy_engine` is Termy's terminal engine as a standalone C library: the VT
+parser, screens, scrollback, protocol state and input encoders, and nothing
+else. It has no PTY, config files, threads, timers, keyring, fonts or network
+code. Your host feeds it program output and reads cells, state, protocol
+replies and encoded input bytes back.
+
+Use it when your application owns the process and transport itself, for
+example a client that mirrors panes from a multiplexer server, a session
+recorder, or a server that keeps the authoritative terminal for each pane.
+If you want libtermy to launch and own a shell, use the
+[C ABI quick start](/docs/developer/libtermy/c) instead.
+
+The header is
+[`crates/engine_ffi/include/termy_engine.h`](https://github.com/lassejlv/termy/blob/main/crates/engine_ffi/include/termy_engine.h)
+and is authoritative for every signature and struct. Check
+`termy_engine_abi_version() == TERMY_ENGINE_ABI_VERSION` at startup.
+
+<Callout type="info">
+  Like the rest of libtermy, this library is in beta. Build the library and
+  header from the same Termy revision on both sides of a connection, because a
+  snapshot written by one version may be rejected by another.
+</Callout>
+
+## Build
+
+```sh
+cargo build --release -p termy_engine_ffi --lib
+```
+
+This produces `target/release/libtermy_engine.a` and a shared library (the
+shared library is skipped on musl targets). To package a target as a tarball
+with the static library, the header, a Clang module map and the linker flags:
+
+```sh
+scripts/package-libtermy-engine.sh x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+scripts/package-libtermy-engine.sh aarch64-apple-darwin
+```
+
+Each target produces `dist/libtermy-engine-<target>.tar.gz`. On macOS the
+script also assembles `dist/TermyEngine.xcframework`, which a Swift package can
+use as a `binaryTarget`. When linking the `.a` yourself, add the system
+libraries listed in the package's `lib/link-flags.txt`.
+
+## Servers and replicas
+
+Create the authoritative terminal with replies enabled, the default. Replies
+to queries such as DA, DSR, DECRQM and color reports come back from
+`termy_engine_feed` immediately and in byte order, so you can write them
+straight to the program:
+
+```c
+TermyEngineOptions options = termy_engine_options_default();
+options.cols = 120;
+options.rows = 40;
+
+TermyEngine *server = NULL;
+termy_engine_new(&options, &server);
+
+TermyEngineBytes replies = {0};
+termy_engine_feed(server, pty_bytes, pty_len, &replies);
+write_to_pty(replies.ptr, replies.len);
+termy_engine_bytes_free(&replies);
+```
+
+A replica parses the same bytes but never answers, because the server already
+did. Start one from a snapshot of the server, then feed it every byte the
+server receives afterwards:
+
+```c
+TermyEngineBytes snapshot = {0};
+termy_engine_snapshot_encode(server, &snapshot);
+send_to_client(snapshot.ptr, snapshot.len);
+termy_engine_bytes_free(&snapshot);
+
+/* On the client: */
+TermyEngine *replica = NULL;
+TermyEngineStatus status = termy_engine_snapshot_decode(
+    snapshot_ptr, snapshot_len, TERMY_ENGINE_REPLIES_DISCARD, &replica);
+if (status == TERMY_ENGINE_UNSUPPORTED_SNAPSHOT_VERSION) {
+  /* The snapshot is newer than this client reads; see "Versions" below. */
+}
+termy_engine_feed(replica, output_ptr, output_len, NULL);
+```
+
+`termy_engine_set_reply_mode` switches an existing handle between the two
+modes.
+
+Synchronized output (`?2026`) buffers bytes until the program ends the update.
+The library has no timer: poll `termy_engine_synchronized_deadline` and call
+`termy_engine_tick` once the deadline passes, so an update that never ends
+still commits.
+
+## Snapshots
+
+A snapshot holds everything that decides how the terminal responds to later
+output:
+
+- both screens and all scrollback, with grapheme clusters, styles, OSC 8
+  hyperlinks, underline colors and wrap flags
+- the cursor with its style, visibility and pending wrap, and the saved
+  cursors (DECSC)
+- scroll region, left/right margins, origin mode and tab stops
+- charsets and every DEC and ANSI mode, including mouse tracking and
+  encoding, bracketed paste, focus reporting, alternate scroll, DECCKM,
+  DECKPAM and each screen's kitty keyboard flag stack
+- OSC 4/10/11/12 color overrides, the title and title stack, the OSC 7
+  working directory and OSC 7501 program status
+- the parser's in-progress sequence (mid-escape, mid-string or mid-UTF-8) and
+  a pending synchronized update
+- the scrollback and payload limits
+- kitty graphics: stored images and animations, placements, and an upload
+  still arriving in chunks (version 2 and later). OSC 1337 (iTerm2) inline
+  images are stored and placed as kitty images.
+
+Decoding a snapshot and feeding it bytes B ends in the same state as feeding
+B to the original, including which scrollback rows are evicted. Snapshots do
+not include queued replies and events (drain them first), render damage (a
+decoded engine starts with a full frame) or an OSC 1337 multipart image still
+receiving parts.
+
+The format starts with the magic `TRMYSNAP` and a version number, and all
+integers are little-endian, so snapshots move between Linux and macOS
+unchanged. `termy_engine_snapshot_peek_version` reads the version without
+decoding. Encoding 16 MiB of scrollback takes tens of milliseconds in a
+release build. Images are stored PNG-compressed.
+
+### Versions
+
+Every release decodes every version from `termy_engine_snapshot_min_version()`
+through `termy_engine_snapshot_version()`, and can encode any of them with
+`termy_engine_snapshot_encode_version`. When a server and its clients run
+different releases, the newer side adapts: a newer client decodes an older
+server's snapshot as is, and a newer server encodes for an older client
+after learning the client's `termy_engine_snapshot_version()` during the
+attach handshake.
+
+| Version | Adds |
+| --- | --- |
+| 1 | The first format |
+| 2 | Scrollback byte limit (and more than 20,000 rows), payload limits, kitty graphics |
+
+Encoding version 1 keeps the newest 20,000 history rows and leaves out kitty
+graphics; the client gets the default byte and payload limits. Releases may
+charge history rows differently, so identical eviction is only guaranteed
+between a server and replicas on the same release.
+
+### Scrollback limit
+
+History keeps at most `scrollback_rows` rows and at most `scrollback_bytes`
+of row storage (16 MiB by default), whichever limit binds first. Set
+`scrollback_rows` to `TERMY_ENGINE_SCROLLBACK_UNLIMITED` to bound history by
+bytes alone. Each row is charged its slot, its cells and
+the grapheme, link and underline-color metadata it references, measured by
+value, so the charge depends only on the bytes fed and a server and its
+replicas evict the same rows. Calling `termy_engine_compact_history` changes
+how later rows are stored, so don't call it on a server or its replicas.
+
+Cells are stored dense (16 bytes each) or packed (4 bytes per character
+plus style runs). When history at its row limit would hold more dense rows
+than the byte limit or 16 MiB, output packs each line it scrolls into
+history into the storage of the row it evicts, keeping room for a full line.
+At 120 columns such a row costs about 650 bytes, so the default 16 MiB
+holds about 25,000 rows of output.
+
+`termy_engine_set_scrollback` and `termy_engine_set_scrollback_bytes` change
+the limits on a live handle.
+
+### Payload limits
+
+OSC and DCS strings longer than `max_string_bytes` (64 KiB by default), and
+OSC 52 clipboard writes longer than `max_clipboard_bytes` (8 MiB by default),
+are dropped whole. The defaults are also the maxima: you can lower the limits
+but not raise them. `termy_engine_set_payload_limits` changes them on a live
+handle; a server and its replicas should use the same values, and snapshots
+carry them. Kitty graphics uploads and OSC 1337 inline images have their own
+limit.
+
+## Frames
+
+`termy_engine_frame` returns the changes since the last frame. A frame is
+full on the first call, when you pass `force_full`, and whenever the size,
+active screen, viewport scroll position, palette or reverse video changed.
+Otherwise its spans list every changed cell, including rows that output
+scrolled. Frame pointers borrow buffers owned by the handle and stay valid
+until the next frame or line read on that handle, so steady-state rendering
+allocates nothing and nothing needs to be freed.
+
+Each `TermyEngineCell` carries:
+
+- the first scalar of its grapheme cluster, with the rest of the cluster in
+  the frame's grapheme array
+- its width role: narrow, wide, spacer tail, or spacer head (a wide glyph
+  that wrapped to the next row)
+- raw colors: `0` for the terminal default, `0x01000000 | n` for palette
+  entry `n`, or `0x02RRGGBB`
+- every SGR attribute, the underline style and color, and a hyperlink index
+- `STYLED` and `BLANK` flags, so a renderer can skip plain blank cells
+
+The frame's cursor reports its shape, blinking, visibility, whether it is in
+the viewport, and whether it sits on the right half of a wide glyph.
+Resolve colors with `termy_engine_effective_colors`, after setting your
+theme with `termy_engine_set_default_colors`.
+
+`termy_engine_read_lines` reads any buffer lines, scrollback included, in the
+same cell format.
+
+## State and queries
+
+- `termy_engine_mode` answers like DECRQM for any mode: 0 not recognized,
+  1 set, 2 reset, 3 permanently set.
+- `termy_engine_get_state` returns size, cursor, mouse tracking and encoding,
+  focus reporting, alternate scroll, bracketed paste, keypad and cursor-key
+  modes, kitty keyboard flags and scrollback counts.
+- `termy_engine_title` and `termy_engine_working_directory` read the current
+  title and OSC 7 directory. A replica restored from a snapshot has them
+  without ever seeing the events.
+- `termy_engine_scrollbar` and `termy_engine_scroll_viewport` support
+  scrollbars and scrolling to the top, the bottom, or a row.
+- `termy_engine_next_event` pops bell, title, directory, progress, clipboard
+  and program-status events one at a time.
+
+## Input encoders
+
+Encoders return the bytes to send to the program and never write anywhere:
+
+- `termy_engine_encode_key` handles legacy keys, DECCKM and DECKPAM, and every
+  kitty keyboard flag. When the host reports which Option key is held, only
+  the sides you configure act as Alt; the other side composes text. Pass the
+  composed text in `text`: legacy encoding sends it as is for every key,
+  Space included (macOS Option+Space sends U+00A0), unless Control or Command
+  is held.
+- `termy_engine_encode_mouse` handles X10, normal, button-event and any-event
+  tracking, the X10, UTF-8, SGR and SGR-pixel encodings, and buttons 1–11.
+  SGR pixel reports (`?1016`) need `pixel_mouse_reports` in the options.
+- `termy_engine_encode_paste` turns line endings into CR, removes control
+  characters that could run commands or end the bracket early, and adds the
+  bracketed-paste markers when you pass `bracketed`.
+- `termy_engine_encode_focus` returns `CSI I` or `CSI O`. Send it only when
+  the state reports focus reporting.
+
+## Text and selection
+
+`termy_engine_read_text` returns a range, or the whole buffer when the range
+is NULL, as plain text, VT text with SGR and OSC 8 preserved, or HTML.
+Options join soft-wrapped rows and trim trailing blanks.
+
+Your host keeps the selection state machine (click timing and drag
+extension). `termy_engine_select_word` and `termy_engine_select_line` return
+the word or logical line under a cell, across soft wraps, for double- and
+triple-click. To keep a selection attached to its text while output scrolls,
+anchor it with `scrolled_into_history` from the state. Resizing reflows rows
+without updating that count, so reset anchors on resize.
+
+## Not included
+
+- kitty graphics in frames: the engine parses, stores and snapshots them, but
+  the C API does not expose placements yet
+- platform keycodes: keys use Termy's key names

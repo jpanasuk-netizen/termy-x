@@ -5,36 +5,59 @@
 
 mod placement;
 mod protocol;
-pub use protocol::{
-    KittyGraphicsCommand, KittyGraphicsInterceptor, KittyGraphicsItem, KittyGraphicsItemRef,
-};
+pub use protocol::KittyGraphicsCommand;
 mod animation;
 mod deletion;
 mod image;
-use image::normalize_image;
+use image::{normalize_image, occupied_cells};
+mod inline;
+pub(crate) use inline::InlineMultipart;
+mod snapshot;
+mod upload;
+pub(crate) use upload::{KittyPreparedUpload, KittyUpload};
+use upload::{UploadData, validate_dimensions};
+#[cfg(test)]
+use upload::{decompress_zlib, temporary_path_can_be_removed};
 #[cfg(test)]
 mod conformance;
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use flate2::read::ZlibDecoder;
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::{
+    Engine as _, alphabet,
+    engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
+};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    fs::File,
-    io::{Cursor, Read, Seek, SeekFrom},
-    path::{Path, PathBuf},
+    io::Cursor,
     sync::Arc,
 };
 
 use crate::TerminalSize;
 
-const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 128 * 1024 * 1024;
 const MAX_CONTROL_BYTES: usize = 4096;
 const MAX_CONTROL_FIELDS: usize = 64;
-const MAX_COMMAND_BYTES: usize = MAX_IMAGE_BYTES * 2;
 const MAX_DIMENSION: u32 = 32_768;
 const MAX_PIXELS: u64 = (MAX_IMAGE_BYTES / 4) as u64;
 const MAX_PLACEMENTS: usize = 4_096;
+
+/// Decodes payloads as leniently as kitty does: padding is optional and the
+/// unused bits of a final symbol are ignored. chafa encodes every chunk on its
+/// own and leaves those bits set, which the strict standard engine rejects.
+const PAYLOAD_BASE64: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new()
+        .with_decode_allow_trailing_bits(true)
+        .with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 const MAX_RELATIVE_DEPTH: usize = 8;
+
+impl KittyGraphicsCommand {
+    pub(crate) fn needs_placeholder_positions(&self) -> bool {
+        self.char_value('a') == Some('d') && !matches!(self.char_value('d'), Some('f' | 'F'))
+    }
+}
 
 #[derive(Clone, Debug)]
 struct StoredImage {
@@ -43,6 +66,9 @@ struct StoredImage {
     height: u32,
     generation: u64,
     number: Option<u32>,
+    // Transmitted with neither `i` nor `I`: no command can refer to it again,
+    // so it lives only as long as its placements.
+    anonymous: bool,
     animation: Option<crate::terminal_engine::media::GraphicsAnimation>,
 }
 
@@ -167,6 +193,13 @@ pub enum KittyGraphicsScreen {
 }
 
 impl KittyGraphicsScreen {
+    fn index(self) -> usize {
+        match self {
+            Self::Primary => 0,
+            Self::Alternate => 1,
+        }
+    }
+
     pub fn from_alternate_screen(alternate_screen: bool) -> Self {
         if alternate_screen {
             Self::Alternate
@@ -185,8 +218,8 @@ pub struct KittyGraphicsRenderPlacement<I = Arc<crate::terminal_engine::media::G
     pub image_width: u32,
     pub image_height: u32,
     pub image_generation: u64,
-    #[serde(with = "crate::remote::serde_deadline")]
-    pub animation_deadline: Option<std::time::Instant>,
+    #[serde(with = "crate::serde_deadline")]
+    pub animation_deadline: Option<web_time::Instant>,
     pub viewport_row: i32,
     pub col: usize,
     pub col_offset: i32,
@@ -250,13 +283,21 @@ pub struct KittyGraphicsApplyResult {
 pub struct KittyGraphicsState {
     images: HashMap<u32, StoredImage>,
     placements: Vec<Placement>,
+    // Maintained on insertion/removal so ordinary text feeds never scan images.
+    virtual_placements: [usize; 2],
     insertion_order: VecDeque<u32>,
     pending: Option<PendingUpload>,
     next_anonymous_id: u32,
     stored_bytes: usize,
+    anonymous_images: usize,
     next_generation: u64,
     next_placement_serial: u64,
     viewport_rows: u16,
+    // Set by `apply_deferring_upload`: completed uploads are handed back
+    // undecoded instead of being decoded here.
+    defer_uploads: bool,
+    deferred: Option<KittyUpload>,
+    animation_work: usize,
 }
 
 impl KittyGraphicsState {
@@ -273,14 +314,16 @@ impl KittyGraphicsState {
                 matches!(placement.location, PlacementLocation::Virtual),
             )
             .placement_size;
-            placement.occupied_cols = ((width + placement.x_offset as f32)
-                / size.cell_width.max(1.0))
-            .ceil()
-            .max(1.0) as u32;
-            placement.occupied_rows = ((height + placement.y_offset as f32)
-                / size.cell_height.max(1.0))
-            .ceil()
-            .max(1.0) as u32;
+            placement.occupied_cols = occupied_cells(
+                placement.display_cols,
+                width + placement.x_offset as f32,
+                size.cell_width.max(1.0),
+            );
+            placement.occupied_rows = occupied_cells(
+                placement.display_rows,
+                height + placement.y_offset as f32,
+                size.cell_height.max(1.0),
+            );
         }
     }
 
@@ -374,12 +417,29 @@ impl KittyGraphicsState {
             );
         }
         let action = command.char_value('a').unwrap_or('t');
-        if matches!(action, 'a' | 'c')
-            || (action == 'd' && matches!(command.char_value('d'), Some('f' | 'F')))
-        {
-            if action == 'd' {
+        if action == 'd' {
+            // Like kitty and ghostty, deletions never reply, whatever `q`
+            // says. A reply the client doesn't read lands at its prompt.
+            let mut result = if matches!(command.char_value('d'), Some('f' | 'F')) {
                 self.pending = None;
-            }
+                match self.edit_animation(&command, None) {
+                    Ok(_) => self.success(&command, true, None, screen),
+                    Err(error) => self.failure(&command, &error),
+                }
+            } else {
+                self.delete(
+                    &command,
+                    cursor_col,
+                    cursor_row,
+                    history_size,
+                    screen,
+                    placeholders,
+                )
+            };
+            result.response = None;
+            return result;
+        }
+        if matches!(action, 'a' | 'c') {
             return match self.edit_animation(&command, None) {
                 Ok(id) => {
                     if command.u32_value('I').is_some() {
@@ -390,17 +450,6 @@ impl KittyGraphicsState {
                 Err(error) => self.failure(&command, &error),
             };
         }
-
-        if action == 'd' {
-            return self.delete(
-                &command,
-                cursor_col,
-                cursor_row,
-                history_size,
-                screen,
-                placeholders,
-            );
-        }
         if action == 'p' {
             return self.put(command, cursor_col, cursor_row, history_size, size, screen);
         }
@@ -409,8 +458,51 @@ impl KittyGraphicsState {
         }
 
         let encoded = std::mem::take(&mut command.payload);
-        let decoded = match BASE64.decode(encoded) {
-            Ok(decoded) if decoded.len() <= MAX_IMAGE_BYTES => decoded,
+        if let Some(pending) = &self.pending {
+            // Some clients repeat the first chunk's control data on every
+            // chunk. kitty and ghostty ignore it, so only a key that changes
+            // the upload counts against continuing it.
+            let foreign = command.control.iter().any(|(key, value)| {
+                !matches!(key, 'm' | 'q') && pending.command.value(*key) != Some(value.as_str())
+            });
+            // A client killed mid-upload never sends the final chunk. A new
+            // transmission abandons that upload instead of failing itself, so
+            // detect it before checking sizes against the abandoned data.
+            let restarts = foreign
+                && command
+                    .control
+                    .iter()
+                    .any(|(key, _)| matches!(key, 'a' | 'i' | 'I' | 'f' | 's' | 'v' | 't'));
+            if foreign {
+                let abandoned = self.pending.take().expect("pending upload");
+                if !restarts {
+                    return self.failure(
+                        &abandoned.command,
+                        "EINVAL:continuation contains unsupported control data",
+                    );
+                }
+            }
+        }
+        // Reject before decoding: base64 yields at least len/4*3 - 2 bytes.
+        let pending = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| pending.decoded.len());
+        let oversized = encoded.len() / 4 * 3 > MAX_IMAGE_BYTES.saturating_sub(pending) + 2;
+        let more = command.u32_value('m').unwrap_or(0) == 1;
+        if self.pending.is_none() && !more && !oversized {
+            // A single-chunk upload decodes its payload with the image.
+            return self.finish_upload(
+                command,
+                UploadData::Base64(encoded),
+                (cursor_col, cursor_row),
+                history_size,
+                size,
+                screen,
+            );
+        }
+        let decoded = match PAYLOAD_BASE64.decode(if oversized { Vec::new() } else { encoded }) {
+            Ok(decoded) if decoded.len() <= MAX_IMAGE_BYTES && !oversized => decoded,
             Ok(_) => {
                 let response_command = self
                     .pending
@@ -430,19 +522,8 @@ impl KittyGraphicsState {
             }
         };
 
-        let more = command.u32_value('m').unwrap_or(0) == 1;
+        // Any upload still pending here is continued by this chunk.
         if let Some(mut pending) = self.pending.take() {
-            if command.control.iter().any(|(key, _)| {
-                !(matches!(key, 'm' | 'q')
-                    || *key == 'a'
-                        && command.char_value('a') == Some('f')
-                        && pending.command.char_value('a') == Some('f'))
-            }) {
-                return self.failure(
-                    &pending.command,
-                    "EINVAL:continuation contains unsupported control data",
-                );
-            }
             if pending.decoded.len().saturating_add(decoded.len()) > MAX_IMAGE_BYTES {
                 return self.failure(
                     &pending.command,
@@ -462,9 +543,8 @@ impl KittyGraphicsState {
             }
             return self.finish_upload(
                 first,
-                pending.decoded,
-                cursor_col,
-                cursor_row,
+                UploadData::Decoded(pending.decoded),
+                (cursor_col, cursor_row),
                 history_size,
                 size,
                 screen,
@@ -481,9 +561,8 @@ impl KittyGraphicsState {
         }
         self.finish_upload(
             command,
-            decoded,
-            cursor_col,
-            cursor_row,
+            UploadData::Decoded(decoded),
+            (cursor_col, cursor_row),
             history_size,
             size,
             screen,
@@ -537,6 +616,7 @@ impl KittyGraphicsState {
         let display_offset = i64::try_from(display_offset).unwrap_or(i64::MAX);
         let rows_i64 = i64::try_from(rows).unwrap_or(i64::MAX);
         let mut result = Vec::new();
+        let mut origins = placement::OriginResolver::new(&self.placements, placeholders);
         for placement in self
             .placements
             .iter()
@@ -598,6 +678,19 @@ impl KittyGraphicsState {
                 });
             };
             if matches!(placement.location, PlacementLocation::Virtual) {
+                // A zero underline color selects one prototype, never every
+                // placement. That prototype depends only on the image, so look
+                // it up once instead of once per placeholder cell.
+                let prototype = self
+                    .placements
+                    .iter()
+                    .rev()
+                    .find(|p| {
+                        p.screen == screen
+                            && p.image_id == placement.image_id
+                            && matches!(p.location, PlacementLocation::Virtual)
+                    })
+                    .is_none_or(|p| p.placement_serial == placement.placement_serial);
                 for cell in placeholders {
                     if cell.image_id != placement.image_id
                         || (cell.placement_id != 0 && cell.placement_id != placement.placement_id)
@@ -608,19 +701,7 @@ impl KittyGraphicsState {
                     {
                         continue;
                     }
-                    // A zero underline color selects one prototype, never every placement.
-                    if cell.placement_id == 0
-                        && self
-                            .placements
-                            .iter()
-                            .rev()
-                            .find(|p| {
-                                p.screen == screen
-                                    && p.image_id == cell.image_id
-                                    && matches!(p.location, PlacementLocation::Virtual)
-                            })
-                            .is_some_and(|p| p.placement_serial != placement.placement_serial)
-                    {
+                    if cell.placement_id == 0 && !prototype {
                         continue;
                     }
                     emit(
@@ -629,7 +710,7 @@ impl KittyGraphicsState {
                         Some((cell.image_col, cell.image_row)),
                     );
                 }
-            } else if let Some(origin) = self.resolve_render_origin(placement, placeholders) {
+            } else if let Some(origin) = origins.resolve(placement) {
                 let (row, col) = match origin {
                     ResolvedOrigin::Buffer { anchor_line, col } => (
                         anchor_line
@@ -665,21 +746,25 @@ impl KittyGraphicsState {
     }
 
     pub fn has_virtual_placements(&self) -> bool {
-        self.placements
-            .iter()
-            .any(|placement| matches!(placement.location, PlacementLocation::Virtual))
+        self.virtual_placements.iter().any(|count| *count != 0)
+    }
+
+    pub(crate) fn has_virtual_placements_on_screen(&self, screen: KittyGraphicsScreen) -> bool {
+        self.virtual_placements[screen.index()] != 0
     }
 
     pub fn reset(&mut self) -> bool {
         let changed = !self.placements.is_empty() || self.pending.is_some();
         self.placements.clear();
+        self.virtual_placements = [0; 2];
         self.pending = None;
+        self.release_unplaced_anonymous_images();
         changed
     }
 
     pub fn clear_visible_on_screen(&mut self, screen: KittyGraphicsScreen) -> bool {
         let before = self.placements.len();
-        self.placements.retain(|placement| {
+        self.retain_placements(|placement| {
             placement.screen != screen || matches!(placement.location, PlacementLocation::Virtual)
         });
         self.remove_orphaned_relative_placements();
@@ -707,7 +792,7 @@ impl KittyGraphicsState {
         let viewport_start = i64::try_from(history_size).unwrap_or(i64::MAX);
         let viewport_end = viewport_start.saturating_add(i64::try_from(rows).unwrap_or(i64::MAX));
         let before = self.placements.len();
-        self.placements.retain(|placement| {
+        self.retain_placements(|placement| {
             if placement.screen != screen {
                 return true;
             }
@@ -758,7 +843,7 @@ impl KittyGraphicsState {
                 *anchor_line = anchor_line.saturating_sub(lines);
             }
         }
-        self.placements.retain(|placement| {
+        self.retain_placements(|placement| {
             placement.screen != screen
                 || !matches!(
                     placement.location,
@@ -862,30 +947,77 @@ impl KittyGraphicsState {
 
     fn finish_upload(
         &mut self,
-        mut command: KittyGraphicsCommand,
-        decoded: Vec<u8>,
-        cursor_col: usize,
-        cursor_row: usize,
+        command: KittyGraphicsCommand,
+        data: UploadData,
+        cursor: (usize, usize),
         history_size: usize,
         size: TerminalSize,
         screen: KittyGraphicsScreen,
     ) -> KittyGraphicsApplyResult {
-        let data = match self.resolve_transmission_data(&command, decoded) {
-            Ok(data) => data,
-            Err(error) => return self.failure(&command, &error),
+        let upload = KittyUpload {
+            command,
+            data,
+            screen,
         };
-        let data = match command.char_value('o') {
-            None => data,
-            Some('z') => match decompress_zlib(&data) {
-                Ok(data) => data,
-                Err(error) => return self.failure(&command, &error),
-            },
-            Some(_) => return self.failure(&command, "EINVAL:unsupported compression"),
-        };
-        let (image, width, height) = match normalize_image(&command, data) {
+        if self.defer_uploads {
+            self.deferred = Some(upload);
+            return KittyGraphicsApplyResult::default();
+        }
+        self.commit_upload(upload.prepare(), cursor, history_size, size)
+    }
+
+    /// Like [`Self::apply_on_screen_with_placeholders`], but a completed
+    /// upload is returned undecoded. Decode it with [`KittyUpload::prepare`]
+    /// (which needs no state) and pass the result to [`Self::commit_upload`]
+    /// before applying any later command.
+    pub(crate) fn apply_deferring_upload(
+        &mut self,
+        command: KittyGraphicsCommand,
+        cursor: (usize, usize),
+        history_size: usize,
+        size: TerminalSize,
+        screen: KittyGraphicsScreen,
+        placeholders: &[KittyGraphicsPlaceholder],
+    ) -> (KittyGraphicsApplyResult, Option<KittyUpload>) {
+        self.defer_uploads = true;
+        let result = self.apply_on_screen_with_placeholders(
+            command,
+            cursor,
+            history_size,
+            size,
+            screen,
+            placeholders,
+        );
+        self.defer_uploads = false;
+        (result, self.deferred.take())
+    }
+
+    pub(crate) fn commit_upload(
+        &mut self,
+        prepared: KittyPreparedUpload,
+        cursor: (usize, usize),
+        history_size: usize,
+        size: TerminalSize,
+    ) -> KittyGraphicsApplyResult {
+        let KittyPreparedUpload {
+            mut command,
+            image,
+            screen,
+        } = prepared;
+        self.viewport_rows = size.rows;
+        let (image, width, height) = match image {
             Ok(image) => image,
             Err(error) => return self.failure(&command, &error),
         };
+        if let Some(inline) = command.inline {
+            let (cols, rows) = inline.display_cells(width, height, size, cursor.0);
+            command
+                .control
+                .extend(cols.map(|cols| ('c', cols.to_string())));
+            command
+                .control
+                .extend(rows.map(|rows| ('r', rows.to_string())));
+        }
 
         if command.char_value('a') == Some('f') {
             return match self.edit_animation(&command, Some(image)) {
@@ -919,6 +1051,7 @@ impl KittyGraphicsState {
             height,
             generation: next_generation,
             number,
+            anonymous: requested_id == 0 && number.is_none(),
             animation: None,
         };
         let byte_len = image.byte_len();
@@ -930,7 +1063,7 @@ impl KittyGraphicsState {
                 &image,
                 image_id,
                 &command,
-                (cursor_col, cursor_row),
+                cursor,
                 history_size,
                 size,
                 screen,
@@ -946,13 +1079,31 @@ impl KittyGraphicsState {
         }
         self.remove_image(image_id);
         self.next_generation = next_generation;
+        self.anonymous_images += usize::from(image.anonymous);
         self.images.insert(image_id, image);
         self.insertion_order.push_back(image_id);
         self.stored_bytes = self.stored_bytes.saturating_add(byte_len);
-        let cursor_advance = staged.and_then(|(placement, advance)| {
+        let mut cursor_advance = None;
+        if let Some((placement, advance)) = staged {
+            // Replacing the image removed its old placements (and their
+            // relative descendants). Like kitty, a parent among them is gone.
+            if let PlacementLocation::Relative {
+                parent_image_id,
+                parent_placement_id,
+                ..
+            } = placement.location
+                && self
+                    .placement_by_key(placement.screen, parent_image_id, parent_placement_id)
+                    .is_none()
+            {
+                let mut result =
+                    self.failure(&command, "ENOPARENT:relative placement parent not found");
+                result.changed = true;
+                return result;
+            }
             self.commit_placement(placement);
-            advance
-        });
+            cursor_advance = advance;
+        }
         self.success(&command, true, cursor_advance, screen)
     }
 
@@ -1078,8 +1229,8 @@ impl KittyGraphicsState {
             virtual_placement,
         )
         .placement_size;
-        let occupied_cols = ((width + x_offset as f32) / cell_width).ceil().max(1.0) as u32;
-        let occupied_rows = ((height + y_offset as f32) / cell_height).ceil().max(1.0) as u32;
+        let occupied_cols = occupied_cells(display_cols, width + x_offset as f32, cell_width);
+        let occupied_rows = occupied_cells(display_rows, height + y_offset as f32, cell_height);
         let placement_id = command.u32_value('p').unwrap_or(0);
         let virtual_placement = command.u32_value('U').unwrap_or(0) == 1;
         let relative_parent = command.u32_value('P').filter(|id| *id > 0);
@@ -1137,58 +1288,40 @@ impl KittyGraphicsState {
         Ok((placement, advance))
     }
 
+    fn retain_placements(&mut self, mut keep: impl FnMut(&Placement) -> bool) {
+        let counts = &mut self.virtual_placements;
+        self.placements.retain(|placement| {
+            if keep(placement) {
+                return true;
+            }
+            if matches!(placement.location, PlacementLocation::Virtual) {
+                counts[placement.screen.index()] -= 1;
+            }
+            false
+        });
+    }
+
     fn commit_placement(&mut self, placement: Placement) {
         if placement.placement_id != 0 {
-            self.placements.retain(|existing| {
+            self.retain_placements(|existing| {
                 existing.screen != placement.screen
                     || existing.image_id != placement.image_id
                     || existing.placement_id != placement.placement_id
             });
         }
         self.next_placement_serial = placement.placement_serial;
+        if matches!(placement.location, PlacementLocation::Virtual) {
+            self.virtual_placements[placement.screen.index()] += 1;
+        }
         self.placements.push(placement);
         if self.placements.len() > MAX_PLACEMENTS {
             let overflow = self.placements.len() - MAX_PLACEMENTS;
-            self.placements.drain(..overflow);
-            self.remove_orphaned_relative_placements();
-        }
-    }
-
-    fn resolve_transmission_data(
-        &self,
-        command: &KittyGraphicsCommand,
-        decoded: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
-        match command.char_value('t').unwrap_or('d') {
-            'd' => Ok(decoded),
-            'f' | 't' => {
-                let temporary = command.char_value('t') == Some('t');
-                let path = PathBuf::from(
-                    std::str::from_utf8(&decoded).map_err(|_| "EINVAL:file path is not UTF-8")?,
-                );
-                let result = read_regular_file(
-                    &path,
-                    command.u32_value('O').unwrap_or(0) as u64,
-                    command
-                        .u32_value('S')
-                        .filter(|size| *size > 0)
-                        .map(u64::from),
-                );
-                if temporary && result.is_ok() && temporary_path_can_be_removed(&path) {
-                    let _ = std::fs::remove_file(&path);
+            for removed in self.placements.drain(..overflow) {
+                if matches!(removed.location, PlacementLocation::Virtual) {
+                    self.virtual_placements[removed.screen.index()] -= 1;
                 }
-                result
             }
-            's' => crate::terminal_engine::media::read_graphics_shared_memory(
-                &decoded,
-                u64::from(command.u32_value('O').unwrap_or(0)),
-                command
-                    .u32_value('S')
-                    .filter(|size| *size > 0)
-                    .map(u64::from),
-                MAX_IMAGE_BYTES,
-            ),
-            _ => Err("EINVAL:unsupported transmission medium".into()),
+            self.remove_orphaned_relative_placements();
         }
     }
 
@@ -1263,13 +1396,40 @@ impl KittyGraphicsState {
     }
 
     fn remove_image(&mut self, image_id: u32) {
+        self.forget_image(image_id);
+        self.retain_placements(|placement| placement.image_id != image_id);
+        self.remove_orphaned_relative_placements();
+    }
+
+    /// Drop stored data only; the caller owns any placement cleanup.
+    fn forget_image(&mut self, image_id: u32) {
         if let Some(image) = self.images.remove(&image_id) {
             self.stored_bytes = self.stored_bytes.saturating_sub(image.byte_len());
+            self.anonymous_images -= usize::from(image.anonymous);
+            self.insertion_order.retain(|id| *id != image_id);
         }
-        self.placements
-            .retain(|placement| placement.image_id != image_id);
-        self.remove_orphaned_relative_placements();
-        self.insertion_order.retain(|id| *id != image_id);
+    }
+
+    /// Free id-less images whose last placement is gone, as kitty does,
+    /// rather than holding them until a later upload exceeds the quota.
+    fn release_unplaced_anonymous_images(&mut self) {
+        if self.anonymous_images == 0 {
+            return;
+        }
+        let placed = self
+            .placements
+            .iter()
+            .map(|placement| placement.image_id)
+            .collect::<HashSet<_>>();
+        let unplaced = self
+            .images
+            .iter()
+            .filter(|(id, image)| image.anonymous && !placed.contains(id))
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in unplaced {
+            self.forget_image(id);
+        }
     }
 
     fn success(
@@ -1315,136 +1475,20 @@ fn response(command: &KittyGraphicsCommand, success: bool, message: &str) -> Opt
     if (success && quiet >= 1) || (!success && quiet >= 2) {
         return None;
     }
-    let image_id = command
-        .u32_value('i')
-        .filter(|id| *id != 0)
-        .or_else(|| command.u32_value('I').filter(|number| *number != 0))?;
-    let mut control = format!("i={image_id}");
-    if let Some(number) = command.u32_value('I').filter(|number| *number != 0) {
-        control.push_str(&format!(",I={number}"));
-    }
+    // As in kitty, `i` and `I` are reported as given: a lookup by number that
+    // found no image answers with `I` alone.
+    let image_id = command.u32_value('i').filter(|id| *id != 0);
+    let number = command.u32_value('I').filter(|number| *number != 0);
+    let mut control = match (image_id, number) {
+        (Some(id), Some(number)) => format!("i={id},I={number}"),
+        (Some(id), None) => format!("i={id}"),
+        (None, Some(number)) => format!("I={number}"),
+        (None, None) => return None,
+    };
     if let Some(placement_id) = command.u32_value('p') {
         control.push_str(&format!(",p={placement_id}"));
     }
     Some(format!("\x1b_G{control};{message}\x1b\\").into_bytes())
-}
-
-fn validate_dimensions(width: u32, height: u32, channels: usize) -> Result<usize, String> {
-    if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err("EINVAL:invalid image dimensions".into());
-    }
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_PIXELS {
-        return Err("EFBIG:image dimensions exceed storage limit".into());
-    }
-    usize::try_from(pixels)
-        .ok()
-        .and_then(|pixels| pixels.checked_mul(channels))
-        .ok_or_else(|| "EFBIG:image dimensions overflow".into())
-}
-
-fn decompress_zlib(data: &[u8]) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    ZlibDecoder::new(data)
-        .take(MAX_IMAGE_BYTES as u64 + 1)
-        .read_to_end(&mut output)
-        .map_err(|_| "EINVAL:invalid zlib payload".to_string())?;
-    if output.len() > MAX_IMAGE_BYTES {
-        return Err("EFBIG:decompressed image exceeds storage limit".into());
-    }
-    Ok(output)
-}
-
-fn read_regular_file(path: &Path, offset: u64, size: Option<u64>) -> Result<Vec<u8>, String> {
-    // Reject FIFOs and devices before opening: a child controls this path and a
-    // blocking FIFO open would otherwise stall the parser thread indefinitely.
-    let initial_metadata =
-        std::fs::metadata(path).map_err(|_| "ENOENT:unable to open image file".to_string())?;
-    if !initial_metadata.is_file() {
-        return Err("EINVAL:invalid image file".into());
-    }
-    let mut file = open_image_file(path)?;
-    let metadata = file
-        .metadata()
-        .map_err(|_| "EIO:unable to inspect image file".to_string())?;
-    if !metadata.is_file() || offset > metadata.len() {
-        return Err("EINVAL:invalid image file".into());
-    }
-    let length = size
-        .unwrap_or(metadata.len() - offset)
-        .min(metadata.len() - offset);
-    if length > MAX_IMAGE_BYTES as u64 {
-        return Err("EFBIG:image file exceeds storage limit".into());
-    }
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|_| "EIO:unable to seek image file".to_string())?;
-    let mut output = Vec::with_capacity(length as usize);
-    file.take(length)
-        .read_to_end(&mut output)
-        .map_err(|_| "EIO:unable to read image file".to_string())?;
-    Ok(output)
-}
-
-fn open_image_file(path: &Path) -> Result<File, String> {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    const NONBLOCK: i32 = 0o4000;
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    const NONBLOCK: i32 = 0x0004;
-
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    {
-        use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
-
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(NONBLOCK)
-            .open(path)
-            .map_err(|_| "ENOENT:unable to open image file".to_string())
-    }
-
-    #[cfg(not(any(
-        target_os = "linux",
-        target_os = "android",
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    )))]
-    File::open(path).map_err(|_| "ENOENT:unable to open image file".to_string())
-}
-
-fn temporary_path_can_be_removed(path: &Path) -> bool {
-    let path_text = path.to_string_lossy();
-    if !path_text.contains("tty-graphics-protocol") {
-        return false;
-    }
-    let Ok(canonical) = path.canonicalize() else {
-        return false;
-    };
-    let mut roots = vec![PathBuf::from("/tmp"), PathBuf::from("/private/tmp")];
-    roots.push(std::env::temp_dir());
-    roots.into_iter().any(|root| {
-        root.canonicalize()
-            .is_ok_and(|root| canonical.starts_with(root))
-    })
 }
 
 #[cfg(test)]

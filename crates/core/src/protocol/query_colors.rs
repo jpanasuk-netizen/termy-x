@@ -5,8 +5,8 @@ pub struct TerminalQueryColors {
     pub ansi: [TerminalColor; 16],
     pub foreground: TerminalColor,
     pub background: TerminalColor,
-    // Retained as part of the query fallback contract, but OSC 12 replies still
-    // only come from an explicit live cursor override in the terminal state.
+    // OSC 12 fallback when no program set a cursor color; `None` reports the
+    // foreground, like xterm.
     pub cursor: Option<TerminalColor>,
 }
 
@@ -111,7 +111,9 @@ impl Default for TerminalQueryColors {
 }
 
 impl TerminalQueryColors {
-    pub(crate) fn indexed_color(self, idx: u8) -> TerminalColor {
+    /// The color OSC 4 reports for palette `idx`: the theme for 0..=15, then
+    /// the xterm 6x6x6 cube and grayscale ramp.
+    pub fn indexed_color(self, idx: u8) -> TerminalColor {
         match idx {
             0..=15 => self.ansi[idx as usize],
             16..=231 => {
@@ -181,7 +183,7 @@ mod tests {
         );
         assert_eq!(
             reply(colors, b"\x1b]4;232;?\x07"),
-            b"\x1b]4;232;rgb:0808/0808/0808\x1b\\"
+            b"\x1b]4;232;rgb:0808/0808/0808\x07"
         );
     }
 
@@ -191,7 +193,7 @@ mod tests {
         colors.ansi[4] = TerminalColor { r: 1, g: 2, b: 3 };
         assert_eq!(
             reply(colors, b"\x1b]4;4;?\x07"),
-            b"\x1b]4;4;rgb:0101/0202/0303\x1b\\"
+            b"\x1b]4;4;rgb:0101/0202/0303\x07"
         );
     }
 
@@ -207,7 +209,7 @@ mod tests {
         };
         assert_eq!(
             reply(defaults, b"\x1b]10;#123456\x07\x1b]10;?\x07"),
-            b"\x1b]10;rgb:1212/3434/5656\x1b\\"
+            b"\x1b]10;rgb:1212/3434/5656\x07"
         );
     }
 
@@ -223,12 +225,12 @@ mod tests {
         };
         assert_eq!(
             reply(defaults, b"\x1b]10;#123456\x07\x1b]110\x07\x1b]10;?\x07"),
-            b"\x1b]10;rgb:4444/5555/6666\x1b\\"
+            b"\x1b]10;rgb:4444/5555/6666\x07"
         );
     }
 
     #[test]
-    fn cursor_queries_require_live_override() {
+    fn cursor_queries_prefer_live_override_then_configured_cursor() {
         let defaults = TerminalQueryColors {
             cursor: Some(TerminalColor {
                 r: 0xab,
@@ -237,10 +239,13 @@ mod tests {
             }),
             ..TerminalQueryColors::default()
         };
-        assert!(reply(defaults, b"\x1b]12;?\x07").is_empty());
+        assert_eq!(
+            reply(defaults, b"\x1b]12;?\x07"),
+            b"\x1b]12;rgb:abab/cdcd/efef\x07"
+        );
         assert_eq!(
             reply(defaults, b"\x1b]12;#102030\x07\x1b]12;?\x07"),
-            b"\x1b]12;rgb:1010/2020/3030\x1b\\"
+            b"\x1b]12;rgb:1010/2020/3030\x07"
         );
     }
 

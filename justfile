@@ -1,12 +1,25 @@
 set shell := ["bash", "-cu"]
 
+# On Windows a bare "bash" can resolve to System32's WSL launcher. Git for
+# Windows' sh is bash, and nothing else named sh ships with Windows, so run
+# just from Git Bash (or with Git's usr/bin on PATH). Shebang recipes also
+# need Git Bash: just maps their interpreter paths with cygpath.
+set windows-shell := ["sh", "-cu"]
+
+# Per-checkout instance home, so `just run`/`just dev` never attach to an
+# installed Termy. Computed by just rather than in a shell `${VAR:-...}`
+# default, whose braces broke on literal `{{ }}` text.
+dev_instance_home := env("TERMY_INSTANCE_HOME", justfile_directory() / "target" / "termy-dev-instance")
+
 # Show available recipes
 @default:
     just --list
 
 # Checkout-local instance lock so this does not silently attach to Termy.app.
+# On Windows it goes through `build`, which embeds termy.manifest (the WinUI
+# tab strip needs it; see scripts/windows/embed-manifest.ps1).
 run:
-    TERMY_INSTANCE_HOME="${TERMY_INSTANCE_HOME:-{{ justfile_directory() }}/target/termy-dev-instance}" cargo run -p termy --release
+    if [ "{{ os() }}" = "windows" ]; then {{ just_executable() }} build && TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} ./target/release/termy.exe; else TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} cargo run -p termy --release; fi
 
 # Measure the custom terminal parser/grid and enforce warmed allocation bounds.
 benchmark-terminal-engine mib="32":
@@ -42,10 +55,11 @@ validate: check fmt-check test-workspace check-boundaries
     cargo clippy --workspace --all-targets -- -D warnings
 
 dev:
-    TERMY_INSTANCE_HOME="${TERMY_INSTANCE_HOME:-{{ justfile_directory() }}/target/termy-dev-instance}" cargo watch -x "run -p termy --release"
+    TERMY_INSTANCE_HOME={{ quote(dev_instance_home) }} cargo watch -x "run -p termy --release"
 
 build:
     cargo build -p termy --release
+    if [ "{{ os() }}" = "windows" ]; then powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/windows/embed-manifest.ps1 -ExePath target/release/termy.exe; fi
 
 check:
     cargo check --workspace
@@ -113,6 +127,11 @@ check-boundaries:
 
 check-file-sizes:
     ./scripts/check-file-sizes.sh
+
+# Build libtermy and run the Swift SDK tests (macOS)
+test-swift-sdk profile="release":
+    ./sdk/swift/scripts/build-libtermy.sh {{ profile }}
+    swift test --package-path sdk/swift
 
 test-tmux-integration:
     #!/usr/bin/env bash
@@ -197,13 +216,13 @@ bump kind:
     cargo update --workspace --offline
     echo "Bumped $CURRENT -> $NEW"
 
-# Set exact version in desktop app + cli Cargo.toml (e.g. just set-version 0.2.12)
+# Set exact version in desktop app + cli Cargo.toml (e.g. just set-version 0.2.12 or 1.0.0-rc.1)
 set-version version:
     #!/usr/bin/env bash
     set -euo pipefail
     NEW="{{ version }}"
-    if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "usage: just set-version <major.minor.patch> (got: $NEW)"; exit 1
+    if ! [[ "$NEW" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
+      echo "usage: just set-version <major.minor.patch[-prerelease]> (got: $NEW)"; exit 1
     fi
     CURRENT=$(grep -m1 '^version = ' crates/desktop_app/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
     export NEW

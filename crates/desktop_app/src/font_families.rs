@@ -14,6 +14,11 @@ const FIXED_ADVANCE_TOLERANCE: f32 = 0.01;
 /// pane.
 static LAST_FALLBACK_NOTIFICATION: Mutex<Option<String>> = Mutex::new(None);
 
+/// The most recent resolution, keyed by the requested family. Panes resolve
+/// the font on creation and on every config apply, and resolving enumerates
+/// every installed font and measures candidates.
+static LAST_RESOLVED_FAMILY: Mutex<Option<(String, SharedString)>> = Mutex::new(None);
+
 /// Clean GPUI's font list before exposing it in settings.
 ///
 /// GPUI includes `.ZedMono` and `.ZedSans` even when the concrete fonts they
@@ -76,6 +81,35 @@ pub(crate) fn effective_terminal_font_family(
     requested: &str,
     text_system: &TextSystem,
 ) -> SharedString {
+    // The cache assumes the app's single text system. Tests build many (often
+    // no-op) text systems, so a shared entry would leak between them.
+    if cfg!(test) {
+        return resolve_terminal_font_family(requested, text_system);
+    }
+    let mut last = LAST_RESOLVED_FAMILY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cached_resolution(&mut last, requested, || {
+        resolve_terminal_font_family(requested, text_system)
+    })
+}
+
+fn cached_resolution(
+    last: &mut Option<(String, SharedString)>,
+    requested: &str,
+    resolve: impl FnOnce() -> SharedString,
+) -> SharedString {
+    if let Some((key, family)) = last.as_ref()
+        && key == requested
+    {
+        return family.clone();
+    }
+    let family = resolve();
+    *last = Some((requested.to_string(), family.clone()));
+    family
+}
+
+fn resolve_terminal_font_family(requested: &str, text_system: &TextSystem) -> SharedString {
     // Most launches need one installed family. Enumerating every system font
     // creates thousands of descriptors before the first window can paint.
     #[cfg(target_os = "macos")]
@@ -151,8 +185,10 @@ fn system_monospace_family() -> String {
         .select_best_match(&[FamilyName::Monospace], &Properties::new())
         .ok()
         .and_then(|handle| handle.load().ok())
-        .map(|font| font.family_name())
-        .unwrap_or_else(|| DEFAULT_FONT_FAMILY.to_string())
+        .map_or_else(
+            || DEFAULT_FONT_FAMILY.to_string(),
+            |font| font.family_name(),
+        )
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -242,6 +278,24 @@ fn ascii_advances_are_fixed(advances: &[f32]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn font_resolution_is_reused_until_the_requested_family_changes() {
+        let mut last = None;
+        let mut resolutions = 0;
+        let mut resolve = |family: &'static str| {
+            resolutions += 1;
+            SharedString::from(family)
+        };
+
+        let mut resolve_as = |requested, family| {
+            cached_resolution(&mut last, requested, || resolve(family)).to_string()
+        };
+        assert_eq!(resolve_as("Menlo", "Menlo"), "Menlo");
+        assert_eq!(resolve_as("Menlo", "other"), "Menlo");
+        assert_eq!(resolve_as("Missing", "Lilex"), "Lilex");
+        assert_eq!(resolutions, 2);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

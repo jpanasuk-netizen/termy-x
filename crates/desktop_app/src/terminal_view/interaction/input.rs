@@ -1,5 +1,4 @@
 use super::*;
-use std::env;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::terminal_view) enum PendingKeyRelease {
@@ -20,31 +19,180 @@ fn should_defer_key_down_to_ime(keystroke: &gpui_kit::Keystroke) -> bool {
         )
 }
 
-fn shell_quote_path(path: &Path) -> String {
+/// AltGr text on Windows, which arrives as Ctrl+Alt. GPUI flags it with
+/// `prefer_character_input` and skips key bindings for it. Leaving it to the
+/// platform text path (WM_CHAR) lets Windows compose AltGr dead keys: writing
+/// the key here would send the spacing accent and swallow the dead-key state,
+/// so the next letter would arrive uncombined.
+fn should_defer_altgr_key_down_to_ime(
+    keystroke: &gpui_kit::Keystroke,
+    prefer_character_input: bool,
+) -> bool {
+    cfg!(target_os = "windows")
+        && prefer_character_input
+        && keystroke.modifiers.control
+        && keystroke.modifiers.alt
+        && !keystroke.modifiers.platform
+        && !keystroke.modifiers.function
+        && keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|text| !text.is_empty())
+}
+
+/// A dead key starting an xkb compose sequence (Linux). GPUI shows the dead
+/// key as marked text first, then sends a KeyDown with no `key_char` whose
+/// `key` is only a US-layout guess for the physical key (e.g. `}` or `\`).
+/// The composed character arrives later as text, so forwarding this key
+/// would type a stray character before it.
+fn is_compose_dead_key(keystroke: &gpui_kit::Keystroke, composing: bool) -> bool {
+    composing
+        && keystroke.key_char.is_none()
+        && !keystroke.modifiers.control
+        && !keystroke.modifiers.alt
+        && !keystroke.modifiers.platform
+        && !keystroke.modifiers.function
+        // GPUI falls back to the keysym name (`dead_tilde`) when it can't guess.
+        && (keystroke.key.chars().count() == 1 || keystroke.key.starts_with("dead_"))
+}
+
+/// How pasted and dropped paths are quoted for the shell that reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathQuoteStyle {
+    /// POSIX shells, including Git Bash and WSL on Windows: single quotes.
+    Posix,
+    /// cmd.exe: double quotes, which a Windows path cannot contain.
+    Cmd,
+    /// PowerShell: single quotes, with each literal quote doubled.
+    PowerShell,
+}
+
+impl PathQuoteStyle {
+    /// The style for a shell program path or name such as
+    /// `C:\Windows\System32\cmd.exe` or `pwsh`.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn for_shell_program(program: &str) -> Self {
+        let name = program
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(program)
+            .to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(name.as_str());
+        match name {
+            "cmd" => Self::Cmd,
+            "powershell" | "pwsh" => Self::PowerShell,
+            _ => Self::Posix,
+        }
+    }
+}
+
+/// PowerShell also ends a single-quoted string at typographic single quotes.
+fn is_powershell_single_quote(ch: char) -> bool {
+    matches!(ch, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}')
+}
+
+fn shell_quote_path(path: &Path, style: PathQuoteStyle) -> String {
     let path_str = path.to_string_lossy();
     let mut quoted = String::with_capacity(path_str.len() + 2);
-    quoted.push('\'');
-    quoted.push_str(&path_str.replace('\'', "'\\''"));
-    quoted.push('\'');
+    match style {
+        PathQuoteStyle::Posix => {
+            quoted.push('\'');
+            quoted.push_str(&path_str.replace('\'', "'\\''"));
+            quoted.push('\'');
+        }
+        PathQuoteStyle::Cmd => {
+            quoted.push('"');
+            quoted.push_str(&path_str);
+            quoted.push('"');
+        }
+        PathQuoteStyle::PowerShell => {
+            quoted.push('\'');
+            for ch in path_str.chars() {
+                if is_powershell_single_quote(ch) {
+                    quoted.push(ch);
+                }
+                quoted.push(ch);
+            }
+            quoted.push('\'');
+        }
+    }
     quoted
 }
 
-fn shell_quote_paths(paths: &[PathBuf]) -> String {
+fn shell_quote_paths(paths: &[PathBuf], style: PathQuoteStyle) -> String {
     paths
         .iter()
-        .map(|path| shell_quote_path(path))
+        .map(|path| shell_quote_path(path, style))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn dropped_paths_to_terminal_paste_input(paths: &[PathBuf]) -> Option<Vec<u8>> {
+fn dropped_paths_to_terminal_paste_input(
+    paths: &[PathBuf],
+    style: PathQuoteStyle,
+) -> Option<Vec<u8>> {
     if paths.is_empty() {
         return None;
     }
 
-    let mut text = shell_quote_paths(paths);
+    let mut text = shell_quote_paths(paths, style);
     text.push(' ');
     Some(text.into_bytes())
+}
+
+/// Pasted line breaks become carriage returns, the byte Enter sends, as in
+/// xterm and Windows Terminal. A bare `\n` reaches Windows console programs
+/// as Ctrl+J, and `\r\n` would add an empty line after each pasted line.
+fn normalize_paste_line_endings(input: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !input.contains(&b'\n') {
+        return std::borrow::Cow::Borrowed(input);
+    }
+
+    let mut normalized = Vec::with_capacity(input.len());
+    let mut index = 0;
+    while index < input.len() {
+        match input[index] {
+            b'\r' if input.get(index + 1) == Some(&b'\n') => {
+                normalized.push(b'\r');
+                index += 2;
+            }
+            b'\n' => {
+                normalized.push(b'\r');
+                index += 1;
+            }
+            byte => {
+                normalized.push(byte);
+                index += 1;
+            }
+        }
+    }
+    std::borrow::Cow::Owned(normalized)
+}
+
+/// The full image path of a running process, used to find a pane's shell.
+#[cfg(target_os = "windows")]
+fn windows_process_image_path(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = [0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    result.ok()?;
+    Some(String::from_utf16_lossy(&buffer[..len as usize]))
 }
 
 fn should_write_drop_to_target(target_is_active: bool, focus_succeeded: bool) -> bool {
@@ -87,38 +235,100 @@ pub(in crate::terminal_view) fn kitty_png_clipboard_item(png: &[u8]) -> Clipboar
     gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, png.to_vec()).into()
 }
 
-fn clipboard_image_cache_dir() -> PathBuf {
-    env::temp_dir().join("termy-clipboard-images")
+/// Pasted images stay this long, so the program they were pasted into has
+/// time to read them; a later paste then deletes them.
+const CLIPBOARD_IMAGE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+const CLIPBOARD_IMAGE_PREFIX: &str = "clipboard-image-";
+
+/// A per-user directory: in a shared temp directory other users could read
+/// pasted images, or plant files where the paste expects to write them.
+fn clipboard_image_cache_dir() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    let base = Some(std::env::temp_dir().join(format!("termy-test-cache-{}", std::process::id())));
+    #[cfg(not(test))]
+    let base = dirs::cache_dir();
+    let base = base.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no user cache directory")
+    })?;
+    Ok(base.join("termy").join("clipboard-images"))
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        // Also tighten a directory that already existed.
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)
+}
+
+fn remove_expired_clipboard_images(dir: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(CLIPBOARD_IMAGE_PREFIX)
+        {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).is_ok_and(|age| age > max_age));
+        if expired {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Write `image` under a fresh random name (created exclusively, owner-only)
+/// in the private `dir`, after removing expired earlier pastes.
+fn write_clipboard_image_in(dir: &Path, image: &gpui_kit::Image) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    create_private_dir(dir)?;
+    remove_expired_clipboard_images(dir, CLIPBOARD_IMAGE_MAX_AGE);
+    let mut file = tempfile::Builder::new()
+        .prefix(CLIPBOARD_IMAGE_PREFIX)
+        .suffix(&format!(".{}", image_extension(image.format())))
+        .tempfile_in(dir)?;
+    file.write_all(image.bytes())?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 fn write_clipboard_image_to_temp_file(image: &gpui_kit::Image) -> std::io::Result<PathBuf> {
-    let dir = clipboard_image_cache_dir();
-    std::fs::create_dir_all(&dir)?;
-
-    let path = dir.join(format!(
-        "clipboard-image-{}.{}",
-        image.id(),
-        image_extension(image.format())
-    ));
-    if !path.exists() {
-        std::fs::write(&path, image.bytes())?;
-    }
-
-    Ok(path)
+    write_clipboard_image_in(&clipboard_image_cache_dir()?, image)
 }
 
 fn clipboard_item_to_terminal_paste_input(
     item: &ClipboardItem,
+    style: PathQuoteStyle,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    // GPUI now exposes file clipboard entries directly. Its text fallback
-    // concatenates paths without separators or shell quoting.
-    if !item
-        .entries()
+    clipboard_entries_to_terminal_paste_input(item.entries(), style)
+}
+
+fn clipboard_entries_to_terminal_paste_input(
+    entries: &[gpui_kit::ClipboardEntry],
+    style: PathQuoteStyle,
+) -> std::io::Result<Option<Vec<u8>>> {
+    // A copied file may also carry a plain-text display name. Paste the file
+    // paths when a file list is present. Without one, text and images follow
+    // the previous order: text first, then a temporary file for an image.
+    let has_files = entries
         .iter()
-        .any(|entry| matches!(entry, gpui_kit::ClipboardEntry::String(_)))
-    {
-        let paths: Vec<_> = item
-            .entries()
+        .any(|entry| matches!(entry, gpui_kit::ClipboardEntry::ExternalPaths(_)));
+    if has_files {
+        let paths: Vec<_> = entries
             .iter()
             .filter_map(|entry| match entry {
                 gpui_kit::ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
@@ -128,15 +338,21 @@ fn clipboard_item_to_terminal_paste_input(
             .cloned()
             .collect();
         if !paths.is_empty() {
-            return Ok(Some(shell_quote_paths(&paths).into_bytes()));
+            return Ok(Some(shell_quote_paths(&paths, style).into_bytes()));
         }
     }
-    if let Some(text) = item.text() {
+
+    let mut text = String::new();
+    for entry in entries {
+        if let gpui_kit::ClipboardEntry::String(value) = entry {
+            text.push_str(value.text());
+        }
+    }
+    if !text.is_empty() {
         return Ok(Some(text.into_bytes()));
     }
 
-    let Some(entry) = item
-        .entries()
+    let Some(entry) = entries
         .iter()
         .find(|entry| matches!(entry, gpui_kit::ClipboardEntry::Image(_)))
     else {
@@ -146,7 +362,7 @@ fn clipboard_item_to_terminal_paste_input(
     match entry {
         gpui_kit::ClipboardEntry::Image(image) => {
             let path = write_clipboard_image_to_temp_file(image)?;
-            Ok(Some(shell_quote_path(&path).into_bytes()))
+            Ok(Some(shell_quote_path(&path, style).into_bytes()))
         }
         gpui_kit::ClipboardEntry::String(_) | gpui_kit::ClipboardEntry::ExternalPaths(_) => {
             Ok(None)
@@ -244,7 +460,6 @@ fn take_deferred_ime_key_release(
 enum PendingKeyReleaseAction {
     Drop,
     ForwardToPane(String),
-    FallbackToActivePane,
 }
 
 fn take_pending_key_release_action(
@@ -256,7 +471,10 @@ fn take_pending_key_release_action(
         Some(PendingKeyRelease::Terminal { pane_id }) => {
             PendingKeyReleaseAction::ForwardToPane(pane_id)
         }
-        None => PendingKeyReleaseAction::FallbackToActivePane,
+        // The terminal never saw this key's press: a key binding consumed it,
+        // or it was held when the window gained focus. Forwarding the release
+        // would hand kitty keyboard clients an unpaired release.
+        None => PendingKeyReleaseAction::Drop,
     }
 }
 
@@ -270,6 +488,33 @@ impl TerminalView {
             self.renaming_workspace,
             self.release_notes_open(),
         )
+    }
+
+    /// How to quote paths pasted into the active pane, chosen by its shell.
+    fn active_pane_path_quote_style(&self) -> PathQuoteStyle {
+        #[cfg(target_os = "windows")]
+        {
+            // tmux runs inside WSL, so its panes are POSIX shells.
+            if self.runtime_kind() == RuntimeKind::Tmux {
+                return PathQuoteStyle::Posix;
+            }
+            // The pane's own process names the shell, including tabs opened
+            // from the shell menu; the configured shell is the fallback.
+            let program = self
+                .active_terminal()
+                .and_then(Terminal::child_pid)
+                .and_then(windows_process_image_path)
+                .unwrap_or_else(|| self.terminal_runtime.resolved_shell_program());
+            if program.trim().is_empty() {
+                // Double quotes work in cmd and PowerShell alike.
+                return PathQuoteStyle::Cmd;
+            }
+            PathQuoteStyle::for_shell_program(&program)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            PathQuoteStyle::Posix
+        }
     }
 
     fn pane_keyboard_mode(&self, pane_id: &str) -> TerminalKeyboardMode {
@@ -347,19 +592,6 @@ impl TerminalView {
         true
     }
 
-    fn write_terminal_keystroke(
-        &mut self,
-        keystroke: &gpui_kit::Keystroke,
-        event_kind: TerminalKeyEventKind,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(pane_id) = self.active_pane_id().map(str::to_owned) else {
-            return false;
-        };
-
-        self.write_terminal_keystroke_to_pane(pane_id.as_str(), keystroke, event_kind, cx)
-    }
-
     fn remember_consumed_key_release(&mut self, key: &str) {
         self.pending_key_releases
             .insert(key.to_string(), PendingKeyRelease::Consumed);
@@ -410,9 +642,6 @@ impl TerminalView {
                     TerminalKeyEventKind::Release,
                     cx,
                 ),
-            PendingKeyReleaseAction::FallbackToActivePane => {
-                self.write_terminal_keystroke(keystroke, TerminalKeyEventKind::Release, cx)
-            }
         }
     }
 
@@ -459,12 +688,9 @@ impl TerminalView {
         position: gpui_kit::Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.overlay_owns_terminal_input() {
+        if self.overlay_owns_terminal_input() || paths.is_empty() {
             return;
         }
-        let Some(input) = dropped_paths_to_terminal_paste_input(paths) else {
-            return;
-        };
         let hit_pane_id = self
             .position_to_pane_cell(position, false)
             .map(|(pane_id, _)| pane_id);
@@ -483,6 +709,12 @@ impl TerminalView {
             return;
         }
 
+        // Quote for the target pane's shell, which is active by now.
+        let Some(input) =
+            dropped_paths_to_terminal_paste_input(paths, self.active_pane_path_quote_style())
+        else {
+            return;
+        };
         self.write_dropped_paths(&input, cx);
     }
 
@@ -671,6 +903,8 @@ impl TerminalView {
             return;
         }
 
+        let input = normalize_paste_line_endings(input);
+        let input: &[u8] = &input;
         self.prepare_terminal_input_write(cx);
         let bracketed_paste = self
             .active_terminal()
@@ -710,6 +944,9 @@ impl TerminalView {
         action: CommandAction,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.forward_edit_command_to_native_search(action) {
+            return true;
+        }
         match action {
             CommandAction::Copy => {
                 if self.copy_active_inline_input_selection(cx) {
@@ -730,6 +967,12 @@ impl TerminalView {
                 }
                 if let Some(selected) = self.selected_text() {
                     cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    // Windows copies with plain Ctrl+C, as Windows Terminal does.
+                    // Dropping the selection lets the next Ctrl+C interrupt.
+                    #[cfg(target_os = "windows")]
+                    if self.clear_selection() {
+                        cx.notify();
+                    }
                 } else {
                     self.write_copy_fallback_input(cx);
                 }
@@ -743,7 +986,10 @@ impl TerminalView {
                     return true;
                 }
                 if let Some(item) = cx.read_from_clipboard() {
-                    match clipboard_item_to_terminal_paste_input(&item) {
+                    match clipboard_item_to_terminal_paste_input(
+                        &item,
+                        self.active_pane_path_quote_style(),
+                    ) {
                         Ok(Some(input)) => {
                             self.write_terminal_paste_input(&input, cx);
                             self.clear_selection();
@@ -818,9 +1064,14 @@ impl TerminalView {
         self.reset_cursor_blink_phase();
         let _ = self.close_terminal_context_menu(cx);
         let _ = self.close_new_tab_menu(cx);
+        let composing = is_compose_dead_key(&event.keystroke, self.ime_marked_text.is_some());
+        let defer_to_ime = should_defer_key_down_to_ime(&event.keystroke)
+            || should_defer_altgr_key_down_to_ime(&event.keystroke, event.prefer_character_input);
         let inspector_route = if self.overlay_owns_terminal_input() {
             "overlay"
-        } else if should_defer_key_down_to_ime(&event.keystroke) {
+        } else if composing {
+            "compose"
+        } else if defer_to_ime {
             "ime"
         } else {
             "pty"
@@ -847,7 +1098,7 @@ impl TerminalView {
             }
 
             if self.search_open {
-                if self.handle_search_key_down(key, event.keystroke.modifiers.shift, cx) {
+                if self.handle_search_key_down(key, event.keystroke.modifiers, cx) {
                     self.remember_consumed_key_release(key);
                 }
                 return;
@@ -878,11 +1129,18 @@ impl TerminalView {
 
         self.last_terminal_modifiers = event.keystroke.modifiers;
 
+        // The composed character (or the dead key itself, if composition is
+        // cancelled) reaches the PTY through the input handler.
+        if composing {
+            self.deferred_ime_key_releases.insert(key.to_string());
+            return;
+        }
+
         // Printable character input without modifiers is delegated to the
         // platform IME / input handler so that CJK input methods work.
         // Named special keys (enter, tab, space, etc.) and modifier
         // combinations are still handled here via keystroke_to_input.
-        if should_defer_key_down_to_ime(&event.keystroke) {
+        if defer_to_ime {
             self.deferred_ime_key_releases.insert(key.to_string());
             // Let the event propagate to the platform IME handler which
             // will call `replace_text_in_range` on our EntityInputHandler.
@@ -960,323 +1218,5 @@ impl TerminalView {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        FileDropTarget, PendingKeyRelease, PendingKeyReleaseAction, classify_file_drop_target,
-        clipboard_item_to_terminal_paste_input, dropped_paths_to_terminal_paste_input,
-        image_extension, kitty_png_clipboard_item, modifier_transition_events, shell_quote_paths,
-        should_defer_key_down_to_ime, should_prepare_terminal_input_write,
-        should_write_drop_to_target, take_deferred_ime_key_release,
-        take_pending_key_release_action, terminal_modifier_transition_events,
-    };
-    use gpui_kit::{Keystroke, Modifiers};
-    use std::{
-        collections::{HashMap, HashSet},
-        path::PathBuf,
-    };
-
-    fn keystroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
-        Keystroke {
-            modifiers,
-            key: key.to_string(),
-            key_char: key_char.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn ime_defers_plain_printable_text() {
-        assert!(should_defer_key_down_to_ime(&keystroke(
-            "a",
-            Some("a"),
-            Modifiers::default(),
-        )));
-    }
-
-    #[test]
-    fn ime_keeps_shifted_printable_text_on_ime_path() {
-        let modifiers = Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        };
-        assert!(should_defer_key_down_to_ime(&keystroke(
-            "A",
-            Some("A"),
-            modifiers
-        )));
-    }
-
-    #[test]
-    fn ime_does_not_defer_special_keys_or_modified_shortcuts() {
-        for key in &["enter", "tab", "space", "backspace", "escape", "delete"] {
-            assert!(
-                !should_defer_key_down_to_ime(&keystroke(key, Some(key), Modifiers::default())),
-                "{key} should not be deferred to IME"
-            );
-        }
-
-        let control = Modifiers {
-            control: true,
-            ..Modifiers::default()
-        };
-        assert!(!should_defer_key_down_to_ime(&keystroke(
-            "c",
-            Some("c"),
-            control
-        )));
-    }
-
-    #[test]
-    fn ime_does_not_defer_keys_without_key_char() {
-        assert!(!should_defer_key_down_to_ime(&keystroke(
-            "f1",
-            None,
-            Modifiers::default(),
-        )));
-    }
-
-    #[test]
-    fn shell_quote_paths_escapes_single_quotes() {
-        let paths = vec![
-            PathBuf::from("/tmp/normal.png"),
-            PathBuf::from("/tmp/quote's test.png"),
-        ];
-
-        assert_eq!(
-            shell_quote_paths(&paths),
-            "'/tmp/normal.png' '/tmp/quote'\\''s test.png'"
-        );
-    }
-
-    #[test]
-    fn dropped_paths_add_a_trailing_space() {
-        let paths = vec![PathBuf::from("/tmp/file with space.png")];
-        let input = dropped_paths_to_terminal_paste_input(&paths).expect("drop should serialize");
-        assert_eq!(
-            String::from_utf8(input).expect("drop input should be utf8"),
-            "'/tmp/file with space.png' "
-        );
-    }
-
-    #[test]
-    fn dropped_paths_rejects_empty_input() {
-        assert!(dropped_paths_to_terminal_paste_input(&[]).is_none());
-    }
-
-    #[test]
-    fn file_drop_writes_when_target_is_already_active() {
-        assert!(should_write_drop_to_target(true, false));
-    }
-
-    #[test]
-    fn file_drop_writes_after_inactive_target_is_focused() {
-        assert!(should_write_drop_to_target(false, true));
-    }
-
-    #[test]
-    fn file_drop_does_not_fall_back_when_target_focus_fails() {
-        assert!(!should_write_drop_to_target(false, false));
-    }
-
-    #[test]
-    fn file_drop_classifies_active_and_inactive_terminal_targets() {
-        assert_eq!(
-            classify_file_drop_target(Some("%left".to_string()), Some("%left"), true),
-            Some(FileDropTarget {
-                pane_id: "%left".to_string(),
-                is_active: true,
-            })
-        );
-        assert_eq!(
-            classify_file_drop_target(Some("%right".to_string()), Some("%left"), true),
-            Some(FileDropTarget {
-                pane_id: "%right".to_string(),
-                is_active: false,
-            })
-        );
-    }
-
-    #[test]
-    fn file_drop_rejects_missing_and_non_terminal_targets() {
-        assert_eq!(classify_file_drop_target(None, Some("%left"), true), None);
-        assert_eq!(
-            classify_file_drop_target(Some("%pane".to_string()), Some("%left"), false),
-            None
-        );
-    }
-
-    #[test]
-    fn clipboard_image_paste_materializes_a_quoted_temp_path() {
-        let item = gpui_kit::ClipboardItem::new_image(&gpui_kit::Image::from_bytes(
-            gpui_kit::ImageFormat::Png,
-            vec![1, 2, 3, 4],
-        ));
-
-        let input = clipboard_item_to_terminal_paste_input(&item)
-            .expect("clipboard image should serialize")
-            .expect("clipboard image should produce paste input");
-        let text = String::from_utf8(input).expect("path should be utf8");
-
-        assert!(text.starts_with('\''));
-        assert!(text.ends_with(".png'"));
-        assert!(text.contains("termy-clipboard-images"));
-    }
-
-    #[test]
-    fn clipboard_file_paths_are_separated_and_shell_quoted() {
-        let paths = gpui_kit::ExternalPaths(
-            [
-                PathBuf::from("/tmp/a b.txt"),
-                PathBuf::from("/tmp/it's.txt"),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let item = gpui_kit::ClipboardEntry::ExternalPaths(paths).into();
-        assert_eq!(
-            clipboard_item_to_terminal_paste_input(&item).unwrap(),
-            Some(b"'/tmp/a b.txt' '/tmp/it'\\''s.txt'".to_vec())
-        );
-    }
-
-    #[test]
-    fn clipboard_text_is_pasted_without_shell_quoting() {
-        let item = gpui_kit::ClipboardItem::new_string("echo hello\n".into());
-        assert_eq!(
-            clipboard_item_to_terminal_paste_input(&item).unwrap(),
-            Some(b"echo hello\n".to_vec())
-        );
-    }
-
-    #[test]
-    fn kitty_png_clipboard_item_preserves_png_bytes_and_format() {
-        let png = [137, 80, 78, 71, 13, 10, 26, 10];
-        let item = kitty_png_clipboard_item(&png);
-
-        assert_eq!(item.entries().len(), 1);
-        let gpui_kit::ClipboardEntry::Image(image) = &item.entries()[0] else {
-            panic!("Kitty clipboard item should contain an image");
-        };
-        assert_eq!(image.format(), gpui_kit::ImageFormat::Png);
-        assert_eq!(image.bytes(), png);
-    }
-
-    #[test]
-    fn image_extension_matches_expected_file_suffixes() {
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Gif), "gif");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Png), "png");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Jpeg), "jpg");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Webp), "webp");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Bmp), "bmp");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Tiff), "tiff");
-        assert_eq!(image_extension(gpui_kit::ImageFormat::Svg), "svg");
-    }
-
-    #[test]
-    fn modifier_transitions_synthesize_shift_press_with_super_held() {
-        let previous = Modifiers {
-            platform: true,
-            ..Modifiers::default()
-        };
-        let current = Modifiers {
-            platform: true,
-            shift: true,
-            ..Modifiers::default()
-        };
-
-        let events = modifier_transition_events(previous, current);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0.key, "shift");
-        assert_eq!(events[0].1, termy_core::TerminalKeyEventKind::Press);
-        assert!(events[0].0.modifiers.platform);
-        assert!(events[0].0.modifiers.shift);
-    }
-
-    #[test]
-    fn overlay_owned_modifier_changes_skip_terminal_events() {
-        let previous = Modifiers {
-            platform: true,
-            ..Modifiers::default()
-        };
-
-        assert!(
-            terminal_modifier_transition_events(previous, Modifiers::default(), true).is_empty()
-        );
-    }
-
-    #[test]
-    fn non_active_pane_writes_skip_terminal_input_prepare() {
-        assert!(should_prepare_terminal_input_write(
-            Some("%pane-1"),
-            "%pane-1"
-        ));
-        assert!(!should_prepare_terminal_input_write(
-            Some("%pane-1"),
-            "%pane-2"
-        ));
-        assert!(!should_prepare_terminal_input_write(None, "%pane-1"));
-    }
-
-    #[test]
-    fn deferred_ime_key_release_is_cleared_without_forwarding() {
-        let mut deferred = HashSet::from(["a".to_string()]);
-
-        assert!(take_deferred_ime_key_release(&mut deferred, "a"));
-        assert!(!take_deferred_ime_key_release(&mut deferred, "a"));
-        assert!(deferred.is_empty());
-    }
-
-    #[test]
-    fn consumed_key_release_is_dropped_after_transient_input_closes() {
-        let mut pending = HashMap::from([("enter".to_string(), PendingKeyRelease::Consumed)]);
-
-        assert_eq!(
-            take_pending_key_release_action(&mut pending, "enter"),
-            PendingKeyReleaseAction::Drop
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn forwarded_key_release_routes_to_original_pane() {
-        let mut pending = HashMap::from([(
-            "enter".to_string(),
-            PendingKeyRelease::Terminal {
-                pane_id: "%pane-1".to_string(),
-            },
-        )]);
-
-        assert_eq!(
-            take_pending_key_release_action(&mut pending, "enter"),
-            PendingKeyReleaseAction::ForwardToPane("%pane-1".to_string())
-        );
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn modifier_releases_keep_their_original_panes() {
-        let mut pending = HashMap::from([
-            (
-                "shift".to_string(),
-                PendingKeyRelease::Terminal {
-                    pane_id: "%left".to_string(),
-                },
-            ),
-            (
-                "super".to_string(),
-                PendingKeyRelease::Terminal {
-                    pane_id: "%right".to_string(),
-                },
-            ),
-        ]);
-
-        assert_eq!(
-            take_pending_key_release_action(&mut pending, "shift"),
-            PendingKeyReleaseAction::ForwardToPane("%left".to_string())
-        );
-        assert_eq!(
-            take_pending_key_release_action(&mut pending, "super"),
-            PendingKeyReleaseAction::ForwardToPane("%right".to_string())
-        );
-        assert!(pending.is_empty());
-    }
-}
+#[path = "input/tests.rs"]
+mod tests;

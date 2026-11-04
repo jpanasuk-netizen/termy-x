@@ -1,9 +1,7 @@
 use std::collections::{HashMap, VecDeque};
-#[cfg(windows)]
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::terminal_engine::{Cell, Engine, Style};
 
@@ -24,11 +22,18 @@ pub struct DetectedViewportLink {
 }
 
 const FILE_URL_CACHE_CAPACITY: usize = 128;
+/// A path that didn't exist may be created any moment (a build output, a file
+/// being written), so a failed lookup is only remembered briefly.
+const FAILED_FILE_URL_TTL: Duration = Duration::from_secs(2);
+/// How far a hover scans for the ends of a link, in cells each way. A longer
+/// run without whitespace (minified code, base64) is not treated as a link,
+/// so hovering it can't walk megabytes of soft-wrapped history.
+const MAX_LINK_SCAN_CELLS: usize = 4096;
 
 #[derive(Default)]
 struct FileUrlLruCache {
     capacity: usize,
-    entries: HashMap<String, Option<String>>,
+    entries: HashMap<String, (Option<String>, Instant)>,
     order: VecDeque<String>,
 }
 
@@ -41,20 +46,23 @@ impl FileUrlLruCache {
         }
     }
 
-    fn get(&mut self, key: &str) -> Option<Option<String>> {
-        let value = self.entries.get(key).cloned()?;
+    fn get(&mut self, key: &str, now: Instant) -> Option<Option<String>> {
+        let (value, stored_at) = self.entries.get(key).cloned()?;
+        if value.is_none() && now.saturating_duration_since(stored_at) >= FAILED_FILE_URL_TTL {
+            return None;
+        }
         self.touch(key);
         Some(value)
     }
 
-    fn insert(&mut self, key: String, value: Option<String>) {
+    fn insert(&mut self, key: String, value: Option<String>, now: Instant) {
         if self.entries.contains_key(&key) {
-            self.entries.insert(key.clone(), value);
+            self.entries.insert(key.clone(), (value, now));
             self.touch(&key);
             return;
         }
 
-        self.entries.insert(key.clone(), value);
+        self.entries.insert(key.clone(), (value, now));
         self.order.push_back(key);
 
         while self.order.len() > self.capacity {
@@ -79,12 +87,12 @@ fn file_url_cache() -> &'static Mutex<FileUrlLruCache> {
 
 fn lookup_cached_file_url(token: &str) -> Option<Option<String>> {
     let mut cache = file_url_cache().lock().ok()?;
-    cache.get(token)
+    cache.get(token, Instant::now())
 }
 
 fn store_cached_file_url(token: &str, resolved: Option<String>) {
     if let Ok(mut cache) = file_url_cache().lock() {
-        cache.insert(token.to_string(), resolved);
+        cache.insert(token.to_string(), resolved, Instant::now());
     }
 }
 
@@ -110,10 +118,10 @@ pub(crate) fn hyperlink_at_viewport_cell(
     // metadata for every visible cell on every mouse-hover lookup.
     let line = row as i32 - grid.display_offset() as i32;
     let row_cells = grid.line(line)?;
-    let target = row_cells[col].hyperlink()?;
+    let target = row_cells.hyperlink(col)?;
     let matches_target = |candidate_col: usize| {
-        row_cells[candidate_col]
-            .hyperlink()
+        row_cells
+            .hyperlink(candidate_col)
             .is_some_and(|other| other == target)
     };
 
@@ -138,11 +146,41 @@ pub(crate) fn hyperlink_at_viewport_cell(
 /// OSC 8 metadata takes priority over heuristic URL detection. The returned
 /// range is clipped to the visible viewport while the target is built from the
 /// complete logical link, including portions currently in scrollback.
+#[cfg(test)]
 pub(crate) fn link_at_viewport_cell(
     term: &Engine,
     row: usize,
     col: usize,
 ) -> Option<DetectedViewportLink> {
+    link_candidate_at_viewport_cell(term, row, col)?.resolve()
+}
+
+/// A link under a viewport cell whose target may still need a filesystem
+/// lookup. Finding it only reads the grid; [`Self::resolve`] does the lookup,
+/// so a caller holding the engine lock can release it in between.
+pub(crate) struct ViewportLinkCandidate {
+    link: DetectedViewportLink,
+    /// The token to classify into `link.target`, and the pane's working
+    /// directory for relative paths. `None` when the target is already known.
+    token: Option<(String, Option<PathBuf>)>,
+}
+
+impl ViewportLinkCandidate {
+    pub(crate) fn resolve(self) -> Option<DetectedViewportLink> {
+        let mut link = self.link;
+        if let Some((token, base_dir)) = self.token {
+            link.target = classify_link_token_in(&token, base_dir.as_deref())?;
+        }
+        Some(link)
+    }
+}
+
+/// [`link_at_viewport_cell`] up to, not including, any filesystem lookup.
+pub(crate) fn link_candidate_at_viewport_cell(
+    term: &Engine,
+    row: usize,
+    col: usize,
+) -> Option<ViewportLinkCandidate> {
     let grid = term;
     let columns = grid.size().cols;
     let screen_lines = grid.size().rows;
@@ -157,12 +195,18 @@ pub(crate) fn link_at_viewport_cell(
     };
     let bounds = grid_line_bounds(grid)?;
 
-    if let Some(target) = grid.line(hovered.line)?[hovered.col].hyperlink() {
+    if let Some(target) = grid.line(hovered.line)?.hyperlink(hovered.col) {
         let target_uri = target.uri.clone();
+        // An OSC 8 run longer than the scan window is clipped to it; the
+        // target is already known.
         let mut start = hovered;
-        while let Some(previous) = previous_wrapped_position(grid, start, bounds, columns) {
-            if grid.line(previous.line)?[previous.col]
-                .hyperlink()
+        for _ in 0..MAX_LINK_SCAN_CELLS {
+            let Some(previous) = previous_wrapped_position(grid, start, bounds, columns) else {
+                break;
+            };
+            if grid
+                .line(previous.line)?
+                .hyperlink(previous.col)
                 .is_some_and(|candidate| candidate == target)
             {
                 start = previous;
@@ -172,9 +216,13 @@ pub(crate) fn link_at_viewport_cell(
         }
 
         let mut end = hovered;
-        while let Some(next) = next_wrapped_position(grid, end, bounds, columns) {
-            if grid.line(next.line)?[next.col]
-                .hyperlink()
+        for _ in 0..MAX_LINK_SCAN_CELLS {
+            let Some(next) = next_wrapped_position(grid, end, bounds, columns) else {
+                break;
+            };
+            if grid
+                .line(next.line)?
+                .hyperlink(next.col)
                 .is_some_and(|candidate| candidate == target)
             {
                 end = next;
@@ -183,14 +231,15 @@ pub(crate) fn link_at_viewport_cell(
             }
         }
 
-        return viewport_link_from_grid_range(
+        let link = viewport_link_from_grid_range(
             start,
             end,
             target_uri,
             display_offset,
             screen_lines,
             columns,
-        );
+        )?;
+        return Some(ViewportLinkCandidate { link, token: None });
     }
 
     let hovered_char = grid_cell_char(grid, hovered);
@@ -204,6 +253,9 @@ pub(crate) fn link_at_viewport_cell(
         let candidate = grid_cell_char(grid, previous);
         if candidate.is_whitespace() {
             break;
+        }
+        if positions_before.len() == MAX_LINK_SCAN_CELLS {
+            return None;
         }
         positions_before.push((previous, candidate));
         cursor = previous;
@@ -221,22 +273,42 @@ pub(crate) fn link_at_viewport_cell(
         if candidate.is_whitespace() {
             break;
         }
+        if positions.len() - hovered_index > MAX_LINK_SCAN_CELLS {
+            return None;
+        }
         positions.push((next, candidate));
         cursor = next;
     }
 
-    let token: Vec<char> = positions.iter().map(|(_, character)| *character).collect();
-    let detected = find_link_in_line(&token, hovered_index)?;
-    let start = positions.get(detected.start_col)?.0;
-    let end = positions.get(detected.end_col)?.0;
-    viewport_link_from_grid_range(
+    let line: Vec<char> = positions.iter().map(|(_, character)| *character).collect();
+    let (start_col, end_col, token) = link_token_in_line(&line, hovered_index)?;
+    let start = positions.get(start_col)?.0;
+    let end = positions.get(end_col)?.0;
+    let link = viewport_link_from_grid_range(
         start,
         end,
-        detected.target,
+        String::new(),
         display_offset,
         screen_lines,
         columns,
-    )
+    )?;
+    let base_dir = grid.working_directory().and_then(working_directory_base);
+    Some(ViewportLinkCandidate {
+        link,
+        token: Some((token, base_dir)),
+    })
+}
+
+/// The pane's OSC 7 directory as a base for relative links, when it is a local
+/// absolute path.
+fn working_directory_base(directory: &str) -> Option<PathBuf> {
+    // `file://host/C:/dir` used to be reported as `/C:/dir`.
+    #[cfg(windows)]
+    let directory = match directory.strip_prefix('/') {
+        Some(stripped) if has_windows_drive_prefix(stripped) => stripped,
+        _ => directory,
+    };
+    Some(PathBuf::from(directory)).filter(|path| path.is_absolute())
 }
 
 #[derive(Clone, Copy)]
@@ -301,7 +373,7 @@ fn next_wrapped_position(
 fn grid_cell_char(grid: &Engine, position: GridPosition) -> char {
     let Some(cell) = grid
         .line(position.line)
-        .and_then(|row| row.get(position.col))
+        .and_then(|row| row.cells().get(position.col))
     else {
         return ' ';
     };
@@ -353,6 +425,17 @@ fn viewport_link_from_grid_range(
 }
 
 pub fn find_link_in_line(line: &[char], col: usize) -> Option<DetectedLink> {
+    let (start_col, end_col, token) = link_token_in_line(line, col)?;
+    Some(DetectedLink {
+        start_col,
+        end_col,
+        target: classify_link_token(&token)?,
+    })
+}
+
+/// The bounds of the whitespace-delimited token at `col`, minus edge
+/// punctuation, and the text to classify.
+fn link_token_in_line(line: &[char], col: usize) -> Option<(usize, usize, String)> {
     if col >= line.len() || line[col].is_whitespace() {
         return None;
     }
@@ -367,11 +450,22 @@ pub fn find_link_in_line(line: &[char], col: usize) -> Option<DetectedLink> {
         end += 1;
     }
 
-    while start <= end && edge_trim_char(line[start]) {
+    // Leading dots are punctuation unless they start a relative path.
+    while start <= end
+        && edge_trim_char(line[start])
+        && !starts_with_relative_prefix(&line[start..=end])
+    {
         start += 1;
     }
     while end >= start && edge_trim_char(line[end]) {
         if end == 0 {
+            break;
+        }
+        // Keep the closing parenthesis of an MSVC `file.cpp(12,3)` location.
+        if cfg!(windows)
+            && line[end] == ')'
+            && msvc_location_start(&line[start..=end].iter().collect::<String>()).is_some()
+        {
             break;
         }
         end -= 1;
@@ -382,16 +476,43 @@ pub fn find_link_in_line(line: &[char], col: usize) -> Option<DetectedLink> {
     }
 
     let token: String = line[start..=end].iter().collect();
-    let target = classify_link_token(token.trim_end_matches(':'))?;
+    let token = token.trim_end_matches(':').to_string();
+    Some((start, end, token))
+}
 
-    Some(DetectedLink {
-        start_col: start,
-        end_col: end,
-        target,
+fn starts_with_relative_prefix(token: &[char]) -> bool {
+    matches!(token, ['.', '/', ..] | ['.', '.', '/', ..])
+        || (cfg!(windows) && matches!(token, ['.', '\\', ..] | ['.', '.', '\\', ..]))
+}
+
+/// `./` and `../` paths, plus `.\` and `..\` on Windows.
+fn is_relative_link_path(path: &str) -> bool {
+    path.starts_with("./")
+        || path.starts_with("../")
+        || (cfg!(windows) && (path.starts_with(".\\") || path.starts_with("..\\")))
+}
+
+/// `~/` home paths, plus `~\` on Windows.
+fn strip_home_prefix(path: &str) -> Option<&str> {
+    path.strip_prefix("~/").or_else(|| {
+        if cfg!(windows) {
+            path.strip_prefix("~\\")
+        } else {
+            None
+        }
     })
 }
 
+/// [`classify_link_token_in`] with relative paths resolved against the
+/// process's working directory.
 pub fn classify_link_token(token: &str) -> Option<String> {
+    classify_link_token_in(token, None)
+}
+
+/// The link target a token stands for. Relative paths (`./`, `../`, and `.\`,
+/// `..\` on Windows) resolve against `base_dir`, normally the pane's OSC 7
+/// working directory, or the process's working directory without one.
+pub fn classify_link_token_in(token: &str, base_dir: Option<&Path>) -> Option<String> {
     if token.is_empty() {
         return None;
     }
@@ -410,7 +531,7 @@ pub fn classify_link_token(token: &str) -> Option<String> {
     }
 
     if looks_like_file_path(token) {
-        return canonicalize_path_to_file_url(token);
+        return canonicalize_path_to_file_url(token, base_dir);
     }
 
     if is_ipv4_with_optional_port_and_path(token) || looks_like_domain(token) {
@@ -423,7 +544,7 @@ pub fn classify_link_token(token: &str) -> Option<String> {
 fn normalize_file_url_token(token: &str) -> Option<String> {
     let raw_path = token.get("file://".len()..)?;
     let local_path = extract_local_path_from_file_url(raw_path)?;
-    canonicalize_path_to_file_url(&local_path)
+    canonicalize_path_to_file_url(&local_path, None)
 }
 
 #[cfg(unix)]
@@ -442,10 +563,10 @@ fn extract_local_path_from_file_url(raw_path: &str) -> Option<String> {
 
 #[cfg(windows)]
 fn extract_local_path_from_file_url(raw_path: &str) -> Option<String> {
-    if let Some(stripped) = raw_path.strip_prefix('/') {
-        if has_windows_drive_prefix(stripped) {
-            return Some(stripped.to_string());
-        }
+    if let Some(stripped) = raw_path.strip_prefix('/')
+        && has_windows_drive_prefix(stripped)
+    {
+        return Some(stripped.to_string());
     }
 
     if has_windows_drive_prefix(raw_path) || Path::new(raw_path).is_absolute() {
@@ -457,10 +578,10 @@ fn extract_local_path_from_file_url(raw_path: &str) -> Option<String> {
         return None;
     }
 
-    if let Some(stripped) = path.strip_prefix('/') {
-        if has_windows_drive_prefix(stripped) {
-            return Some(stripped.to_string());
-        }
+    if let Some(stripped) = path.strip_prefix('/')
+        && has_windows_drive_prefix(stripped)
+    {
+        return Some(stripped.to_string());
     }
 
     if has_windows_drive_prefix(path) || Path::new(path).is_absolute() {
@@ -475,11 +596,20 @@ fn extract_local_path_from_file_url(_: &str) -> Option<String> {
     None
 }
 
-fn canonicalize_path_to_file_url(token: &str) -> Option<String> {
-    let normalized_key = strip_line_col_suffix(token);
-    if normalized_key.is_empty() {
+fn canonicalize_path_to_file_url(token: &str, base_dir: Option<&Path>) -> Option<String> {
+    let path = strip_line_col_suffix(token);
+    if path.is_empty() {
         return None;
     }
+    // Joining first also keys the cache by directory for relative paths.
+    let joined;
+    let normalized_key = match base_dir {
+        Some(base_dir) if is_relative_link_path(path) => {
+            joined = base_dir.join(path).to_string_lossy().into_owned();
+            joined.as_str()
+        }
+        _ => path,
+    };
 
     if let Some(cached) = lookup_cached_file_url(normalized_key) {
         return cached;
@@ -507,9 +637,9 @@ fn canonicalize_path_to_file_url_uncached(token: &str) -> Option<String> {
     Some(format!("file:///{}", canonical.trim_start_matches('/')))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn expand_tilde_path(path: &str) -> Option<PathBuf> {
-    let remainder = path.strip_prefix("~/")?;
+    let remainder = strip_home_prefix(path)?;
     let home = dirs::home_dir()?;
     Some(home.join(remainder))
 }
@@ -521,20 +651,37 @@ fn canonicalize_path_to_file_url_uncached(token: &str) -> Option<String> {
         return None;
     }
 
-    if let Some(stripped) = raw_path.strip_prefix('/') {
-        if has_windows_drive_prefix(stripped) {
-            raw_path = stripped;
-        }
+    if let Some(stripped) = raw_path.strip_prefix('/')
+        && has_windows_drive_prefix(stripped)
+    {
+        raw_path = stripped;
     }
 
-    if !has_windows_drive_prefix(raw_path) && !Path::new(raw_path).is_absolute() {
+    let path = expand_tilde_path(raw_path).unwrap_or_else(|| PathBuf::from(raw_path));
+    // Relative paths without a pane directory resolve against the process's
+    // one. A rooted path with no drive (`/usr/lib`) is MSYS or WSL output that
+    // names another filesystem, so it is not a local link.
+    if !path.is_absolute() && !is_relative_link_path(raw_path) {
         return None;
     }
 
-    let canonical = std::fs::canonicalize(raw_path).ok()?;
+    let canonical = dunce::canonicalize(path).ok()?;
     let canonical = canonical.to_string_lossy();
-    let canonical = canonical.strip_prefix(r"\\?\").unwrap_or(&canonical);
+    // dunce keeps the verbatim prefix when dropping it would change the path
+    // (long paths, reserved names); a file URL has no verbatim form anyway.
+    let canonical = match canonical.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => canonical
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&canonical)
+            .to_string(),
+    };
     let canonical = canonical.replace('\\', "/");
+
+    // `\\server\share\dir` becomes `file://server/share/dir`.
+    if let Some(share) = canonical.strip_prefix("//") {
+        return (!share.is_empty()).then(|| format!("file://{share}"));
+    }
 
     if !has_windows_drive_prefix(&canonical) {
         return None;
@@ -666,13 +813,18 @@ fn looks_like_file_path(input: &str) -> bool {
     }
 
     // Home directory paths
-    if path.starts_with("~/") {
+    if strip_home_prefix(path).is_some() {
         return has_path_like_structure(path);
     }
 
     // Relative paths starting with ./ or ../
-    if path.starts_with("./") || path.starts_with("../") {
+    if is_relative_link_path(path) {
         return has_path_like_structure(path);
+    }
+
+    // UNC paths (\\server\share\file)
+    if cfg!(windows) && is_unc_path(path) {
+        return true;
     }
 
     // Windows absolute paths (C:\, D:\, etc.)
@@ -686,7 +838,36 @@ fn looks_like_file_path(input: &str) -> bool {
     false
 }
 
+/// `\\server\share` with a non-empty server and share, not a `\\?\` or `\\.\`
+/// device path.
+fn is_unc_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("\\\\") else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let server = parts.next().unwrap_or_default();
+    let share = parts.next().unwrap_or_default();
+    !server.is_empty() && server != "?" && server != "." && !share.is_empty()
+}
+
+/// Where an MSVC-style `(line)` or `(line,col)` location suffix starts, as in
+/// `file.cpp(12,3)`.
+fn msvc_location_start(input: &str) -> Option<usize> {
+    let inner = input.strip_suffix(')')?;
+    let open = inner.rfind('(')?;
+    let location = &inner[open + 1..];
+    let (line, col) = location.split_once(',').unwrap_or((location, "0"));
+    let is_number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (open > 0 && is_number(line) && is_number(col)).then_some(open)
+}
+
 fn strip_line_col_suffix(input: &str) -> &str {
+    if cfg!(windows)
+        && let Some(open) = msvc_location_start(input)
+    {
+        return &input[..open];
+    }
+
     // Handle patterns like "file.rs:42" or "file.rs:42:10"
     let mut path = input;
 
@@ -724,12 +905,13 @@ fn has_path_like_structure(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileUrlLruCache, classify_link_token, hyperlink_at_viewport_cell, link_at_viewport_cell,
+        FAILED_FILE_URL_TTL, FileUrlLruCache, MAX_LINK_SCAN_CELLS, classify_link_token,
+        classify_link_token_in, hyperlink_at_viewport_cell, link_at_viewport_cell,
     };
     use crate::terminal_engine::{Engine, Options, Size};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     fn term_with_input(cols: u16, rows: u16, input: &[u8]) -> Engine {
         let mut term = Engine::new(
@@ -912,14 +1094,180 @@ mod tests {
 
     #[test]
     fn file_url_lru_cache_evicts_old_entries() {
+        let now = Instant::now();
         let mut cache = FileUrlLruCache::new(2);
-        cache.insert("a".to_string(), Some("file:///a".to_string()));
-        cache.insert("b".to_string(), Some("file:///b".to_string()));
-        assert_eq!(cache.get("a"), Some(Some("file:///a".to_string())));
-        cache.insert("c".to_string(), Some("file:///c".to_string()));
+        cache.insert("a".to_string(), Some("file:///a".to_string()), now);
+        cache.insert("b".to_string(), Some("file:///b".to_string()), now);
+        assert_eq!(cache.get("a", now), Some(Some("file:///a".to_string())));
+        cache.insert("c".to_string(), Some("file:///c".to_string()), now);
 
-        assert_eq!(cache.get("a"), Some(Some("file:///a".to_string())));
-        assert_eq!(cache.get("b"), None);
-        assert_eq!(cache.get("c"), Some(Some("file:///c".to_string())));
+        assert_eq!(cache.get("a", now), Some(Some("file:///a".to_string())));
+        assert_eq!(cache.get("b", now), None);
+        assert_eq!(cache.get("c", now), Some(Some("file:///c".to_string())));
+    }
+
+    #[test]
+    fn failed_file_url_lookups_expire() {
+        let now = Instant::now();
+        let mut cache = FileUrlLruCache::new(4);
+        cache.insert("found".to_string(), Some("file:///found".to_string()), now);
+        cache.insert("missing".to_string(), None, now);
+        assert_eq!(cache.get("missing", now), Some(None));
+
+        let later = now + FAILED_FILE_URL_TTL;
+        assert_eq!(cache.get("missing", later), None);
+        assert_eq!(
+            cache.get("found", later),
+            Some(Some("file:///found".to_string()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_paths_resolve_against_the_pane_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "notes").expect("write temp file");
+        let canonical = fs::canonicalize(&file_path).expect("canonicalize temp file");
+        let expected = format!(
+            "file:///{}",
+            canonical.to_string_lossy().trim_start_matches('/')
+        );
+
+        assert_eq!(
+            classify_link_token_in("./notes.txt", Some(dir.path())),
+            Some(expected.clone())
+        );
+
+        // The engine's OSC 7 directory is the base for hovered links.
+        let mut input = format!("\x1b]7;file://localhost{}\x1b\\", dir.path().display());
+        input.push_str("see ./notes.txt");
+        let term = term_with_input(40, 2, input.as_bytes());
+        let link = link_at_viewport_cell(&term, 0, 6).expect("relative path link");
+        assert_eq!(link.target, expected);
+        assert_eq!((link.start_col, link.end_col), (4, 14));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_relative_paths_resolve_against_the_pane_working_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("notes.txt");
+        fs::write(&file_path, "notes").expect("write temp file");
+        let canonical = dunce::canonicalize(&file_path).expect("canonicalize temp file");
+        let expected =
+            classify_link_token(&canonical.to_string_lossy()).expect("absolute path link");
+        assert!(expected.starts_with("file:///"), "{expected}");
+        assert!(!expected.contains('?'), "{expected}");
+
+        assert_eq!(
+            classify_link_token_in(r".\notes.txt", Some(dir.path())),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            classify_link_token_in("./notes.txt", Some(dir.path())),
+            Some(expected.clone())
+        );
+
+        // A Windows OSC 7 URL (`file://host/C:/dir`) is the base for hovered links.
+        let url_path = dir.path().to_string_lossy().replace('\\', "/");
+        let mut input = format!("\x1b]7;file://localhost/{url_path}\x1b\\");
+        input.push_str(r"see .\notes.txt");
+        let term = term_with_input(40, 2, input.as_bytes());
+        let link = link_at_viewport_cell(&term, 0, 6).expect("relative path link");
+        assert_eq!(link.target, expected);
+        assert_eq!((link.start_col, link.end_col), (4, 14));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn msvc_locations_link_to_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("main.cpp");
+        fs::write(&file_path, "int main() {}").expect("write temp file");
+        let token = file_path.to_string_lossy();
+        let expected = classify_link_token(&token).expect("base file path should classify");
+
+        for suffix in ["(12)", "(12,3)", ":12", ":12:3"] {
+            assert_eq!(
+                classify_link_token(&format!("{token}{suffix}")),
+                Some(expected.clone()),
+                "{suffix}"
+            );
+        }
+
+        let line: Vec<char> = r"C:\src\main.cpp(12,3): error C2065".chars().collect();
+        assert_eq!(
+            super::link_token_in_line(&line, 3).map(|(_, _, token)| token),
+            Some(r"C:\src\main.cpp(12,3)".to_string())
+        );
+        let line: Vec<char> = r"at C:\src\main.cpp(12)".chars().collect();
+        assert_eq!(
+            super::link_token_in_line(&line, 5),
+            Some((3, 21, r"C:\src\main.cpp(12)".to_string()))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_forms_are_recognised() {
+        assert!(super::looks_like_file_path(r"\\server\share\file.txt"));
+        assert!(super::looks_like_file_path(r".\src\main.rs"));
+        assert!(super::looks_like_file_path(r"..\lib.rs"));
+        assert!(super::looks_like_file_path(r"~\notes.txt"));
+        assert!(!super::looks_like_file_path(r"\\?\"));
+        assert!(!super::looks_like_file_path(r"\\server"));
+
+        let line: Vec<char> = r"(.\src\main.rs)".chars().collect();
+        assert_eq!(
+            super::link_token_in_line(&line, 3),
+            Some((1, 13, r".\src\main.rs".to_string()))
+        );
+    }
+
+    #[test]
+    fn msvc_location_suffixes_are_parsed() {
+        assert_eq!(super::msvc_location_start("main.cpp(12)"), Some(8));
+        assert_eq!(super::msvc_location_start("main.cpp(12,3)"), Some(8));
+        assert_eq!(super::msvc_location_start("main.cpp(x)"), None);
+        assert_eq!(super::msvc_location_start("main.cpp(12,)"), None);
+        assert_eq!(super::msvc_location_start("(12)"), None);
+        assert_eq!(super::msvc_location_start("main.cpp"), None);
+    }
+
+    #[test]
+    fn leading_dots_of_relative_paths_are_kept() {
+        let line: Vec<char> = "(./src/main.rs) ../lib.rs ...end".chars().collect();
+        assert_eq!(
+            super::link_token_in_line(&line, 3),
+            Some((1, 13, "./src/main.rs".to_string()))
+        );
+        assert_eq!(
+            super::link_token_in_line(&line, 18),
+            Some((16, 24, "../lib.rs".to_string()))
+        );
+        assert_eq!(
+            super::link_token_in_line(&line, 29),
+            Some((29, 31, "end".to_string()))
+        );
+    }
+
+    #[test]
+    fn hover_does_not_scan_unbounded_runs_without_whitespace() {
+        let cols = 80;
+        let url = "https://example.com/";
+        // Longer than the scan window on both sides of any hovered cell.
+        let long = format!("{url}{}", "a".repeat(2 * MAX_LINK_SCAN_CELLS + 10));
+        let rows = long.len().div_ceil(cols) + 1;
+        let term = term_with_input(cols as u16, rows as u16, long.as_bytes());
+        for row in [0, rows / 2, rows - 2] {
+            assert!(link_at_viewport_cell(&term, row, 0).is_none(), "{row}");
+        }
+
+        // A link that fits in the window is still found across wrapped rows.
+        let fits = format!("{url}{}", "a".repeat(200));
+        let term = term_with_input(cols as u16, 4, fits.as_bytes());
+        let link = link_at_viewport_cell(&term, 2, 0).expect("wrapped link");
+        assert_eq!(link.target, fits);
     }
 }

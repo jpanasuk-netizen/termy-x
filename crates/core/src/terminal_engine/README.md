@@ -9,7 +9,9 @@ by native, display-only, tmux and persistent Termy sessions.
   to the screen in runs. Complete UTF-8 scalars within a chunk use one dispatch;
   malformed and fragmented sequences retain the streaming fallback. CSI
   parameters use fixed arrays; OSC/DCS/APC share a reusable, bounded buffer.
-  Fragment boundaries must never change behavior.
+  Completed or aborted strings release buffers larger than 64 KiB. Fragment
+  boundaries must never change behavior; the synchronized-output scanner uses
+  the same string limits without retaining a second copy of each payload.
 - `grid.rs` owns primary/alternate screens, scrollback, wide characters,
   cursor state and dirty ranges. Scrolling moves row ownership and reuses
   evicted row allocations once history is full. Rows track a conservative
@@ -29,31 +31,72 @@ by native, display-only, tmux and persistent Termy sessions.
   increase lookup work beyond four entries or change immutable cell metadata.
 - `grid/print.rs` joins streaming emoji/grapheme sequences and adjusts their
   column width, including right-margin promotion and one-column reflow.
+  Width changes damage erased spacer cells even when the cursor is hidden.
   `grid/row.rs` packs cold history into scalar/flag arrays, style runs, and shared
   metadata while leaving active rows dense.
 - `dispatch.rs` applies control sequences and owns modes, palette changes,
   hyperlinks and bounded event/reply queues. Clipboard controls share the parser
   and synchronized commits, avoiding a second scan and filtered input copy.
+  DECSTR resets VT state while preserving screen contents. Supported DEC private
+  modes can be saved and restored, including synchronized output.
   `queries.rs` reports live VT state.
+- `snapshot.rs` encodes and decodes the engine's full state in a versioned,
+  little-endian format: both screens and history with metadata tables,
+  cursors, margins, tabs, charsets, modes, keyboard stacks, palette, titles,
+  working directory, program status, the parser's in-progress sequence and a
+  pending synchronized update, the scrollback and payload limits, and kitty
+  graphics (images PNG-compressed). Rows keep their packed representation,
+  metadata charge and storage capacities. A row's byte charge doesn't depend
+  on its representation, so a decoded engine fed the same bytes evicts the
+  same history. Queued events and replies, damage and caches
+  are not included. Every build reads and writes versions
+  `MIN_SNAPSHOT_VERSION..=SNAPSHOT_VERSION`; `snapshot/v1.snap` is a fixture
+  written by the first release. Tests feed random streams split at random points to
+  an engine and to its decoded copy and compare canonical encodings.
 - `sync.rs` buffers synchronized output with a 2 MiB limit and a 150 ms timeout.
   A syntax-aware marker scanner preserves ordering across fragmented strings.
 - `graphics.rs` applies image commands and ordered scroll/clear effects inside
-  the same parser commits as text. Animation revision polling allocates nothing.
+  the same parser commits as text. Upload chunks do not scan the viewport for
+  Unicode placeholders; visual mutations invalidate placeholder placement state.
+  Virtual placement counts are maintained per screen, so checking for
+  placeholders during ordinary text feeds does not scan retained images. History
+  evicted during height resize moves image anchors with the retained text.
+  Animation revision polling allocates nothing.
+- `media/shared_memory.rs` copies bounded image transfers into owned storage.
+  Linux descriptor reads handle concurrent truncation as an error. macOS uses
+  a kernel-mediated mapping copy because its shared-memory descriptors do not
+  support descriptor reads.
 - `transport/` provides bounded native PTY input/output on Unix and Windows.
   The runtime maintenance thread sleeps until a synchronized-output deadline or
   a pending history-compaction step. History compaction starts 250 ms after the
-  last added history row and processes at most 256 rows per step.
+  last added history row and processes at most 256 rows per step. Windows control
+  workers wait on child-exit and resize/close events instead of polling a timer.
 - `Engine` is single-owner state. Transport/runtime synchronization belongs
   outside it. Active viewport reads borrow row slices. Cold history is expanded
-  on demand for borrowed reads; search and bulk visitors reuse scratch storage.
+  on demand for borrowed reads; invalidation visits only the interval containing
+  those reads. Search and bulk visitors reuse scratch storage.
 
-Sustained output retains the dense scrolling fast path. Quiet history compacts
+Sustained output retains the dense scrolling fast path while dense history
+stays within the byte budget and 16 MiB. Larger or byte-bound histories pack
+each line output scrolls in into the storage of the row it evicts, with room
+for a whole line (a quarter of a dense row), so floods allocate nothing and
+write little cold memory either way. Quiet history compacts
 without changing damage or generation. Direct engine hosts can explicitly call
 `compact_history()` after a burst. Allocation benchmarks report active and
 settled retained heap separately from parsing throughput.
+The transition out of quiet compaction counts output bytes across feeds, so
+fragmenting a burst into small writes does not keep packing new history rows.
 Grid dimensions are clamped to 4,096 per axis and 1,048,576 cells in total.
-History retains at most 20,000 rows and 1,048,576 cells, so wide grids can retain
-fewer rows than the configured history count. Combining suffixes, CSI parameters,
+History retains at most the configured rows (`usize::MAX` for no row limit) and
+the configured byte budget (16 MiB by default). Rows are charged their ring slot,
+their cells as a packed row with room for the whole line (what a flood stores),
+and their cell metadata measured by value, whether they are stored dense or
+packed. Storage depends on when compaction ran and on how output was split into
+feeds; the charge doesn't, so engines fed the same bytes evict the same rows.
+History past the budget packs its queued dense rows; rows that resist packing
+(a style change every few cells) can take up to four times their charge. A
+widen evicts nothing the old width kept; later output evicts down to the
+budget. Combining suffixes, CSI parameters,
 strings, title stacks, keyboard stacks, events and replies are also bounded. The runtime event queue
 has an 8 MiB retained-payload budget as well as a count limit; dropping clipboard
 chunks aborts the transaction, and resets still revoke permission grants.
@@ -70,6 +113,12 @@ fragmentation checks, without an Alacritty test oracle.
 
 The Unicode, CJK rendering, memory, and native presented-frame measurements are
 documented in the [follow-up report](../../../../docs/engineering/unicode-history-performance-2026-10-05.md).
+The [October 7 audit report](../../../../docs/engineering/terminal-engine-audit-fixes-2026-10-07.md)
+records the subsequent correctness fixes, targeted regression measurements, and
+remaining throughput and presentation limitations. The
+[October 8 review fixes](../../../../docs/engineering/terminal-engine-review-fixes-2026-10-08.md)
+cover shared-memory truncation, resize image anchors, grapheme damage and retained
+placement lookup costs.
 
 ```sh
 cargo test -p termy_core terminal_engine
@@ -98,6 +147,18 @@ each revision's release library before comparing saved executables; its source
 header gives the `rustc` command. The seven cases cover plain scrolling, styled
 redraws, repeated Unicode, 16,384 distinct Unicode scalars, repeated combining
 marks, 112 distinct combining marks, and one-byte fragmented plain text.
+
+`crates/core/examples/scrollback_bench.rs` measures feed throughput while output
+scrolls through history under row and byte limits (a 117x32 engine fed 64 KiB
+chunks, best of seven runs): plain text of varying line lengths, long wrapping
+lines and Unicode, from no history to unlimited rows under 16 and 64 MiB. Run
+one case with `-- <MiB> <plain|long|unicode> <rows|unlimited> <byte limit MiB>`.
+Compare revisions by running their builds alternately; shared machines vary.
+
+```sh
+cargo run --release -p termy_core --example scrollback_bench -- 32
+cargo run --release -p termy_core --example scrollback_bench -- 32 plain unlimited 16
+```
 
 Run the saved binaries with `scripts/benchmark-terminal-facades.py` from the
 repository root:

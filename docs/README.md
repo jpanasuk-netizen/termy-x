@@ -9,6 +9,7 @@ live under `website/content/`.
 - [Development](development.md): crash logs, render metrics, benchmarks, and tmux testing.
 - [Testing](engineering/testing.md): the test pyramid and smallest useful validation commands.
 - [Release packaging](architecture/release-packaging.md): artifact and packaging ownership.
+- [1.0.0-rc.10 release notes](releases/1.0.0-rc.10.md): candidate changes, including a link-safety fix.
 
 ## Architecture
 
@@ -27,7 +28,9 @@ scorecard, testing strategy, and decomposition plans.
 - [Configuration](configuration.md) — generated; do not edit directly.
 - [Keybindings](keybindings.md) — generated; do not edit directly.
 - [libtermy](libtermy.md)
+- [Program status (OSC 7501)](program-status.md): reporting task state, desktop indicators, and embedding APIs.
 - [Plugin runtime](plugins.md)
+- [Terminal protocols](../website/content/docs/reference/terminal-protocols.mdx): supported escape sequences, modes, queries, and extensions. Update it when the engine's dispatch or queries change.
 
 Repository benchmarks should be reproducible from the commands in
 [Development](development.md); do not add standalone result snapshots without

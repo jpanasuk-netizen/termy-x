@@ -2,8 +2,19 @@
 use super::*;
 
 impl Shared {
-    pub(super) fn schedule_maintenance(self: &Arc<Self>, state: &State) {
+    /// Hand the timer the state's deadline, if it changed. Called under the
+    /// engine lock after every feed, so the unchanged case stays inline.
+    #[inline]
+    pub(super) fn schedule_maintenance(self: &Arc<Self>, state: &mut State) {
         let deadline = state.maintenance_deadline();
+        if state.published_maintenance != Some(deadline) {
+            state.published_maintenance = Some(deadline);
+            self.publish_maintenance(deadline);
+        }
+    }
+
+    #[inline(never)]
+    fn publish_maintenance(self: &Arc<Self>, deadline: Option<Instant>) {
         let mut signal = self
             .sync_signal
             .state
@@ -57,7 +68,13 @@ impl Shared {
                             return;
                         };
                         let mut state = shared.state();
+                        // The timer just dropped its deadline, so the next
+                        // schedule must hand it one even if it is unchanged.
+                        state.published_maintenance = None;
                         if state.maintenance_deadline() != Some(deadline) {
+                            // A feed changed the deadline after the timer took
+                            // this one; give the timer the new one.
+                            shared.schedule_maintenance(&mut state);
                             break;
                         }
                         let now = Instant::now();
@@ -85,30 +102,25 @@ impl Shared {
                             if state.engine.take_history_activity() {
                                 state.defer_history_compaction(now);
                             }
-                            while let Some(event) = state.engine.pop_event() {
-                                state.engine_event(event);
-                            }
-                            state.engine.drain_replies(&mut replies);
+                            replies = state.take_engine_output();
                             state.generation = state.generation.wrapping_add(1);
                         }
-                        shared.schedule_maintenance(&state);
-                        drop(state);
+                        let tab_chrome_changed = committed && state.take_tab_chrome_changed();
+                        shared.schedule_maintenance(&mut state);
                         if !replies.is_empty() {
-                            let transport = shared
-                                .transport
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .upgrade();
-                            if let Some(transport) = transport {
-                                if let Err(error) = transport.write_protocol_reply_owned(replies) {
-                                    log::warn!("terminal timeout reply failed: {error}");
+                            match shared.live_transport() {
+                                Some(transport) => {
+                                    Shared::write_replies_locked(&transport, replies);
                                 }
-                            } else {
-                                shared.state().append_replies(&replies);
+                                None => state.append_replies(&replies),
                             }
                         }
+                        drop(state);
                         if committed {
                             shared.notify();
+                        }
+                        if tab_chrome_changed {
+                            shared.notify_tab_chrome();
                         }
                         break;
                     }

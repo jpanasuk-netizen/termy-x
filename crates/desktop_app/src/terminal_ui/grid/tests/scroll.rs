@@ -57,7 +57,6 @@ fn scrolling_retains_unmodified_text_allocations_and_repairs_cursor_rows() {
         panic!("text batch")
     };
     assert_eq!(batch.text.as_ptr(), text_ptr);
-    assert_eq!(batch.row, 2);
     assert_eq!(batch.text.as_ref(), "d");
 }
 
@@ -173,7 +172,6 @@ fn full_damage_reuses_shifted_cells_without_losing_cursor_or_hover_changes() {
         panic!("text batch")
     };
     assert_eq!(batch.text.as_ptr(), retained_ptr);
-    assert_eq!(batch.row, 0);
 
     next.cursor_cell = Some((0, 0));
     next.cursor_visible = true;

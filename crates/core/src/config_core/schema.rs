@@ -1,6 +1,6 @@
 use crate::config_core::types::{
     AppConfig, AppIcon, AppearanceMode, CursorStyle, PaneFocusEffect, TabBarPosition,
-    TabCloseVisibility, TabTitleMode, TabWidthMode, TerminalScrollbarStyle,
+    TabCloseVisibility, TabStyle, TabTitleMode, TabWidthMode, TerminalScrollbarStyle,
     TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback,
 };
 
@@ -303,6 +303,17 @@ pub const TAB_BAR_POSITION_ENUM_CHOICES: &[EnumChoice] = &[
     },
 ];
 
+pub const TAB_STYLE_ENUM_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        value: "native",
+        label: "Native",
+    },
+    EnumChoice {
+        value: "custom",
+        label: "Custom",
+    },
+];
+
 pub const WORKING_DIR_FALLBACK_ENUM_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         value: "home",
@@ -315,6 +326,10 @@ pub const WORKING_DIR_FALLBACK_ENUM_CHOICES: &[EnumChoice] = &[
 ];
 
 pub const WINDOWS_SHELL_ENUM_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        value: "auto",
+        label: "Automatic",
+    },
     EnumChoice {
         value: "cmd",
         label: "Command Prompt",
@@ -330,6 +345,32 @@ pub const WINDOWS_SHELL_ENUM_CHOICES: &[EnumChoice] = &[
     EnumChoice {
         value: "git_bash",
         label: "Git Bash",
+    },
+];
+
+pub const CLIPBOARD_READ_ENUM_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        value: "ask",
+        label: "Ask",
+    },
+    EnumChoice {
+        value: "allow",
+        label: "Allow",
+    },
+    EnumChoice {
+        value: "deny",
+        label: "Deny",
+    },
+];
+
+pub const TERM_PROGRAM_ENUM_CHOICES: &[EnumChoice] = &[
+    EnumChoice {
+        value: "ghostty",
+        label: "Ghostty (compatible)",
+    },
+    EnumChoice {
+        value: "termy",
+        label: "Termy",
     },
 ];
 
@@ -360,7 +401,7 @@ define_root_settings! {
     (AppIcon, "app_icon", [], Appearance, "APP", "App Icon", "macOS app icon shown in the Dock and app switcher", ["app", "icon", "dock", "macos", "old"], RootSettingValueKind::Enum, false),
     (ChromeContrast, "chrome_contrast", [], Appearance, "CHROME", "Increase Chrome Contrast", "Increase contrast of non-terminal UI surfaces", ["chrome", "contrast", "sidebar", "titlebar", "panel", "overlay", "tab strip"], RootSettingValueKind::Boolean, false),
     (AutoUpdate, "auto_update", [], Advanced, "UPDATES", "Auto Update", "Enable automatic update checks", ["update", "check", "upgrade", "version"], RootSettingValueKind::Boolean, false),
-    (MultiplexerEnabled, "multiplexer_enabled", [], Terminal, "SESSIONS", "Built-in Multiplexer", "Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy.", ["multiplexer", "session", "background", "persist", "restore", "quit"], RootSettingValueKind::Boolean, false),
+    (MultiplexerEnabled, "multiplexer_enabled", [], Terminal, "SESSIONS", "Built-in Multiplexer", "Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy. Turning it off leaves running sessions in the background; run `termy mux shutdown` to end them.", ["multiplexer", "session", "background", "persist", "restore", "quit", "preview", "experimental"], RootSettingValueKind::Boolean, false),
     (TmuxEnabled, "tmux_enabled", [], Terminal, "TMUX", "Tmux Enabled", "Enable tmux runtime integration", ["tmux", "runtime", "integration", "enabled"], RootSettingValueKind::Boolean, false),
     (TmuxPersistence, "tmux_persistence", [], Terminal, "TMUX", "Tmux Persistence", "Reuse tmux tabs and panes across app restarts", ["tmux", "session", "persistence", "restart"], RootSettingValueKind::Boolean, false),
     (TmuxExclusive, "tmux_exclusive", [], Terminal, "TMUX", "Tmux Exclusive", "Stay in tmux control mode; restart it instead of falling back to a classic terminal when control mode exits", ["tmux", "exclusive", "control", "mode", "restart", "fallback"], RootSettingValueKind::Boolean, false),
@@ -387,6 +428,7 @@ define_root_settings! {
     (TabCloseVisibility, "tab_close_visibility", [], Tabs, "TAB STRIP", "Close Button Visibility", "When tab close buttons are visible", ["tab", "close", "visibility", "hover"], RootSettingValueKind::Enum, false),
     (TabWidthMode, "tab_width_mode", [], Tabs, "TAB STRIP", "Tab Width Mode", "How tab widths react to active state", ["tab", "width", "layout", "active"], RootSettingValueKind::Enum, false),
     (TabBarPosition, "tab_bar_position", [], Tabs, "TAB STRIP", "Tab Bar Position", "Where the tab bar is rendered: top strip or right sidebar", ["tab", "bar", "position", "sidebar", "vertical", "right", "top"], RootSettingValueKind::Enum, false),
+    (TabStyle, "tab_style", [], Tabs, "TAB STRIP", "Tab Style", "native: macOS window tabs (applies to new windows) or the WinUI tab strip on Windows (opaque windows, after a restart); custom: Termy's tab strip", ["tab", "style", "native", "custom", "macos", "appkit", "window", "windows", "winui"], RootSettingValueKind::Enum, false),
     (TabSwitchModifierHints, "tab_switch_modifier_hints", [], Tabs, "TAB STRIP", "Show Tab Switch Hints", "Show secondary+1..9 number badges on the first nine tabs while the secondary modifier is held", ["tab", "switch", "hints", "modifier", "secondary", "shortcuts"], RootSettingValueKind::Boolean, false),
     (AutoHideTabbar, "auto_hide_tabbar", [], Tabs, "TAB STRIP", "Auto-hide Tab Bar", "Hide the tab bar when only one tab is open", ["tab", "tabs", "hide", "auto", "single", "tabbar"], RootSettingValueKind::Boolean, false),
     (SidebarEnabled, "sidebar_enabled", [], Tabs, "SIDEBAR", "Workspace Sidebar", "Show the left sidebar for grouping tabs into workspaces", ["sidebar", "workspace", "workspaces", "tabs", "groups"], RootSettingValueKind::Boolean, false),
@@ -396,9 +438,10 @@ define_root_settings! {
     (Shell, "shell", [], Terminal, "SHELL", "Shell", "Optional executable path used for new sessions; overrides the Windows shell preset on Windows", ["shell", "bash", "zsh", "fish", "custom"], RootSettingValueKind::Text, false),
     (Term, "term", [], Terminal, "SHELL", "TERM", "TERM value exposed to child applications", ["term", "terminal", "env"], RootSettingValueKind::Text, false),
     (Colorterm, "colorterm", [], Terminal, "SHELL", "COLORTERM", "COLORTERM value exposed to child applications", ["colorterm", "color", "env"], RootSettingValueKind::Text, false),
+    (TermProgram, "term_program", [], Terminal, "SHELL", "TERM_PROGRAM", "Terminal identity exposed to child applications: ghostty enables features such as Claude Code progress bars, termy reports Termy in tools like neofetch", ["term_program", "terminal", "identity", "ghostty", "neofetch", "env"], RootSettingValueKind::Enum, false),
     (MacosOptionAsAlt, "macos_option_as_alt", [], Terminal, "KEYBOARD", "Use Option As Alt", "Send macOS Option plus printable keys as escape-prefixed terminal Alt input", ["macos", "option", "alt", "meta", "escape", "keyboard"], RootSettingValueKind::Boolean, false),
-    (WindowWidth, "window_width", [], Advanced, "WINDOW", "Window Width", "Default startup window width in pixels", ["window", "width", "startup", "size"], RootSettingValueKind::Numeric, false),
-    (WindowHeight, "window_height", [], Advanced, "WINDOW", "Window Height", "Default startup window height in pixels", ["window", "height", "startup", "size"], RootSettingValueKind::Numeric, false),
+    (WindowWidth, "window_width", [], Advanced, "WINDOW", "Window Width", "Startup window width in pixels before a window size has been saved", ["window", "width", "startup", "size"], RootSettingValueKind::Numeric, false),
+    (WindowHeight, "window_height", [], Advanced, "WINDOW", "Window Height", "Startup window height in pixels before a window size has been saved", ["window", "height", "startup", "size"], RootSettingValueKind::Numeric, false),
     (InspectorHeight, "inspector_height", [], Advanced, "UI", "Inspector Height", "Remembered height in pixels of the developer inspector panel", ["inspector", "height", "developer", "panel", "debug"], RootSettingValueKind::Numeric, false),
     (FontFamily, "font_family", [], Appearance, "FONT", "Font Family", "Font family used in terminal UI", ["font", "typeface", "text"], RootSettingValueKind::Special, false),
     (UiFontFamily, "ui_font_family", [], Appearance, "FONT", "UI Font Family", "Font family used for tabs, command palette, and settings UI (not the terminal cells)", ["font", "typeface", "ui", "chrome", "tabs", "settings"], RootSettingValueKind::Special, false),
@@ -420,9 +463,10 @@ define_root_settings! {
     (PaneFocusStrength, "pane_focus_strength", [], Terminal, "UI", "Pane Focus Strength", "Strength of active pane emphasis (0.0 to 2.0)", ["pane", "focus", "strength", "dimming"], RootSettingValueKind::Numeric, false),
     (CopyOnSelect, "copy_on_select", [], Terminal, "CLIPBOARD", "Copy On Select", "Automatically copy selected text to clipboard", ["copy", "select", "clipboard", "selection"], RootSettingValueKind::Boolean, false),
     (CopyOnSelectToast, "copy_on_select_toast", [], Terminal, "CLIPBOARD", "Copy On Select Toast", "Show a toast when text is copied on select", ["copy", "select", "toast"], RootSettingValueKind::Boolean, false),
+    (ClipboardRead, "clipboard_read", [], Terminal, "CLIPBOARD", "Clipboard Read Access", "Whether programs may read the clipboard with OSC 52 (ask, allow, or deny)", ["clipboard", "osc", "52", "paste", "read", "security"], RootSettingValueKind::Enum, false),
     (CommandPaletteShowKeybinds, "command_palette_show_keybinds", [], Terminal, "UI", "Show Keybindings In Palette", "Show shortcut badges in command palette rows", ["palette", "keybinds", "shortcuts"], RootSettingValueKind::Boolean, false),
     (ShellIntegrationEnabled, "shell_integration_enabled", [], Terminal, "SHELL", "Shell Integration", "Enable OSC 133 shell integration for command lifecycle tracking", ["shell", "integration", "osc", "133", "prompt", "command"], RootSettingValueKind::Boolean, false),
-    (ProgressIndicatorEnabled, "progress_indicator_enabled", [], Terminal, "UI", "Progress Indicators", "Show progress from OSC 9;4 sequences in tab badges", ["progress", "indicator", "tab", "badge", "osc"], RootSettingValueKind::Boolean, false),
+    (ProgressIndicatorEnabled, "progress_indicator_enabled", [], Terminal, "UI", "Progress Indicators", "Show OSC 9;4 progress bars and OSC 7501 program status badges", ["progress", "indicator", "tab", "badge", "osc", "status"], RootSettingValueKind::Boolean, false),
     (Keybind, "keybind", [], Keybindings, "KEYBINDS", "Keyboard shortcuts", "Customize shortcuts for tabs, panes, and app commands", ["keybind", "shortcut", "command", "tab", "switch", "cycle", "keyboard"], RootSettingValueKind::Special, true),
 }
 
@@ -467,6 +511,7 @@ pub fn root_setting_enum_choices(id: RootSettingId) -> Option<&'static [EnumChoi
         RootSettingId::TabCloseVisibility => Some(TAB_CLOSE_VISIBILITY_ENUM_CHOICES),
         RootSettingId::TabWidthMode => Some(TAB_WIDTH_MODE_ENUM_CHOICES),
         RootSettingId::TabBarPosition => Some(TAB_BAR_POSITION_ENUM_CHOICES),
+        RootSettingId::TabStyle => Some(TAB_STYLE_ENUM_CHOICES),
         RootSettingId::ThemeMode => Some(THEME_MODE_ENUM_CHOICES),
         RootSettingId::AppIcon => Some(APP_ICON_ENUM_CHOICES),
         RootSettingId::WindowsShell => Some(WINDOWS_SHELL_ENUM_CHOICES),
@@ -474,6 +519,8 @@ pub fn root_setting_enum_choices(id: RootSettingId) -> Option<&'static [EnumChoi
         RootSettingId::ScrollbarVisibility => Some(SCROLLBAR_VISIBILITY_ENUM_CHOICES),
         RootSettingId::ScrollbarStyle => Some(SCROLLBAR_STYLE_ENUM_CHOICES),
         RootSettingId::PaneFocusEffect => Some(PANE_FOCUS_EFFECT_ENUM_CHOICES),
+        RootSettingId::ClipboardRead => Some(CLIPBOARD_READ_ENUM_CHOICES),
+        RootSettingId::TermProgram => Some(TERM_PROGRAM_ENUM_CHOICES),
 
         _ => None,
     }
@@ -562,12 +609,17 @@ pub fn root_setting_default_value(config: &AppConfig, id: RootSettingId) -> Opti
             TabBarPosition::Top => "top".to_string(),
             TabBarPosition::Right => "right".to_string(),
         }),
+        RootSettingId::TabStyle => Some(match config.tab_style {
+            TabStyle::Native => "native".to_string(),
+            TabStyle::Custom => "custom".to_string(),
+        }),
         RootSettingId::TabSwitchModifierHints => Some(config.tab_switch_modifier_hints.to_string()),
         RootSettingId::AutoHideTabbar => Some(config.auto_hide_tabbar.to_string()),
         RootSettingId::SidebarEnabled => Some(config.sidebar_enabled.to_string()),
         RootSettingId::SidebarWidth => Some(config.sidebar_width.to_string()),
         RootSettingId::ShowTermyInTitlebar => Some(config.show_termy_in_titlebar.to_string()),
         RootSettingId::WindowsShell => Some(match config.windows_shell {
+            WindowsShell::Auto => "auto".to_string(),
             WindowsShell::Cmd => "cmd".to_string(),
             WindowsShell::PowerShell => "powershell".to_string(),
             WindowsShell::PowerShellCore => "pwsh".to_string(),
@@ -576,6 +628,7 @@ pub fn root_setting_default_value(config: &AppConfig, id: RootSettingId) -> Opti
         RootSettingId::Shell => config.shell.clone(),
         RootSettingId::Term => Some(config.term.clone()),
         RootSettingId::Colorterm => config.colorterm.clone(),
+        RootSettingId::TermProgram => Some(config.term_program.as_str().to_string()),
         RootSettingId::MacosOptionAsAlt => Some(config.macos_option_as_alt.to_string()),
         RootSettingId::WindowWidth => Some(config.window_width.to_string()),
         RootSettingId::WindowHeight => Some(config.window_height.to_string()),
@@ -620,6 +673,7 @@ pub fn root_setting_default_value(config: &AppConfig, id: RootSettingId) -> Opti
         RootSettingId::PaneFocusStrength => Some(config.pane_focus_strength.to_string()),
         RootSettingId::CopyOnSelect => Some(config.copy_on_select.to_string()),
         RootSettingId::CopyOnSelectToast => Some(config.copy_on_select_toast.to_string()),
+        RootSettingId::ClipboardRead => Some(config.clipboard_read.as_str().to_string()),
         RootSettingId::CommandPaletteShowKeybinds => {
             Some(config.command_palette_show_keybinds.to_string())
         }
@@ -716,7 +770,7 @@ mod tests {
         );
         assert_eq!(
             enum_choice_values(RootSettingId::WindowsShell),
-            vec!["cmd", "powershell", "pwsh", "git_bash"]
+            vec!["auto", "cmd", "powershell", "pwsh", "git_bash"]
         );
 
         assert_eq!(
@@ -726,6 +780,20 @@ mod tests {
         assert_eq!(
             enum_choice_values(RootSettingId::PaneFocusEffect),
             vec!["off", "soft_spotlight", "cinematic", "minimal"]
+        );
+
+        assert_eq!(
+            enum_choice_values(RootSettingId::ClipboardRead),
+            vec!["ask", "allow", "deny"]
+        );
+
+        assert_eq!(
+            root_setting_value_kind(RootSettingId::TermProgram),
+            RootSettingValueKind::Enum
+        );
+        assert_eq!(
+            enum_choice_values(RootSettingId::TermProgram),
+            vec!["ghostty", "termy"]
         );
 
         assert_eq!(

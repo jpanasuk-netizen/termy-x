@@ -12,7 +12,6 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::themes::{THEME_REGISTRY_CACHE_VERSION, ThemeRegistryCache, ThemeStoreTheme};
 use crate::{
     ConfigDiagnostic, ConfigDiagnosticKind, KittyGraphicsRenderPlacement, LoadedTermyConfig,
     ProgressState, Terminal, TerminalClipboardContent, TerminalClipboardLocation,
@@ -42,6 +41,8 @@ pub enum TermyFfiStatus {
     SerializeFailed = 7,
     Panicked = 8,
     InvalidArgument = 9,
+    UnsupportedSnapshotVersion = 10,
+    InvalidSnapshot = 11,
 }
 
 #[cfg(test)]
@@ -496,6 +497,9 @@ pub struct TermyFfiTerminal {
     terminal: Terminal,
     wakeups_tx: Option<Sender<()>>,
     wakeups_rx: Option<Receiver<()>>,
+    /// PNG exports from the last graphics batch. Images cache their encoding
+    /// only while someone holds it, so this keeps polling from re-encoding.
+    kitty_png_exports: Vec<std::sync::Arc<Vec<u8>>>,
 }
 
 pub struct TermyFfiConfig {
@@ -866,12 +870,48 @@ fn ffi_cursor_from_cursor(cursor: Option<crate::TerminalCursorState>) -> TermyFf
     })
 }
 
+// `TermyCell` is laid out as `TermyFfiCell`, so a frame's cells are handed
+// to C hosts as they are. Every bit pattern of a `TermyCell` (a `char` is a
+// valid `u32`, `bool`s are `bool`s) is a valid `TermyFfiCell`.
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<TermyCell>() == size_of::<TermyFfiCell>());
+    assert!(align_of::<TermyCell>() == align_of::<TermyFfiCell>());
+    assert!(offset_of!(TermyCell, char) == offset_of!(TermyFfiCell, codepoint));
+    assert!(offset_of!(TermyCell, fg) == offset_of!(TermyFfiCell, fg));
+    assert!(offset_of!(TermyCell, bg) == offset_of!(TermyFfiCell, bg));
+    assert!(
+        offset_of!(TermyCell, uses_terminal_default_bg)
+            == offset_of!(TermyFfiCell, uses_terminal_default_bg)
+    );
+    assert!(offset_of!(TermyCell, bold) == offset_of!(TermyFfiCell, bold));
+    assert!(offset_of!(TermyCell, render_text) == offset_of!(TermyFfiCell, render_text));
+    assert!(
+        offset_of!(TermyCell, wide_character_spacer)
+            == offset_of!(TermyFfiCell, wide_character_spacer)
+    );
+    assert!(offset_of!(TermyCell, line_wrapped) == offset_of!(TermyFfiCell, line_wrapped));
+    assert!(offset_of!(TermyCell, italic) == offset_of!(TermyFfiCell, italic));
+    assert!(offset_of!(TermyCell, underline) == offset_of!(TermyFfiCell, underline));
+    assert!(offset_of!(TermyCell, strikethrough) == offset_of!(TermyFfiCell, strikethrough));
+    assert!(size_of::<TermyColor>() == size_of::<TermyFfiColor>());
+    assert!(offset_of!(TermyColor, r) == offset_of!(TermyFfiColor, r));
+    assert!(offset_of!(TermyColor, g) == offset_of!(TermyFfiColor, g));
+    assert!(offset_of!(TermyColor, b) == offset_of!(TermyFfiColor, b));
+    assert!(offset_of!(TermyColor, a) == offset_of!(TermyFfiColor, a));
+};
+
+fn ffi_cells(cells: Vec<TermyCell>) -> Vec<TermyFfiCell> {
+    let mut cells = std::mem::ManuallyDrop::new(cells);
+    let (ptr, len, capacity) = (cells.as_mut_ptr(), cells.len(), cells.capacity());
+    // SAFETY: the types have the same size, alignment and field layout
+    // (asserted above), every `TermyCell` is a valid `TermyFfiCell`, and the
+    // allocation is handed over whole, so it is freed with the same layout.
+    unsafe { Vec::from_raw_parts(ptr.cast::<TermyFfiCell>(), len, capacity) }
+}
+
 fn ffi_frame_update_from_update(update: TermyFrameUpdate) -> TermyFfiFrameUpdate {
-    let cells = update
-        .cells
-        .into_iter()
-        .map(TermyFfiCell::from)
-        .collect::<Vec<_>>();
+    let cells = ffi_cells(update.cells);
     let (cells_ptr, cells_len, cells_capacity) = leak_vec(cells);
 
     let (damage_kind, spans) = match update.damage {
@@ -929,12 +969,13 @@ fn ffi_bytes_from_string(value: String) -> TermyFfiBytes {
 
 fn ffi_kitty_graphics_placement_from_placement(
     placement: KittyGraphicsRenderPlacement,
+    png: TermyFfiBytes,
 ) -> TermyFfiKittyGraphicsPlacement {
     TermyFfiKittyGraphicsPlacement {
         placement_serial: placement.placement_serial,
         image_id: placement.image_id,
         placement_id: placement.placement_id,
-        png: ffi_bytes_from_vec(placement.image.png().as_ref().to_vec()),
+        png,
         image_width: placement.image_width,
         image_height: placement.image_height,
         image_generation: placement.image_generation,
@@ -1002,6 +1043,10 @@ fn ffi_event_from_event(event: TerminalEvent) -> TermyFfiEvent {
             kind: 5,
             ..TermyFfiEvent::default()
         },
+        TerminalEvent::InputDropped => TermyFfiEvent {
+            kind: 14,
+            ..TermyFfiEvent::default()
+        },
         TerminalEvent::ClipboardStore(text) => TermyFfiEvent {
             kind: 6,
             payload: ffi_bytes_from_string(text),
@@ -1033,6 +1078,13 @@ fn ffi_event_from_event(event: TerminalEvent) -> TermyFfiEvent {
                 ..TermyFfiEvent::default()
             }
         }
+        TerminalEvent::ProgramStatus(records) => TermyFfiEvent {
+            kind: 13,
+            payload: ffi_bytes_from_string(
+                serde_json::to_string(&records).expect("status records serialize"),
+            ),
+            ..TermyFfiEvent::default()
+        },
         TerminalEvent::WorkingDirectory(path) => TermyFfiEvent {
             kind: 12,
             payload: ffi_bytes_from_string(path),
@@ -1416,6 +1468,7 @@ unsafe fn terminal_new_with_runtime_config(
             terminal,
             wakeups_tx: Some(wakeups_tx),
             wakeups_rx: Some(wakeups_rx),
+            kitty_png_exports: Vec::new(),
         }));
     }
     TermyFfiStatus::Ok
@@ -1446,6 +1499,23 @@ pub unsafe extern "C" fn termy_terminal_new(
     })
 }
 
+/// A display terminal with a wake channel. Output is fed by the host, but a
+/// synchronized update (`?2026`) that times out commits later on its own; the
+/// wake channel is how the host learns to render it and send its replies.
+fn display_terminal(size: TerminalSize) -> TermyFfiTerminal {
+    let (wakeups_tx, wakeups_rx) = bounded(1);
+    let sender = wakeups_tx.clone();
+    let notifier = crate::TerminalWakeupNotifier::new(move || {
+        let _ = sender.try_send(());
+    });
+    TermyFfiTerminal {
+        terminal: Terminal::new_display_with_wakeup_notifier(size, None, Some(notifier)),
+        wakeups_tx: Some(wakeups_tx),
+        wakeups_rx: Some(wakeups_rx),
+        kitty_png_exports: Vec::new(),
+    }
+}
+
 /// Create a display-only terminal: a grid with no PTY/shell, fed via
 /// `termy_terminal_feed_output`. Used for tmux control-mode panes. All other
 /// terminal functions (render, resize, snapshot, free) work on the result.
@@ -1458,13 +1528,8 @@ pub unsafe extern "C" fn termy_display_terminal_new(
         if out_terminal.is_null() {
             return TermyFfiStatus::Null;
         }
-        let terminal = Terminal::new_display(size.into(), None);
         unsafe {
-            *out_terminal = Box::into_raw(Box::new(TermyFfiTerminal {
-                terminal,
-                wakeups_tx: None,
-                wakeups_rx: None,
-            }));
+            *out_terminal = Box::into_raw(Box::new(display_terminal(size.into())));
         }
         TermyFfiStatus::Ok
     })
@@ -2117,10 +2182,49 @@ fn settings_write_contents_to(
     path: &std::path::Path,
     contents: &str,
 ) -> Result<(), TermyFfiStatus> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
+    use std::io::Write as _;
+
+    // Write the file a symlink points at, so dotfile managers (stow, chezmoi)
+    // keep their link.
+    let target = settings_write_target(path);
+    let parent = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::create_dir_all(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
+    // Replace the file atomically: truncating in place would let a concurrent
+    // read see an empty file, which reads as the default template and could
+    // be written back over the user's config.
+    let mut temp =
+        tempfile::NamedTempFile::new_in(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        let _ = temp.as_file().set_permissions(metadata.permissions());
     }
-    std::fs::write(path, contents).map_err(|_| TermyFfiStatus::WriteFailed)
+    temp.write_all(contents.as_bytes())
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|_| TermyFfiStatus::WriteFailed)?;
+    temp.persist(&target)
+        .map(drop)
+        .map_err(|_| TermyFfiStatus::WriteFailed)
+}
+
+/// The file `path` resolves to through symlinks, or `path` itself.
+fn settings_write_target(path: &Path) -> PathBuf {
+    if let Ok(target) = std::fs::canonicalize(path) {
+        return target;
+    }
+    // A dangling link: create the file it names.
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        let Ok(link) = std::fs::read_link(&target) else {
+            break;
+        };
+        target = match target.parent() {
+            Some(parent) => parent.join(link),
+            None => link,
+        };
+    }
+    target
 }
 
 fn settings_color_hex(app: &cfg::AppConfig, id: cfg::ColorSettingId) -> Option<String> {
@@ -2149,337 +2253,16 @@ fn settings_color_hex(app: &cfg::AppConfig, id: cfg::ColorSettingId) -> Option<S
     rgb.map(|c| format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b))
 }
 
-const SETTINGS_THEME_REGISTRY_URL: &str =
-    "https://raw.githubusercontent.com/termy-org/themes/main/index.json";
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SettingsLegacyThemeStoreTheme {
-    name: String,
-    slug: String,
-    #[serde(default)]
-    description: String,
-    latest_version: Option<String>,
-    file_url: Option<String>,
-}
-
-impl SettingsLegacyThemeStoreTheme {
-    fn into_theme(self) -> Option<ThemeStoreTheme> {
-        let name = self.name.trim().to_string();
-        let slug = crate::themes::normalize_theme_id(&self.slug);
-        if name.is_empty() || slug.is_empty() {
-            return None;
-        }
-
-        Some(ThemeStoreTheme {
-            name,
-            slug,
-            description: self.description,
-            latest_version: self.latest_version,
-            file_url: self.file_url,
-        })
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(untagged)]
-enum SettingsThemeStorePayload {
-    Legacy(Vec<SettingsLegacyThemeStoreTheme>),
-    Registry(crate::themes::ThemeRegistryIndex),
-}
-
-fn settings_installed_theme_ids(config_path: Option<&Path>) -> Vec<String> {
-    let Some(config_path) = config_path else {
-        return Vec::new();
-    };
-    let Some(config_dir) = config_path.parent() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(config_dir.join("themes")) else {
-        return Vec::new();
-    };
-
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let is_json = path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
-            if !is_json {
-                return None;
-            }
-
-            let stem = path.file_stem()?.to_str()?;
-            let normalized = crate::themes::normalize_theme_id(stem);
-            (!normalized.is_empty()).then_some(normalized)
-        })
-        .collect()
-}
-
-fn settings_theme_registry_url() -> String {
-    std::env::var("TERMY_THEME_REGISTRY_URL")
-        .or_else(|_| std::env::var("THEME_STORE_REGISTRY_URL"))
-        .unwrap_or_else(|_| SETTINGS_THEME_REGISTRY_URL.to_string())
-}
-
-fn settings_theme_registry_cache_path(config_path: Option<&Path>) -> Option<PathBuf> {
-    let owned_config_path;
-    let config_path = if let Some(path) = config_path {
-        path
-    } else {
-        owned_config_path = cfg::config_path()?;
-        owned_config_path.as_path()
-    };
-    Some(config_path.parent()?.join("theme_registry.cache"))
-}
-
-fn settings_current_unix_timestamp() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs())
-}
-
-fn settings_theme_registry_fetch_url(registry_url: &str) -> String {
-    if !registry_url.contains("raw.githubusercontent.com") {
-        return registry_url.to_string();
-    }
-
-    let separator = if registry_url.contains('?') { '&' } else { '?' };
-    format!(
-        "{registry_url}{separator}termy_cache_bust={}",
-        settings_current_unix_timestamp()
-    )
-}
-
-fn settings_load_theme_registry_cache(config_path: Option<&Path>) -> Option<ThemeRegistryCache> {
-    let path = settings_theme_registry_cache_path(config_path)?;
-    let bytes = std::fs::read(path).ok()?;
-    let cache: ThemeRegistryCache = bincode::deserialize(&bytes).ok()?;
-    (cache.version == THEME_REGISTRY_CACHE_VERSION).then_some(cache)
-}
-
-fn settings_save_theme_registry_cache(
-    config_path: Option<&Path>,
-    themes: &[ThemeStoreTheme],
-    registry_url: &str,
-    etag: Option<String>,
-) {
-    let Some(path) = settings_theme_registry_cache_path(config_path) else {
-        return;
-    };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    let cache = ThemeRegistryCache {
-        version: THEME_REGISTRY_CACHE_VERSION,
-        fetched_at: settings_current_unix_timestamp(),
-        registry_url: registry_url.to_string(),
-        etag,
-        themes: themes.to_vec(),
-    };
-
-    if let Ok(bytes) = bincode::serialize(&cache) {
-        let _ = std::fs::write(path, bytes);
-    }
-}
-
-fn settings_parse_theme_store_payload(
-    raw_json: &str,
-    registry_url: &str,
-) -> Result<Vec<ThemeStoreTheme>, String> {
-    let payload: SettingsThemeStorePayload = serde_json::from_str(raw_json)
-        .map_err(|error| format!("Invalid theme registry response: {error}"))?;
-
-    let mut parsed: Vec<ThemeStoreTheme> = match payload {
-        SettingsThemeStorePayload::Legacy(themes) => themes
-            .into_iter()
-            .filter_map(SettingsLegacyThemeStoreTheme::into_theme)
-            .collect(),
-        SettingsThemeStorePayload::Registry(index) => index
-            .themes
-            .into_iter()
-            .filter_map(|theme| {
-                let slug = crate::themes::normalize_theme_id(&theme.slug);
-                (!slug.is_empty() && !theme.name.trim().is_empty()).then(|| ThemeStoreTheme {
-                    name: theme.name.trim().to_string(),
-                    slug,
-                    description: theme.description,
-                    latest_version: Some(theme.latest_version),
-                    file_url: Some(crate::themes::registry_file_url(registry_url, &theme.file)),
-                })
-            })
-            .collect(),
-    };
-
-    parsed.sort_unstable_by(|left, right| {
-        left.name
-            .to_ascii_lowercase()
-            .cmp(&right.name.to_ascii_lowercase())
-    });
-    Ok(parsed)
-}
-
-fn settings_fetch_theme_registry_themes(
-    config_path: Option<&Path>,
-) -> Result<Vec<ThemeStoreTheme>, String> {
-    let registry_url = settings_theme_registry_url();
-    let cached = settings_load_theme_registry_cache(config_path);
-    let cached_etag = cached.as_ref().and_then(|cache| {
-        (cache.registry_url == registry_url)
-            .then(|| cache.etag.clone())
-            .flatten()
-    });
-
-    // Bound the request: ureq otherwise blocks indefinitely on connect/read,
-    // and this runs synchronously on the main thread when Settings opens, so a
-    // slow or hostile registry host (the URL is overridable via
-    // TERMY_THEME_REGISTRY_URL) could hang the app.
-    let mut request = ureq::get(&settings_theme_registry_fetch_url(&registry_url))
-        .timeout(std::time::Duration::from_secs(10))
-        .set("Accept", "application/json")
-        .set("Cache-Control", "no-cache")
-        .set("Pragma", "no-cache");
-
-    if let Some(ref etag) = cached_etag {
-        request = request.set("If-None-Match", etag);
-    }
-
-    match request.call() {
-        Ok(response) if response.status() == 304 => cached
-            .filter(|cache| cache.registry_url == registry_url)
-            .map(|cache| cache.themes)
-            .ok_or_else(|| {
-                "Server returned 304 Not Modified but no matching local cache exists".to_string()
-            }),
-        Ok(response) => {
-            let etag = response.header("etag").map(str::to_string);
-            let raw = response
-                .into_string()
-                .map_err(|error| format!("Invalid theme registry response: {error}"))?;
-            let themes = settings_parse_theme_store_payload(&raw, &registry_url)?;
-            settings_save_theme_registry_cache(config_path, &themes, &registry_url, etag);
-            Ok(themes)
-        }
-        Err(error) => cached
-            .filter(|cache| cache.registry_url == registry_url)
-            .map(|cache| cache.themes)
-            .ok_or_else(|| format!("Failed to fetch store themes: {error}")),
-    }
-}
-
-fn settings_theme_store_ids(config_path: Option<&Path>) -> Vec<String> {
-    if config_path.is_none() {
-        return Vec::new();
-    }
-
-    let registry_url = settings_theme_registry_url();
-    if let Some(cache) = settings_load_theme_registry_cache(config_path)
-        && cache.registry_url == registry_url
-        && !cache.themes.is_empty()
-    {
-        return cache.themes.into_iter().map(|theme| theme.slug).collect();
-    }
-
-    settings_fetch_theme_registry_themes(config_path)
-        .map(|themes| themes.into_iter().map(|theme| theme.slug).collect())
-        .unwrap_or_default()
-}
-
-fn settings_installed_theme_versions_path(config_path: &Path) -> Option<PathBuf> {
-    Some(config_path.parent()?.join("theme_store_installed.json"))
-}
-
-fn settings_installed_theme_file_path(config_path: &Path, slug: &str) -> Option<PathBuf> {
-    let normalized = crate::themes::normalize_theme_id(slug);
-    if normalized.is_empty() {
-        return None;
-    }
-    Some(
-        config_path
-            .parent()?
-            .join("themes")
-            .join(format!("{normalized}.json")),
-    )
-}
-
-fn settings_load_installed_theme_versions(config_path: &Path) -> HashMap<String, String> {
-    let Some(path) = settings_installed_theme_versions_path(config_path) else {
-        return HashMap::new();
-    };
-    let Ok(contents) = std::fs::read_to_string(path) else {
-        return HashMap::new();
-    };
-    serde_json::from_str::<HashMap<String, String>>(&contents)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(slug, version)| {
-            (
-                crate::themes::normalize_theme_id(&slug),
-                version.trim().to_string(),
-            )
-        })
-        .filter(|(slug, _)| !slug.is_empty())
-        .collect()
-}
-
-fn settings_persist_installed_theme_versions(
-    config_path: &Path,
-    versions: &HashMap<String, String>,
-) -> Result<(), TermyFfiStatus> {
-    let path =
-        settings_installed_theme_versions_path(config_path).ok_or(TermyFfiStatus::WriteFailed)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
-    }
-    let contents =
-        serde_json::to_string_pretty(versions).map_err(|_| TermyFfiStatus::SerializeFailed)?;
-    std::fs::write(path, contents).map_err(|_| TermyFfiStatus::WriteFailed)
-}
-
-fn settings_install_theme_from_registry(slug: &str) -> Result<(), TermyFfiStatus> {
-    let normalized = crate::themes::normalize_theme_id(slug);
-    if normalized.is_empty() {
-        return Err(TermyFfiStatus::UnknownKey);
-    }
-
-    let config_path = cfg::config_path().ok_or(TermyFfiStatus::ConfigLoadFailed)?;
-    let themes = settings_fetch_theme_registry_themes(Some(config_path.as_path()))
-        .map_err(|_| TermyFfiStatus::ConfigLoadFailed)?;
-    let theme = themes
-        .into_iter()
-        .find(|theme| theme.slug.eq_ignore_ascii_case(&normalized))
-        .ok_or(TermyFfiStatus::UnknownKey)?;
-    let file_url = theme.file_url.ok_or(TermyFfiStatus::ConfigLoadFailed)?;
-
-    let response = ureq::get(&file_url)
-        .timeout(std::time::Duration::from_secs(10))
-        .set("Accept", "application/json")
-        .call()
-        .map_err(|_| TermyFfiStatus::ConfigLoadFailed)?;
-    let contents = response
-        .into_string()
-        .map_err(|_| TermyFfiStatus::ConfigLoadFailed)?;
-    crate::themes::parse_theme_colors_json(&contents)
-        .map_err(|_| TermyFfiStatus::SerializeFailed)?;
-
-    let path = settings_installed_theme_file_path(&config_path, &normalized)
-        .ok_or(TermyFfiStatus::WriteFailed)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| TermyFfiStatus::WriteFailed)?;
-    }
-    std::fs::write(path, contents).map_err(|_| TermyFfiStatus::WriteFailed)?;
-
-    let mut versions = settings_load_installed_theme_versions(&config_path);
-    versions.insert(normalized, theme.latest_version.unwrap_or_default());
-    settings_persist_installed_theme_versions(&config_path, &versions)
+fn settings_themes_dir(config_path: Option<&Path>) -> Option<PathBuf> {
+    Some(config_path?.parent()?.join("themes"))
 }
 
 fn settings_theme_label(theme_id: &str) -> String {
     if theme_id == cfg::SHELL_DECIDE_THEME_ID {
         return "Shell Decide".to_string();
+    }
+    if let Some(theme) = crate::themes::find_builtin_theme(theme_id) {
+        return theme.name.to_string();
     }
 
     theme_id
@@ -2500,23 +2283,16 @@ fn settings_installed_theme_colors(
     theme_id: &str,
     config_path: Option<&Path>,
 ) -> Option<crate::themes::ThemeColors> {
-    let normalized = crate::themes::normalize_theme_id(theme_id);
-    if normalized.is_empty() || normalized == cfg::SHELL_DECIDE_THEME_ID {
+    if crate::themes::normalize_theme_id(theme_id) == cfg::SHELL_DECIDE_THEME_ID {
         return None;
     }
-
-    let config_dir = config_path.and_then(Path::parent)?;
-    let path = config_dir.join("themes").join(format!("{normalized}.json"));
-    if let Ok(contents) = std::fs::read_to_string(path)
-        && let Ok(colors) = crate::themes::parse_theme_colors_json(&contents)
-    {
-        return Some(colors);
-    }
-    None
+    crate::themes::load_local_theme(&settings_themes_dir(config_path)?, theme_id)
 }
 
 fn settings_theme_swatches(theme_id: &str, config_path: Option<&Path>) -> Vec<String> {
-    let Some(colors) = settings_installed_theme_colors(theme_id, config_path) else {
+    let Some(colors) = settings_installed_theme_colors(theme_id, config_path)
+        .or_else(|| crate::themes::builtin_theme(theme_id))
+    else {
         return Vec::new();
     };
     [
@@ -2532,33 +2308,56 @@ fn settings_theme_swatches(theme_id: &str, config_path: Option<&Path>) -> Vec<St
     .collect()
 }
 
+/// Termy's themes and the shell-decided theme first, then the built-in
+/// collection, local themes, and finally a configured value nothing provides.
 fn settings_theme_choices(
     loaded: &LoadedTermyConfig,
     current_value: Option<&str>,
 ) -> Vec<serde_json::Value> {
     use serde_json::json;
 
-    let mut ids = BTreeSet::new();
-    ids.insert(cfg::SHELL_DECIDE_THEME_ID.to_string());
-    let installed_ids: BTreeSet<String> = settings_installed_theme_ids(loaded.path.as_deref())
-        .into_iter()
+    let config_path = loaded.path.as_deref();
+    let local_ids = settings_themes_dir(config_path)
+        .map(|dir| crate::themes::local_theme_ids(&dir))
+        .unwrap_or_default();
+    let builtins = crate::themes::builtin_themes();
+    let termy_count = crate::themes::TERMY_THEME_IDS.len();
+    let mut ids: Vec<String> = builtins[..termy_count]
+        .iter()
+        .map(|theme| theme.id.to_string())
         .collect();
-    ids.extend(settings_theme_store_ids(loaded.path.as_deref()));
-    ids.extend(installed_ids.iter().cloned());
-    if let Some(current_value) = current_value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        ids.insert(current_value.to_string());
+    ids.push(cfg::SHELL_DECIDE_THEME_ID.to_string());
+    ids.extend(
+        builtins[termy_count..]
+            .iter()
+            .map(|theme| theme.id.to_string()),
+    );
+    ids.extend(
+        local_ids
+            .iter()
+            .filter(|id| crate::themes::builtin_theme(id).is_none())
+            .cloned(),
+    );
+    let current = current_value
+        .map(crate::themes::normalize_theme_id)
+        .filter(|value| !value.is_empty());
+    let current_is_available = current.as_ref().is_none_or(|current| ids.contains(current));
+    if let Some(current) = current.filter(|_| !current_is_available) {
+        ids.push(current);
     }
 
     ids.into_iter()
         .map(|theme_id| {
+            // Whether the theme can be applied: built in, a local file, or
+            // the shell-decided theme.
+            let installed = theme_id == cfg::SHELL_DECIDE_THEME_ID
+                || local_ids.contains(&theme_id)
+                || crate::themes::builtin_theme(&theme_id).is_some();
             json!({
                 "value": theme_id,
                 "label": settings_theme_label(&theme_id),
-                "installed": theme_id == cfg::SHELL_DECIDE_THEME_ID || installed_ids.contains(&theme_id),
-                "swatches": settings_theme_swatches(&theme_id, loaded.path.as_deref()),
+                "installed": installed,
+                "swatches": settings_theme_swatches(&theme_id, config_path),
             })
         })
         .collect()
@@ -2826,23 +2625,6 @@ pub unsafe extern "C" fn termy_settings_set_keybinds(
     )
 }
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn termy_settings_install_theme(
-    slug_ptr: *const u8,
-    slug_len: usize,
-) -> TermyFfiStatus {
-    ffi_status_guard(|| {
-        let slug = match unsafe { required_utf8(slug_ptr, slug_len) } {
-            Ok(slug) => slug,
-            Err(status) => return status,
-        };
-        match settings_install_theme_from_registry(slug) {
-            Ok(()) => TermyFfiStatus::Ok,
-            Err(status) => status,
-        }
-    })
-}
-
 /// Installs the bundled `termy-cli` shim (symlink into a PATH dir + shell PATH
 /// setup), reusing `termy_cli_install_core`. `shell` may be null to use $SHELL.
 /// A human-readable summary (or error) is written to `out_message`.
@@ -3037,7 +2819,10 @@ pub unsafe extern "C" fn termy_tmux_control_notifications_free(
 }
 
 /// Runs a tmux command over the control channel; writes its output to
-/// `out_output` (free with `termy_buffer_free`).
+/// `out_output` (free with `termy_buffer_free`). A command containing a
+/// newline, carriage return or NUL is rejected with `InvalidArgument`: tmux
+/// would run each line as a separate command, so text spliced into a command
+/// could inject another one.
 #[cfg(unix)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn termy_tmux_control_send(
@@ -3054,6 +2839,9 @@ pub unsafe extern "C" fn termy_tmux_control_send(
             Ok(value) => value,
             Err(status) => return status,
         };
+        if crate::tmux_control_core::command::validate_tmux_control_arg(command).is_err() {
+            return TermyFfiStatus::InvalidArgument;
+        }
         let session = unsafe { &*session };
         match session.send_command(command) {
             Ok(output) => {
@@ -3222,6 +3010,121 @@ pub unsafe extern "C" fn termy_terminal_feed_output(
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_feed_output_with_replies(
+    terminal: *mut TermyFfiTerminal,
+    bytes_ptr: *const u8,
+    bytes_len: usize,
+    out_replies: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_replies.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        if bytes_len != 0 && bytes_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let bytes = if bytes_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(bytes_ptr, bytes_len) }
+        };
+        let replies = unsafe { (*terminal).terminal.feed_output_with_replies(bytes) };
+        unsafe {
+            *out_replies = if replies.is_empty() {
+                TermyFfiBytes::default()
+            } else {
+                ffi_bytes_from_vec(replies)
+            };
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_set_protocol_replies_enabled(
+    terminal: *mut TermyFfiTerminal,
+    enabled: bool,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe { (*terminal).terminal.set_protocol_replies_enabled(enabled) };
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_encode(
+    terminal: *mut TermyFfiTerminal,
+    out_snapshot: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_snapshot.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let Some(snapshot) = (unsafe { (*terminal).terminal.encode_snapshot() }) else {
+            return TermyFfiStatus::InvalidArgument;
+        };
+        unsafe { *out_snapshot = ffi_bytes_from_vec(snapshot) };
+        TermyFfiStatus::Ok
+    })
+}
+
+fn ffi_snapshot_status(error: &crate::terminal_engine::SnapshotError) -> TermyFfiStatus {
+    match error {
+        crate::terminal_engine::SnapshotError::UnsupportedVersion(_) => {
+            TermyFfiStatus::UnsupportedSnapshotVersion
+        }
+        _ => TermyFfiStatus::InvalidSnapshot,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_decode(
+    snapshot_ptr: *const u8,
+    snapshot_len: usize,
+    out_terminal: *mut *mut TermyFfiTerminal,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if out_terminal.is_null() || snapshot_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        unsafe { *out_terminal = ptr::null_mut() };
+        let bytes = unsafe { slice::from_raw_parts(snapshot_ptr, snapshot_len) };
+        let terminal = display_terminal(TerminalSize::default());
+        match terminal.terminal.restore_snapshot(bytes) {
+            Some(Ok(())) => {}
+            Some(Err(error)) => return ffi_snapshot_status(&error),
+            None => return TermyFfiStatus::InvalidArgument,
+        }
+        unsafe {
+            *out_terminal = Box::into_raw(Box::new(terminal));
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_snapshot_restore(
+    terminal: *mut TermyFfiTerminal,
+    snapshot_ptr: *const u8,
+    snapshot_len: usize,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || snapshot_ptr.is_null() {
+            return TermyFfiStatus::Null;
+        }
+        let bytes = unsafe { slice::from_raw_parts(snapshot_ptr, snapshot_len) };
+        match unsafe { (*terminal).terminal.restore_snapshot(bytes) } {
+            Some(Ok(())) => TermyFfiStatus::Ok,
+            Some(Err(error)) => ffi_snapshot_status(&error),
+            None => TermyFfiStatus::InvalidArgument,
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn termy_terminal_encode_key(
     terminal: *mut TermyFfiTerminal,
     keystroke: *const TermyFfiKeystroke,
@@ -3330,6 +3233,69 @@ pub unsafe extern "C" fn termy_terminal_encode_mouse(
 
         unsafe {
             *out_bytes = encoded.map_or_else(|| termy_null_buffer(), ffi_bytes_from_vec);
+        }
+        TermyFfiStatus::Ok
+    })
+}
+
+/// Paste text with line endings as Enter, unsafe controls removed, and the
+/// bracketed-paste markers when the program enabled them. Matches
+/// `termy_engine_encode_paste` and the wasm encoder.
+fn encode_paste(text: &[u8], bracketed: bool) -> Vec<u8> {
+    let text = String::from_utf8_lossy(text);
+    let mut body = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                body.push('\r');
+            }
+            '\n' => body.push('\r'),
+            '\t' => body.push('\t'),
+            // Other C0 controls, DEL and C1 controls could run commands or
+            // end the bracket early, including nested end markers.
+            '\0'..='\x1f' | '\x7f'..='\u{9f}' => {}
+            character => body.push(character),
+        }
+    }
+    if !bracketed {
+        return body.into_bytes();
+    }
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(body.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn termy_terminal_encode_paste(
+    terminal: *mut TermyFfiTerminal,
+    text_ptr: *const u8,
+    text_len: usize,
+    out_bytes: *mut TermyFfiBytes,
+) -> TermyFfiStatus {
+    ffi_status_guard(|| {
+        if terminal.is_null() || out_bytes.is_null() || (text_ptr.is_null() && text_len > 0) {
+            return TermyFfiStatus::Null;
+        }
+        // (null, 0) is an empty paste, as for `termy_terminal_write`.
+        let text = if text_len == 0 {
+            &[][..]
+        } else {
+            unsafe { slice::from_raw_parts(text_ptr, text_len) }
+        };
+        let bracketed = unsafe { (*terminal).terminal.bracketed_paste_mode() };
+        let encoded = encode_paste(text, bracketed);
+        unsafe {
+            *out_bytes = if encoded.is_empty() {
+                termy_null_buffer()
+            } else {
+                ffi_bytes_from_vec(encoded)
+            };
         }
         TermyFfiStatus::Ok
     })
@@ -3549,12 +3515,7 @@ pub unsafe extern "C" fn termy_terminal_snapshot(
         }
 
         let frame = unsafe { (*terminal).terminal.snapshot() };
-        let cells = frame
-            .cells
-            .into_iter()
-            .map(TermyFfiCell::from)
-            .collect::<Vec<_>>();
-        let (cells_ptr, cells_len, cells_capacity) = leak_vec(cells);
+        let (cells_ptr, cells_len, cells_capacity) = leak_vec(ffi_cells(frame.cells));
         let cursor = ffi_cursor_from_cursor(frame.cursor);
 
         unsafe {
@@ -3625,13 +3586,13 @@ pub unsafe extern "C" fn termy_frame_update_free(
 
         let update = unsafe { &mut *update };
         if !update.cells_ptr.is_null() {
-            unsafe {
-                drop(Vec::from_raw_parts(
-                    update.cells_ptr,
-                    update.cells_len,
-                    update.cells_capacity,
-                ));
-            }
+            // SAFETY: the cells were allocated as a `Vec<TermyCell>` (see
+            // `ffi_cells`), whose layout `TermyFfiCell` shares. No cell is
+            // read: the buffer is taken back empty.
+            let cells = unsafe {
+                Vec::<TermyCell>::from_raw_parts(update.cells_ptr.cast(), 0, update.cells_capacity)
+            };
+            crate::frame::recycle_frame_cells(cells);
         }
         if !update.spans_ptr.is_null() {
             unsafe {
@@ -3781,11 +3742,28 @@ pub unsafe extern "C" fn termy_terminal_kitty_graphics_placements(
             return TermyFfiStatus::Null;
         }
 
-        let (revision, placements) = unsafe { (*terminal).terminal.kitty_graphics_snapshot() };
+        let terminal = unsafe { &mut *terminal };
+        let (revision, placements) = terminal.terminal.kitty_graphics_snapshot();
+        // An image may have thousands of Unicode placeholder placements. They
+        // all share one C copy of its PNG, which the batch frees once.
+        let mut png_exports = HashMap::new();
+        let mut exports = Vec::new();
         let placements = placements
             .into_iter()
-            .map(ffi_kitty_graphics_placement_from_placement)
+            .map(|placement| {
+                let png = *png_exports
+                    .entry(std::sync::Arc::as_ptr(&placement.image))
+                    .or_insert_with(|| {
+                        let png = placement.image.png();
+                        let bytes = ffi_bytes_from_vec(png.to_vec());
+                        exports.push(png);
+                        bytes
+                    });
+                ffi_kitty_graphics_placement_from_placement(placement, png)
+            })
             .collect::<Vec<_>>();
+        // Hold the encodings of images still placed until the next batch.
+        terminal.kitty_png_exports = exports;
         let (placements_ptr, placements_len, placements_capacity) = leak_vec(placements);
         unsafe {
             *out_batch = TermyFfiKittyGraphicsBatch {
@@ -3817,8 +3795,12 @@ pub unsafe extern "C" fn termy_kitty_graphics_batch_free(
                     batch.placements_capacity,
                 )
             };
+            // Placements of one image share a buffer; free each one once.
+            let mut freed = std::collections::HashSet::new();
             for placement in placements {
-                free_bytes(placement.png);
+                if freed.insert(placement.png.ptr) {
+                    free_bytes(placement.png);
+                }
             }
         }
         *batch = TermyFfiKittyGraphicsBatch::default();
@@ -4221,6 +4203,58 @@ pub unsafe extern "C" fn termy_query_color_default_foreground(
 mod tests {
     use super::*;
 
+    #[test]
+    fn graphics_batch_encodes_each_shared_image_once() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let commands = b"\x1b_Ga=T,f=32,s=1,v=1,i=1,p=1,c=1,r=1,C=1,q=2;AQID/w==\x1b\\\x1b[1;2H\x1b_Ga=p,i=1,p=2,c=1,r=1,C=1,q=2;\x1b\\";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, commands.as_ptr(), commands.len()) },
+            TermyFfiStatus::Ok
+        );
+        let image = unsafe {
+            (*terminal).terminal.kitty_graphics_placements()[0]
+                .image
+                .clone()
+        };
+        assert_eq!(image.png_encoding_count(), 0);
+
+        let mut batch = TermyFfiKittyGraphicsBatch::default();
+        assert_eq!(
+            unsafe { termy_terminal_kitty_graphics_placements(terminal, &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(batch.placements_len, 2);
+        assert_eq!(image.png_encoding_count(), 1);
+        let placements =
+            unsafe { slice::from_raw_parts(batch.placements_ptr, batch.placements_len) };
+        for placement in placements {
+            let png = unsafe { slice::from_raw_parts(placement.png.ptr, placement.png.len) };
+            assert!(png.starts_with(b"\x89PNG"));
+        }
+        // Placements of one image share one C copy of its PNG.
+        assert_eq!(placements[0].png, placements[1].png);
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+
+        // The export outlives the batch, so polling again does not re-encode.
+        assert_eq!(
+            unsafe { termy_terminal_kitty_graphics_placements(terminal, &mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(image.png_encoding_count(), 1);
+        assert_eq!(
+            unsafe { termy_kitty_graphics_batch_free(&mut batch) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
     fn glyph_test_cell(character: char) -> TermyFfiCell {
         TermyFfiCell {
             codepoint: character as u32,
@@ -4344,6 +4378,68 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn settings_write_replaces_the_symlink_target_atomically() {
+        let root = tempfile::tempdir().expect("temporary settings root");
+        let dotfiles = root.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).expect("create dotfiles directory");
+        let target = dotfiles.join("config.txt");
+        std::fs::write(&target, "font_size = 12\n").expect("seed config");
+        let config_dir = root.path().join("termy");
+        std::fs::create_dir(&config_dir).expect("create config directory");
+        let link = config_dir.join("config.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("link config");
+
+        settings_write_contents_to(&link, "font_size = 14\n").expect("write settings");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "font_size = 14\n"
+        );
+        // No temporary files are left next to either file.
+        assert_eq!(std::fs::read_dir(&dotfiles).expect("list").count(), 1);
+        assert_eq!(std::fs::read_dir(&config_dir).expect("list").count(), 1);
+
+        // A dangling link still writes the file it names.
+        std::fs::remove_file(&target).expect("remove target");
+        settings_write_contents_to(&link, "font_size = 16\n").expect("write settings");
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "font_size = 16\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_write_never_exposes_a_truncated_file() {
+        let root = tempfile::tempdir().expect("temporary settings root");
+        let path = root.path().join("config.txt");
+        let contents = "font_size = 14\n".repeat(4096);
+        settings_write_contents_to(&path, &contents).expect("seed config");
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, contents, done) = (path.clone(), contents.clone(), done.clone());
+            std::thread::spawn(move || {
+                for _ in 0..200 {
+                    settings_write_contents_to(&path, &contents).expect("write settings");
+                }
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        while !done.load(Ordering::SeqCst) {
+            let read = std::fs::read_to_string(&path).expect("read config");
+            assert_eq!(read.len(), contents.len(), "a reader saw a partial config");
+        }
+        writer.join().expect("writer thread");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn settings_write_reports_read_only_config_directory() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -4426,11 +4522,18 @@ mod tests {
                 .iter()
                 .any(|choice| choice["value"] == "termy")
         );
+        let values: Vec<&str> = theme_choices
+            .iter()
+            .filter_map(|choice| choice["value"].as_str())
+            .collect();
+        assert_eq!(
+            &values[..3],
+            ["termy", "termy-light", cfg::SHELL_DECIDE_THEME_ID],
+            "Termy's themes and shell-decide lead the list"
+        );
         assert!(
-            !theme_choices
-                .iter()
-                .any(|choice| choice["value"] == "tokyo-night"),
-            "schema loaded from in-memory contents must not synthesize legacy built-in themes"
+            values.contains(&"dracula"),
+            "the built-in collection is offered"
         );
         assert!(
             sections
@@ -5145,17 +5248,18 @@ mod tests {
             cell_width: 9.0,
             cell_height: 18.0,
         };
-        #[cfg(target_os = "windows")]
-        let command: &[u8] = b"echo abc";
-        #[cfg(not(target_os = "windows"))]
-        let command: &[u8] = b"printf abc";
         let mut terminal = ptr::null_mut();
 
         assert_eq!(
-            unsafe { termy_terminal_new(size, command.as_ptr(), command.len(), &mut terminal) },
+            unsafe { termy_display_terminal_new(size, &mut terminal) },
             TermyFfiStatus::Ok
         );
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Frame extraction is independent of PTY startup and shell timing.
+        let output = b"abc";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
 
         let mut update = TermyFfiFrameUpdate::default();
         assert_eq!(
@@ -5343,4 +5447,97 @@ mod tests {
         assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
         assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
     }
+
+    #[test]
+    fn display_terminal_wakes_when_a_synchronized_update_times_out() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let output = b"\x1b[?2026hframe";
+        assert_eq!(
+            unsafe { termy_terminal_feed_output(terminal, output.as_ptr(), output.len()) },
+            TermyFfiStatus::Ok
+        );
+        let mut woke = false;
+        // Drop any signal from the feed itself.
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 0, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        // The timed-out update is committed without further output, so only
+        // the wake channel can tell the host to render it.
+        assert_eq!(
+            unsafe { termy_terminal_wait_for_wakeup(terminal, 5_000, &mut woke) },
+            TermyFfiStatus::Ok
+        );
+        assert!(woke);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+
+    #[test]
+    fn terminal_encode_paste_cannot_escape_the_bracket() {
+        let mut terminal = ptr::null_mut();
+        assert_eq!(
+            unsafe { termy_display_terminal_new(termy_size_default(), &mut terminal) },
+            TermyFfiStatus::Ok
+        );
+        let paste = |text: &[u8]| {
+            let mut bytes = TermyFfiBytes::default();
+            assert_eq!(
+                unsafe {
+                    termy_terminal_encode_paste(terminal, text.as_ptr(), text.len(), &mut bytes)
+                },
+                TermyFfiStatus::Ok
+            );
+            let encoded = if bytes.ptr.is_null() {
+                Vec::new()
+            } else {
+                unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec()
+            };
+            unsafe { termy_buffer_free(bytes) };
+            encoded
+        };
+
+        assert_eq!(paste(b"a\r\nb\x1b[201~\x03\tc"), b"a\rb[201~\tc");
+        unsafe { (*terminal).terminal.hydrate_output(b"\x1b[?2004h") };
+        // A single-pass marker strip would collapse this into a real end marker.
+        assert_eq!(
+            paste(b"x\x1b[20\x1b[201~1~rm -rf ~\n"),
+            b"\x1b[200~x[20[201~1~rm -rf ~\r\x1b[201~"
+        );
+        assert_eq!(paste("\u{9b}201~".as_bytes()), b"\x1b[200~201~\x1b[201~");
+        let mut bytes = TermyFfiBytes::default();
+        assert_eq!(
+            unsafe { termy_terminal_encode_paste(terminal, ptr::null(), 0, &mut bytes) },
+            TermyFfiStatus::Ok
+        );
+        assert_eq!(unsafe { termy_buffer_free(bytes) }, TermyFfiStatus::Ok);
+        assert_eq!(unsafe { termy_terminal_free(terminal) }, TermyFfiStatus::Ok);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn program_status_ffi_event_has_json_snapshot_and_empty_clear() {
+    let mut engine = crate::terminal_engine::Engine::new(Default::default(), Default::default());
+    engine.feed(b"\x1b]7501;state=blocked:kind=auth:app=deploy:msg=SGk=\x07");
+    let event = ffi_event_from_event(TerminalEvent::ProgramStatus(engine.program_status()));
+    assert_eq!(event.kind, 13);
+    // SAFETY: the event owns this live allocation until free_bytes below.
+    let bytes = unsafe { std::slice::from_raw_parts(event.payload.ptr, event.payload.len) };
+    let json: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    assert_eq!(json[0]["state"], "blocked");
+    assert_eq!(json[0]["kind"], "auth");
+    assert_eq!(json[0]["msg"], "Hi");
+    assert!(json[0]["progress"].is_null());
+    free_bytes(event.payload);
+    let event = ffi_event_from_event(TerminalEvent::ProgramStatus(vec![]));
+    // SAFETY: the clear event owns this live allocation until free_bytes below.
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(event.payload.ptr, event.payload.len) },
+        b"[]"
+    );
+    free_bytes(event.payload);
 }

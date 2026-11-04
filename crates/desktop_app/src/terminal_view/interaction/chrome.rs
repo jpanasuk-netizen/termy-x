@@ -58,7 +58,10 @@ impl TerminalView {
         _sidebar_tabs: bool,
         show_tab_strip_chrome: bool,
     ) -> f32 {
-        Self::window_titlebar_height_for_platform(cfg!(target_os = "macos"), show_tab_strip_chrome)
+        Self::window_titlebar_height_for_platform(
+            cfg!(any(target_os = "macos", target_os = "windows")),
+            show_tab_strip_chrome,
+        )
     }
 
     fn window_titlebar_height_for_platform(
@@ -72,6 +75,16 @@ impl TerminalView {
         }
     }
 
+    /// Height of Termy's own titlebar row. Native tab windows use AppKit's
+    /// titlebar, which sits outside the content view.
+    pub(in super::super) fn window_titlebar_height(&self) -> f32 {
+        if self.native_window_tabs {
+            0.0
+        } else {
+            Self::window_titlebar_height_for(false, self.should_render_tab_strip_chrome())
+        }
+    }
+
     fn terminal_content_top_inset_for(
         sidebar_tabs: bool,
         show_tab_strip_chrome: bool,
@@ -81,6 +94,9 @@ impl TerminalView {
     }
 
     pub(in super::super) fn terminal_content_top_inset(&self) -> f32 {
+        if self.native_window_tabs {
+            return 0.0;
+        }
         Self::terminal_content_top_inset_for(
             false,
             self.should_render_tab_strip_chrome(),
@@ -126,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn linux_and_windows_titlebar_height_collapses_when_tab_strip_hidden() {
+    fn linux_titlebar_height_collapses_when_tab_strip_hidden() {
         assert_eq!(
             TerminalView::window_titlebar_height_for_platform(false, false),
             0.0

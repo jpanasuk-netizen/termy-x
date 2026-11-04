@@ -4,8 +4,8 @@ use termy_core::{
     TerminalClipboardLocation, TerminalClipboardReadRequest, TerminalClipboardReadResult,
     TerminalClipboardTarget, TerminalClipboardWriteRequest, TerminalClipboardWriteResult,
     TerminalCursorState, TerminalKeyboardMode, TerminalMouseMode, TerminalOptions, TerminalPalette,
-    TerminalQueryColors, TerminalRenderDamageSnapshot, TerminalRenderRead, TerminalReplyHost,
-    TerminalRuntimeConfig, TerminalSize,
+    TerminalQueryColors, TerminalRenderRead, TerminalReplyHost, TerminalRuntimeConfig,
+    TerminalSize,
 };
 
 /// Display terminal for a tmux pane. Core owns parsing, screen state and protocols
@@ -52,9 +52,6 @@ impl PaneTerminal {
     }
     pub fn link_at(&self, row: usize, col: usize) -> Option<DetectedViewportLink> {
         self.read().link_at(row, col)
-    }
-    pub fn take_render_damage_snapshot(&self) -> TerminalRenderDamageSnapshot {
-        self.read().take_render_damage_snapshot()
     }
     pub fn render_read(&self, force_full: bool) -> TerminalRenderRead {
         self.read().render_read(force_full)
@@ -358,7 +355,8 @@ mod tests {
         assert_eq!(placements.len(), 1);
         assert_eq!(placements[0].image_id, 91);
         assert_eq!(placements[0].display_cols, Some(2));
-        assert_eq!(terminal.cursor_position(), (2, 2));
+        // As in kitty: just past the image, on its last row.
+        assert_eq!(terminal.cursor_position(), (2, 1));
     }
 
     #[test]
@@ -447,11 +445,12 @@ mod tests {
 
         terminal.feed_output(b"\x1b[4;1H\x1b_Ga=T,f=32,s=1,v=1,i=92,c=2,r=3;AQID/w==\x1b\\");
 
-        assert_eq!(terminal.scroll_state(), (0, 3));
+        // The cursor stays on the image's last row, so 3 rows scroll 2.
+        assert_eq!(terminal.scroll_state(), (0, 2));
         assert_eq!(terminal.cursor_position(), (2, 3));
         let placements = terminal.kitty_graphics_placements();
         assert_eq!(placements.len(), 1);
-        assert_eq!(placements[0].viewport_row, 0);
+        assert_eq!(placements[0].viewport_row, 1);
     }
 
     #[test]
@@ -474,7 +473,7 @@ mod tests {
         assert_eq!(terminal.cursor_position(), (2, 3));
         let placements = terminal.kitty_graphics_placements();
         assert_eq!(placements.len(), 1);
-        assert_eq!(placements[0].viewport_row, 0);
+        assert_eq!(placements[0].viewport_row, 1);
     }
 
     #[test]

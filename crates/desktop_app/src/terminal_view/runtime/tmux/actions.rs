@@ -310,7 +310,10 @@ impl TerminalView {
         let closing_overlay = self.session.tabs.get(index).map(|tab| {
             (
                 tab.title.clone(),
-                Self::stable_tab_render_width(tab.display_width),
+                Self::stable_tab_render_width(
+                    tab.display_width,
+                    self.horizontal_tab_metrics().min_width,
+                ),
                 index == self.session.active_tab,
             )
         });
@@ -640,6 +643,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: Terminal::new_tmux(TerminalSize::default(), TerminalOptions::default()),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),
@@ -655,6 +659,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: Terminal::new_tmux(TerminalSize::default(), TerminalOptions::default()),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),

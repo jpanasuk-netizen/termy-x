@@ -1,0 +1,186 @@
+name: libtermy vs libghostty-vt
+
+# Builds libtermy (termy_core cdylib) and libghostty-vt from source, compiles
+# scripts/vt-library-bench/vt_library_bench.c once against each C ABI, and
+# runs alternating paired throughput comparisons on hosted runners. Reports
+# only; nothing here gates merges.
+on:
+  workflow_dispatch:
+    inputs:
+      ghostty_ref:
+        description: "ghostty-org/ghostty ref to benchmark against"
+        required: false
+        default: "05dcf887ef51ea27821f20979493306ec3a19149"
+      mib:
+        description: "MiB per case (1 to 256)"
+        required: false
+        default: "32"
+      pairs:
+        description: "Alternating pairs per case (1 to 24)"
+        required: false
+        default: "6"
+  schedule:
+    - cron: "17 4 * * 1"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "crates/core/**"
+      - "scripts/vt-library-bench/**"
+      - "scripts/benchmark-vt-libraries.py"
+      - ".github/workflows/vt-library-benchmark.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vt-library-benchmark-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: libtermy vs libghostty-vt (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    env:
+      GHOSTTY_REF: ${{ inputs.ghostty_ref || '05dcf887ef51ea27821f20979493306ec3a19149' }}
+      BENCH_MIB: ${{ inputs.mib || '32' }}
+      BENCH_PAIRS: ${{ inputs.pairs || '6' }}
+      REPORT_DIR: ${{ github.workspace }}/vt-library-benchmark
+    steps:
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$BENCH_MIB" =~ ^[1-9][0-9]{0,2}$ ]] || (( BENCH_MIB > 256 )); then
+            echo "mib must be an integer from 1 to 256" >&2
+            exit 2
+          fi
+          if ! [[ "$BENCH_PAIRS" =~ ^[1-9][0-9]?$ ]] || (( BENCH_PAIRS > 24 )); then
+            echo "pairs must be an integer from 1 to 24" >&2
+            exit 2
+          fi
+          mkdir -p "$REPORT_DIR"
+
+      - name: Checkout termy
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          path: termy
+
+      - name: Checkout ghostty
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ghostty-org/ghostty
+          ref: ${{ env.GHOSTTY_REF }}
+          path: ghostty
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: vt-library-benchmark
+          workspaces: termy -> target
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      # Both libraries use their portable default codegen: Rust targets the
+      # baseline CPU unless told otherwise, and Ghostty's packaging guide uses
+      # -Dcpu=baseline. SIMD paths that dispatch at runtime stay enabled.
+      - name: Build libghostty-vt
+        working-directory: ghostty
+        run: zig build -Demit-lib-vt -Doptimize=ReleaseFast -Dcpu=baseline
+
+      - name: Build libtermy
+        working-directory: termy
+        run: cargo build --locked --release -p termy_core --lib
+
+      - name: Compile benchmark harnesses
+        shell: bash
+        run: |
+          set -euo pipefail
+          source="$GITHUB_WORKSPACE/termy/scripts/vt-library-bench/vt_library_bench.c"
+          termy_lib="$GITHUB_WORKSPACE/termy/target/release"
+          ghostty_root="$GITHUB_WORKSPACE/ghostty"
+          ls -l "$termy_lib"/libtermy_core.* "$ghostty_root"/zig-out/lib
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DVT_BACKEND_TERMY \
+            -I "$GITHUB_WORKSPACE/termy/crates/core/include" "$source" \
+            -L "$termy_lib" -ltermy_core -Wl,-rpath,"$termy_lib" \
+            -o "$REPORT_DIR/bench-termy"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -DVT_BACKEND_GHOSTTY \
+            -I "$ghostty_root/include" "$source" \
+            -L "$ghostty_root/zig-out/lib" -lghostty-vt -Wl,-rpath,"$ghostty_root/zig-out/lib" \
+            -o "$REPORT_DIR/bench-ghostty"
+          # Smoke run: both binaries load their library and finish every case.
+          "$REPORT_DIR/bench-termy" 1 all --frame
+          "$REPORT_DIR/bench-ghostty" 1 all --frame
+
+      - name: Record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "termy commit: $(git -C termy rev-parse HEAD)"
+            echo "ghostty commit: $(git -C ghostty rev-parse HEAD)"
+            "$REPORT_DIR/bench-ghostty" 1 plain | grep '^ghostty:'
+            echo "runner: $RUNNER_OS/$RUNNER_ARCH ${ImageOS:-unknown}/${ImageVersion:-unknown}"
+            echo "kernel: $(uname -srvm)"
+            rustc --version
+            zig version
+            cc --version | head -1
+          } | tee "$REPORT_DIR/provenance.txt"
+
+      - name: Compare feed throughput
+        id: feed
+        shell: bash
+        run: |
+          python3 termy/scripts/benchmark-vt-libraries.py \
+            --termy "$REPORT_DIR/bench-termy" --ghostty "$REPORT_DIR/bench-ghostty" \
+            --mib "$BENCH_MIB" --pairs "$BENCH_PAIRS" \
+            --output "$REPORT_DIR/feed.json" --markdown "$REPORT_DIR/summary.md"
+
+      - name: Compare throughput with frame updates
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 termy/scripts/benchmark-vt-libraries.py \
+            --termy "$REPORT_DIR/bench-termy" --ghostty "$REPORT_DIR/bench-ghostty" \
+            --mib "$BENCH_MIB" --pairs "$BENCH_PAIRS" --frame \
+            --output "$REPORT_DIR/frame.json" --markdown "$REPORT_DIR/summary.md"
+
+      - name: Summarize
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          {
+            echo "## libtermy vs libghostty-vt (${{ matrix.os }})"
+            echo
+            echo 'Same C harness, same payloads, 120x40 grid, 1000 history lines. The fragmented case makes one C call per byte, so it includes per-call ABI overhead.'
+            echo
+            echo '```text'
+            cat "$REPORT_DIR/provenance.txt" 2>/dev/null || echo "no provenance recorded"
+            echo '```'
+            echo
+            cat "$REPORT_DIR/summary.md" 2>/dev/null || echo "No results produced."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vt-library-benchmark-${{ matrix.os }}-${{ github.sha }}
+          path: |
+            ${{ env.REPORT_DIR }}/*.json
+            ${{ env.REPORT_DIR }}/*.md
+            ${{ env.REPORT_DIR }}/*.txt
+          if-no-files-found: warn
+          retention-days: 30

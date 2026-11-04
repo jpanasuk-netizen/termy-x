@@ -147,7 +147,7 @@ fn render_keybindings_doc() -> String {
     }
 
     output.push_str("`secondary` maps to `cmd` on macOS and `ctrl` on non-macOS platforms.\n\n");
-    output.push_str("Numbered pane actions (`focus_pane_1` through `focus_pane_9`) target panes in the same order as `focus_pane_next`, within the active tab. A missing pane or already-focused pane is left unchanged. The default `secondary-alt-1` through `secondary-alt-9` shortcuts leave `secondary-1` through `secondary-9` available for tabs.\n\n");
+    output.push_str("Numbered pane actions (`focus_pane_1` through `focus_pane_9`) target panes in the same order as `focus_pane_next`, within the active tab. A missing pane or already-focused pane is left unchanged. The default `secondary-alt-1` through `secondary-alt-9` shortcuts leave `secondary-1` through `secondary-9` available for tabs. On Windows, panes use `alt-1` through `alt-9` and tabs use `ctrl-alt-1` through `ctrl-alt-9`, so plain `ctrl` shortcuts stay with the shell.\n\n");
     output.push_str("## Config Syntax\n\n");
     output.push_str("Supported forms:\n\n");
     output.push_str("- `keybind = clear`\n");
@@ -253,8 +253,11 @@ fn root_default_display(defaults: &AppConfig, id: RootSettingId) -> String {
         RootSettingId::WorkingDirFallback => {
             "`home` (macOS/Windows), `process` (Linux/other)".to_string()
         }
-        RootSettingId::FontFamily | RootSettingId::UiFontFamily => {
+        RootSettingId::FontFamily => {
             "`Menlo` (macOS), `Consolas` (Windows), `monospace` (Linux/other)".to_string()
+        }
+        RootSettingId::UiFontFamily => {
+            "`.SystemUIFont` (macOS), `Consolas` (Windows), `monospace` (Linux/other)".to_string()
         }
         RootSettingId::Keybind => "built-in platform defaults".to_string(),
         _ => root_setting_default_value(defaults, id)
@@ -286,7 +289,8 @@ fn render_default_config_template() -> String {
             RootSettingId::WorkingDirFallback => "home".to_string(),
             // Platform-dependent default; pin the macOS value so the generated
             // template is identical on every platform.
-            RootSettingId::FontFamily | RootSettingId::UiFontFamily => "Menlo".to_string(),
+            RootSettingId::FontFamily => "Menlo".to_string(),
+            RootSettingId::UiFontFamily => ".SystemUIFont".to_string(),
             _ => {
                 root_setting_default_value(&defaults, spec.id).unwrap_or_else(|| "none".to_string())
             }

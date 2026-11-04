@@ -3,16 +3,16 @@ use crate::chrome_style::ChromeContrastProfile;
 use crate::colors::TerminalColors;
 use crate::commands::{self, CommandAction};
 use crate::config::{
-    self, AppConfig, CursorStyle as AppCursorStyle, PaneFocusEffect, SystemAppearance,
-    TabBarPosition, TabCloseVisibility, TabTitleConfig, TabTitleSource, TabWidthMode, TaskConfig,
-    TerminalScrollbarStyle, TerminalScrollbarVisibility, resolve_active_theme,
-    system_appearance_from_window,
+    self, AppConfig, ClipboardReadPolicy, CursorStyle as AppCursorStyle, PaneFocusEffect,
+    SystemAppearance, TabBarPosition, TabCloseVisibility, TabTitleConfig, TabTitleSource,
+    TabWidthMode, TaskConfig, TerminalScrollbarStyle, TerminalScrollbarVisibility,
+    resolve_active_theme, system_appearance_from_window,
 };
 use crate::keybindings;
 use crate::terminal_ui::{
     CellRenderInfo, PaneTerminal, TerminalGrid, TerminalGridPaintCacheHandle,
-    TerminalGridPaintDamage, TerminalGridRows, TmuxLaunchTarget, TmuxPaneMouseMode,
-    keystroke_to_input,
+    TerminalGridPaintDamage, TerminalGridRow, TerminalGridRows, TmuxLaunchTarget,
+    TmuxPaneMouseMode, keystroke_to_input,
 };
 use crate::ui::scrollbar::{ScrollbarVisibilityController, ScrollbarVisibilityMode};
 use crate::ui::toast::ToastManager;
@@ -49,18 +49,20 @@ use termy_core::session_model::{
 };
 use termy_core::{
     CommandLifecycle, KittyGraphicsRenderPlacement, ProgressState, TabTitleShellIntegration,
-    Terminal as NativeTerminal, TerminalClipboardContent, TerminalClipboardLocation,
-    TerminalClipboardReadRequest, TerminalClipboardReadResult, TerminalClipboardTarget,
-    TerminalClipboardWriteRequest, TerminalClipboardWriteResult, TerminalColor,
-    TerminalCursorState, TerminalCursorStyle, TerminalDamageSnapshot, TerminalDirtySpan,
-    TerminalEvent, TerminalKeyEventKind, TerminalKeyboardMode, TerminalLaunch, TerminalMouseMode,
-    TerminalOptions, TerminalPalette, TerminalQueryColors, TerminalReplyHost,
+    TermProgram as RuntimeTermProgram, Terminal as NativeTerminal, TerminalClipboardContent,
+    TerminalClipboardLocation, TerminalClipboardReadRequest, TerminalClipboardReadResult,
+    TerminalClipboardTarget, TerminalClipboardWriteRequest, TerminalClipboardWriteResult,
+    TerminalColor, TerminalCursorState, TerminalCursorStyle, TerminalDamageSnapshot,
+    TerminalDirtySpan, TerminalEvent, TerminalKeyEventKind, TerminalKeyboardMode, TerminalLaunch,
+    TerminalMouseMode, TerminalOptions, TerminalPalette, TerminalQueryColors, TerminalReplyHost,
     TerminalRuntimeConfig, TerminalSize, TerminalWakeupNotifier,
     WindowsShell as RuntimeWindowsShell, WorkingDirFallback as RuntimeWorkingDirFallback,
     normalize_working_directory_candidate, resolve_launch_working_directory,
     resolve_working_directory_path,
 };
 
+#[cfg(test)]
+mod startup_size_tests;
 #[cfg(all(test, unix))]
 mod working_dir_tests;
 
@@ -76,11 +78,14 @@ mod interaction;
 mod kitty_images;
 #[cfg(target_os = "macos")]
 mod macos_file_drop;
+#[cfg(target_os = "macos")]
+mod macos_native_search;
 mod metrics;
 mod multiplexer_session;
 mod overlay_view;
 mod persistence;
 mod plugin_ui;
+mod program_status;
 mod render;
 mod render_cache;
 mod runtime;
@@ -110,8 +115,8 @@ use appearance::{
     scaled_background_alpha_for_opacity, scaled_chrome_alpha_for_opacity,
 };
 use backend::{
-    ClipboardTextCache, GpuiClipboardReplyHost, NativeTerminalInstance, Terminal, TerminalCellRef,
-    TerminalLineRange, TerminalRenderDamageSnapshot, TerminalViewportScroll,
+    ClipboardTextCache, GpuiClipboardReplyHost, HostSizeClaim, NativeTerminalInstance, Terminal,
+    TerminalCellRef, TerminalLineRange, TerminalRenderDamageSnapshot, TerminalViewportScroll,
     TerminalViewportScrollDirection, terminal_engine_label,
 };
 use command_palette::{
@@ -140,6 +145,7 @@ use runtime::{RuntimeKind, RuntimeState, TmuxRuntime};
 use session::SessionState;
 pub(crate) use tab_strip::constants::*;
 use tab_strip::state::TabStripState;
+pub(crate) use tab_strip::style::{HorizontalTabMetrics, TabStripActionRailMetrics};
 
 type TabId = u64;
 type NativeTerminalWakeupId = u64;
@@ -215,6 +221,16 @@ enum DeferredTerminalResize {
 struct SelectionPos {
     col: usize,
     line: i32,
+}
+
+/// The active pane's scroll state as last observed on the UI thread. Comparing
+/// against it tells output scrolling the selected text apart from user scrolls
+/// (which resync it) and from switching to another pane.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ContentScrollBaseline {
+    pane: Option<(TabId, String)>,
+    display_offset: usize,
+    history_size: usize,
 }
 
 #[derive(Clone)]
@@ -461,10 +477,11 @@ impl Terminal {
     #[cfg(test)]
     fn new_test_display(size: TerminalSize) -> Self {
         Self::Native(NativeTerminalInstance {
+            terminal: Mutex::new(NativeTerminal::new_display(size, None)),
             session: None,
             wakeup_id: 0,
             wakeup_route: Arc::new(Mutex::new(None)),
-            terminal: Mutex::new(NativeTerminal::new_display(size, None)),
+            host_size: None,
         })
     }
 
@@ -501,31 +518,96 @@ impl Terminal {
     ) -> anyhow::Result<Self> {
         Self::build_native(wakeup_router, |notifier| {
             if let Some(client) = multiplexer {
-                let (id, terminal) = client.create(
+                let config = runtime_config.cloned().unwrap_or_default();
+                // Resolved here, as a local tab would: the host runs in the
+                // home directory with an environment of its own.
+                let working_directory =
+                    termy_core::multiplexer::PaneLaunch::client_working_directory(
+                        configured_working_dir,
+                        config.working_dir_fallback,
+                    );
+                let created = crate::multiplexer::create_pane(
+                    client,
                     termy_core::multiplexer::PaneLaunch {
                         size,
-                        working_directory: configured_working_dir.map(str::to_owned),
+                        working_directory,
                         shell_integration: tab_title_shell_integration.cloned(),
-                        config: runtime_config.cloned().unwrap_or_default(),
+                        config,
                         launch: launch.cloned(),
+                        environment: Some(termy_core::multiplexer::PaneLaunch::client_environment()),
                     },
-                    Some(notifier),
-                )?;
-                Ok((
-                    terminal,
-                    Some(crate::multiplexer::PaneSession::new(id, client.clone())),
-                ))
-            } else {
-                let terminal = NativeTerminal::new_with_launch_and_wakeup_notifier(
-                    size,
-                    configured_working_dir,
-                    Some(notifier),
-                    tab_title_shell_integration,
-                    runtime_config,
-                    launch,
-                )?;
-                Ok((terminal, None))
+                    Some(notifier.clone()),
+                );
+                match created {
+                    Ok((id, terminal)) => {
+                        return Ok((
+                            terminal,
+                            Some(crate::multiplexer::PaneSession::new(id, client.clone())),
+                        ));
+                    }
+                    // No host could be reached or started: open a regular
+                    // terminal rather than fail the tab or window (audit B12).
+                    Err(error) if termy_core::multiplexer::is_connection_error(&error) => {
+                        log::error!("Cannot start a multiplexer terminal: {error:#}");
+                        crate::ui::toast::error(format!(
+                            "The built-in multiplexer is unavailable, so this terminal ends when Termy quits: {}",
+                            format!("{error:#}").lines().next().unwrap_or_default()
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                }
             }
+            let terminal = NativeTerminal::new_with_launch_and_wakeup_notifier(
+                size,
+                configured_working_dir,
+                Some(notifier),
+                tab_title_shell_integration,
+                runtime_config,
+                launch,
+            )?;
+            Ok((terminal, None))
+        })
+    }
+
+    /// A new session that starts with a saved buffer. Locally the buffer is
+    /// replayed before the shell starts, so it can't interleave with the new
+    /// prompt. The session host has no such path in its protocol: replaying
+    /// after the spawn would print the new prompt above the old text, so a
+    /// new host pane starts without the buffer. Saved scrollback is therefore
+    /// never carried into multiplexer panes, whether they come from the
+    /// import of a regular session or from loading a named layout that saved
+    /// buffers (`load_named_layout` → `restore_workspace`).
+    fn new_native_restoring(
+        size: TerminalSize,
+        configured_working_dir: Option<&str>,
+        wakeup_router: Option<&NativeTerminalWakeupRouter>,
+        tab_title_shell_integration: Option<&TabTitleShellIntegration>,
+        runtime_config: Option<&TerminalRuntimeConfig>,
+        multiplexer: Option<&termy_core::multiplexer::SessionClient>,
+        restored_output: &[u8],
+    ) -> anyhow::Result<Self> {
+        if multiplexer.is_some() {
+            return Self::new_native_with_launch(
+                size,
+                configured_working_dir,
+                wakeup_router,
+                tab_title_shell_integration,
+                runtime_config,
+                None,
+                multiplexer,
+            );
+        }
+        Self::build_native(wakeup_router, |notifier| {
+            let terminal = NativeTerminal::new_with_launch_restoring_output(
+                size,
+                configured_working_dir,
+                Some(notifier),
+                tab_title_shell_integration,
+                runtime_config,
+                None,
+                restored_output,
+            )?;
+            Ok((terminal, None))
         })
     }
 
@@ -572,11 +654,17 @@ impl Terminal {
             }
         });
         let (terminal, session) = create(notifier)?;
+        // A new pane has the size this view created it at; a reattached one
+        // keeps the host's size until this view's layout asks for another.
+        let host_size = session
+            .is_some()
+            .then(|| Mutex::new(HostSizeClaim::new(terminal.size())));
         Ok(Self::Native(NativeTerminalInstance {
+            terminal: Mutex::new(terminal),
+            session,
             wakeup_id,
             wakeup_route,
-            session,
-            terminal: Mutex::new(terminal),
+            host_size,
         }))
     }
 
@@ -585,6 +673,23 @@ impl Terminal {
             Self::Native(native) => native.session.as_ref().map(|session| session.id.as_str()),
             Self::Tmux(_) => None,
         }
+    }
+
+    /// `true` once the session host that ran this pane is gone. The tab
+    /// stays, marked as ended (see [`crate::multiplexer::report_host_lost`]).
+    fn session_host_lost(&self) -> bool {
+        match self {
+            Self::Native(native) => {
+                native.session.is_some() && native.terminal.lock().unwrap().session_host_lost()
+            }
+            Self::Tmux(_) => false,
+        }
+    }
+
+    /// `true` when the terminal runs in the shared session host, so state it
+    /// is given (options, size) also applies to every other client.
+    fn is_session_host_pane(&self) -> bool {
+        self.session_id().is_some()
     }
 
     fn detach_session(&self) {
@@ -608,6 +713,17 @@ impl Terminal {
         }
     }
 
+    /// Feed a test display terminal as if its program printed `bytes`.
+    #[cfg(test)]
+    fn feed_test_output(&self, bytes: &[u8]) {
+        if let Self::Native(terminal) = self
+            && let Ok(terminal) = terminal.lock()
+        {
+            terminal.feed_output(bytes);
+        }
+    }
+
+    #[cfg(test)]
     fn hydrate_output(&self, bytes: &[u8]) {
         match self {
             Self::Tmux(terminal) => terminal.feed_output(bytes),
@@ -635,6 +751,17 @@ impl Terminal {
             Self::Native(terminal) => {
                 if let Ok(terminal) = terminal.lock() {
                     terminal.write_owned(input);
+                }
+            }
+            Self::Tmux(_) => {}
+        }
+    }
+
+    fn write_mouse_motion(&self, input: Vec<u8>) {
+        match self {
+            Self::Native(terminal) => {
+                if let Ok(terminal) = terminal.lock() {
+                    terminal.write_mouse_motion(input);
                 }
             }
             Self::Tmux(_) => {}
@@ -673,11 +800,63 @@ impl Terminal {
     fn resize(&self, new_size: TerminalSize) {
         match self {
             Self::Tmux(terminal) => terminal.resize(new_size),
-            Self::Native(terminal) => {
-                if let Ok(mut terminal) = terminal.lock() {
+            Self::Native(native) => {
+                let mut overridden = false;
+                if let Ok(mut terminal) = native.lock() {
+                    overridden = terminal.host_size_overridden();
                     terminal.resize(new_size);
                 }
+                if let Some(claim) = &native.host_size {
+                    claim
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .applied(new_size, overridden, Instant::now());
+                }
             }
+        }
+    }
+
+    fn host_size_claim(&self) -> Option<std::sync::MutexGuard<'_, HostSizeClaim>> {
+        let Self::Native(native) = self else {
+            return None;
+        };
+        let claim = native.host_size.as_ref()?;
+        Some(
+            claim
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    fn host_size_overridden(&self) -> bool {
+        match self {
+            Self::Native(native) if native.host_size.is_some() => native
+                .lock()
+                .is_ok_and(|terminal| terminal.host_size_overridden()),
+            _ => false,
+        }
+    }
+
+    /// `true` while another client's resize of this session-host pane waits
+    /// for this view to re-assert its own size. Always `false` for local
+    /// terminals, whose size only this view changes.
+    fn host_size_reassert_pending(&self) -> bool {
+        let overridden = self.host_size_overridden();
+        self.host_size_claim()
+            .is_some_and(|claim| claim.wants_reassert(overridden))
+    }
+
+    /// Whether the layout pass must resize this terminal to `next`. `current`
+    /// is the size it has or was last asked for.
+    fn needs_resize(&self, current: TerminalSize, next: TerminalSize, now: Instant) -> bool {
+        let stale = current.cols != next.cols
+            || current.rows != next.rows
+            || current.cell_width != next.cell_width
+            || current.cell_height != next.cell_height;
+        let overridden = self.host_size_overridden();
+        match self.host_size_claim() {
+            Some(mut claim) => claim.needs_resize(next, stale, overridden, now),
+            None => stale,
         }
     }
 
@@ -699,6 +878,16 @@ impl Terminal {
             Self::Native(terminal) => terminal
                 .lock()
                 .map(|terminal| terminal.size())
+                .unwrap_or_default(),
+        }
+    }
+
+    fn requested_size(&self) -> TerminalSize {
+        match self {
+            Self::Tmux(terminal) => terminal.size(),
+            Self::Native(terminal) => terminal
+                .lock()
+                .map(|terminal| terminal.requested_size())
                 .unwrap_or_default(),
         }
     }
@@ -856,30 +1045,18 @@ impl Terminal {
         }
     }
 
-    fn take_render_damage_snapshot(&self) -> TerminalRenderDamageSnapshot {
-        match self {
-            Self::Tmux(terminal) => {
-                TerminalRenderDamageSnapshot::from_core(terminal.take_render_damage_snapshot())
-            }
-            Self::Native(terminal) => terminal.lock().map_or_else(
-                |_| TerminalRenderDamageSnapshot::from_damage(TerminalDamageSnapshot::Full),
-                |terminal| {
-                    TerminalRenderDamageSnapshot::from_core(terminal.take_render_damage_snapshot())
-                },
-            ),
-        }
-    }
-
     fn try_kitty_graphics_placements(&self) -> Option<Vec<KittyGraphicsRenderPlacement>> {
         self.try_kitty_graphics_snapshot()
             .map(|(_, placements)| placements)
     }
 
+    /// `None` while another holder has the terminal locked, so a caller can
+    /// keep its previous placements instead of waiting.
     fn try_kitty_graphics_snapshot(&self) -> Option<(u64, Vec<KittyGraphicsRenderPlacement>)> {
         match self {
             Self::Tmux(terminal) => Some(terminal.kitty_graphics_snapshot()),
             Self::Native(terminal) => terminal
-                .lock()
+                .try_lock()
                 .ok()
                 .map(|terminal| terminal.kitty_graphics_snapshot()),
         }
@@ -929,6 +1106,22 @@ impl Terminal {
         }
     }
 
+    /// Changes whenever the terminal's content, size or scroll position does.
+    fn content_generation(&self) -> Option<u64> {
+        self.with_core_terminal(|terminal| {
+            terminal
+                .visit_viewport_cells_locked(|_, _, _, _| {})
+                .generation
+        })
+    }
+
+    fn content_generation_is(&self, generation: u64) -> bool {
+        self.with_core_terminal(|terminal| {
+            terminal.visit_viewport_ranges_locked_at_generation(generation, &[], |_, _, _, _, _| {})
+        })
+        .unwrap_or(false)
+    }
+
     fn for_each_renderable_cell(
         &self,
         mut visitor: impl FnMut(usize, i32, usize, TerminalCellRef<'_>),
@@ -960,25 +1153,18 @@ impl Terminal {
         Some(display_offset)
     }
 
-    fn for_each_damage_cell(
+    /// Take render damage and read the cells it names under one core lock;
+    /// see `termy_core::Terminal::with_render_damage`. `read` must not call
+    /// back into this terminal.
+    fn with_render_damage<R>(
         &self,
-        spans: &[TerminalDirtySpan],
-        generation: Option<u64>,
-        mut visitor: impl FnMut(usize, usize, i32, usize, TerminalCellRef<'_>),
-    ) -> bool {
-        let Some(generation) = generation else {
-            return false;
-        };
+        read: impl FnOnce(TerminalRenderDamageSnapshot, termy_core::TerminalDamageCells<'_>) -> R,
+    ) -> Option<R> {
         self.with_core_terminal(|terminal| {
-            terminal.visit_viewport_ranges_locked_at_generation(
-                generation,
-                spans,
-                |row, offset, line, col, cell| {
-                    visitor(row, offset, line, col, TerminalCellRef(cell));
-                },
-            )
+            terminal.with_render_damage(|damage, cells| {
+                read(TerminalRenderDamageSnapshot::from_core(damage), cells)
+            })
         })
-        .unwrap_or(false)
     }
 
     fn line_bounds(&self) -> Option<(i32, i32)> {
@@ -1022,6 +1208,7 @@ struct TerminalPane {
     // Progress reported by this pane's shell via OSC 9;4; the tab strip shows
     // the per-tab aggregate (TerminalTab::aggregate_progress_state).
     progress_state: ProgressState,
+    program_status: Vec<termy_core::ProgramStatusRecord>,
     render_cache: RefCell<TerminalPaneRenderCache>,
     /// Tracks the previous alternate-screen state so that transitions can be
     /// detected during `sync_terminal_size` and a SIGWINCH nudge sent.
@@ -1083,6 +1270,7 @@ impl TerminalPane {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal,
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),
@@ -1092,6 +1280,13 @@ impl TerminalPane {
 
     fn terminal(&self) -> &Terminal {
         &self.terminal
+    }
+
+    /// A prompt (OSC 133;A) ends the program that reported progress, so its
+    /// bar must not stay up, like OSC 7501 working records. Returns whether
+    /// the bar was showing.
+    fn clear_progress_at_prompt(&mut self) -> bool {
+        std::mem::take(&mut self.progress_state).is_active()
     }
 }
 
@@ -1239,6 +1434,20 @@ pub struct TerminalView {
     native_terminal_wakeup_batch: HashSet<NativeTerminalWakeupId>,
     focus_handle: FocusHandle,
     window_handle: gpui_kit::AnyWindowHandle,
+    /// AppKit draws this window's tabs: the window holds one tab, and any
+    /// other tab moves into its own native tab window.
+    native_window_tabs: bool,
+    /// `tab_style = native` on Windows: the horizontal strip uses the
+    /// Windows 11 style. Follows config reloads.
+    windows_native_tab_style: bool,
+    /// The WinUI `TabView` drawing that strip, once created.
+    #[cfg(target_os = "windows")]
+    winui_tab_strip: Option<tab_strip::winui::WinUiTabStripHost>,
+    /// The tab this native tab window shows.
+    native_tab_home: Option<TabId>,
+    native_tab_split_pending: bool,
+    /// Last title and titlebar color given to AppKit.
+    native_window_chrome: Option<tabs::NativeWindowChrome>,
     owns_persisted_session: bool,
     multiplexer: Option<Arc<crate::multiplexer::WindowSession>>,
     multiplexer_enabled_config: bool,
@@ -1307,6 +1516,7 @@ pub struct TerminalView {
     background_blur: bool,
     background_support_context: BackgroundSupportContext,
     last_window_background_appearance: Option<WindowBackgroundAppearance>,
+    native_titlebar: crate::native_titlebar::NativeTitlebarTheme,
     warned_blur_unsupported_once: bool,
     padding_x: f32,
     padding_y: f32,
@@ -1316,6 +1526,7 @@ pub struct TerminalView {
     line_height: f32,
     copy_on_select: bool,
     copy_on_select_toast: bool,
+    clipboard_read: ClipboardReadPolicy,
     last_terminal_modifiers: gpui_kit::Modifiers,
     pending_key_releases: HashMap<String, PendingKeyRelease>,
     deferred_ime_key_releases: HashSet<String>,
@@ -1323,11 +1534,15 @@ pub struct TerminalView {
     selection_head: Option<SelectionPos>,
     selection_dragging: bool,
     selection_moved: bool,
+    /// Last pointer position of a selection drag, read by the autoscroll timer
+    /// so scrolling continues while the pointer rests outside the pane.
+    selection_autoscroll_pointer: Option<gpui_kit::Point<Pixels>>,
+    selection_autoscroll_running: bool,
     kitty_image_selection: Option<KittyImageSelection>,
-    /// Tracks the active terminal's display_offset as observed from the UI thread.
+    /// Tracks the active terminal's scroll state as observed from the UI thread.
     /// Updated after every user-initiated scroll and after each content-scroll adjustment,
-    /// so that process_terminal_events can detect only content-driven offset changes.
-    content_scroll_baseline: usize,
+    /// so that process_terminal_events can detect only content-driven scrolling.
+    content_scroll_baseline: ContentScrollBaseline,
     pending_cursor_move_click: Option<PendingCursorMoveClick>,
     pending_cursor_move_preview: Option<PendingCursorMovePreview>,
     terminal_context_menu: Option<TerminalContextMenuState>,
@@ -1399,6 +1614,11 @@ pub struct TerminalView {
     search_debounce_token: u64,
     search_scan_incomplete: bool,
     search_options_open: bool,
+    /// AppKit find bar shown instead of Termy's in native tab windows.
+    #[cfg(target_os = "macos")]
+    native_search_bar: Option<macos_native_search::NativeSearchBar>,
+    #[cfg(target_os = "macos")]
+    search_focus_request: u64,
     // IME composing state for terminal mode
     ime_marked_text: Option<String>,
     ime_selected_range: Option<Range<usize>>,
@@ -1410,8 +1630,6 @@ pub struct TerminalView {
     allow_quit_without_prompt: bool,
     auto_updater: Option<Entity<AutoUpdater>>,
     show_update_banner: bool,
-    last_notified_update_state: Option<UpdateState>,
-    update_check_toast_id: Option<u64>,
     release_notes: Option<update_overlay::ReleaseNotesDialog>,
     release_notes_generation: u64,
     release_notes_scroll: ScrollHandle,
@@ -1561,6 +1779,7 @@ impl TerminalView {
         TerminalRuntimeConfig {
             shell: config.shell.clone(),
             windows_shell: match config.windows_shell {
+                config::WindowsShell::Auto => RuntimeWindowsShell::Auto,
                 config::WindowsShell::Cmd => RuntimeWindowsShell::Cmd,
                 config::WindowsShell::PowerShell => RuntimeWindowsShell::PowerShell,
                 config::WindowsShell::PowerShellCore => RuntimeWindowsShell::PowerShellCore,
@@ -1568,6 +1787,10 @@ impl TerminalView {
             },
             term: config.term.clone(),
             colorterm: config.colorterm.clone(),
+            term_program: match config.term_program {
+                config::TermProgram::Termy => RuntimeTermProgram::Termy,
+                config::TermProgram::Ghostty => RuntimeTermProgram::Ghostty,
+            },
             environment: Default::default(),
             query_colors: Self::terminal_query_colors(colors),
             working_dir_fallback,
@@ -1672,7 +1895,7 @@ impl TerminalView {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
             let path = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-            return path.is_dir().then(|| path.to_string_lossy().into_owned());
+            path.is_dir().then(|| path.to_string_lossy().into_owned())
         }
 
         #[cfg(target_os = "macos")]
@@ -1710,8 +1933,27 @@ impl TerminalView {
         // cwd. A candidate that does not resolve locally must fall through to the
         // configured working_dir instead of shadowing it and collapsing to the
         // home-directory fallback at spawn time (issue #336).
+        #[cfg(windows)]
+        let candidate = candidate.map(Self::strip_slash_before_windows_drive);
         normalize_working_directory_candidate(candidate)
             .filter(|value| resolve_working_directory_path(Some(value)).is_some())
+    }
+
+    /// `/C:/dir` as `C:/dir`. Session hosts and snapshots from before OSC 7
+    /// learned Windows paths report `file://host/C:/dir` that way.
+    #[cfg(windows)]
+    fn strip_slash_before_windows_drive(value: &str) -> &str {
+        let trimmed = value.trim();
+        match trimmed.strip_prefix('/') {
+            Some(rest)
+                if rest.len() >= 2
+                    && rest.as_bytes()[0].is_ascii_alphabetic()
+                    && rest.as_bytes()[1] == b':' =>
+            {
+                rest
+            }
+            _ => value,
+        }
     }
 
     fn resolve_preferred_working_directory(
@@ -2307,7 +2549,6 @@ impl TerminalView {
     }
 
     fn handle_auto_update_state_change(&mut self, state: &UpdateState, cx: &mut Context<Self>) {
-        self.sync_update_toasts(Some(state));
         let was_banner_visible = self.show_update_banner;
         self.show_update_banner = Self::overlay_banner_visible_for_state(Some(state));
         self.notify_overlay(cx);
@@ -2331,15 +2572,12 @@ impl TerminalView {
     }
 
     fn ensure_auto_updater(&mut self, cx: &mut Context<Self>) -> Option<Entity<AutoUpdater>> {
-        if !AutoUpdater::supported_on_current_platform() {
-            return None;
-        }
-
         if let Some(updater) = self.auto_updater.as_ref() {
             return Some(updater.clone());
         }
 
-        let updater = cx.new(|_| AutoUpdater::new(crate::APP_VERSION));
+        let updater = AutoUpdater::global(cx)?;
+        update_toasts::UpdateToasts::observe(&updater, cx);
         self.observe_auto_updater(&updater, cx);
         self.auto_updater = Some(updater.clone());
         Some(updater)
@@ -2914,11 +3152,11 @@ impl TerminalView {
         // windows start fresh and must not mirror its tmux session or overwrite
         // its native workspace snapshot when they close.
         let owns_persisted_session = !crate::app_actions::has_window::<Self>(cx);
-        if let Err(error) = crate::multiplexer::initialize(&config, cx) {
-            crate::StartupBlocker::MainWindowOpen(error).present_alert_and_exit();
-        }
+        // Falls back to regular terminals, with a toast, if the host fails.
+        crate::multiplexer::initialize(&config, cx);
         let multiplexer_enabled_config = config.multiplexer_enabled;
-        config.multiplexer_enabled = crate::multiplexer::enabled(cx);
+        // After a fallback this window uses plain local terminals, not tmux.
+        crate::multiplexer::effective_config(&mut config, cx);
         let (multiplexer, live_session) =
             crate::multiplexer::claim_window(cx, owns_persisted_session)
                 .map_or((None, None), |(window, session)| (Some(window), session));
@@ -3141,14 +3379,17 @@ impl TerminalView {
         );
         let startup_predicted_title =
             Self::predicted_prompt_seed_title(&tab_title, predicted_prompt_cwd.as_deref());
-        let initial_cols = TerminalSize::default().cols;
-        let initial_rows = TerminalSize::default().rows;
+        let mut initial_cols = TerminalSize::default().cols;
+        let mut initial_rows = TerminalSize::default().rows;
         let startup_native_session = if !empty
             && live_session.is_none()
             && owns_persisted_session
             && configured_runtime_kind == RuntimeKind::Native
         {
             match Self::load_startup_native_session(&config) {
+                Ok(session) if multiplexer.is_some() => {
+                    session.map(Self::startup_session_for_multiplexer_import)
+                }
                 Ok(session) => session,
                 Err(error) => {
                     log::error!("Failed to preload native tab workspace: {error}");
@@ -3159,28 +3400,17 @@ impl TerminalView {
         } else {
             None
         };
-        let defer_native_terminal = empty
-            || live_session.is_some()
-            || startup_native_session
-                .as_ref()
-                .is_some_and(|startup| startup.session.is_some());
-        let (runtime, initial_snapshot, mut native_terminal) =
-            Self::runtime_startup_from_app_config(
-                &config,
-                &event_wakeup_tx,
-                &native_terminal_wakeup_router,
-                configured_working_dir.as_deref(),
-                &tab_shell_integration,
-                &terminal_runtime,
-                benchmark_config
-                    .as_ref()
-                    .map(|config| config.command.as_str()),
-                initial_cols,
-                initial_rows,
-                defer_native_terminal,
-                multiplexer.as_ref().map(|window| window.client()),
-            );
+        let (runtime, initial_snapshot) = Self::runtime_startup_from_app_config(
+            &config,
+            &event_wakeup_tx,
+            configured_working_dir.as_deref(),
+            &terminal_runtime,
+            initial_cols,
+            initial_rows,
+        );
         let resolved_runtime_kind = runtime.kind();
+        let native_window_tabs = crate::native_window_tabs_enabled(&config)
+            && resolved_runtime_kind == RuntimeKind::Native;
         if resolved_runtime_kind != configured_runtime_kind {
             // Preinstalled menus and shortcuts must follow the runtime we actually
             // started, including a tmux preflight/control-session fallback.
@@ -3188,7 +3418,6 @@ impl TerminalView {
         }
 
         let plugin_runtime = PluginRuntime::new(config_path.as_deref());
-        crate::launch_probe::record_stage("terminal_created");
         let mut view = Self {
             session: SessionState::new(),
             workspace_sidebar_enabled: config.sidebar_enabled,
@@ -3206,6 +3435,13 @@ impl TerminalView {
             native_terminal_wakeup_batch: HashSet::new(),
             focus_handle,
             window_handle,
+            native_window_tabs,
+            windows_native_tab_style: crate::windows_native_tab_style(&config),
+            #[cfg(target_os = "windows")]
+            winui_tab_strip: None,
+            native_tab_home: None,
+            native_tab_split_pending: false,
+            native_window_chrome: None,
             owns_persisted_session,
             multiplexer,
             multiplexer_enabled_config,
@@ -3275,6 +3511,7 @@ impl TerminalView {
             background_blur: config.background_blur,
             background_support_context,
             last_window_background_appearance: None,
+            native_titlebar: crate::native_titlebar::NativeTitlebarTheme::for_window(window),
             warned_blur_unsupported_once: false,
             padding_x,
             padding_y,
@@ -3284,6 +3521,7 @@ impl TerminalView {
             line_height: config.line_height.clamp(MIN_LINE_HEIGHT, MAX_LINE_HEIGHT),
             copy_on_select: config.copy_on_select,
             copy_on_select_toast: config.copy_on_select_toast,
+            clipboard_read: config.clipboard_read,
             last_terminal_modifiers: gpui_kit::Modifiers::default(),
             pending_key_releases: HashMap::default(),
             deferred_ime_key_releases: HashSet::default(),
@@ -3291,8 +3529,10 @@ impl TerminalView {
             selection_head: None,
             selection_dragging: false,
             selection_moved: false,
+            selection_autoscroll_pointer: None,
+            selection_autoscroll_running: false,
             kitty_image_selection: None,
-            content_scroll_baseline: 0,
+            content_scroll_baseline: ContentScrollBaseline::default(),
             pending_cursor_move_click: None,
             pending_cursor_move_preview: None,
             terminal_context_menu: None,
@@ -3360,6 +3600,10 @@ impl TerminalView {
             search_debounce_token: 0,
             search_scan_incomplete: false,
             search_options_open: false,
+            #[cfg(target_os = "macos")]
+            native_search_bar: None,
+            #[cfg(target_os = "macos")]
+            search_focus_request: 0,
             ime_marked_text: None,
             ime_selected_range: None,
             pending_clipboard: None,
@@ -3369,8 +3613,6 @@ impl TerminalView {
             allow_quit_without_prompt: false,
             auto_updater: None,
             show_update_banner: false,
-            last_notified_update_state: None,
-            update_check_toast_id: None,
             release_notes: None,
             release_notes_generation: 0,
             release_notes_scroll: ScrollHandle::new(),
@@ -3386,8 +3628,14 @@ impl TerminalView {
             crate::ui::toast::warning(TMUX_NEEDS_PREFIX_WINDOWS_TOAST);
         }
         let restored_native_workspace = if let Some(session) = live_session {
+            // The host already has a layout, so the store's session counts as
+            // imported, also for users who enabled the multiplexer before the
+            // import marker existed.
+            view.record_multiplexer_import();
             match view.restore_stored_session(session, cx) {
-                Ok(()) => true,
+                // A window whose active workspace is empty still gets a
+                // terminal to type in.
+                Ok(()) => !view.session.tabs.is_empty(),
                 Err(error) => {
                     log::error!("Failed to restore multiplexer tabs: {error}");
                     crate::ui::toast::error(format!("Could not restore multiplexer tabs: {error}"));
@@ -3400,7 +3648,10 @@ impl TerminalView {
                     let _ = view.workspace_store.set(Some(startup.store));
                     match startup.session {
                         Some(session) => match view.restore_stored_session(session, cx) {
-                            Ok(()) => true,
+                            Ok(()) => {
+                                view.record_multiplexer_import();
+                                true
+                            }
                             Err(error) => {
                                 log::error!("Failed to restore native tab workspace: {error}");
                                 crate::ui::toast::error("Failed to restore saved native tabs");
@@ -3415,24 +3666,41 @@ impl TerminalView {
         } else {
             false
         };
-        if resolved_runtime_kind == RuntimeKind::Native
-            && !empty
-            && !restored_native_workspace
-            && native_terminal.is_none()
-        {
-            native_terminal = Some(Self::start_native_terminal(
-                &view.native_terminal_wakeup_router,
-                view.configured_working_dir.as_deref(),
-                &view.tab_shell_integration,
-                &view.terminal_runtime,
-                view.benchmark_session
-                    .as_ref()
-                    .map(|session| session.command()),
-                initial_cols,
-                initial_rows,
-                view.multiplexer_client(),
-            ));
-        }
+        let native_terminal =
+            if resolved_runtime_kind == RuntimeKind::Native && !empty && !restored_native_workspace
+            {
+                let cell_size = view.calculate_cell_size(window, cx);
+                let viewport = window.viewport_size();
+                (initial_cols, initial_rows) = Self::terminal_grid_size_for_pane_count(
+                    1,
+                    viewport.width.into(),
+                    viewport.height.into(),
+                    view.effective_sidebar_width() + view.workspace_sidebar_width(),
+                    view.terminal_content_top_inset(),
+                    view.padding_x,
+                    view.padding_y,
+                    cell_size.width.into(),
+                    cell_size.height.into(),
+                );
+                Some(Self::start_native_terminal(
+                    &view.native_terminal_wakeup_router,
+                    view.configured_working_dir.as_deref(),
+                    &view.tab_shell_integration,
+                    &view.terminal_runtime,
+                    view.benchmark_session
+                        .as_ref()
+                        .map(|session| session.command()),
+                    TerminalSize {
+                        cols: initial_cols,
+                        rows: initial_rows,
+                        cell_width: cell_size.width.into(),
+                        cell_height: cell_size.height.into(),
+                    },
+                    view.multiplexer_client(),
+                ))
+            } else {
+                None
+            };
 
         match initial_snapshot {
             Some(initial_snapshot) => view.apply_tmux_snapshot(initial_snapshot),
@@ -3452,6 +3720,7 @@ impl TerminalView {
                 }
             }
         }
+        crate::launch_probe::record_stage("terminal_created");
 
         if view.benchmark_session.is_some() {
             cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -3479,10 +3748,14 @@ impl TerminalView {
             })
             .detach();
         }
+        view.start_multiplexer_layout_sync(cx);
         cx.on_release(|view, _cx| view.prepare_multiplexer_detach())
             .detach();
         cx.on_app_quit(|view, _cx| {
             view.prepare_multiplexer_detach();
+            // Sparkle's "Install and Relaunch" terminates the app without the
+            // quit flow, so the workspace must be flushed here too.
+            view.sync_persisted_native_workspace();
             async {}
         })
         .detach();
@@ -3543,6 +3816,8 @@ impl TerminalView {
             .detach();
         }
 
+        #[cfg(target_os = "macos")]
+        crate::auto_update::sparkle::sync_automatic_checks(config.auto_update, cx);
         if config.auto_update
             && let Some(updater) = view.ensure_auto_updater(cx)
         {
@@ -3551,7 +3826,7 @@ impl TerminalView {
                 cx.background_executor()
                     .timer(Duration::from_millis(5000))
                     .await;
-                cx.update(|cx| AutoUpdater::check(weak, cx));
+                cx.update(|cx| AutoUpdater::check_if_idle(weak, cx));
             })
             .detach();
         }
@@ -3564,6 +3839,25 @@ impl TerminalView {
             }
         }
         view.sync_native_terminal_wakeup_interest();
+        if view.native_window_tabs {
+            #[cfg(target_os = "macos")]
+            view.install_native_search_bar(window, cx);
+            cx.observe_self(|view, cx| view.sync_native_window_chrome(cx))
+                .detach();
+            // Closing or merging tabs elsewhere activates another tab window,
+            // which may now need its title back (or hidden) in the titlebar.
+            #[cfg(target_os = "macos")]
+            cx.observe_window_activation(window, |_, window, _| {
+                crate::macos_native_tabs::refresh_titlebar_tabs(window);
+            })
+            .detach();
+            // Leaving fullscreen turns the titlebar opaque again.
+            cx.observe_window_bounds(window, |view, _, cx| {
+                view.native_window_chrome = None;
+                view.sync_native_window_chrome(cx);
+            })
+            .detach();
+        }
         view.appearance_subscription =
             Some(cx.observe_window_appearance(window, |view, window, cx| {
                 view.handle_window_appearance_change(window.appearance(), cx);
@@ -3617,23 +3911,10 @@ impl TerminalView {
         // Cell colors are resolved before entering the pane cache. A repaint by
         // itself would otherwise reuse rows from the previous appearance.
         self.clear_pane_render_caches();
-        for tab in &self.session.tabs {
-            for pane in &tab.panes {
-                pane.terminal().set_query_colors(query_colors);
-            }
-        }
+        // Hidden panes answer OSC 10/11 too (nvim in a stashed workspace or a
+        // zoom-parked split), so every live pane gets the new colors.
+        self.for_each_live_pane(|_, pane| pane.terminal().set_query_colors(query_colors));
         cx.notify();
-    }
-
-    pub(crate) fn reload_theme_assets(&mut self, cx: &mut Context<Self>) {
-        let resolved = match self.theme_mode {
-            config::AppearanceMode::Manual => self.manual_theme.clone(),
-            config::AppearanceMode::System => match self.system_appearance {
-                SystemAppearance::Light => self.light_theme.clone(),
-                SystemAppearance::Dark => self.dark_theme.clone(),
-            },
-        };
-        self.apply_resolved_theme(resolved, cx);
     }
 
     fn apply_runtime_config(&mut self, config: AppConfig, cx: &mut Context<Self>) -> bool {
@@ -3642,6 +3923,8 @@ impl TerminalView {
             cx.text_system().as_ref(),
         );
         crate::app_icon::apply_from_config(&config);
+        #[cfg(target_os = "macos")]
+        crate::auto_update::sparkle::sync_automatic_checks(config.auto_update, cx);
         keybindings::install_keybindings(cx, &config, self.runtime_uses_tmux());
         self.cached_tmux_binary = {
             let binary = config.tmux_binary.trim().to_string();
@@ -3665,6 +3948,9 @@ impl TerminalView {
         let tab_close_visibility_changed = self.tab_close_visibility != config.tab_close_visibility;
         let tab_width_mode_changed = self.tab_width_mode != config.tab_width_mode;
         let tab_bar_position_changed = self.tab_bar_position != config.tab_bar_position;
+        let windows_native_tab_style = crate::windows_native_tab_style(&config);
+        let windows_native_tab_style_changed =
+            self.windows_native_tab_style != windows_native_tab_style;
         let tab_switch_modifier_hints_changed = self
             .tab_strip
             .switch_hints
@@ -3690,6 +3976,7 @@ impl TerminalView {
         self.tab_close_visibility = config.tab_close_visibility;
         self.tab_width_mode = config.tab_width_mode;
         self.tab_bar_position = config.tab_bar_position;
+        self.windows_native_tab_style = windows_native_tab_style;
         self.auto_hide_tabbar = config.auto_hide_tabbar;
         self.show_termy_in_titlebar = config.show_termy_in_titlebar;
         self.show_debug_overlay = config.show_debug_overlay;
@@ -3730,9 +4017,12 @@ impl TerminalView {
         }
         if self.multiplexer_enabled_config != config.multiplexer_enabled {
             self.multiplexer_enabled_config = config.multiplexer_enabled;
-            crate::ui::toast::info(
-                "Built-in multiplexer setting saved. Restart Termy to apply it.",
-            );
+            // Probing the host lock only matters when the setting turns off.
+            let host_running = !config.multiplexer_enabled && Self::multiplexer_host_is_running();
+            crate::ui::toast::info(Self::multiplexer_setting_toast(
+                config.multiplexer_enabled,
+                host_running,
+            ));
         }
         self.tmux_enabled_config = config.tmux_enabled;
         let native_tab_persistence_changed =
@@ -3812,6 +4102,7 @@ impl TerminalView {
         self.padding_y = config.padding_y.max(0.0);
         self.copy_on_select = config.copy_on_select;
         self.copy_on_select_toast = config.copy_on_select_toast;
+        self.clipboard_read = config.clipboard_read;
         self.mouse_scroll_multiplier = config.mouse_scroll_multiplier;
         self.pane_focus_effect = config.pane_focus_effect;
         self.pane_focus_strength = config.pane_focus_strength;
@@ -3832,24 +4123,7 @@ impl TerminalView {
             cx.notify();
         }
         self.clear_pane_render_caches();
-        let inactive_history = self
-            .inactive_tab_scrollback
-            .unwrap_or(self.terminal_runtime.scrollback_history);
-        let active_options = self.terminal_runtime.term_options();
-        let inactive_options = (inactive_history != active_options.scrollback_history)
-            .then(|| active_options.with_scrollback_history(inactive_history));
-        for (tab_index, tab) in self.session.tabs.iter().enumerate() {
-            let options = if tab_index == self.session.active_tab {
-                active_options
-            } else {
-                inactive_options.unwrap_or(active_options)
-            };
-            for pane in &tab.panes {
-                pane.terminal().set_term_options(options);
-                pane.terminal()
-                    .set_query_colors(self.terminal_runtime.query_colors);
-            }
-        }
+        self.push_runtime_options_to_live_panes();
 
         for index in 0..self.session.tabs.len() {
             self.refresh_tab_title(index);
@@ -3857,6 +4131,7 @@ impl TerminalView {
         if tab_close_visibility_changed
             || tab_width_mode_changed
             || tab_bar_position_changed
+            || windows_native_tab_style_changed
             || show_termy_in_titlebar_changed
             || simple_mode_changed
             || auto_hide_tabbar_changed
@@ -3866,6 +4141,7 @@ impl TerminalView {
         }
         if tab_switch_modifier_hints_changed
             || tab_bar_position_changed
+            || windows_native_tab_style_changed
             || auto_hide_tabbar_changed
             || simple_mode_changed
             || workspace_sidebar_changed
@@ -4021,19 +4297,9 @@ impl TerminalView {
         if should_redraw {
             self.debug_overlay_stats.record_terminal_redraw();
 
-            // Detect content-driven display_offset changes: the terminal engine auto-increments the
-            // offset to keep the viewport stable when new lines arrive while the user is
-            // scrolled into history. The background PTY thread already updated the offset
-            // before we got here, so we compare against content_scroll_baseline (a value
-            // we maintain separately from user-initiated scrolls) to find the delta.
-            let current_offset = self.active_terminal().map_or(0, |t| t.scroll_state().0);
-            if current_offset != self.content_scroll_baseline {
-                self.adjust_selection_for_display_offset_change(
-                    self.content_scroll_baseline,
-                    current_offset,
-                );
-                self.content_scroll_baseline = current_offset;
-            }
+            // Output scrolls content up while the selection stays put in
+            // terminal lines; follow it so the selection keeps its text.
+            self.follow_content_scroll_with_selection();
         }
 
         should_redraw
@@ -4050,7 +4316,7 @@ impl TerminalView {
         let mut should_redraw = false;
         let mut should_quit = false;
         let active_tab = self.session.active_tab;
-        let mut clipboard_text = ClipboardTextCache::default();
+        let mut clipboard_text = ClipboardTextCache::new(self.clipboard_read);
         self.record_benchmark_terminal_event_drain_pass();
 
         let mut pending_tab_closures: HashSet<TabId> = HashSet::new();
@@ -4091,6 +4357,9 @@ impl TerminalView {
                 if events.is_empty() && !has_more {
                     continue;
                 }
+                if terminal.session_host_lost() {
+                    crate::multiplexer::report_host_lost();
+                }
 
                 let active_pane_id = active_pane_id
                     .get_or_insert_with(|| self.session.tabs[tab_index].active_pane_id.clone());
@@ -4110,6 +4379,7 @@ impl TerminalView {
                                 should_redraw = true;
                             }
                         }
+                        TerminalEvent::InputDropped => backend::warn_input_dropped(),
                         TerminalEvent::Bell => {
                             if tab_index == active_tab {
                                 should_redraw = true;
@@ -4121,10 +4391,19 @@ impl TerminalView {
                         TerminalEvent::Exit => {
                             let simulated_pane_counts =
                                 simulated_pane_counts.get_or_insert_with(|| {
+                                    // A zoomed tab parks its other panes in
+                                    // the zoom snapshot; they still run.
                                     self.session
                                         .tabs
                                         .iter()
-                                        .map(|tab| (tab.id, tab.panes.len()))
+                                        .map(|tab| {
+                                            let parked = self
+                                                .session
+                                                .native_pane_zoom_snapshots
+                                                .get(&tab.id)
+                                                .map_or(0, |zoom| zoom.other_panes.len());
+                                            (tab.id, tab.panes.len() + parked)
+                                        })
                                         .collect()
                                 });
                             let exit_should_quit = Self::schedule_native_exit(
@@ -4172,6 +4451,8 @@ impl TerminalView {
                                     .command_lifecycle
                                     .prompt_start();
                             }
+                            should_redraw |= self.session.tabs[tab_index].panes[pane_index]
+                                .clear_progress_at_prompt();
                         }
                         TerminalEvent::ShellCommandStart => {
                             if self.shell_integration_enabled {
@@ -4207,6 +4488,11 @@ impl TerminalView {
                                     });
                                 }
                             }
+                        }
+                        // Program status (OSC 7501) — shown only as a tab badge.
+                        TerminalEvent::ProgramStatus(records) => {
+                            self.session.tabs[tab_index].panes[pane_index].program_status = records;
+                            should_redraw = true;
                         }
                         // Progress indicator (OSC 9;4) — tracked per pane; the
                         // tab strip shows the per-tab aggregate.
@@ -4259,7 +4545,9 @@ impl TerminalView {
 
         if should_quit {
             // Shell `exit` in the last native pane closes only its own window.
-            self.sync_persisted_native_workspace();
+            if !self.discard_multiplexer_window() {
+                self.sync_persisted_native_workspace();
+            }
             if self.benchmark_exit_on_complete() {
                 self.schedule_benchmark_exit(cx);
                 should_redraw = true;
@@ -4481,6 +4769,23 @@ mod tests {
         assert_eq!(first.as_deref(), Some("clipboard"));
         assert_eq!(second.as_deref(), Some("clipboard"));
         assert_eq!(reads.get(), 1);
+    }
+
+    #[test]
+    fn clipboard_reads_follow_the_configured_policy_and_ask_once_per_drain() {
+        let asks = Cell::new(0);
+        let ask = |answer| {
+            asks.set(asks.get() + 1);
+            answer
+        };
+        assert!(!ClipboardTextCache::new(ClipboardReadPolicy::Deny).read_permitted(|| ask(true)));
+        assert!(ClipboardTextCache::new(ClipboardReadPolicy::Allow).read_permitted(|| ask(false)));
+        assert_eq!(asks.get(), 0);
+
+        let mut cache = ClipboardTextCache::new(ClipboardReadPolicy::Ask);
+        assert!(!cache.read_permitted(|| ask(false)));
+        assert!(!cache.read_permitted(|| ask(true)));
+        assert_eq!(asks.get(), 1);
     }
 
     #[test]

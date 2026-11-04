@@ -31,6 +31,13 @@ pub(crate) struct SpawnConfig {
     pub(crate) environment: Vec<(String, String)>,
 }
 
+/// How a PTY child ended: an exit code, or the signal that terminated it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChildExit {
+    pub(crate) code: Option<i32>,
+    pub(crate) signal: Option<i32>,
+}
+
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 mod unix;
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
@@ -152,5 +159,71 @@ mod tests {
         exit_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("shell should finish after final output");
+    }
+}
+
+/// Variables describing the terminal or multiplexer that launched Termy (for
+/// example from an IDE or tmux). A shell inside Termy is in neither, and tools
+/// such as tmux and editors misbehave when they believe otherwise. `COLORTERM`
+/// and `TERM_PROGRAM_VERSION` are Termy's own to set (or omit when configured
+/// off), so an inherited value must not leak through either. The same holds
+/// for the variables of Termy's own session host, which sets them per pane.
+pub(crate) fn belongs_to_parent_terminal(name: &std::ffi::OsStr) -> bool {
+    const NAMES: &[&str] = &[
+        "TMUX",
+        "TMUX_PANE",
+        "TERMY_MUX_DIR",
+        "TERMY_MUX_PANE",
+        "STY",
+        "WINDOW",
+        "ZELLIJ",
+        "ZELLIJ_SESSION_NAME",
+        "ZELLIJ_PANE_ID",
+        "KITTY_WINDOW_ID",
+        "KITTY_PID",
+        "KITTY_LISTEN_ON",
+        "KITTY_PUBLIC_KEY",
+        "KITTY_INSTALLATION_DIR",
+        "ITERM_SESSION_ID",
+        "ITERM_PROFILE",
+        // iTerm2 sets these (and ssh forwards LC_*), advertising its image protocol.
+        "LC_TERMINAL",
+        "LC_TERMINAL_VERSION",
+        "TERM_SESSION_ID",
+        "WT_SESSION",
+        "WT_PROFILE_ID",
+        "ALACRITTY_WINDOW_ID",
+        "ALACRITTY_SOCKET",
+        "ALACRITTY_LOG",
+        "WEZTERM_PANE",
+        "WEZTERM_UNIX_SOCKET",
+        "WEZTERM_EXECUTABLE",
+        "WEZTERM_EXECUTABLE_DIR",
+        "WEZTERM_CONFIG_DIR",
+        "WEZTERM_CONFIG_FILE",
+        "GHOSTTY_RESOURCES_DIR",
+        "GHOSTTY_BIN_DIR",
+        "GHOSTTY_SHELL_FEATURES",
+        "VTE_VERSION",
+        "KONSOLE_VERSION",
+        "KONSOLE_DBUS_SESSION",
+        "TERMINAL_EMULATOR",
+        "COLORTERM",
+        "TERM_PROGRAM_VERSION",
+        "COLUMNS",
+        "LINES",
+    ];
+    const PREFIX: &str = "VSCODE_";
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    // Windows environment names are case-insensitive.
+    if cfg!(windows) {
+        NAMES.iter().any(|known| known.eq_ignore_ascii_case(name))
+            || name
+                .get(..PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(PREFIX))
+    } else {
+        NAMES.contains(&name) || name.starts_with(PREFIX)
     }
 }

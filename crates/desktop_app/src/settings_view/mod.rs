@@ -1,14 +1,13 @@
 use crate::colors::TerminalColors;
 use crate::config::{self, AppConfig, SystemAppearance, system_appearance_from_window};
 use crate::text_input::{TextInputAlignment, TextInputElement, TextInputProvider, TextInputState};
-use crate::theme_store::{self, ThemeStoreAuthSession, ThemeStoreAuthUser, ThemeStoreTheme};
 use crate::ui::scrollbar::{self as ui_scrollbar, ScrollbarPaintStyle, ScrollbarRange};
 use gpui_kit::{
     AnyElement, AsyncApp, Bounds, Context, FocusHandle, Font, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, Pixels, Render, Rgba, ScrollAnchor, ScrollHandle, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, StyledImage, TextAlign, WeakEntity, Window,
-    WindowBackgroundAppearance, canvas, deferred, div, img, point, prelude::FluentBuilder, px, svg,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Render, Rgba, ScrollAnchor, ScrollHandle, ScrollWheelEvent, SharedString,
+    StatefulInteractiveElement, Styled, TextAlign, WeakEntity, Window, WindowBackgroundAppearance,
+    canvas, deferred, div, point, prelude::FluentBuilder, px, svg,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -50,24 +49,17 @@ use input_mode::KeyInputMode;
 const SIDEBAR_WIDTH: f32 = 208.0;
 // Section icons sit in a small tinted tile, the way macOS System Settings
 // colour-codes its sidebar; the glyph itself is smaller than the tile.
-const SIDEBAR_ICON_SIZE: f32 = 14.0;
-const SIDEBAR_ICON_TILE_SIZE: f32 = 24.0;
-const SIDEBAR_ICON_TILE_RADIUS: f32 = 6.0;
-const SIDEBAR_ITEM_HEIGHT: f32 = 34.0;
-const SIDEBAR_ITEM_RADIUS: f32 = 8.0;
+const SIDEBAR_ICON_SIZE: f32 = 12.0;
+const SIDEBAR_ICON_TILE_SIZE: f32 = 20.0;
+const SIDEBAR_ICON_TILE_RADIUS: f32 = 5.0;
+const SIDEBAR_ITEM_HEIGHT: f32 = 28.0;
+const SIDEBAR_ITEM_RADIUS: f32 = 6.0;
 // Larger tile beside each section title so the content column echoes the
 // sidebar's colour coding.
 const SECTION_ICON_TILE_SIZE: f32 = 32.0;
 const SECTION_ICON_TILE_RADIUS: f32 = 9.0;
 const SECTION_ICON_SIZE: f32 = 18.0;
-// Knob travel when a switch flips; the just-toggled switch is the only one
-// animated so opening the window never sweeps every knob at once.
-const SETTINGS_SWITCH_ANIMATION_MS: u64 = 180;
 const SETTINGS_INPUT_FOCUS_RING_WIDTH: f32 = 3.0;
-// Accent bar marking the selected sidebar item; mirrors the active-tab and
-// command-palette selection indicators so the chrome speaks one language.
-const SIDEBAR_SELECTED_ACCENT_WIDTH: f32 = 2.0;
-const SIDEBAR_SELECTED_ACCENT_INSET_Y: f32 = 8.0;
 const SIDEBAR_GROUP_GAP: f32 = 16.0;
 const SIDEBAR_GROUP_LABEL_SIZE: f32 = 11.0;
 // Settings content is constrained and centered like native macOS System
@@ -86,22 +78,18 @@ const SETTINGS_SCROLLBAR_TRACK_ALPHA: f32 = 0.10;
 const SETTINGS_SCROLLBAR_THUMB_ALPHA: f32 = 0.42;
 const SETTINGS_SCROLLBAR_THUMB_ACTIVE_ALPHA: f32 = 0.58;
 const SETTINGS_OVERLAY_PANEL_ALPHA_FLOOR_RATIO: f32 = 0.72;
-const SETTINGS_SWITCH_WIDTH: f32 = 38.0;
-const SETTINGS_SWITCH_HEIGHT: f32 = 22.0;
-const SETTINGS_SWITCH_KNOB_SIZE: f32 = 18.0;
 const SETTINGS_SEARCH_PREVIEW_LIMIT: usize = 6;
 const SETTINGS_SLIDER_VALUE_WIDTH: f32 = 60.0;
 const SETTINGS_OPACITY_STEP_RATIO: f32 = 0.05;
 const SETTINGS_CONTROL_INNER_PADDING: f32 = 8.0;
 const SETTINGS_OPACITY_CONTROL_GAP: f32 = 6.0;
-const SETTINGS_CARD_RADIUS: f32 = 12.0;
+const SETTINGS_CARD_RADIUS: f32 = 10.0;
 const SETTINGS_INPUT_RADIUS: f32 = 7.0;
 const SETTINGS_BUTTON_RADIUS: f32 = 6.0;
-const SETTINGS_SWITCH_RADIUS: f32 = 11.0;
 // Section title and subtitle sizes now live in `crate::design_system::metrics`.
 const CARD_GAP: f32 = 22.0;
-const CARD_ROW_PADDING_X: f32 = 16.0;
-const CARD_ROW_PADDING_Y: f32 = 11.0;
+const CARD_ROW_PADDING_X: f32 = 12.0;
+const CARD_ROW_PADDING_Y: f32 = 9.0;
 const CONTENT_GUTTER_X: f32 = 32.0;
 const CONTENT_GUTTER_Y: f32 = 24.0;
 static NEXT_BACKGROUND_OPACITY_PREVIEW_OWNER_ID: AtomicU64 = AtomicU64::new(1);
@@ -111,7 +99,6 @@ pub(crate) enum SettingsSection {
     Terminal,
     Ssh,
     Tabs,
-    ThemeStore,
     Plugins,
     Advanced,
     Colors,
@@ -152,9 +139,6 @@ pub struct SettingsWindow {
     sidebar_search_selecting: bool,
     sidebar_search_cache_query: String,
     sidebar_search_match_cache: HashSet<&'static str>,
-    theme_store_search_state: TextInputState,
-    theme_store_search_active: bool,
-    theme_store_search_selecting: bool,
     search_navigation_last_target: Option<&'static str>,
     search_navigation_last_jump_at: Option<Instant>,
     capturing_action: Option<CommandId>,
@@ -168,21 +152,12 @@ pub struct SettingsWindow {
     hovered_setting_action: Option<SharedString>,
     hovered_reset_section: Option<SettingsSection>,
     // Switch that was toggled most recently, so only its knob animates.
-    switch_animation: Option<(SharedString, std::time::Instant)>,
     scroll_animation_token: u64,
     colors: TerminalColors,
     system_appearance: SystemAppearance,
     appearance_subscription: Option<gpui_kit::Subscription>,
     last_window_background_appearance: Option<WindowBackgroundAppearance>,
-    theme_store_themes: Vec<ThemeStoreTheme>,
-    theme_store_loaded: bool,
-    theme_store_loading: bool,
-    theme_store_error: Option<String>,
-    theme_store_from_cache: bool,
-    theme_store_auth_session: Option<ThemeStoreAuthSession>,
-    theme_store_auth_loading: bool,
-    theme_store_auth_error: Option<String>,
-    theme_store_installed_versions: HashMap<String, String>,
+    native_titlebar: crate::native_titlebar::NativeTitlebarTheme,
     plugin_runtime: PluginRuntime,
     installed_plugins: Vec<InstalledPlugin>,
     plugin_settings: BTreeMap<String, Vec<PluginSettingState>>,
@@ -259,9 +234,6 @@ impl SettingsWindow {
             sidebar_search_selecting: false,
             sidebar_search_cache_query: String::new(),
             sidebar_search_match_cache: HashSet::new(),
-            theme_store_search_state: TextInputState::new(String::new()),
-            theme_store_search_active: false,
-            theme_store_search_selecting: false,
             search_navigation_last_target: None,
             search_navigation_last_jump_at: None,
             capturing_action: None,
@@ -275,21 +247,12 @@ impl SettingsWindow {
             scrollbar_lane_bounds: None,
             hovered_setting_action: None,
             hovered_reset_section: None,
-            switch_animation: None,
             scroll_animation_token: 0,
             colors,
             system_appearance,
             appearance_subscription: None,
             last_window_background_appearance: None,
-            theme_store_themes: Vec::new(),
-            theme_store_loaded: false,
-            theme_store_loading: false,
-            theme_store_error: None,
-            theme_store_from_cache: false,
-            theme_store_auth_session: None,
-            theme_store_auth_loading: false,
-            theme_store_auth_error: None,
-            theme_store_installed_versions: theme_store::load_installed_theme_versions(),
+            native_titlebar: crate::native_titlebar::NativeTitlebarTheme::for_window(window),
             plugin_runtime,
             installed_plugins,
             plugin_settings: BTreeMap::new(),
@@ -375,313 +338,6 @@ impl SettingsWindow {
             self.colors = TerminalColors::from_config(&self.config, self.system_appearance);
             cx.notify();
         }
-    }
-
-    fn theme_store_api_base_url() -> String {
-        theme_store::theme_store_api_base_url()
-    }
-
-    fn theme_store_registry_url() -> String {
-        theme_store::theme_store_registry_url()
-    }
-
-    fn ensure_theme_store_themes_loaded(&mut self, cx: &mut Context<Self>) {
-        if self.theme_store_loaded || self.theme_store_loading {
-            return;
-        }
-        self.load_cached_theme_store_themes();
-        self.refresh_theme_store_themes(cx);
-    }
-
-    fn load_cached_theme_store_themes(&mut self) {
-        let registry_url = Self::theme_store_registry_url();
-        let Some(themes) = theme_store::load_cached_theme_store_themes(&registry_url) else {
-            return;
-        };
-        self.theme_store_themes = themes;
-        self.theme_store_loaded = true;
-        self.theme_store_error = None;
-        self.theme_store_from_cache = true;
-    }
-
-    fn refresh_theme_store_themes(&mut self, cx: &mut Context<Self>) {
-        if self.theme_store_loading {
-            return;
-        }
-
-        self.theme_store_loading = true;
-        self.theme_store_error = None;
-        self.theme_store_from_cache = false;
-        let registry_url = Self::theme_store_registry_url();
-
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { theme_store::fetch_theme_store_themes_blocking(&registry_url) })
-                .await;
-
-            let _ = cx.update(|cx| {
-                this.update(cx, |view, cx| {
-                    view.theme_store_loading = false;
-                    match result {
-                        Ok((themes, from_cache)) => {
-                            view.theme_store_themes = themes;
-                            view.theme_store_loaded = true;
-                            view.theme_store_error = None;
-                            view.theme_store_from_cache = from_cache;
-                        }
-                        Err(error) => {
-                            view.theme_store_loaded = true;
-                            if view.theme_store_themes.is_empty() {
-                                view.theme_store_error = Some(error);
-                                view.theme_store_from_cache = false;
-                            } else {
-                                log::warn!(
-                                    "Theme registry refresh failed; keeping cached themes: {error}"
-                                );
-                                view.theme_store_error = None;
-                                view.theme_store_from_cache = true;
-                            }
-                        }
-                    }
-                    cx.notify();
-                })
-            });
-        })
-        .detach();
-    }
-
-    fn install_theme_store_theme(&mut self, theme: ThemeStoreTheme, cx: &mut Context<Self>) {
-        let installed_slug = theme.slug.trim().to_ascii_lowercase();
-        let installed_version = theme.latest_version.clone().unwrap_or_default();
-        let loading_id = crate::ui::toast::loading(format!("Installing {}...", theme.name));
-
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { theme_store::install_theme_from_store_blocking(theme) })
-                .await;
-
-            crate::ui::toast::dismiss_toast(loading_id);
-
-            let _ = cx.update(|cx| {
-                this.update(cx, |view, cx| {
-                    match result {
-                        Ok(installed_theme) => {
-                            crate::ui::toast::success(installed_theme.message);
-                            view.theme_store_installed_versions
-                                .insert(installed_slug.clone(), installed_version.clone());
-                            if let Err(error) = theme_store::persist_installed_theme_versions(
-                                &view.theme_store_installed_versions,
-                            ) {
-                                log::error!("Failed to persist installed theme state: {error}");
-                            }
-                            let _ = view.reload_config_if_changed(cx);
-                            view.reload_theme_assets(cx);
-                            crate::app_actions::refresh_open_terminal_theme_assets(cx);
-                        }
-                        Err(error) => crate::ui::toast::error(error),
-                    }
-                    cx.notify();
-                })
-            });
-        })
-        .detach();
-    }
-
-    fn confirm_install_theme_store_theme(
-        &mut self,
-        theme: ThemeStoreTheme,
-        cx: &mut Context<Self>,
-    ) {
-        let title = "Install Theme";
-        let message = format!(
-            "Install theme \"{}\" into your local theme library?",
-            theme.name
-        );
-
-        cx.spawn(async move |this, cx: &mut AsyncApp| {
-            let confirmed = crate::native_sdk::confirm(title, &message);
-            if !confirmed {
-                return;
-            }
-
-            let _ = cx.update(|cx| {
-                this.update(cx, |view, cx| {
-                    view.install_theme_store_theme(theme.clone(), cx);
-                })
-            });
-        })
-        .detach();
-    }
-
-    fn uninstall_theme_store_theme(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let key = slug.trim().to_ascii_lowercase();
-        if key.is_empty() {
-            return;
-        }
-
-        if termy_core::themes::builtin_theme(&key).is_none() {
-            let reset = match config::reset_theme_references_in_config(&key) {
-                Ok(reset) => reset,
-                Err(error) => {
-                    log::error!("Failed to reset theme references during uninstall: {error}");
-                    crate::ui::toast::error("Failed to reset selected theme");
-                    return;
-                }
-            };
-            if reset.theme {
-                self.config.theme = config::SHELL_DECIDE_THEME_ID.to_string();
-            }
-            if reset.theme_light {
-                self.config.theme_light = "termy-light".to_string();
-            }
-            if reset.theme_dark {
-                self.config.theme_dark = "termy".to_string();
-            }
-        }
-
-        match theme_store::uninstall_installed_theme(&key) {
-            Ok(true) => {
-                self.theme_store_installed_versions.remove(&key);
-                let _ = self.reload_config_if_changed(cx);
-                self.reload_theme_assets(cx);
-                crate::app_actions::refresh_open_terminal_theme_assets(cx);
-                crate::ui::toast::success("Theme uninstalled");
-            }
-            Ok(false) => {
-                self.reload_theme_assets(cx);
-                crate::app_actions::refresh_open_terminal_theme_assets(cx);
-                crate::ui::toast::info("Theme is not installed");
-            }
-            Err(error) => {
-                log::error!("Failed to uninstall theme: {error}");
-                crate::ui::toast::error(error);
-            }
-        }
-    }
-
-    pub(crate) fn apply_theme_store_install(
-        &mut self,
-        slug: &str,
-        version: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.theme_store_installed_versions
-            .insert(slug.trim().to_ascii_lowercase(), version.to_string());
-        self.reload_theme_assets(cx);
-        cx.notify();
-    }
-
-    fn reload_theme_assets(&mut self, cx: &mut Context<Self>) {
-        self.colors = TerminalColors::from_config(&self.config, self.system_appearance);
-        cx.notify();
-    }
-
-    fn logout_theme_store_user(&mut self, cx: &mut Context<Self>) {
-        if self.theme_store_auth_loading {
-            return;
-        }
-        let Some(session) = self.theme_store_auth_session.clone() else {
-            return;
-        };
-
-        self.theme_store_auth_loading = true;
-        self.theme_store_auth_error = None;
-        let api_base = Self::theme_store_api_base_url();
-
-        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            let session_token = session.session_token.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    theme_store::logout_auth_session_blocking(&api_base, &session_token)?;
-                    theme_store::clear_auth_session()
-                })
-                .await;
-
-            let _ = cx.update(|cx| {
-                this.update(cx, |view, cx| {
-                    view.theme_store_auth_loading = false;
-                    match result {
-                        Ok(()) => {
-                            view.theme_store_auth_session = None;
-                            view.theme_store_auth_error = None;
-                            crate::ui::toast::success("Logged out from theme store");
-                        }
-                        Err(error) => {
-                            log::error!("Failed to logout from theme store: {error}");
-                            view.theme_store_auth_error = Some(error.clone());
-                            crate::ui::toast::error(error);
-                        }
-                    }
-                    cx.notify();
-                })
-            });
-        })
-        .detach();
-    }
-
-    fn theme_store_auth_display_name(user: &ThemeStoreAuthUser) -> String {
-        user.name
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| format!("@{}", user.github_login))
-    }
-
-    fn theme_store_auth_avatar_fallback_label(user: &ThemeStoreAuthUser) -> String {
-        user.github_login
-            .chars()
-            .next()
-            .map_or_else(|| "?".to_string(), |ch| ch.to_ascii_uppercase().to_string())
-    }
-
-    pub(super) fn open_url(url: &str) -> Result<(), String> {
-        #[cfg(target_os = "macos")]
-        {
-            if Command::new("open")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        #[cfg(target_os = "linux")]
-        {
-            if Command::new("xdg-open")
-                .arg(url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        #[cfg(target_os = "windows")]
-        {
-            if Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-
-        if webbrowser::open(url).is_ok() {
-            return Ok(());
-        }
-
-        Err(format!("Failed to open URL: {url}"))
     }
 
     fn apply_runtime_config(&mut self, config: AppConfig) -> bool {
@@ -884,59 +540,6 @@ impl SettingsWindow {
         true
     }
 
-    fn handle_theme_store_search_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.theme_store_search_active || self.active_input.is_some() {
-            return false;
-        }
-
-        if Self::cmd_only(event.keystroke.modifiers)
-            && event.keystroke.key.eq_ignore_ascii_case("a")
-        {
-            self.theme_store_search_state.select_all();
-            cx.notify();
-            return true;
-        }
-
-        match event.keystroke.key.as_str() {
-            "escape" => {
-                self.theme_store_search_active = false;
-                self.theme_store_search_selecting = false;
-                cx.notify();
-            }
-            "backspace" => {
-                self.theme_store_search_state.delete_backward();
-                cx.notify();
-            }
-            "delete" => {
-                self.theme_store_search_state.delete_forward();
-                cx.notify();
-            }
-            "left" => {
-                self.theme_store_search_state.move_left();
-                cx.notify();
-            }
-            "right" => {
-                self.theme_store_search_state.move_right();
-                cx.notify();
-            }
-            "home" => {
-                self.theme_store_search_state.move_to_start();
-                cx.notify();
-            }
-            "end" => {
-                self.theme_store_search_state.move_to_end();
-                cx.notify();
-            }
-            _ => {}
-        }
-
-        true
-    }
-
     fn handle_active_input_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         if self.ssh_input.is_some() {
             self.handle_ssh_input_key_down(event, cx);
@@ -1077,9 +680,6 @@ impl SettingsWindow {
             KeyInputMode::SidebarSearch => {
                 let _ = self.handle_sidebar_search_key_down(event, window, cx);
             }
-            KeyInputMode::ThemeStoreSearch => {
-                let _ = self.handle_theme_store_search_key_down(event, cx);
-            }
             KeyInputMode::ActiveInput => self.handle_active_input_key_down(event, cx),
             KeyInputMode::Idle => {}
         }
@@ -1102,8 +702,6 @@ impl TextInputProvider for SettingsWindow {
         settings_input.or({
             if self.sidebar_search_active {
                 Some(&self.sidebar_search_state)
-            } else if self.theme_store_search_active {
-                Some(&self.theme_store_search_state)
             } else {
                 None
             }
@@ -1125,8 +723,6 @@ impl TextInputProvider for SettingsWindow {
             settings_input
         } else if self.sidebar_search_active {
             Some(&mut self.sidebar_search_state)
-        } else if self.theme_store_search_active {
-            Some(&mut self.theme_store_search_state)
         } else {
             None
         }
@@ -1234,6 +830,7 @@ impl gpui_kit::EntityInputHandler for SettingsWindow {
 impl Render for SettingsWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_window_background_appearance(window);
+        self.native_titlebar.sync(&self.colors);
         // Components from `termy_ui` read their colors from a global, so refresh
         // it before building this frame's element tree.
         self.sync_ui_tokens(cx);
@@ -1292,15 +889,12 @@ impl Render for SettingsWindow {
                 if view.active_input.is_some()
                     || view.ssh_input.is_some()
                     || view.sidebar_search_active
-                    || view.theme_store_search_active
                     || view.capturing_action.is_some()
                 {
                     view.active_input = None;
                     view.ssh_input = None;
                     view.capturing_action = None;
                     view.blur_sidebar_search();
-                    view.theme_store_search_active = false;
-                    view.theme_store_search_selecting = false;
                     cx.notify();
                 }
             }))

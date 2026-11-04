@@ -104,6 +104,31 @@ fn ensure_config_file_watcher_started() {
 }
 
 pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigIoError> {
+    write_replacing(path, contents, true)
+}
+
+/// Like [`write_atomic`] but without `fsync`, for small state files written
+/// from the UI thread (such as window geometry) that are cheap to lose on a
+/// power failure. The temp-file rename still never leaves a torn file.
+pub(crate) fn write_atomic_unsynced(path: &Path, contents: &str) -> Result<(), ConfigIoError> {
+    write_replacing(path, contents, false)
+}
+
+fn write_replacing(path: &Path, contents: &str, sync: bool) -> Result<(), ConfigIoError> {
+    // Renaming over a symlink would replace the link itself with a regular
+    // file, detaching dotfile managers (stow, chezmoi, home-manager). Replace
+    // the file the link points to instead.
+    let resolved;
+    let path = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        resolved = fs::canonicalize(path).map_err(|source| ConfigIoError::WriteConfig {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        resolved.as_path()
+    } else {
+        path
+    };
     let parent = path
         .parent()
         .ok_or_else(|| ConfigIoError::InvalidConfigPath(path.to_path_buf()))?;
@@ -122,12 +147,14 @@ pub(crate) fn write_atomic(path: &Path, contents: &str) -> Result<(), ConfigIoEr
         path: path.to_path_buf(),
         source,
     })?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|source| ConfigIoError::WriteConfig {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    if sync {
+        temp.as_file()
+            .sync_all()
+            .map_err(|source| ConfigIoError::WriteConfig {
+                path: path.to_path_buf(),
+                source,
+            })?;
+    }
     temp.persist(path)
         .map_err(|error| ConfigIoError::PersistTempFile {
             path: path.to_path_buf(),
@@ -170,12 +197,68 @@ pub fn open_config_file() -> Result<(), ConfigIoError> {
 
     #[cfg(target_os = "windows")]
     {
-        run_open_command("cmd", &["/C", "start", ""], &path)?;
+        open_config_file_windows(&path)?;
     }
 
     Ok(())
 }
 
+/// `ShellExecuteW` "open" returns this when no app is registered for the type.
+#[cfg(target_os = "windows")]
+const SE_ERR_NOASSOC: isize = 31;
+
+/// Open `path` with its associated app. `ShellExecuteW` involves no shell, so
+/// cmd metacharacters in the path are harmless and no console window flashes.
+#[cfg(target_os = "windows")]
+fn open_config_file_windows(path: &Path) -> Result<(), ConfigIoError> {
+    match shell_execute_open(path.as_os_str()) {
+        Ok(()) => Ok(()),
+        // No app is registered for the config file type; notepad always exists.
+        Err(SE_ERR_NOASSOC) => {
+            Command::new("notepad.exe")
+                .arg(path)
+                .spawn()
+                .map_err(|source| ConfigIoError::LaunchOpenCommand {
+                    command: "notepad.exe",
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+            Ok(())
+        }
+        Err(code) => Err(ConfigIoError::LaunchOpenCommand {
+            command: "ShellExecuteW",
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("ShellExecuteW failed with code {code}")),
+        }),
+    }
+}
+
+/// Ask the Windows shell to "open" `target` (a file, folder, or URL) with the
+/// registered handler. Returns the `ShellExecuteW` result code on failure.
+#[cfg(target_os = "windows")]
+pub(crate) fn shell_execute_open(target: &std::ffi::OsStr) -> Result<(), isize> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let operation: Vec<u16> = "open".encode_utf16().chain(std::iter::once(0)).collect();
+    let file: Vec<u16> = target.encode_wide().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR::from_raw(operation.as_ptr()),
+            PCWSTR::from_raw(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as isize;
+    if code <= 32 { Err(code) } else { Ok(()) }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn run_open_command(
     command: &'static str,
     args: &[&str],
@@ -240,5 +323,31 @@ mod tests {
             })
             .collect();
         assert_eq!(entries, vec!["config.txt".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_symlinked_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dotfiles = dir.path().join("dotfiles");
+        std::fs::create_dir(&dotfiles).expect("create dotfiles dir");
+        let target = dotfiles.join("config.txt");
+        std::fs::write(&target, "theme = termy\n").expect("write target");
+        let link = dir.path().join("config.txt");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        write_atomic(&link, "theme = nord\n").expect("write through symlink");
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("link metadata")
+                .file_type()
+                .is_symlink(),
+            "config symlink was replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read target"),
+            "theme = nord\n"
+        );
     }
 }

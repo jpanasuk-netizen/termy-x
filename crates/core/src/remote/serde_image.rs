@@ -1,6 +1,7 @@
+use crate::KittyGraphicsRenderPlacement;
 use crate::terminal_engine::media::GraphicsImage;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 impl Serialize for GraphicsImage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -16,6 +17,38 @@ impl<'de> Deserialize<'de> for GraphicsImage {
     }
 }
 
+pub(crate) fn retain_png_exports(
+    placements: &[KittyGraphicsRenderPlacement],
+) -> HashMap<*const GraphicsImage, Arc<Vec<u8>>> {
+    let mut exports = HashMap::new();
+    for placement in placements {
+        exports
+            .entry(Arc::as_ptr(&placement.image))
+            .or_insert_with(|| placement.image.png());
+    }
+    exports
+}
+
+/// Preserve the legacy placement wire format while sharing a PNG export among
+/// every placement of an image for the duration of a serialization pass.
+pub(crate) mod placements {
+    use super::*;
+
+    pub fn serialize<S: Serializer>(
+        placements: &[KittyGraphicsRenderPlacement],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let _exports = retain_png_exports(placements);
+        placements.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<KittyGraphicsRenderPlacement>, D::Error> {
+        Vec::deserialize(deserializer)
+    }
+}
+
 fn validate_dimensions<E: Error>(width: u32, height: u32) -> Result<(), E> {
     if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 64 * 1024 * 1024 {
         return Err(E::custom("invalid terminal image dimensions"));
@@ -23,8 +56,9 @@ fn validate_dimensions<E: Error>(width: u32, height: u32) -> Result<(), E> {
     Ok(())
 }
 
-/// The negotiated graphics stream transfers decoded pixels once. Preserve the
-/// legacy PNG representation above for clients and hosts using protocol v1.
+/// The graphics stream (`Update::GraphicsState`) transfers decoded pixels
+/// once. The PNG representation above remains for `RemoteReply::Graphics`,
+/// the snapshot a `RemoteBackend` requests when its state carries no graphics.
 pub(crate) mod raw {
     use super::*;
 
@@ -59,9 +93,12 @@ pub(crate) mod raw {
         image: &Arc<GraphicsImage>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        let rgba = image.rgba();
-        let bytes = rgba.unwrap_or_else(|| image.png());
-        (image.width, image.height, rgba.is_some(), Bytes(bytes)).serialize(serializer)
+        if let Some(rgba) = image.rgba() {
+            (image.width, image.height, true, Bytes(rgba)).serialize(serializer)
+        } else {
+            let png = image.png();
+            (image.width, image.height, false, Bytes(png.as_slice())).serialize(serializer)
+        }
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(

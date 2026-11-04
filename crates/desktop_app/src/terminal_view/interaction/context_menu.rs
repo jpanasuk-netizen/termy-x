@@ -167,7 +167,7 @@ impl TerminalView {
         let Some(png) = selection
             .as_ref()
             .and_then(|selection| self.current_kitty_image_placement(selection))
-            .map(|placement| placement.image.png().clone())
+            .map(|placement| placement.image.png())
         else {
             let _ = self.close_terminal_context_menu(cx);
             return;
@@ -385,6 +385,18 @@ impl TerminalView {
         };
 
         self.open_tab_context_menu_with_native_anchor(tab_index, position, native_anchor, cx);
+    }
+
+    /// Opens the tab menu for a click that GPUI did not see (the WinUI strip
+    /// reports its own right-clicks).
+    #[cfg(target_os = "windows")]
+    pub(in super::super) fn open_tab_context_menu(
+        &mut self,
+        tab_index: usize,
+        position: gpui_kit::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_tab_context_menu_with_native_anchor(tab_index, position, None, cx);
     }
 
     fn open_tab_context_menu_with_native_anchor(

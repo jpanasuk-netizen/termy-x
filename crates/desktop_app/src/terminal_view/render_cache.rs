@@ -4,7 +4,6 @@ use crate::terminal_ui::{TerminalGridPaintCacheHandle, TerminalGridRows};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::terminal_view) struct KittyGraphicsRenderCacheKey {
     pub(in crate::terminal_view) graphics_revision: u64,
-    pub(in crate::terminal_view) terminal_generation: Option<u64>,
     pub(in crate::terminal_view) cols: usize,
     pub(in crate::terminal_view) rows: usize,
     pub(in crate::terminal_view) display_offset: usize,
@@ -41,6 +40,12 @@ pub(in crate::terminal_view) struct TerminalPaneRenderCache {
     pub(in crate::terminal_view) kitty_images: super::kitty_images::KittyImageCache,
     pub(in crate::terminal_view) kitty_placements: Vec<termy_core::KittyGraphicsRenderPlacement>,
     pub(in crate::terminal_view) kitty_placements_key: Option<KittyGraphicsRenderCacheKey>,
+    /// `tui_surface_background` inputs and result while `cells` are reused:
+    /// (TUI paints the border, configured background, surface background).
+    pub(in crate::terminal_view) surface_background: Option<(bool, gpui_kit::Rgba, gpui_kit::Rgba)>,
+    /// The pane's persisted buffer and the terminal content generation it was
+    /// extracted at. `clear` keeps it: it does not depend on render settings.
+    pub(in crate::terminal_view) persisted_buffer: Option<(u64, Option<String>)>,
 }
 
 impl TerminalPaneRenderCache {
@@ -54,6 +59,7 @@ impl TerminalPaneRenderCache {
         self.kitty_images.clear();
         self.kitty_placements.clear();
         self.kitty_placements_key = None;
+        self.surface_background = None;
     }
 }
 
@@ -90,6 +96,8 @@ mod tests {
             kitty_images: Default::default(),
             kitty_placements: Vec::new(),
             kitty_placements_key: None,
+            surface_background: None,
+            persisted_buffer: None,
         };
         cache.paint_cache.debug_seed_rows_for_tests(3);
         assert_eq!(cache.paint_cache.debug_row_cache_len_for_tests(), 3);

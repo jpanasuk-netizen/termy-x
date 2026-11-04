@@ -176,6 +176,7 @@ impl TerminalView {
             CommandAction::Quit => {
                 self.execute_quit_command_action(action, window, cx);
             }
+            CommandAction::ToggleTabBarVisibility if self.toggle_native_window_tab_bar(window) => {}
             CommandAction::ToggleTabBarVisibility => {
                 let next_visibility = if self.should_render_tab_strip_chrome() {
                     TabBarVisibility::ForceHidden
@@ -219,6 +220,8 @@ impl TerminalView {
             | CommandAction::ImportColors
             | CommandAction::AppInfo
             | CommandAction::OpenSettings
+            | CommandAction::NewWindow
+            | CommandAction::ReopenDetachedWindow
             | CommandAction::CheckForUpdates
             | CommandAction::ViewReleaseNotes => {
                 self.execute_app_system_command_action(action, cx);
@@ -369,6 +372,15 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.execute_command_action(CommandAction::CheckForUpdates, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_reopen_detached_window_action(
+        &mut self,
+        _: &commands::ReopenDetachedWindow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::ReopenDetachedWindow, true, window, cx);
     }
 
     pub(in super::super) fn handle_view_release_notes_action(

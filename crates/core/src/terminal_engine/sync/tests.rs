@@ -4,7 +4,7 @@ use super::*;
 fn scanner_stops_at_grouped_end_marker_and_refreshes_on_nested_begin() {
     let now = Instant::now();
     let mut update = SynchronizedUpdate::default();
-    update.begin(now);
+    update.begin(now, None);
     let later = now + Duration::from_millis(20);
     let result = update.push(b"frame\x1b[?2004;2026hmore\x1b[?25;2026lafter", later);
     assert!(result.commit);
@@ -22,7 +22,7 @@ fn scanner_matches_every_end_marker_split_boundary() {
     for split in 0..=bytes.len() {
         let now = Instant::now();
         let mut update = SynchronizedUpdate::default();
-        update.begin(now);
+        update.begin(now, None);
         let first = update.push(&bytes[..split], now);
         if !first.commit {
             let second = update.push(&bytes[split..], now);
@@ -37,7 +37,7 @@ fn scanner_matches_every_end_marker_split_boundary() {
 fn malformed_and_cancelled_markers_do_not_end_buffering() {
     let now = Instant::now();
     let mut update = SynchronizedUpdate::default();
-    update.begin(now);
+    update.begin(now, None);
     for bytes in [
         b"\x1b[2026l".as_slice(),
         b"\x1b[?2026:1l",
@@ -50,30 +50,38 @@ fn malformed_and_cancelled_markers_do_not_end_buffering() {
 }
 
 #[test]
-fn oversized_string_embedded_marker_is_discarded_until_st() {
-    let now = Instant::now();
-    let mut update = SynchronizedUpdate::default();
-    update.begin(now);
-    assert!(!update.push(b"\x1b_", now).commit);
-    assert!(!update.push(&vec![b'x'; 64 * 1024 + 1], now).commit);
-    assert!(!update.push(b"\x1b[?2026l", now).commit);
-    assert!(update.push(b"\x1b\\\x1b[?2026l", now).commit);
+fn oversized_string_isolates_escapes_until_a_csi_end_marker() {
+    for introducer in [b"\x1b]", b"\x1bP"] {
+        let now = Instant::now();
+        let mut update = SynchronizedUpdate::default();
+        update.begin(now, None);
+        assert!(!update.push(introducer, now).commit);
+        assert!(!update.push(&vec![b'x'; 64 * 1024 + 1], now).commit);
+        assert!(!update.push(b"\x1b]\x1bP\x1b\n", now).commit);
+        assert!(update.push(b"\x1b[?2026l", now).commit);
+    }
 }
 
 #[test]
-fn byte_budget_commits_at_exact_bound_and_reuses_allocation() {
+fn byte_budget_commits_at_exact_bound_and_releases_most_of_the_buffer() {
     let now = Instant::now();
     let mut update = SynchronizedUpdate::default();
-    update.begin(now);
+    update.begin(now, None);
     let bytes = vec![b'x'; MAX_SYNC_BYTES + 100];
     let result = update.push(&bytes, now);
     assert_eq!(result.consumed, MAX_SYNC_BYTES);
     assert!(result.commit);
     assert!(update.bytes.capacity() <= MAX_SYNC_BYTES);
     let buffer = update.take_buffer().unwrap();
+    update.recycle_buffer(buffer);
+    assert!(update.bytes.capacity() <= RETAINED_SYNC_BYTES);
+    update.begin(now, None);
+    assert!(!update.push(b"small next frame", now).commit);
+    // A frame within the retained size reuses its buffer.
+    let buffer = update.take_buffer().unwrap();
     let allocation = buffer.as_ptr();
     update.recycle_buffer(buffer);
-    update.begin(now);
+    update.begin(now, None);
     assert!(!update.push(b"small next frame", now).commit);
     assert_eq!(update.bytes.as_ptr(), allocation);
 }
@@ -87,6 +95,7 @@ mod engine {
             Size { cols: 16, rows: 3 },
             Options {
                 scrollback_history: 20,
+                ..Default::default()
             },
         )
     }
@@ -104,6 +113,64 @@ mod engine {
         let mut bytes = Vec::new();
         engine.drain_replies(&mut bytes);
         bytes
+    }
+
+    #[test]
+    fn interrupted_large_apc_commits_at_each_end_marker_boundary() {
+        let ending = b"\x1b[?2026lEND\x1b[6n";
+        for split in 0..=ending.len() {
+            let now = Instant::now();
+            let mut engine = engine();
+            engine.feed_at(b"old\x1b[?2026h\r\x1b_G", now);
+            engine.feed_at(&vec![b'x'; 64 * 1024 + 1], now);
+            assert_eq!(text(&engine, 0), "old             ");
+            engine.feed_at(&ending[..split], now);
+            engine.feed_at(&ending[split..], now);
+            assert!(
+                engine.synchronized_update_deadline().is_none(),
+                "split {split}"
+            );
+            assert_eq!(text(&engine, 0), "END             ", "split {split}");
+            assert_eq!(replies(&mut engine), b"\x1b[1;4R", "split {split}");
+        }
+    }
+
+    #[test]
+    fn restoring_saved_disabled_sync_mode_commits_every_fragmentation() {
+        let ending = b"\x1b[?2026rEND";
+        for split in 0..=ending.len() {
+            let now = Instant::now();
+            let mut engine = engine();
+            engine.feed_at(b"old\x1b[?2026s\x1b[?2026h\r", now);
+            engine.feed_at(&ending[..split], now);
+            engine.feed_at(&ending[split..], now);
+            assert!(
+                engine.synchronized_update_deadline().is_none(),
+                "split {split}"
+            );
+            assert_eq!(text(&engine, 0), "END             ", "split {split}");
+        }
+    }
+
+    #[test]
+    fn saves_inside_sync_batches_replace_the_scanners_prior_saved_mode() {
+        let now = Instant::now();
+        let mut engine = engine();
+        engine.feed_at(b"old\x1b[?2026s\x1b[?2026h\rnew\x1b[?2026s", now);
+        // Saving while active overwrites the disabled state inherited at begin.
+        for byte in b"\x1b[?2026r" {
+            engine.feed_at(&[*byte], now);
+        }
+        assert!(engine.synchronized_update_deadline().is_some());
+        assert_eq!(text(&engine, 0), "old             ");
+        engine.feed_at(b"\x1b[?2026l", now);
+        assert_eq!(text(&engine, 0), "new             ");
+        // The authoritative parser must retain that same saved enabled state.
+        engine.feed_at(b"\x1b[?2026r\rnext", now);
+        assert!(engine.synchronized_update_deadline().is_some());
+        assert_eq!(text(&engine, 0), "new             ");
+        engine.feed_at(b"\x1b[?2026l", now);
+        assert_eq!(text(&engine, 0), "next            ");
     }
 
     #[test]
@@ -152,7 +219,7 @@ mod engine {
         let mut whole = engine();
         whole.feed(bytes);
         let rows: Vec<_> = (0..3)
-            .map(|row| whole.viewport_row(row).unwrap().to_vec())
+            .map(|row| whole.viewport_row(row).unwrap().snapshot())
             .collect();
         let expected_replies = replies(&mut whole);
         for split in 0..=bytes.len() {
@@ -162,13 +229,26 @@ mod engine {
             assert_eq!(fragmented.cursor(), whole.cursor(), "split {split}");
             for (row, expected) in rows.iter().enumerate() {
                 assert_eq!(
-                    fragmented.viewport_row(row).unwrap(),
+                    &fragmented.viewport_row(row).unwrap().snapshot(),
                     expected,
                     "split {split}, row {row}"
                 );
             }
             assert_eq!(replies(&mut fragmented), expected_replies, "split {split}");
         }
+    }
+
+    #[test]
+    fn repeated_begin_markers_cannot_hold_output_past_the_maximum() {
+        let mut engine = engine();
+        let start = Instant::now();
+        engine.feed_at(b"\x1b[?2026hframe", start);
+        let mut now = start;
+        while now < start + SYNC_MAX_HOLD + SYNC_TIMEOUT {
+            now += Duration::from_millis(100);
+            engine.feed_at(b"\x1b[?2026h", now);
+        }
+        assert_eq!(text(&engine, 0), "frame           ");
     }
 
     #[test]
@@ -243,6 +323,38 @@ mod engine {
         assert_eq!(text(&engine, 0), "frame               ");
         assert_eq!(replies(&mut engine), b"\x1b[1;6R");
         assert!(engine.synchronized_update_deadline().is_none());
+    }
+
+    #[test]
+    fn resizing_to_the_current_size_keeps_the_update_and_the_open_grapheme() {
+        let mut engine = engine();
+        // A regional indicator pairs with the next one printed.
+        engine.feed("\u{1f1e9}".as_bytes());
+        let size = engine.size();
+        let generation = engine.generation();
+        engine.resize(size);
+        assert_eq!(engine.generation(), generation);
+        engine.feed("\u{1f1ea}".as_bytes());
+        assert_eq!(engine.viewport_row(0).unwrap().combining(0), "\u{1f1ea}");
+
+        engine.feed(b"\x1b[?2026hframe");
+        engine.resize(size);
+        assert!(engine.synchronized_update_deadline().is_some());
+    }
+
+    #[test]
+    fn a_large_update_does_not_pin_its_buffer() {
+        let mut engine = engine();
+        engine.feed(b"\x1b[?2026h");
+        engine.feed(&b"x".repeat(1024 * 1024));
+        engine.feed(b"\x1b[?2026l");
+        assert!(engine.synchronized_update.bytes.capacity() <= RETAINED_SYNC_BYTES);
+        // Small frames keep reusing theirs.
+        engine.feed(b"\x1b[?2026hsmall frame\x1b[?2026l");
+        let capacity = engine.synchronized_update.bytes.capacity();
+        assert_ne!(capacity, 0);
+        engine.feed(b"\x1b[?2026hsmall frame\x1b[?2026l");
+        assert_eq!(engine.synchronized_update.bytes.capacity(), capacity);
     }
 
     #[test]

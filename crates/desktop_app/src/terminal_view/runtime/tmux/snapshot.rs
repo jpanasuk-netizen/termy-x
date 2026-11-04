@@ -84,24 +84,48 @@ impl TerminalView {
         }
     }
 
-    fn hydrate_pane_terminal(
+    /// Capture every pane of `snapshot` that `existing_terminals` does not
+    /// already hold, in one batch (see `TmuxClient::capture_panes`).
+    fn capture_new_panes(
         tmux_client: &TmuxClient,
-        pane: &TmuxPaneState,
+        snapshot: &TmuxSnapshot,
+        existing_terminals: &std::collections::HashMap<String, Terminal>,
         options: TerminalOptions,
-        cell_size: Option<Size<Pixels>>,
-    ) -> (Terminal, Option<String>) {
-        let terminal =
-            Terminal::new_tmux(Self::terminal_size_for_pane_state(pane, cell_size), options);
-
+    ) -> std::collections::HashMap<String, anyhow::Result<Vec<u8>>> {
         // Always rebuild panes from full tmux history and let terminal content
         // define cursor state. Snapshot cursor coordinates can drift relative to
         // captured rows across attach/switch timing, so we do not inject cursor
         // position escapes during hydration.
         // Bound capture to local retention + current viewport so hydration keeps
         // user-visible context without paying unbounded tmux history costs.
-        let capture_rows =
-            Self::hydration_capture_row_budget(options.scrollback_history, pane.height);
-        let capture = tmux_client.capture_pane(&pane.id, capture_rows);
+        let requests = snapshot
+            .windows
+            .iter()
+            .flat_map(|window| &window.panes)
+            .filter(|pane| !existing_terminals.contains_key(&pane.id))
+            .map(|pane| {
+                (
+                    pane.id.as_str(),
+                    Self::hydration_capture_row_budget(options.scrollback_history, pane.height),
+                )
+            })
+            .collect::<Vec<_>>();
+        let captures = tmux_client.capture_panes(&requests);
+        requests
+            .iter()
+            .map(|(pane_id, _)| (*pane_id).to_string())
+            .zip(captures)
+            .collect()
+    }
+
+    fn hydrate_pane_terminal(
+        capture: anyhow::Result<Vec<u8>>,
+        pane: &TmuxPaneState,
+        options: TerminalOptions,
+        cell_size: Option<Size<Pixels>>,
+    ) -> (Terminal, Option<String>) {
+        let terminal =
+            Terminal::new_tmux(Self::terminal_size_for_pane_state(pane, cell_size), options);
 
         match capture {
             Ok(capture) => {
@@ -186,6 +210,12 @@ impl TerminalView {
             .terminal_runtime
             .term_options()
             .with_scrollback_history(hydration_scrollback_history);
+        let mut captures = Self::capture_new_panes(
+            &self.tmux_runtime().client,
+            &snapshot,
+            &existing_terminals,
+            hydration_options,
+        );
         for window in &snapshot.windows {
             let mut panes = Vec::new();
             for pane_state in &window.panes {
@@ -193,8 +223,11 @@ impl TerminalView {
                     if let Some(existing) = existing_terminals.remove(&pane_state.id) {
                         (existing, false, None)
                     } else {
+                        let capture = captures.remove(&pane_state.id).unwrap_or_else(|| {
+                            Err(anyhow::anyhow!("pane {} appears twice", pane_state.id))
+                        });
                         let (terminal, hydration_error) = Self::hydrate_pane_terminal(
-                            &self.tmux_runtime().client,
+                            capture,
                             pane_state,
                             hydration_options,
                             self.cached_cell_size_for_font_size(self.font_size),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::theme_store;
+use crate::theme_library;
 use gpui_kit::Modifiers;
 use gpui_kit::point;
 use state::{
@@ -238,6 +238,19 @@ impl TerminalView {
         Self::command_palette_core_command_items_for_state(capabilities)
     }
 
+    /// Commands that only make sense while the built-in multiplexer runs.
+    fn command_palette_multiplexer_items(&self, cx: &App) -> Option<CommandPaletteItem> {
+        self.multiplexer.as_ref()?;
+        let detached = crate::multiplexer::detached_windows(cx);
+        Some(CommandPaletteItem::command_with_state(
+            "Reopen Detached Window",
+            "restore closed window multiplexer background sessions running",
+            CommandAction::ReopenDetachedWindow,
+            detached > 0,
+            (detached == 0).then_some("None detached"),
+        ))
+    }
+
     fn command_palette_items_for_mode(
         &mut self,
         mode: CommandPaletteMode,
@@ -247,6 +260,7 @@ impl TerminalView {
             CommandPaletteMode::Commands => {
                 let mut items =
                     Self::command_palette_command_items_for_state(self.command_capabilities());
+                items.extend(self.command_palette_multiplexer_items(cx));
                 items.push(CommandPaletteItem::manage_ssh_hosts());
                 let ssh_enabled = self.runtime_kind() == RuntimeKind::Native;
                 items.extend(
@@ -612,7 +626,7 @@ impl TerminalView {
     }
 
     fn command_palette_theme_items(&self) -> Vec<CommandPaletteItem> {
-        let theme_ids = theme_store::load_installed_theme_ids();
+        let theme_ids = theme_library::available_theme_ids();
 
         ordered_theme_ids_for_palette(theme_ids, &self.theme_id)
             .into_iter()
@@ -738,6 +752,8 @@ impl TerminalView {
         }
 
         let _ = self.close_terminal_context_menu(cx);
+        // Typing goes to the palette, not the AppKit search field.
+        self.release_native_search_focus();
         let was_open = self.command_palette.is_open();
         if !was_open {
             self.command_palette.reload_recents();
@@ -1766,7 +1782,11 @@ mod tests {
         });
         let (view, cx) =
             cx.add_window_view(|window, cx| TerminalView::new_for_window(window, cx, config, true));
-        cx.simulate_keystrokes("secondary-p");
+        cx.simulate_keystrokes(if cfg!(target_os = "windows") {
+            "ctrl-shift-p"
+        } else {
+            "secondary-p"
+        });
         cx.run_until_parked();
         view.read_with(cx, |view, _| assert!(view.is_command_palette_open()));
         cx.simulate_input("split");

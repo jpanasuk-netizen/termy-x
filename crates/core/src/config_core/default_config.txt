@@ -13,7 +13,7 @@ app_icon = default
 chrome_contrast = false
 # Enable automatic update checks
 auto_update = true
-# Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy.
+# Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy. Turning it off leaves running sessions in the background; run `termy mux shutdown` to end them.
 multiplexer_enabled = false
 # Enable tmux runtime integration
 tmux_enabled = false
@@ -67,6 +67,8 @@ tab_close_visibility = hover
 tab_width_mode = uniform
 # Where the tab bar is rendered: top strip or right sidebar
 tab_bar_position = top
+# native: macOS window tabs (applies to new windows) or the WinUI tab strip on Windows (opaque windows, after a restart); custom: Termy's tab strip
+tab_style = native
 # Show secondary+1..9 number badges on the first nine tabs while the secondary modifier is held
 tab_switch_modifier_hints = true
 # Hide the tab bar when only one tab is open
@@ -78,25 +80,27 @@ sidebar_width = 200
 # Show or hide the termy branding in the titlebar
 show_termy_in_titlebar = true
 # Preset shell used for new sessions on Windows
-windows_shell = cmd
+windows_shell = auto
 # Optional executable path used for new sessions; overrides the Windows shell preset on Windows
 shell = none
 # TERM value exposed to child applications
 term = xterm-256color
 # COLORTERM value exposed to child applications
 colorterm = truecolor
+# Terminal identity exposed to child applications: ghostty enables features such as Claude Code progress bars, termy reports Termy in tools like neofetch
+term_program = ghostty
 # Send macOS Option plus printable keys as escape-prefixed terminal Alt input
 macos_option_as_alt = false
-# Default startup window width in pixels
+# Startup window width in pixels before a window size has been saved
 window_width = 1280
-# Default startup window height in pixels
+# Startup window height in pixels before a window size has been saved
 window_height = 820
 # Remembered height in pixels of the developer inspector panel
 inspector_height = 280
 # Font family used in terminal UI
 # font_family = Menlo
 # Font family used for tabs, command palette, and settings UI (not the terminal cells)
-# ui_font_family = Menlo
+# ui_font_family = .SystemUIFont
 # Terminal font size in pixels
 font_size = 14
 # Terminal line height multiplier (0.8 to 2.5)
@@ -133,11 +137,13 @@ pane_focus_strength = 0.6
 copy_on_select = false
 # Show a toast when text is copied on select
 copy_on_select_toast = true
+# Whether programs may read the clipboard with OSC 52 (ask, allow, or deny)
+clipboard_read = ask
 # Show shortcut badges in command palette rows
 command_palette_show_keybinds = true
 # Enable OSC 133 shell integration for command lifecycle tracking
 shell_integration_enabled = true
-# Show progress from OSC 9;4 sequences in tab badges
+# Show OSC 9;4 progress bars and OSC 7501 program status badges
 progress_indicator_enabled = true
 
 # Keybindings (repeatable)

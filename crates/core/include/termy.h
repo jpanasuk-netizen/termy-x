@@ -21,6 +21,10 @@ typedef enum {
   /* A Rust panic was caught before it could unwind across the C ABI. */
   TERMY_FFI_PANICKED = 8,
   TERMY_FFI_INVALID_ARGUMENT = 9,
+  /* The snapshot was written by an incompatible format version. */
+  TERMY_FFI_UNSUPPORTED_SNAPSHOT_VERSION = 10,
+  /* The bytes are not a snapshot, or it is truncated or corrupt. */
+  TERMY_FFI_INVALID_SNAPSHOT = 11,
 } TermyFfiStatus;
 
 typedef enum {
@@ -36,6 +40,10 @@ typedef enum {
   TERMY_FFI_EVENT_SHELL_COMMAND_FINISHED = 10,
   TERMY_FFI_EVENT_PROGRESS = 11,
   TERMY_FFI_EVENT_WORKING_DIRECTORY = 12,
+  /* UTF-8 JSON array of OSC 7501 records in payload; replaces the prior snapshot. */
+  TERMY_FFI_EVENT_PROGRAM_STATUS = 13,
+  /* Keys or a paste were dropped because the program's input backlog is full. */
+  TERMY_FFI_EVENT_INPUT_DROPPED = 14,
 } TermyFfiEventKind;
 
 typedef enum {
@@ -226,6 +234,9 @@ typedef void (*TermyFfiProtocolReplyCallback)(
     TermyFfiUserData user_data,
     TermyFfiByteSlice reply);
 
+/* Placements of the same image in one batch share a single `png` buffer
+ * (same pointer). Never free it directly: termy_kitty_graphics_batch_free
+ * releases each buffer once. */
 typedef struct {
   uint64_t placement_serial;
   uint32_t image_id;
@@ -513,6 +524,9 @@ TermyFfiStatus termy_terminal_new_with_options(
     TermyFfiSize size,
     const TermyFfiTerminalOptions *options,
     TermyFfiTerminal **out_terminal);
+/* A terminal without a PTY, fed with termy_terminal_feed_output. Its wake
+ * channel fires when a synchronized update (?2026) times out and commits
+ * without further output, so hosts should render and drain replies then. */
 TermyFfiStatus termy_display_terminal_new(
     TermyFfiSize size,
     TermyFfiTerminal **out_terminal);
@@ -592,14 +606,13 @@ TermyFfiStatus termy_settings_set_color(
 TermyFfiStatus termy_settings_set_keybinds(
     const uint8_t *text_ptr,
     size_t text_len);
-TermyFfiStatus termy_settings_install_theme(
-    const uint8_t *slug_ptr,
-    size_t slug_len);
 TermyFfiStatus termy_cli_install(
     const uint8_t *shell_ptr,
     size_t shell_len,
     TermyFfiBytes *out_message);
 
+/* tmux control mode is unix-only; libtermy does not export it on Windows. */
+#ifndef _WIN32
 typedef struct {
   uint32_t kind;
   TermyFfiBytes pane_id;
@@ -627,12 +640,16 @@ TermyFfiStatus termy_tmux_control_poll(
     TermyFfiTmuxNotificationBatch *out_batch);
 TermyFfiStatus termy_tmux_control_notifications_free(
     TermyFfiTmuxNotificationBatch *batch);
+/* Runs one tmux command. A command containing a newline, carriage return or
+ * NUL returns TERMY_FFI_INVALID_ARGUMENT: tmux would run each line as its own
+ * command. Quote untrusted arguments before splicing them in. */
 TermyFfiStatus termy_tmux_control_send(
     TermyFfiTmuxControl *session,
     const uint8_t *command_ptr,
     size_t command_len,
     TermyFfiBytes *out_output);
 void termy_tmux_control_close(TermyFfiTmuxControl *session);
+#endif /* _WIN32 */
 
 TermyFfiStatus termy_settings_prettify_config(void);
 TermyFfiStatus termy_terminal_reload_default_config_colors(TermyFfiTerminal *terminal);
@@ -652,6 +669,49 @@ TermyFfiStatus termy_terminal_feed_output(
     TermyFfiTerminal *terminal,
     const uint8_t *bytes_ptr,
     size_t bytes_len);
+/* Display terminals: feed output and return every protocol reply queued so
+ * far (DA, DSR, DECRQM, color and status reports), synchronously and in the
+ * order the engine produced them, so a status report precedes a following
+ * DA reply. Replies otherwise wait for the protocol_reply_callback of
+ * termy_terminal_drain_events_with_clipboard. Free with termy_buffer_free;
+ * an empty result has a null pointer. Terminals with a PTY send replies to
+ * the child themselves and return none. */
+TermyFfiStatus termy_terminal_feed_output_with_replies(
+    TermyFfiTerminal *terminal,
+    const uint8_t *bytes_ptr,
+    size_t bytes_len,
+    TermyFfiBytes *out_replies);
+/* Replica mode for display terminals that mirror another terminal's output,
+ * which already answered: with replies disabled, queries are parsed and
+ * change no state, and every reply is dropped instead of queued. Enabled by
+ * default. */
+TermyFfiStatus termy_terminal_set_protocol_replies_enabled(
+    TermyFfiTerminal *terminal,
+    bool enabled);
+/* Full terminal state: screens and scrollback with cells, graphemes, styles,
+ * links and wrap flags; cursors, saved cursors, margins, tab stops, charsets,
+ * modes, kitty keyboard stacks, palette overrides, title stack, OSC 7
+ * directory and the parser's in-progress sequence. Versioned and
+ * little-endian; see crates/core/src/terminal_engine/snapshot.rs. Kitty
+ * graphics are included; queued events and replies are not. Decoding reads
+ * the current and every older snapshot version. Release the buffer like
+ * other returned bytes. Multiplexer-backed terminals return
+ * TERMY_FFI_INVALID_ARGUMENT. */
+TermyFfiStatus termy_terminal_snapshot_encode(
+    TermyFfiTerminal *terminal,
+    TermyFfiBytes *out_snapshot);
+/* A new display terminal holding a snapshot's state. Feeding it the bytes
+ * the original receives next leaves both in the same state. */
+TermyFfiStatus termy_terminal_snapshot_decode(
+    const uint8_t *snapshot_ptr,
+    size_t snapshot_len,
+    TermyFfiTerminal **out_terminal);
+/* Replace an existing terminal's state with a snapshot. The terminal keeps
+ * its configured query colors, default cursor style and cell size. */
+TermyFfiStatus termy_terminal_snapshot_restore(
+    TermyFfiTerminal *terminal,
+    const uint8_t *snapshot_ptr,
+    size_t snapshot_len);
 TermyFfiStatus termy_terminal_encode_key(
     TermyFfiTerminal *terminal,
     const TermyFfiKeystroke *keystroke,
@@ -664,6 +724,15 @@ TermyFfiStatus termy_terminal_encode_key_with_options(
 TermyFfiStatus termy_terminal_encode_mouse(
     TermyFfiTerminal *terminal,
     const TermyFfiMouseInput *input,
+    TermyFfiBytes *out_bytes);
+/* Encode pasted UTF-8 text for the program: line endings become Enter,
+ * control characters (C0 except tab, DEL, C1) are dropped so the paste cannot
+ * run commands or end the bracket early, and the text is wrapped in
+ * bracketed-paste markers when the program enabled mode 2004. */
+TermyFfiStatus termy_terminal_encode_paste(
+    TermyFfiTerminal *terminal,
+    const uint8_t *text_ptr,
+    size_t text_len,
     TermyFfiBytes *out_bytes);
 TermyFfiStatus termy_terminal_resize(TermyFfiTerminal *terminal, TermyFfiSize size);
 TermyFfiStatus termy_terminal_set_wakeup_enabled(
@@ -758,7 +827,9 @@ TermyFfiStatus termy_terminal_drain_events(
  * host must enforce its own clipboard permission policy using the request
  * permission fields. protocol_reply_callback receives reply bytes for
  * display-only terminals without an owned PTY; its byte slice is borrowed only
- * for that callback. No callback may re-enter the same terminal handle. */
+ * for that callback. A NULL protocol_reply_callback drops the queued replies
+ * without changing any other state. No callback may re-enter the same
+ * terminal handle. */
 TermyFfiStatus termy_terminal_drain_events_with_clipboard(
     TermyFfiTerminal *terminal,
     TermyFfiUserData user_data,

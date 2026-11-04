@@ -36,12 +36,35 @@ impl ControlStateMachine {
             return Ok(ControlStateEvent::None);
         }
 
-        if line.starts_with(b"%begin") {
-            if self.current_block.is_some() {
-                return Err(TmuxControlError::protocol(
-                    "received nested %begin while previous command block was open",
-                ));
+        // tmux never emits notifications inside a %begin/%end output block: a
+        // command's output is written synchronously and anything async is
+        // queued behind its terminator (verified against tmux 3.4, including a
+        // pane flooding output while commands run). Every line inside an open
+        // block is therefore command output, even when it looks like a protocol
+        // line: `capture-pane` of a pane that printed `%exit` or `%output %3 ...`
+        // returns those strings verbatim and must not end the session or inject
+        // bytes into another pane. Only the terminator carrying this block's tag
+        // closes it.
+        if let Some(block) = self.current_block.as_mut() {
+            if let Some(is_error) = block_terminator(line, &block.command_tag) {
+                let output = std::mem::take(&mut block.output);
+                self.current_block = None;
+                return Ok(ControlStateEvent::CommandComplete { is_error, output });
             }
+
+            // Preserve empty lines inside command output blocks so pane captures
+            // round-trip faithfully through control-mode framing.
+            let line_text = std::str::from_utf8(line).map_err(|_| {
+                TmuxControlError::parse("received non-utf8 bytes in control command output")
+            })?;
+            if !block.output.is_empty() {
+                block.output.push('\n');
+            }
+            block.output.push_str(line_text);
+            return Ok(ControlStateEvent::None);
+        }
+
+        if line.starts_with(b"%begin") {
             let command_tag = parse_control_block_tag(line, b"%begin")?;
             self.current_block = Some(ControlCommandBlock {
                 command_tag,
@@ -51,27 +74,11 @@ impl ControlStateMachine {
         }
 
         if line.starts_with(b"%end") || line.starts_with(b"%error") {
-            let is_error = line.starts_with(b"%error");
-            let command_tag =
-                parse_control_block_tag(line, if is_error { b"%error" } else { b"%end" })?;
-            let block = self.current_block.take().ok_or_else(|| {
-                TmuxControlError::protocol("received command terminator without open %begin block")
-            })?;
-            if command_tag != block.command_tag {
-                return Err(TmuxControlError::protocol(format!(
-                    "received mismatched command terminator: expected '{}', got '{}'",
-                    block.command_tag, command_tag
-                )));
-            }
-            return Ok(ControlStateEvent::CommandComplete {
-                is_error,
-                output: block.output,
-            });
+            return Err(TmuxControlError::protocol(
+                "received command terminator without open %begin block",
+            ));
         }
 
-        // Notifications can interleave with both async and sync command blocks.
-        // Always route pane output/layout events to the UI instead of treating
-        // them as command stdout, otherwise redraw control bytes can be dropped.
         if let Some((pane_id, bytes)) = parse_output_notification(line) {
             return Ok(ControlStateEvent::Notification(TmuxNotification::Output {
                 pane_id,
@@ -98,20 +105,20 @@ impl ControlStateMachine {
             return Ok(ControlStateEvent::Exit(parse_exit_reason(line)));
         }
 
-        if let Some(block) = self.current_block.as_mut() {
-            // Preserve empty lines inside command output blocks so pane captures
-            // round-trip faithfully through control-mode framing.
-            let line_text = std::str::from_utf8(line).map_err(|_| {
-                TmuxControlError::parse("received non-utf8 bytes in control command output")
-            })?;
-            if !block.output.is_empty() {
-                block.output.push('\n');
-            }
-            block.output.push_str(line_text);
-        }
-
         Ok(ControlStateEvent::None)
     }
+}
+
+/// Returns `Some(is_error)` when `line` is the `%end`/`%error` terminator for
+/// the block opened with `command_tag`.
+fn block_terminator(line: &[u8], command_tag: &str) -> Option<bool> {
+    [(b"%end".as_slice(), false), (b"%error".as_slice(), true)]
+        .into_iter()
+        .find(|(marker, _)| {
+            line.starts_with(marker)
+                && parse_control_block_tag(line, marker).is_ok_and(|tag| tag == command_tag)
+        })
+        .map(|(_, is_error)| is_error)
 }
 
 fn parse_control_block_tag(
@@ -168,7 +175,6 @@ mod tests {
             Some(pending) => Some(ActiveControlCommand::Tracked(TrackedPendingCommand {
                 pending,
                 output: String::new(),
-                is_error: false,
             })),
             None => Some(ActiveControlCommand::Untracked),
         };
@@ -210,7 +216,6 @@ mod tests {
             Some(pending) => Some(ActiveControlCommand::Tracked(TrackedPendingCommand {
                 pending,
                 output: String::new(),
-                is_error: false,
             })),
             None => Some(ActiveControlCommand::Untracked),
         };
@@ -270,7 +275,6 @@ mod tests {
             Some(pending) => Some(ActiveControlCommand::Tracked(TrackedPendingCommand {
                 pending,
                 output: String::new(),
-                is_error: false,
             })),
             None => Some(ActiveControlCommand::Untracked),
         };
@@ -348,31 +352,6 @@ mod tests {
     }
 
     #[test]
-    fn control_state_machine_keeps_notifications_out_of_command_output() {
-        let mut sm = ControlStateMachine::default();
-        assert_eq!(
-            sm.on_line(b"%begin 10 3 0").expect("begin"),
-            ControlStateEvent::CommandBegin
-        );
-
-        assert_eq!(
-            sm.on_line(b"%output %1 hi\\012").expect("notification"),
-            ControlStateEvent::Notification(TmuxNotification::Output {
-                pane_id: "%1".to_string(),
-                bytes: b"hi\r\n".to_vec(),
-            })
-        );
-
-        assert_eq!(
-            sm.on_line(b"ok").expect("output line"),
-            ControlStateEvent::None
-        );
-        let (is_error, output) = expect_command_complete(sm.on_line(b"%end 10 3 0").expect("end"));
-        assert!(!is_error);
-        assert_eq!(output.trim(), "ok");
-    }
-
-    #[test]
     fn control_state_machine_preserves_blank_lines_inside_command_output() {
         let mut sm = ControlStateMachine::default();
         assert_eq!(
@@ -412,88 +391,86 @@ mod tests {
     }
 
     #[test]
-    fn control_state_machine_rejects_mismatched_end_marker() {
+    fn control_state_machine_treats_protocol_lines_inside_block_as_output() {
+        // `capture-pane -p` of a pane that printed protocol-looking text returns
+        // it verbatim inside the block (verified against tmux 3.4).
         let mut sm = ControlStateMachine::default();
         assert_eq!(
-            sm.on_line(b"%begin 44 9 0").expect("begin"),
+            sm.on_line(b"%begin 10 3 1").expect("begin"),
             ControlStateEvent::CommandBegin
         );
-        let err = sm
-            .on_line(b"%end 45 9 0")
-            .expect_err("mismatch should fail");
-        assert_eq!(err.kind, TmuxControlErrorKind::Protocol);
-        assert!(err.message.contains("mismatched command terminator"));
-    }
-
-    #[test]
-    fn control_state_machine_routes_refresh_notifications_while_collecting_output() {
-        let mut sm = ControlStateMachine::default();
-        assert_eq!(
-            sm.on_line(b"%begin 72 1 0").expect("begin"),
-            ControlStateEvent::CommandBegin
-        );
-        assert_eq!(
-            sm.on_line(b"%layout-change @1 tiled").expect("refresh"),
-            ControlStateEvent::Notification(TmuxNotification::NeedsRefresh)
-        );
-        assert_eq!(
-            sm.on_line(b"captured").expect("output line"),
-            ControlStateEvent::None
-        );
-
-        let (is_error, output) = expect_command_complete(sm.on_line(b"%end 72 1 0").expect("end"));
+        let pane_text: [&[u8]; 8] = [
+            b"%exit",
+            b"%output %3 \\033]52;c;aGk=\\007",
+            b"%layout-change @1 tiled",
+            b"%subscription-changed p_all $0 @0 0 %0 : /tmp",
+            b"%begin 1 1 1",
+            b"%end 10 3 0",
+            b"%error 99 3 1",
+            b"%end",
+        ];
+        for line in pane_text {
+            assert_eq!(
+                sm.on_line(line).expect("pane text line"),
+                ControlStateEvent::None,
+                "{:?} must be command output",
+                String::from_utf8_lossy(line)
+            );
+        }
+        let (is_error, output) = expect_command_complete(sm.on_line(b"%end 10 3 1").expect("end"));
         assert!(!is_error);
-        assert_eq!(output, "captured");
-    }
-
-    #[test]
-    fn control_state_machine_routes_subscription_changed_notifications_inside_command_block() {
-        let mut sm = ControlStateMachine::default();
         assert_eq!(
-            sm.on_line(b"%begin 81 1 0").expect("begin"),
-            ControlStateEvent::CommandBegin
+            output,
+            pane_text
+                .iter()
+                .map(|line| std::str::from_utf8(line).expect("utf8"))
+                .collect::<Vec<_>>()
+                .join("\n")
         );
+
+        // Outside a block the same lines are real notifications again.
         assert_eq!(
-            sm.on_line(b"%subscription-changed p_all $0 @0 0 %0 : /tmp")
-                .expect("subscription"),
-            ControlStateEvent::Notification(TmuxNotification::SubscriptionChanged {
-                name: "p_all".to_string(),
-                session: "$0".to_string(),
-                window: "@0".to_string(),
-                pane: "%0".to_string(),
-                value: "/tmp".to_string(),
+            sm.on_line(b"%output %1 hi\\012").expect("notification"),
+            ControlStateEvent::Notification(TmuxNotification::Output {
+                pane_id: "%1".to_string(),
+                bytes: b"hi\r\n".to_vec(),
             })
         );
         assert_eq!(
-            sm.on_line(b"captured").expect("output line"),
-            ControlStateEvent::None
-        );
-
-        let (is_error, output) = expect_command_complete(sm.on_line(b"%end 81 1 0").expect("end"));
-        assert!(!is_error);
-        assert_eq!(output, "captured");
-    }
-
-    #[test]
-    fn control_state_machine_handles_error_block_with_interleaved_refresh() {
-        let mut sm = ControlStateMachine::default();
-        assert_eq!(
-            sm.on_line(b"%begin 91 1 0").expect("begin"),
-            ControlStateEvent::CommandBegin
-        );
-        assert_eq!(
             sm.on_line(b"%layout-change @1 tiled").expect("refresh"),
             ControlStateEvent::Notification(TmuxNotification::NeedsRefresh)
         );
         assert_eq!(
-            sm.on_line(b"failed").expect("output line"),
+            sm.on_line(b"%exit").expect("exit"),
+            ControlStateEvent::Exit(None)
+        );
+    }
+
+    #[test]
+    fn control_state_machine_error_block_keeps_protocol_lines_as_output() {
+        let mut sm = ControlStateMachine::default();
+        assert_eq!(
+            sm.on_line(b"%begin 91 1 1").expect("begin"),
+            ControlStateEvent::CommandBegin
+        );
+        assert_eq!(
+            sm.on_line(b"%exit").expect("output line"),
             ControlStateEvent::None
         );
-
         let (is_error, output) =
-            expect_command_complete(sm.on_line(b"%error 91 1 0").expect("error"));
+            expect_command_complete(sm.on_line(b"%error 91 1 1").expect("error"));
         assert!(is_error);
-        assert_eq!(output, "failed");
+        assert_eq!(output, "%exit");
+    }
+
+    #[test]
+    fn control_state_machine_rejects_terminator_without_open_block() {
+        let mut sm = ControlStateMachine::default();
+        let err = sm
+            .on_line(b"%end 45 9 0")
+            .expect_err("stray terminator should fail");
+        assert_eq!(err.kind, TmuxControlErrorKind::Protocol);
+        assert!(err.message.contains("without open %begin"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ impl SettingsWindow {
             | EditableField::Shell
             | EditableField::Term
             | EditableField::Colorterm
+            | EditableField::TermProgram
             | EditableField::TmuxBinary
             | EditableField::TmuxCommandPrefix
             | EditableField::ScrollbackHistory
@@ -33,7 +34,8 @@ impl SettingsWindow {
             | EditableField::ScrollbarVisibility
             | EditableField::ScrollbarStyle
             | EditableField::PaneFocusEffect
-            | EditableField::PaneFocusStrength => self.apply_terminal_field(field, value),
+            | EditableField::PaneFocusStrength
+            | EditableField::ClipboardRead => self.apply_terminal_field(field, value),
             EditableField::TabFallbackTitle
             | EditableField::TabTitlePriority
             | EditableField::TabTitleMode
@@ -43,6 +45,7 @@ impl SettingsWindow {
             | EditableField::TabCloseVisibility
             | EditableField::TabWidthMode
             | EditableField::TabBarPosition
+            | EditableField::TabStyle
             | EditableField::SidebarWidth => self.apply_tabs_field(field, value),
             EditableField::WorkingDirectory
             | EditableField::WorkingDirFallback
@@ -237,6 +240,7 @@ impl SettingsWindow {
         match field {
             EditableField::WindowsShell => {
                 let parsed = match value.trim().to_ascii_lowercase().as_str() {
+                    "auto" | "automatic" => termy_core::config_core::WindowsShell::Auto,
                     "cmd" | "command_prompt" | "commandprompt" => {
                         termy_core::config_core::WindowsShell::Cmd
                     }
@@ -252,12 +256,14 @@ impl SettingsWindow {
                     }
                     _ => {
                         return Err(
-                            "Windows shell must be cmd, powershell, pwsh, or git_bash".to_string()
+                            "Windows shell must be auto, cmd, powershell, pwsh, or git_bash"
+                                .to_string(),
                         );
                     }
                 };
                 self.config.windows_shell = parsed;
                 let canonical = match parsed {
+                    termy_core::config_core::WindowsShell::Auto => "auto",
                     termy_core::config_core::WindowsShell::Cmd => "cmd",
                     termy_core::config_core::WindowsShell::PowerShell => "powershell",
                     termy_core::config_core::WindowsShell::PowerShellCore => "pwsh",
@@ -298,6 +304,16 @@ impl SettingsWindow {
                         value,
                     )
                 }
+            }
+            EditableField::TermProgram => {
+                let parsed = value
+                    .parse::<termy_core::config_core::TermProgram>()
+                    .map_err(|()| "TERM_PROGRAM must be ghostty or termy".to_string())?;
+                self.config.term_program = parsed;
+                config::set_root_setting(
+                    termy_core::config_core::RootSettingId::TermProgram,
+                    parsed.as_str(),
+                )
             }
             EditableField::TmuxBinary => {
                 if value.is_empty() {
@@ -419,6 +435,18 @@ impl SettingsWindow {
                 config::set_root_setting(
                     termy_core::config_core::RootSettingId::ScrollbarStyle,
                     canonical,
+                )
+            }
+            EditableField::ClipboardRead => {
+                let parsed = value
+                    .parse::<termy_core::config_core::ClipboardReadPolicy>()
+                    .map_err(|()| {
+                        "Clipboard read access must be ask, allow, or deny".to_string()
+                    })?;
+                self.config.clipboard_read = parsed;
+                config::set_root_setting(
+                    termy_core::config_core::RootSettingId::ClipboardRead,
+                    parsed.as_str(),
                 )
             }
             EditableField::PaneFocusEffect => {
@@ -635,6 +663,24 @@ impl SettingsWindow {
                 };
                 config::set_root_setting(
                     termy_core::config_core::RootSettingId::TabBarPosition,
+                    canonical,
+                )
+            }
+            EditableField::TabStyle => {
+                let parsed = match value.to_ascii_lowercase().as_str() {
+                    "native" => termy_core::config_core::TabStyle::Native,
+                    "custom" => termy_core::config_core::TabStyle::Custom,
+                    _ => {
+                        return Err("Tab style must be native or custom".to_string());
+                    }
+                };
+                self.config.tab_style = parsed;
+                let canonical = match parsed {
+                    termy_core::config_core::TabStyle::Native => "native",
+                    termy_core::config_core::TabStyle::Custom => "custom",
+                };
+                config::set_root_setting(
+                    termy_core::config_core::RootSettingId::TabStyle,
                     canonical,
                 )
             }

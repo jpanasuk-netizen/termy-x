@@ -1,8 +1,6 @@
 use super::GraphicsImage;
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
+use web_time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct GraphicsFrame {
@@ -74,6 +72,29 @@ impl GraphicsAnimation {
     pub fn byte_len(&self) -> usize {
         self.frames.iter().map(|frame| frame.image.byte_len()).sum()
     }
+
+    /// Playback state, loop count, completed loops and the next deadline.
+    pub(crate) fn playback(&self) -> (u32, Option<u32>, u32, Option<Instant>) {
+        (self.state, self.loops, self.completed_loops, self.deadline)
+    }
+
+    /// An animation with [`Self::playback`]'s state. `frames` must be
+    /// non-empty and `current` one of them.
+    pub(crate) fn from_playback(
+        frames: Vec<GraphicsFrame>,
+        current: usize,
+        (state, loops, completed_loops, deadline): (u32, Option<u32>, u32, Option<Instant>),
+    ) -> Self {
+        debug_assert!(current < frames.len());
+        Self {
+            frames,
+            current,
+            state,
+            loops,
+            completed_loops,
+            deadline,
+        }
+    }
     pub fn current_frame(&self) -> &GraphicsFrame {
         &self.frames[self.current]
     }
@@ -121,10 +142,11 @@ impl GraphicsAnimation {
                 .ok_or("EINVAL:animation frame has no decoded pixels")?
                 .to_vec()
         } else {
-            let color = update.background.to_be_bytes();
-            (0..u64::from(width) * u64::from(height))
-                .flat_map(|_| color)
-                .collect()
+            // Copy whole pixels, not one byte at a time through an iterator.
+            update
+                .background
+                .to_be_bytes()
+                .repeat(width as usize * height as usize)
         };
         let source = patch
             .rgba()
@@ -195,23 +217,56 @@ impl GraphicsAnimation {
         {
             return Err("EINVAL:overlapping composition in the same frame".into());
         }
-        let mut pixels = self.frames[destination]
-            .image
-            .rgba()
-            .ok_or("EINVAL:undecoded destination frame")?
-            .to_vec();
+        // A same-frame composition copies just its source rectangle (the
+        // frame can't be borrowed both ways); otherwise hold the source frame
+        // without touching the destination's reference count.
+        let (source_image, region) = if source == destination {
+            let pixels = image.rgba().ok_or("EINVAL:undecoded source frame")?;
+            let mut region = Vec::with_capacity(w as usize * h as usize * 4);
+            for row in command.source_y..command.source_y + h {
+                let start = (row as usize * width as usize + command.source_x as usize) * 4;
+                region.extend_from_slice(&pixels[start..start + w as usize * 4]);
+            }
+            (None, Some(region))
+        } else {
+            (Some(image.clone()), None)
+        };
+        let (source_pixels, source_width, source_origin) = match (&region, &source_image) {
+            (Some(region), _) => (region.as_slice(), w, (0, 0)),
+            (None, image) => (
+                image
+                    .as_deref()
+                    .and_then(GraphicsImage::rgba)
+                    .ok_or("EINVAL:undecoded source frame")?,
+                width,
+                (command.source_x, command.source_y),
+            ),
+        };
+        let frame = &mut self.frames[destination];
+        // Compose in place unless a snapshot or the stored image still holds
+        // this frame; only then copy it.
+        if Arc::get_mut(&mut frame.image).is_none() {
+            let pixels = frame
+                .image
+                .rgba()
+                .ok_or("EINVAL:undecoded destination frame")?
+                .to_vec();
+            frame.image = Arc::new(GraphicsImage::from_rgba(width, height, pixels));
+        }
+        let destination_pixels = Arc::get_mut(&mut frame.image)
+            .and_then(GraphicsImage::rgba_mut)
+            .ok_or("EINVAL:undecoded destination frame")?;
         composite(
-            &mut pixels,
+            destination_pixels,
             width,
-            image.rgba().ok_or("EINVAL:undecoded source frame")?,
-            width,
-            (command.source_x, command.source_y),
+            source_pixels,
+            source_width,
+            source_origin,
             (command.destination_x, command.destination_y),
             (w, h),
             command.replace,
         );
-        self.frames[destination].image = Arc::new(GraphicsImage::from_rgba(width, height, pixels));
-        self.frames[destination].generation = generation;
+        frame.generation = generation;
         Ok(())
     }
 

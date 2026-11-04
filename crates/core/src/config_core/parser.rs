@@ -7,11 +7,13 @@ use crate::config_core::constants::{
     SHELL_DECIDE_THEME_ID, VALID_SECTIONS,
 };
 use crate::config_core::diagnostics::{ConfigDiagnostic, ConfigDiagnosticKind, ConfigParseReport};
+use crate::config_core::document::strip_bom;
 use crate::config_core::schema::{RootSettingId, root_setting_from_key, root_setting_spec};
 use crate::config_core::types::{
-    AppConfig, AppearanceMode, CursorStyle, KeybindConfigLine, PaneFocusEffect, TabBarPosition,
-    TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode, TaskConfig,
-    TerminalScrollbarStyle, TerminalScrollbarVisibility, ThemeId, WindowsShell, WorkingDirFallback,
+    AppConfig, AppearanceMode, ClipboardReadPolicy, CursorStyle, KeybindConfigLine,
+    PaneFocusEffect, TabBarPosition, TabCloseVisibility, TabStyle, TabTitleMode, TabTitleSource,
+    TabWidthMode, TaskConfig, TermProgram, TerminalScrollbarStyle, TerminalScrollbarVisibility,
+    ThemeId, WindowsShell, WorkingDirFallback,
 };
 
 #[derive(Default)]
@@ -41,7 +43,8 @@ impl AppConfig {
         let mut seen_root_keys: HashMap<RootSettingId, usize> = HashMap::new();
         let mut task_entries: BTreeMap<String, PendingTaskConfig> = BTreeMap::new();
 
-        for (line_number, line) in contents.lines().enumerate() {
+        // Notepad and PowerShell 5 save UTF-8 with a byte-order mark.
+        for (line_number, line) in strip_bom(contents).lines().enumerate() {
             let line_number = line_number + 1;
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -554,6 +557,19 @@ impl AppConfig {
                         );
                     }
                 }
+                RootSettingId::TabStyle => {
+                    if let Some(parsed) = TabStyle::from_str(value) {
+                        config.tab_style = parsed;
+                    } else {
+                        push_invalid_value(
+                            &mut diagnostics,
+                            line_number,
+                            key,
+                            value,
+                            "one of: native, custom",
+                        );
+                    }
+                }
                 RootSettingId::TabSwitchModifierHints => {
                     if let Some(parsed) =
                         parse_bool_field(&mut diagnostics, line_number, key, value)
@@ -598,7 +614,7 @@ impl AppConfig {
                             line_number,
                             key,
                             value,
-                            "one of: cmd, powershell, git_bash",
+                            "one of: auto, cmd, powershell, pwsh, git_bash",
                         );
                     }
                 }
@@ -618,6 +634,19 @@ impl AppConfig {
                 }
                 RootSettingId::Colorterm => {
                     config.colorterm = parse_optional_string_value(value);
+                }
+                RootSettingId::TermProgram => {
+                    if let Ok(parsed) = value.parse::<TermProgram>() {
+                        config.term_program = parsed;
+                    } else {
+                        push_invalid_value(
+                            &mut diagnostics,
+                            line_number,
+                            key,
+                            value,
+                            "one of: ghostty, termy",
+                        );
+                    }
                 }
                 RootSettingId::MacosOptionAsAlt => {
                     if let Some(parsed) =
@@ -820,6 +849,19 @@ impl AppConfig {
                         parse_usize_field(&mut diagnostics, line_number, key, value)
                     {
                         config.inactive_tab_scrollback = Some(parsed.min(MAX_SCROLLBACK_HISTORY));
+                    }
+                }
+                RootSettingId::ClipboardRead => {
+                    if let Ok(parsed) = value.parse::<ClipboardReadPolicy>() {
+                        config.clipboard_read = parsed;
+                    } else {
+                        push_invalid_value(
+                            &mut diagnostics,
+                            line_number,
+                            key,
+                            value,
+                            "one of: ask, allow, deny",
+                        );
                     }
                 }
                 RootSettingId::PaneFocusEffect => {

@@ -1,23 +1,25 @@
 [workspace]
 members = [
-    "crates/core",
-    "crates/desktop_app",
-    "crates/cli",
-    "crates/x_core",
-    "crates/x_cli",
+  "crates/core",
+  "crates/desktop_app",
+  "crates/cli",
+  "crates/wasm",
+  "crates/pty",
+  "crates/engine_ffi",
+  "crates/x_core",
+  "crates/x_cli",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0"
 dirs = "6.0"
+dunce = "1"
 flume = "0.11"
 # Keep Termy's own controls and assets; Kit supplies GPUI and the native platforms.
 gpui-kit = { version = "=0.7.0", default-features = false }
 keyring = "4.1.1"
 log = "0.4"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-polling = "3.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -72,3 +74,11 @@ strip = "symbols"
 inherits = "release"
 debug = 1
 strip = "none"
+
+# Size-optimized wasm build for the @termysh/* npm packages.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

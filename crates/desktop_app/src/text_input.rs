@@ -26,7 +26,6 @@ pub struct TextInputState {
     last_line_layouts: Vec<Option<ShapedLine>>,
 }
 
-#[allow(dead_code)]
 impl TextInputState {
     pub fn new(text: String) -> Self {
         let mut state = Self {
@@ -54,10 +53,6 @@ impl TextInputState {
         self.selection_reversed = false;
         self.invalidate_layout();
         self.move_to_end();
-    }
-
-    pub fn clear(&mut self) {
-        self.set_text(String::new());
     }
 
     pub fn move_to_end(&mut self) {

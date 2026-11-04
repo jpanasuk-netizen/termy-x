@@ -32,13 +32,14 @@ fn writer_control_coalesces_to_the_latest_resize() {
         "all pending resize work should share one wake"
     );
     let mut applied = Vec::new();
-    assert!(
-        service_writer_control(&(), &writer.control, &mut |_, window_size| {
+    assert!(service_writer_control(
+        &(),
+        &writer.control,
+        &mut |_, window_size| {
             applied.push(window_size);
             Ok(())
-        })
-        .expect("resize control should apply")
-    );
+        }
+    ));
 
     assert_eq!(applied, vec![latest]);
 }
@@ -53,13 +54,14 @@ fn writer_control_reapplies_a_same_size_nudge() {
         writer
             .resize(window_size)
             .expect("same-size resize should queue");
-        assert!(
-            service_writer_control(&(), &writer.control, &mut |_, applied_size| {
+        assert!(service_writer_control(
+            &(),
+            &writer.control,
+            &mut |_, applied_size| {
                 applied.push(applied_size);
                 Ok(())
-            })
-            .expect("same-size resize should apply")
-        );
+            }
+        ));
     }
 
     assert_eq!(applied, vec![window_size, window_size]);
@@ -74,13 +76,14 @@ fn writer_control_close_is_sticky_and_cancels_pending_work() {
     writer.close();
 
     let mut resize_called = false;
-    assert!(
-        !service_writer_control(&(), &writer.control, &mut |_, _| {
+    assert!(!service_writer_control(
+        &(),
+        &writer.control,
+        &mut |_, _| {
             resize_called = true;
             Ok(())
-        })
-        .expect("close control should be readable")
-    );
+        }
+    ));
     assert!(!resize_called, "close should cancel the pending resize");
     assert!(writer.control.is_closed());
     assert_eq!(
@@ -295,7 +298,7 @@ fn protocol_reply_lane_survives_normal_saturation_and_is_bounded() {
 }
 
 #[test]
-fn unqueueable_reader_reply_closes_instead_of_being_dropped() {
+fn unqueueable_reader_reply_is_dropped_and_keeps_the_writer_open() {
     let (writer, _receiver) = WriterHandle::channel_with_all_limits(
         WriterLimits {
             max_bytes: 1,
@@ -306,8 +309,11 @@ fn unqueueable_reader_reply_closes_instead_of_being_dropped() {
             max_entries: 0,
         },
     );
-    assert!(!queue_reader_protocol_reply(&writer, b"reply".to_vec()));
-    assert!(writer.control.is_closed());
+    queue_reader_protocol_reply(&writer, b"reply".to_vec());
+    assert!(!writer.control.is_closed());
+    assert_eq!(writer.control.protocol_reply_backlog(), (0, 0));
+    writer.close();
+    queue_reader_protocol_reply(&writer, b"reply".to_vec());
     assert_eq!(writer.control.protocol_reply_backlog(), (0, 0));
 }
 
@@ -481,7 +487,7 @@ fn protocol_reply_preempts_a_blocked_normal_write_then_normal_fifo_resumes() {
 }
 
 #[test]
-fn protocol_reply_preempts_at_a_bounded_partial_write_boundary() {
+fn protocol_reply_waits_for_a_partial_write_to_finish() {
     let (writer, receiver) = WriterHandle::channel();
     writer
         .write_owned(b"normal-one".to_vec())
@@ -511,16 +517,17 @@ fn protocol_reply_preempts_at_a_bounded_partial_write_boundary() {
         |_, _| Ok(()),
     );
 
-    assert_eq!(sink.bytes, b"noreplyrmal-onenormal-two");
+    assert_eq!(sink.bytes, b"normal-onereplynormal-two");
     assert_eq!(control.backlog(), (0, 0));
     assert_eq!(control.protocol_reply_backlog(), (0, 0));
 }
 
 #[test]
-fn oversized_live_reader_reply_forces_a_bounded_session_shutdown() {
+fn unqueueable_live_reader_reply_is_dropped_without_ending_the_session() {
     const MARKER: &[u8] = b"TERMY_NATIVE_OVERSIZED_REPLY_READY";
 
     let (exit_tx, exit_rx) = mpsc::sync_channel(1);
+    let (echo_tx, echo_rx) = mpsc::sync_channel(1);
     let mut output = Vec::new();
     let mut replied = false;
     let terminal = Transport::spawn(
@@ -528,7 +535,8 @@ fn oversized_live_reader_reply_forces_a_bounded_session_shutdown() {
             program: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
-                "trap '' HUP; printf TERMY_NATIVE_OVERSIZED_REPLY_READY; exec sleep 30".to_string(),
+                "printf TERMY_NATIVE_OVERSIZED_REPLY_READY; read line; printf \"got:$line\""
+                    .to_string(),
             ],
             working_directory: None,
             environment: Vec::new(),
@@ -536,6 +544,9 @@ fn oversized_live_reader_reply_forces_a_bounded_session_shutdown() {
         test_size(),
         move |bytes| {
             output.extend_from_slice(bytes);
+            if output.windows(4).any(|part| part == b"got:") {
+                let _ = echo_tx.try_send(());
+            }
             if !replied && output.windows(MARKER.len()).any(|part| part == MARKER) {
                 replied = true;
                 vec![b'x'; MAX_PROTOCOL_REPLY_BACKLOG_BYTES + 1]
@@ -549,8 +560,82 @@ fn oversized_live_reader_reply_forces_a_bounded_session_shutdown() {
     )
     .expect("PTY should start before the oversized reply is generated");
 
+    assert!(
+        exit_rx.recv_timeout(Duration::from_millis(500)).is_err(),
+        "an unqueueable reply must not end the session"
+    );
+    terminal
+        .write_owned(b"still-alive\n".to_vec())
+        .expect("input should still reach the child");
+    echo_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("child should keep reading input");
     exit_rx
         .recv_timeout(Duration::from_secs(3))
-        .expect("unqueueable live reply should force child exit without deadlocking");
+        .expect("child should exit normally");
     drop(terminal);
+}
+
+#[test]
+fn mouse_motion_fills_only_half_the_backlog_and_leaves_room_for_keys() {
+    let (writer, _receiver) = WriterHandle::channel_with_limits(WriterLimits {
+        max_bytes: 8,
+        max_entries: 4,
+    });
+    writer.write_motion_owned(b"m1".to_vec()).unwrap();
+    writer.write_motion_owned(b"m2".to_vec()).unwrap();
+    let dropped = writer
+        .write_motion_owned(b"m3".to_vec())
+        .expect_err("motion past half the backlog is dropped");
+    assert_eq!(dropped.kind(), ErrorKind::WouldBlock);
+    assert_eq!(writer.control.backlog(), (4, 2));
+    writer.write_owned(b"k1".to_vec()).unwrap();
+    writer.write_owned(b"k2".to_vec()).unwrap();
+    assert_eq!(writer.control.backlog(), (8, 4));
+}
+
+#[test]
+fn waiting_on_a_hung_up_descriptor_fails_instead_of_spinning() {
+    // Close-on-exec, so a child that another test forks meanwhile doesn't
+    // keep the read end open.
+    let (read, write) = io::pipe().unwrap();
+    let write = File::from(std::os::fd::OwnedFd::from(write));
+    let (wake, _wake_sender) = signal_socket_pair().unwrap();
+    drop(read);
+    let started = Instant::now();
+    let result = wait_for_pty_writable(&write, &wake);
+    assert!(started.elapsed() < Duration::from_millis(500), "{result:?}");
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::BrokenPipe);
+}
+
+#[test]
+fn a_failed_resize_keeps_the_writer_running() {
+    let (writer, receiver) = WriterHandle::channel();
+    let control = writer.control.clone();
+    writer
+        .resize(WinSize::from(test_size()))
+        .expect("resize should queue");
+    writer
+        .write_owned(b"after".to_vec())
+        .expect("write should queue");
+    let protocol_replies = writer.protocol_replies.clone();
+    drop(writer);
+
+    let mut resizes = 0;
+    let sink = run_pty_writer_loop(
+        PartialWriter {
+            max_write: usize::MAX,
+            ..PartialWriter::default()
+        },
+        receiver,
+        control,
+        protocol_replies,
+        |_| Ok(()),
+        |_, _| {
+            resizes += 1;
+            Err(io::Error::from_raw_os_error(25))
+        },
+    );
+    assert_eq!(resizes, 1);
+    assert_eq!(sink.bytes, b"after");
 }

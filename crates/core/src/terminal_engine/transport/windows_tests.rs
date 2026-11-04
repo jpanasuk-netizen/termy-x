@@ -123,6 +123,15 @@ fn win32_abi_layouts_match_the_sdk() {
         mem::size_of::<ClosePseudoConsoleFn>(),
         mem::size_of::<usize>()
     );
+    if cfg!(target_pointer_width = "64") {
+        assert_eq!(mem::size_of::<JobObjectBasicLimitInformation>(), 64);
+        assert_eq!(mem::size_of::<JobObjectExtendedLimitInformation>(), 144);
+        assert_eq!(mem::size_of::<ProcessEntry32W>(), 568);
+    } else {
+        assert_eq!(mem::size_of::<JobObjectBasicLimitInformation>(), 40);
+        assert_eq!(mem::size_of::<ProcessEntry32W>(), 556);
+    }
+    assert_eq!(mem::size_of::<FileTime>(), 8);
 }
 
 #[test]
@@ -141,6 +150,117 @@ fn command_line_quotes_windows_backslashes_and_quotes() {
         decode_nul_terminated(&command),
         r#""C:\Program Files\shell.exe" plain "" "two words\\" "say \"hi\"""#
     );
+}
+
+#[test]
+fn command_processor_payload_after_s_c_is_passed_raw() {
+    let payload = r#"echo "two words" & dir "C:\Program Files\" | findstr x"#;
+    let command = command_processor_command_line(
+        "cmd.exe",
+        &[
+            "/D".to_string(),
+            "/S".to_string(),
+            "/C".to_string(),
+            payload.to_string(),
+        ],
+    )
+    .expect("cmd payload should encode");
+    assert_eq!(
+        decode_nul_terminated(&command),
+        format!(r#"cmd.exe /D /S /C "{payload}""#)
+    );
+
+    // Without `/S`, or with arguments after the command, cmd strips quotes
+    // differently, so normal quoting applies.
+    for args in [
+        vec!["/C".to_string(), r#"say "hi""#.to_string()],
+        vec![
+            "/S".to_string(),
+            "/C".to_string(),
+            "echo".to_string(),
+            "x y".to_string(),
+        ],
+    ] {
+        assert_eq!(
+            command_processor_command_line("cmd.exe", &args).unwrap(),
+            command_line("cmd.exe", &args).unwrap()
+        );
+    }
+    assert!(is_command_processor(Path::new(
+        r"C:\Windows\System32\CMD.EXE"
+    )));
+    assert!(!is_command_processor(Path::new(r"C:\tools\cmd.cmd")));
+}
+
+#[test]
+fn executable_lookup_follows_pathext_and_skips_extensionless_files() {
+    let directory = TestDirectory::new("pathext lookup");
+    let base = directory.path().join("tool");
+    fs::write(&base, "#!/bin/sh\n").unwrap();
+    fs::write(base.with_extension("cmd"), "@echo off\r\n").unwrap();
+    fs::write(base.with_extension("com"), "").unwrap();
+    let pathext = OsStr::new(".COM;.EXE;.BAT;.CMD");
+    assert_eq!(
+        executable_candidate(&base, pathext),
+        Some(base.with_extension("COM"))
+    );
+    assert_eq!(
+        executable_candidate(&base, OsStr::new(".EXE;.CMD")),
+        Some(base.with_extension("CMD"))
+    );
+    assert_eq!(executable_candidate(&base, OsStr::new(".EXE")), None);
+
+    let versioned = directory.path().join("tool.v2");
+    fs::write(&versioned, "").unwrap();
+    assert_eq!(
+        executable_candidate(&versioned, pathext),
+        Some(versioned.clone())
+    );
+    assert_eq!(
+        executable_candidate(&base.with_extension("cmd"), pathext),
+        Some(base.with_extension("cmd"))
+    );
+}
+
+#[test]
+fn image_subsystem_tells_console_programs_from_gui_programs() {
+    let test_binary = std::env::current_exe().expect("test binary path");
+    assert_eq!(
+        image_subsystem(&test_binary),
+        Some(IMAGE_SUBSYSTEM_WINDOWS_CUI)
+    );
+    assert_eq!(
+        cached_image_subsystem(&test_binary),
+        Some(IMAGE_SUBSYSTEM_WINDOWS_CUI)
+    );
+    let system_root =
+        std::env::var_os("SystemRoot").map_or_else(|| PathBuf::from("C:/Windows"), PathBuf::from);
+    let explorer = system_root.join("explorer.exe");
+    if explorer.is_file() {
+        assert_eq!(image_subsystem(&explorer), Some(2));
+    }
+    let directory = TestDirectory::new("not a pe image");
+    let text = directory.path().join("plain.exe");
+    fs::write(&text, "not an executable").unwrap();
+    assert_eq!(image_subsystem(&text), None);
+}
+
+#[test]
+fn new_job_lists_no_processes_and_skips_nothing_on_close() {
+    let job = JobObject::new().expect("job object should be created");
+    assert_eq!(
+        job.process_ids().expect("empty job should list"),
+        Vec::<Dword>::new()
+    );
+    job.terminate_console_processes(std::process::id());
+}
+
+#[test]
+fn foreground_descendant_name_reports_a_live_process() {
+    let name = foreground_descendant_name(std::process::id())
+        .expect("the test process should appear in a process snapshot");
+    assert!(name.to_ascii_lowercase().ends_with(".exe"), "{name}");
+    assert!(foreground_descendant_name(0xFFFF_FFFC).is_none());
 }
 
 #[test]
@@ -201,7 +321,22 @@ fn working_directory_is_lexically_absolute_and_rejects_namespaces() {
             .expect("ordinary absolute path should normalize"),
         PathBuf::from(r"C:\base\two")
     );
-    for path in [r"\\?\C:\work", r"\\.\C:\work", r"D:work"] {
+    for (verbatim, legacy) in [
+        (r"\\?\C:\work", r"C:\work"),
+        (r"\\?\UNC\server\share\work", r"\\server\share\work"),
+    ] {
+        assert_eq!(
+            normalize_absolute_path(Path::new(verbatim))
+                .expect("verbatim path with a legacy form should normalize"),
+            PathBuf::from(legacy)
+        );
+        assert_eq!(
+            normalize_working_directory(Some(Path::new(verbatim)))
+                .expect("verbatim working directory should normalize"),
+            Some(PathBuf::from(legacy))
+        );
+    }
+    for path in [r"\\.\C:\work", r"D:work", r"\\?\C:\work\..\x"] {
         let error = normalize_absolute_path(Path::new(path))
             .expect_err("unsafe or drive-relative path should fail");
         assert_eq!(error.kind(), ErrorKind::InvalidInput);
@@ -314,10 +449,8 @@ fn writer_harness_with_limits(
     protocol_reply_bytes: usize,
     protocol_reply_entries: usize,
 ) -> (WriterHandle, mpsc::Receiver<WriterCommand>) {
-    let state = Arc::new(ControlState::default());
-    let (sender, _receiver) = mpsc::sync_channel(1);
     WriterHandle::channel_with_limits(
-        ControlHandle { sender, state },
+        ControlHandle::new().expect("control event should be created"),
         write_bytes,
         write_entries,
         protocol_reply_bytes,
@@ -468,10 +601,10 @@ fn protocol_reply_lane_survives_normal_saturation_and_is_bounded() {
 }
 
 #[test]
-fn unqueueable_reader_reply_closes_instead_of_being_dropped() {
+fn unqueueable_reader_reply_is_dropped_and_keeps_the_writer_open() {
     let (writer, _receiver) = writer_harness_with_limits(1, 1, 0, 0);
-    assert!(!queue_reader_protocol_reply(&writer, b"reply".to_vec()));
-    assert!(writer.control.state.is_closed());
+    assert!(queue_reader_protocol_reply(&writer, b"reply".to_vec()));
+    assert!(!writer.control.state.is_closed());
     assert_eq!(writer.protocol_replies.budget.usage(), (0, 0));
 }
 
@@ -557,12 +690,7 @@ fn writer_and_control_wakes_coalesce_while_latest_resize_wins() {
         Ok(WriterCommand::Wake(_))
     ));
 
-    let state = Arc::new(ControlState::default());
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let control = ControlHandle {
-        sender,
-        state: state.clone(),
-    };
+    let control = ControlHandle::new().expect("control event should be created");
     for size in [
         Coord { x: 80, y: 24 },
         Coord { x: 100, y: 30 },
@@ -572,22 +700,44 @@ fn writer_and_control_wakes_coalesce_while_latest_resize_wins() {
             .request_resize(size)
             .expect("coalesced resize should succeed");
     }
-    assert!(matches!(receiver.try_recv(), Ok(ControlCommand::Wake)));
-    assert!(matches!(
-        receiver.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
-    assert_eq!(state.take_resize(), Some(Coord { x: 132, y: 44 }));
+    // SAFETY: The test owns the live event; zero-timeout waits never block.
+    assert_eq!(
+        unsafe { WaitForSingleObject(control.wake.0.raw(), 0) },
+        WAIT_OBJECT_0
+    );
+    assert_eq!(
+        unsafe { WaitForSingleObject(control.wake.0.raw(), 0) },
+        WAIT_TIMEOUT
+    );
+    assert_eq!(control.state.take_resize(), Some(Coord { x: 132, y: 44 }));
 
     for _ in 0..128 {
         control.close();
     }
-    assert!(state.is_closed());
-    assert!(matches!(receiver.try_recv(), Ok(ControlCommand::Wake)));
-    assert!(matches!(
-        receiver.try_recv(),
-        Err(mpsc::TryRecvError::Empty)
-    ));
+    assert!(control.state.is_closed());
+    assert_eq!(
+        unsafe { WaitForSingleObject(control.wake.0.raw(), 0) },
+        WAIT_OBJECT_0
+    );
+    assert_eq!(
+        unsafe { WaitForSingleObject(control.wake.0.raw(), 0) },
+        WAIT_TIMEOUT
+    );
+}
+
+#[test]
+fn control_wait_wakes_for_preexisting_requests_and_child_exit() {
+    // An event can stand in for a process's signaled kernel-handle state.
+    let process = ControlEvent::new().expect("process surrogate event should be created");
+    let control = ControlHandle::new().expect("control event should be created");
+    control.request_resize(Coord { x: 100, y: 30 }).unwrap();
+    assert!(!wait_for_control(&process.0, &control.wake).unwrap());
+    assert_eq!(control.state.take_resize(), Some(Coord { x: 100, y: 30 }));
+
+    process.signal().unwrap();
+    control.close();
+    assert!(wait_for_control(&process.0, &control.wake).unwrap());
+    assert!(!wait_for_control(&process.0, &control.wake).unwrap());
 }
 
 #[test]
@@ -613,6 +763,46 @@ fn conpty_delivers_final_child_output_before_exit_callback() {
         output_contains(&output, &marker),
         "the exit callback snapshot must contain the final output marker"
     );
+}
+
+#[test]
+fn reader_drains_final_output_when_the_reply_lane_is_already_closed() {
+    let (reader, output_writer) = create_pipe().expect("output pipe should open");
+    let (writer, _input_receiver) = writer_harness();
+    writer.close();
+    let (finished_sender, finished_receiver) = mpsc::channel();
+    finished_sender.send(()).unwrap();
+    let (exit_sender, exit_receiver) = mpsc::channel();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    let reader_thread = thread::spawn(move || {
+        run_reader(
+            reader,
+            &mut |bytes| {
+                reader_output.lock().unwrap().extend_from_slice(bytes);
+                b"terminal-query-reply".to_vec()
+            },
+            move || exit_sender.send(()).unwrap(),
+            writer,
+            finished_receiver,
+        );
+    });
+
+    // Exceed the reader's 32 KiB buffer so stopping after its first failed
+    // response necessarily loses later output, regardless of pipe chunking.
+    let mut expected = vec![b'x'; 128 * 1024];
+    expected.extend_from_slice(b"<FINAL-OUTPUT-MARKER>");
+    let mut remaining = expected.as_slice();
+    while !remaining.is_empty() {
+        let written = write_handle(&output_writer, remaining).expect("reader must keep draining");
+        remaining = &remaining[written..];
+    }
+    drop(output_writer);
+    exit_receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("exit should follow the complete output drain");
+    reader_thread.join().unwrap();
+    assert_eq!(*output.lock().unwrap(), expected);
 }
 
 #[test]
@@ -677,4 +867,16 @@ fn conpty_batch_wrapper_uses_the_normalized_working_directory() {
     let proof = fs::read_to_string(work.join("cwd-proof.txt"))
         .expect("batch file should write relative to the normalized cwd");
     assert_eq!(proof.trim(), marker);
+}
+
+#[test]
+fn parent_terminal_variables_match_case_insensitively() {
+    use crate::terminal_engine::transport::belongs_to_parent_terminal;
+    for name in ["wt_session", "Tmux", "vscode_injection", "ColorTerm"] {
+        assert!(
+            belongs_to_parent_terminal(std::ffi::OsStr::new(name)),
+            "{name}"
+        );
+    }
+    assert!(!belongs_to_parent_terminal(std::ffi::OsStr::new("Path")));
 }

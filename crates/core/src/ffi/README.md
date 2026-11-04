@@ -23,6 +23,18 @@ coordinates, margin clipping, and `next_frame_delay_ms` (zero means static).
 The PNG buffer remains independently owned and is released with the batch.
 Hosts must rebuild against the updated header; the placement struct ABI changed.
 
+Display terminals can mirror another terminal. `termy_terminal_snapshot_encode`
+and `termy_terminal_snapshot_decode`/`_restore` carry the engine's full state
+(see `terminal_engine/snapshot.rs`). `termy_terminal_set_protocol_replies_enabled`
+turns a display terminal into a replica that parses queries without answering,
+and `termy_terminal_feed_output_with_replies` returns replies synchronously, in
+the order the engine produced them. A NULL `protocol_reply_callback` drops
+queued replies without changing other state.
+
+The library is also built as a `staticlib`. Hosts that need only the engine,
+without the `native` feature's PTY, config, keyring, font and network code,
+link `libtermy_engine` from `crates/engine_ffi` instead.
+
 ## Validation
 
 ```sh

@@ -173,13 +173,6 @@ impl SearchResults {
             .get(&line)
             .is_some_and(|ranges| ranges_contain_col(ranges, col))
     }
-
-    pub fn matches_in_range(&self, min_line: i32, max_line: i32) -> Vec<&SearchMatch> {
-        self.matches
-            .iter()
-            .filter(|m| m.line >= min_line && m.line <= max_line)
-            .collect()
-    }
 }
 
 fn sort_and_merge_ranges(ranges: &mut Vec<(usize, usize)>) {

@@ -200,12 +200,15 @@ impl TerminalView {
             }));
 
         for index in 0..self.session.tabs.len() {
-            let (tab_title, pinned, progress_state) = {
+            let (tab_title, pinned, progress_state, program_status) = {
                 let tab = &self.session.tabs[index];
                 (
                     tab.title.clone(),
                     tab.pinned,
                     tab.aggregate_progress_state(),
+                    self.progress_indicator_enabled
+                        .then(|| tab.program_status_state())
+                        .flatten(),
                 )
             };
             let is_active = index == self.session.active_tab;
@@ -260,6 +263,7 @@ impl TerminalView {
             let available_text_px = Self::tab_title_text_area_width(
                 tab_row_width,
                 text_reserve_slot_width + icon_slot_width,
+                TAB_TEXT_PADDING_X,
             );
             let label = Self::format_tab_label_for_render_measured(
                 &tab_title,
@@ -290,6 +294,8 @@ impl TerminalView {
                     open_anim_progress: None,
                     hover_progress: self.tab_strip.hover_progress(index, now),
                     progress_state,
+                    program_status,
+                    show_trailing_separator: false,
                 },
                 font_family,
                 colors,

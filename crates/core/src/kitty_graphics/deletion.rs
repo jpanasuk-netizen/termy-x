@@ -1,3 +1,4 @@
+use super::placement::OriginResolver;
 use super::*;
 use std::collections::HashSet;
 
@@ -51,6 +52,7 @@ impl KittyGraphicsState {
                     .filter(|id| *id >= low && *id <= high),
             );
         }
+        let mut origins = OriginResolver::new(&self.placements, placeholders);
         let removed: HashSet<_> = self
             .placements
             .iter()
@@ -66,8 +68,7 @@ impl KittyGraphicsState {
                     'r' => placement.image_id >= low && placement.image_id <= high,
                     _ if matches!(placement.location, PlacementLocation::Virtual) => false,
                     _ => {
-                        let Some(origin) = self.resolve_render_origin(placement, placeholders)
-                        else {
+                        let Some(origin) = origins.resolve(placement) else {
                             return false;
                         };
                         let (top, origin_col) = match origin {
@@ -107,8 +108,7 @@ impl KittyGraphicsState {
             .map(|placement| placement.placement_serial)
             .collect();
         let before = self.placements.len();
-        self.placements
-            .retain(|placement| !removed.contains(&placement.placement_serial));
+        self.retain_placements(|placement| !removed.contains(&placement.placement_serial));
         self.remove_orphaned_relative_placements();
         if free {
             for id in ids {

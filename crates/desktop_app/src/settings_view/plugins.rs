@@ -811,6 +811,7 @@ impl SettingsWindow {
                 let toggle_key = key.clone();
                 self.render_switch(
                     SharedString::from(format!("plugin-setting-toggle-{plugin_id}-{key}")),
+                    title.clone(),
                     checked,
                     cx,
                     move |view, _, cx| {

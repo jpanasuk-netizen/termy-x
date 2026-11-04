@@ -1,5 +1,4 @@
 use super::*;
-use gpui_kit::AnimationExt as _;
 
 impl SettingsWindow {
     fn masked_secret_value(text: &str) -> String {
@@ -212,6 +211,32 @@ impl SettingsWindow {
         cx: &mut Context<Self>,
         on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> AnyElement {
+        self.render_badged_setting_row(
+            search_key,
+            id,
+            title,
+            None,
+            description,
+            checked,
+            cx,
+            on_toggle,
+        )
+    }
+
+    /// A switch row with an optional badge after the title, such as the
+    /// "Early Preview" mark on unfinished features.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_badged_setting_row(
+        &mut self,
+        search_key: &'static str,
+        id: &'static str,
+        title: &'static str,
+        badge: Option<crate::design_system::Badge>,
+        description: &'static str,
+        checked: bool,
+        cx: &mut Context<Self>,
+        on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
         let is_search_match = self.setting_matches_sidebar_query(search_key);
         let match_stripe = self.accent_with_alpha(0.85);
         let match_bg = self.accent_with_alpha(0.06);
@@ -243,7 +268,14 @@ impl SettingsWindow {
                     .min_w(px(0.0))
                     .flex_col()
                     .gap(px(1.0))
-                    .child(div().text_sm().text_color(self.text_primary()).child(title))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_sm().text_color(self.text_primary()).child(title))
+                            .children(badge),
+                    )
                     .child(
                         div()
                             .text_xs()
@@ -259,7 +291,7 @@ impl SettingsWindow {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(self.render_switch(id, checked, cx, on_toggle))
+                    .child(self.render_switch(id, title, checked, cx, on_toggle))
                     .child(self.render_reset_setting_button(search_key, cx)),
             );
 
@@ -284,93 +316,58 @@ impl SettingsWindow {
             cx,
             move |view, window, cx| {
                 let next = !checked;
-                match config::set_root_setting(setting, &next.to_string()) {
-                    Ok(()) => {
-                        let _ = view.reload_config_if_changed(cx);
-                        if setting == RootSettingId::SimpleMode && next {
-                            window.remove_window();
-                        }
-                        cx.notify();
-                    }
-                    Err(error) => crate::ui::toast::error(error),
+                if view.apply_root_bool_setting(setting, next, cx)
+                    && setting == RootSettingId::SimpleMode
+                    && next
+                {
+                    window.remove_window();
                 }
             },
         )
     }
 
+    /// Write a boolean root setting and reload the config. Returns false
+    /// (after showing the error) when the write fails.
+    pub(super) fn apply_root_bool_setting(
+        &mut self,
+        setting: RootSettingId,
+        value: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match config::set_root_setting(setting, &value.to_string()) {
+            Ok(()) => {
+                let _ = self.reload_config_if_changed(cx);
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                crate::ui::toast::error(error);
+                false
+            }
+        }
+    }
+
+    /// An `NSSwitch`, flipped on press. The thumb slides on the shared
+    /// switch curve; Reduce Motion snaps it.
     pub(super) fn render_switch(
         &self,
         id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
         checked: bool,
         cx: &mut Context<Self>,
         on_toggle: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
     ) -> impl IntoElement {
         let id: SharedString = id.into();
-        let accent = self.accent_with_alpha(0.95);
-        let mut bg_off = self.colors.foreground;
-        bg_off.a = 0.22;
-        let track_color = if checked { accent } else { bg_off };
-        let knob_color = self.contrasting_text_for_fill(track_color, self.bg_card());
-        let knob_top = (SETTINGS_SWITCH_HEIGHT - SETTINGS_SWITCH_KNOB_SIZE) * 0.5;
-        let knob_off_left = knob_top;
-        let knob_on_left = SETTINGS_SWITCH_WIDTH - SETTINGS_SWITCH_KNOB_SIZE - knob_top;
-        let knob_left_for = move |on_progress: f32| {
-            knob_off_left + (knob_on_left - knob_off_left) * on_progress.clamp(0.0, 1.0)
-        };
-        let resting_left = knob_left_for(if checked { 1.0 } else { 0.0 });
-
-        let knob = div()
-            .absolute()
-            .top(px(knob_top))
-            .left(px(resting_left))
-            .w(px(SETTINGS_SWITCH_KNOB_SIZE))
-            .h(px(SETTINGS_SWITCH_KNOB_SIZE))
-            .rounded_full()
-            .bg(knob_color)
-            .shadow_sm();
-
-        // Only the switch that was just flipped animates; every other knob
-        // renders at rest so the window never sweeps all of them on open.
-        let animation_window = std::time::Duration::from_millis(SETTINGS_SWITCH_ANIMATION_MS);
-        let is_animating = self
-            .switch_animation
-            .as_ref()
-            .is_some_and(|(anim_id, started)| {
-                *anim_id == id && started.elapsed() < animation_window
-            });
-        let knob: AnyElement = if is_animating {
-            knob.with_animation(
-                SharedString::from(format!("{id}-knob-{checked}")),
-                gpui_kit::Animation::new(animation_window).with_easing(gpui_kit::ease_out_quint()),
-                move |knob, delta| {
-                    let on_progress = if checked { delta } else { 1.0 - delta };
-                    knob.left(px(knob_left_for(on_progress)))
-                },
-            )
-            .into_any_element()
-        } else {
-            knob.into_any_element()
-        };
-
-        let anim_id = id.clone();
-        div()
-            .id(id)
-            .w(px(SETTINGS_SWITCH_WIDTH))
-            .h(px(SETTINGS_SWITCH_HEIGHT))
-            .rounded(px(SETTINGS_SWITCH_RADIUS))
-            .bg(track_color)
-            .cursor_pointer()
-            .relative()
-            .child(knob)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |view, _event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    view.switch_animation = Some((anim_id.clone(), std::time::Instant::now()));
+        let view = cx.entity().downgrade();
+        crate::ui::native::mac_switch(id, &self.native())
+            .checked(checked)
+            .accessibility_label(label)
+            .on_change(move |_, window, cx| {
+                let _ = view.update(cx, |view, cx| {
                     on_toggle(view, window, cx);
                     cx.notify();
-                }),
-            )
+                });
+            })
     }
 
     pub(super) fn active_dropdown_options(
@@ -1090,7 +1087,7 @@ impl SettingsWindow {
             .id("background-opacity-slider")
             .relative()
             .w(px(slider_width))
-            .h(px(SETTINGS_SWITCH_KNOB_SIZE))
+            .h(px(18.0))
             .cursor_pointer()
             .on_mouse_down(
                 MouseButton::Left,
@@ -1176,15 +1173,16 @@ impl SettingsWindow {
                     .bg(slider_fill),
             )
             .child(
+                // `NSSlider` knob: white, with the switch thumb's soft lift.
                 div()
                     .absolute()
-                    .top(px(2.0))
-                    .left(px(slider_thumb_left))
-                    .w(px(14.0))
-                    .h(px(14.0))
+                    .top(px(1.0))
+                    .left(px(slider_thumb_left - 1.0))
+                    .w(px(16.0))
+                    .h(px(16.0))
                     .rounded_full()
-                    .bg(self.accent())
-                    .shadow_sm(),
+                    .bg(gpui_kit::white())
+                    .shadow(self.native().lift_shadow()),
             )
             .into_any_element()
     }
@@ -1258,8 +1256,8 @@ impl SettingsWindow {
         let text_primary = self.text_primary();
         let text_secondary = self.text_secondary();
         let text_muted = self.text_muted();
-        let slider_track = self.bg_hover();
-        let slider_fill = self.accent_with_alpha(0.9);
+        let slider_track = self.native().track;
+        let slider_fill = self.accent();
         let slider_width = Self::background_opacity_slider_width();
         let slider_ratio = self.effective_background_opacity();
         let slider_fill_width = slider_ratio * slider_width;

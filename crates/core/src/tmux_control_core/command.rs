@@ -53,6 +53,16 @@ pub fn command_with_completion_token(command: &str, completion_token: &str) -> S
     )
 }
 
+/// True when `output` is exactly a completion-token line from some request.
+/// A request that failed fast on an error can leave its token behind (a failing
+/// command nested in `if-shell` doesn't stop the outer list), and that stray
+/// block must not be mistaken for output of the next request.
+pub fn is_control_completion_token(output: &str) -> bool {
+    output
+        .strip_prefix(CONTROL_COMPLETION_TOKEN_PREFIX)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 pub fn split_control_completion_token(output: &str, completion_token: &str) -> Option<String> {
     if output == completion_token {
         return Some(String::new());
@@ -147,6 +157,16 @@ mod tests {
         // In tmux's command language an unquoted `#` starts a comment, which
         // would silently discard format arguments such as subscriptions.
         assert_eq!(quote_tmux_arg("#{pane_id}"), "'#{pane_id}'");
+    }
+
+    #[test]
+    fn completion_token_detection_matches_only_whole_tokens() {
+        assert!(is_control_completion_token(&next_control_completion_token()));
+        assert!(!is_control_completion_token(
+            CONTROL_COMPLETION_TOKEN_PREFIX
+        ));
+        assert!(!is_control_completion_token("__termy_cmd_done_12\nmore"));
+        assert!(!is_control_completion_token("ok"));
     }
 
     #[test]

@@ -10,6 +10,7 @@ mod mouse;
 mod mouse_reporting;
 mod native_panes;
 mod pane_move;
+mod pane_resize;
 mod quit;
 mod scroll;
 mod selection;

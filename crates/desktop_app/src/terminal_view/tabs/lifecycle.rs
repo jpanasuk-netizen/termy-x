@@ -63,6 +63,9 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if let Some(handled) = self.execute_native_window_tab_action(action, window) {
+            return handled;
+        }
         match action {
             CommandAction::RenameTab => {
                 self.begin_rename_tab(self.session.active_tab, cx);
@@ -361,6 +364,30 @@ impl TerminalView {
         }
     }
 
+    /// Whether "+" would open the new-tab menu instead of adding a tab. The
+    /// Windows 11 tab style then shows a separate chevron for the menu.
+    pub(crate) fn new_tab_menu_has_choices(&self) -> bool {
+        should_show_new_tab_menu(
+            self.runtime_kind(),
+            cfg!(target_os = "windows"),
+            !self.saved_ssh_hosts.is_empty(),
+        )
+    }
+
+    /// Chevron next to "+" in the Windows 11 tab style: always the menu.
+    pub(crate) fn handle_new_tab_menu_button(
+        &mut self,
+        anchor: (f32, f32),
+        cx: &mut Context<Self>,
+    ) {
+        self.reload_saved_ssh_hosts();
+        if self.new_tab_menu_has_choices() {
+            self.toggle_new_tab_menu(anchor, cx);
+        } else {
+            self.add_tab(cx);
+        }
+    }
+
     pub(crate) fn toggle_new_tab_menu(&mut self, anchor: (f32, f32), cx: &mut Context<Self>) {
         if self.new_tab_menu_anchor.take().is_none() {
             self.new_tab_menu_anchor = Some(anchor);
@@ -600,26 +627,14 @@ impl TerminalView {
         );
         self.refresh_tab_title(new_tab_index);
         self.session.active_tab = new_tab_index;
-        if let Some(inactive_scrollback) = self.inactive_tab_scrollback {
-            let active_options = self.terminal_runtime.term_options();
-            let inactive_options = active_options.with_scrollback_history(inactive_scrollback);
-            if let Some(tab) = self.session.tabs.get(old_active_tab) {
-                for pane in &tab.panes {
-                    pane.terminal().set_term_options(inactive_options);
-                }
-            }
-            if let Some(tab) = self.session.tabs.get(new_tab_index) {
-                for pane in &tab.panes {
-                    pane.terminal().set_term_options(active_options);
-                }
-            }
-        }
+        self.sync_active_tab_scrollback(Some(old_active_tab));
         self.mark_tab_strip_layout_dirty();
         self.reset_tab_interaction_state();
         self.sync_tab_strip_for_active_tab();
         self.sync_plugin_lifecycle_state(false, cx);
         self.schedule_persist_native_workspace(cx);
         self.start_new_tab_animation(tab_id, cx);
+        self.schedule_native_window_tab_split(cx);
         cx.notify();
         true
     }
@@ -648,7 +663,10 @@ impl TerminalView {
         self.push_closing_tab_overlay(
             index,
             self.session.tabs[index].title.clone(),
-            Self::stable_tab_render_width(self.session.tabs[index].display_width),
+            Self::stable_tab_render_width(
+                self.session.tabs[index].display_width,
+                self.horizontal_tab_metrics().min_width,
+            ),
             index == self.session.active_tab,
             cx,
         );
@@ -668,6 +686,8 @@ impl TerminalView {
         } else if self.session.active_tab >= self.session.tabs.len() {
             self.session.active_tab = self.session.tabs.len() - 1;
         }
+        // The closed tab may have been the active one.
+        self.sync_active_tab_scrollback(None);
 
         match self.renaming_tab {
             Some(editing) if editing == index => {
@@ -700,9 +720,129 @@ impl TerminalView {
             && self.session.tabs.is_empty()
             && !self.has_other_workspaces()
         {
-            self.sync_persisted_native_workspace();
+            if !self.discard_multiplexer_window() {
+                self.sync_persisted_native_workspace();
+            }
             crate::app_actions::close_terminal_window::<Self>(self.window_handle, cx);
         }
+    }
+
+    /// Visit every pane with a live terminal: the visible strip, tabs stashed
+    /// on inactive workspaces, and split panes parked by a zoom. Settings that
+    /// every terminal must follow (theme colors, runtime options) go through
+    /// here so hidden panes do not keep stale values until they reattach.
+    /// The callback gets the id of the tab that owns the pane.
+    pub(in crate::terminal_view) fn for_each_live_pane(
+        &self,
+        mut f: impl FnMut(TabId, &TerminalPane),
+    ) {
+        let tabs = self.session.tabs.iter().chain(
+            self.session
+                .workspaces
+                .iter()
+                .flat_map(|workspace| &workspace.tabs),
+        );
+        for tab in tabs {
+            for pane in &tab.panes {
+                f(tab.id, pane);
+            }
+        }
+        for (tab_id, zoom) in &self.session.native_pane_zoom_snapshots {
+            for pane in &zoom.other_panes {
+                f(*tab_id, pane);
+            }
+        }
+    }
+
+    /// The single policy for `inactive_tab_scrollback`. A local pane in an
+    /// inactive tab drops to the cap to save memory. A session-host pane keeps
+    /// the full limit: its history lives in the shared host, where a cap
+    /// would trim it permanently for every client, also after Termy quits.
+    pub(in crate::terminal_view) fn scrollback_options_for_pane(
+        &self,
+        terminal: &Terminal,
+        active_tab: bool,
+    ) -> TerminalOptions {
+        let active_options = self.terminal_runtime.term_options();
+        match self.inactive_tab_scrollback {
+            Some(cap) if !active_tab && !terminal.is_session_host_pane() => {
+                active_options.with_scrollback_history(cap)
+            }
+            _ => active_options,
+        }
+    }
+
+    fn for_each_pane_in_tab(&self, tab_id: TabId, mut f: impl FnMut(&TerminalPane)) {
+        if let Some(tab) = self.session.tabs.iter().find(|tab| tab.id == tab_id) {
+            tab.panes.iter().for_each(&mut f);
+        }
+        if let Some(zoom) = self.session.native_pane_zoom_snapshots.get(&tab_id) {
+            zoom.other_panes.iter().for_each(f);
+        }
+    }
+
+    /// Apply `inactive_tab_scrollback`: the tab at `tab_index` gets the full
+    /// scrollback when `active`, else the inactive cap. Session-host panes are
+    /// left alone (see `scrollback_options_for_pane`).
+    pub(in crate::terminal_view) fn set_tab_scrollback_options(
+        &self,
+        tab_index: usize,
+        active: bool,
+    ) {
+        if self.inactive_tab_scrollback.is_none() {
+            return;
+        }
+        let Some(tab_id) = self.session.tabs.get(tab_index).map(|tab| tab.id) else {
+            return;
+        };
+        self.for_each_pane_in_tab(tab_id, |pane| {
+            let terminal = pane.terminal();
+            if terminal.is_session_host_pane() {
+                return;
+            }
+            terminal.set_term_options(self.scrollback_options_for_pane(terminal, active));
+        });
+    }
+
+    /// Re-apply `inactive_tab_scrollback` to the whole visible strip, after a
+    /// workspace was restored or switched in with freshly started tabs.
+    pub(in crate::terminal_view) fn sync_all_tab_scrollback(&self) {
+        for index in 0..self.session.tabs.len() {
+            self.set_tab_scrollback_options(index, index == self.session.active_tab);
+        }
+    }
+
+    /// Push the current query colors and terminal options to every live pane,
+    /// including stashed workspaces and zoom-parked splits.
+    pub(in crate::terminal_view) fn push_runtime_options_to_live_panes(&self) {
+        let active_tab_id = self
+            .session
+            .tabs
+            .get(self.session.active_tab)
+            .map(|tab| tab.id);
+        let query_colors = self.terminal_runtime.query_colors;
+        self.for_each_live_pane(|tab_id, pane| {
+            let terminal = pane.terminal();
+            terminal.set_term_options(
+                self.scrollback_options_for_pane(terminal, Some(tab_id) == active_tab_id),
+            );
+            terminal.set_query_colors(query_colors);
+        });
+    }
+
+    /// Every path that changes `session.active_tab` calls this afterwards:
+    /// the tab active before (if it is still in the strip, at index
+    /// `previous_active`) drops to the inactive scrollback cap, and the newly
+    /// active tab gets its full scrollback back.
+    pub(in crate::terminal_view) fn sync_active_tab_scrollback(
+        &self,
+        previous_active: Option<usize>,
+    ) {
+        let active = self.session.active_tab;
+        if let Some(previous) = previous_active.filter(|previous| *previous != active) {
+            self.set_tab_scrollback_options(previous, false);
+        }
+        self.set_tab_scrollback_options(active, true);
     }
 
     pub(crate) fn tab_index_by_id(&self, tab_id: TabId) -> Option<usize> {
@@ -764,6 +904,13 @@ impl TerminalView {
         self.renaming_tab = Some(index);
         self.rename_input
             .set_text(self.session.tabs[index].title.clone());
+        // The WinUI strip edits the title in its own tab instead, and reports
+        // the result as a rename event.
+        #[cfg(target_os = "windows")]
+        if self.begin_winui_tab_rename(index) {
+            self.renaming_tab = None;
+            return;
+        }
         self.reset_cursor_blink_phase();
         self.inline_input_selecting = false;
         // Recompute tab widths so the renamed tab expands to its editing width.
@@ -791,17 +938,7 @@ impl TerminalView {
                     self.mark_tab_strip_layout_dirty();
                 }
 
-                if let Some(inactive_scrollback) = self.inactive_tab_scrollback {
-                    let active_options = self.terminal_runtime.term_options();
-                    let inactive_options =
-                        active_options.with_scrollback_history(inactive_scrollback);
-                    for pane in &self.session.tabs[old_active].panes {
-                        pane.terminal().set_term_options(inactive_options);
-                    }
-                    for pane in &self.session.tabs[index].panes {
-                        pane.terminal().set_term_options(active_options);
-                    }
-                }
+                self.sync_active_tab_scrollback(Some(old_active));
 
                 self.reset_tab_rename_state();
                 self.reset_tab_drag_state();
@@ -952,6 +1089,16 @@ impl TerminalView {
         let Some(tab_index) = self.tab_index_by_id(tab_id) else {
             return false;
         };
+        // A zoomed tab holds only its zoomed pane; put the parked ones back
+        // first, so closing (say, an exited zoomed pane) keeps them running.
+        if let Some(mut zoom) = self.session.native_pane_zoom_snapshots.remove(&tab_id) {
+            if let Some(layout_tree) = zoom.layout_tree.take() {
+                self.session
+                    .native_pane_layout_trees
+                    .insert(tab_id, layout_tree);
+            }
+            Self::unzoom_panes(&mut self.session.tabs[tab_index], zoom);
+        }
         let Some(tab) = self.session.tabs.get(tab_index) else {
             return false;
         };
@@ -1381,7 +1528,10 @@ impl TerminalView {
         .map_err(|error| format!("Failed to split pane: {error}"))
     }
 
-    fn dispose_native_terminals(terminals: Vec<Terminal>, cx: &mut Context<Self>) {
+    pub(in crate::terminal_view) fn dispose_native_terminals(
+        terminals: Vec<Terminal>,
+        cx: &mut Context<Self>,
+    ) {
         if terminals.is_empty() {
             return;
         }
@@ -1407,7 +1557,7 @@ impl TerminalView {
         terminals
     }
 
-    fn invalidate_native_split_generation(&mut self) {
+    pub(in crate::terminal_view) fn invalidate_native_split_generation(&mut self) {
         self.native_split_generation = self.native_split_generation.saturating_add(1);
     }
 
@@ -2206,6 +2356,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: test_terminal(),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),

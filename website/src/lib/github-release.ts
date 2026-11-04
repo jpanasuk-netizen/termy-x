@@ -67,16 +67,9 @@ function parseGitHubResponse<T>(
   throw new Error(`GitHub API returned an invalid ${context}: ${details}`);
 }
 
-function githubHeaders(): Record<string, string> {
-  const headers: Record<string, string> = {
-    Accept: 'application/vnd.github+json',
-    'User-Agent': `${gitConfig.repo}-website`,
-  };
-  if (process.env.GITHUB_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-  }
-  return headers;
-}
+// The repo is public, so pages call GitHub from the browser without a token;
+// each visitor gets their own unauthenticated rate limit.
+const githubHeaders = { Accept: 'application/vnd.github+json' };
 
 function mapGitHubRelease(data: GitHubReleaseResponse): GitHubRelease {
   return {
@@ -235,8 +228,6 @@ export interface GitHubReleaseYearGroup {
   releases: GitHubRelease[];
 }
 
-let releasesRequest: Promise<GitHubRelease[]> | undefined;
-
 export function groupGitHubReleasesByYear(
   releases: GitHubRelease[],
 ): GitHubReleaseYearGroup[] {
@@ -251,20 +242,9 @@ export function groupGitHubReleasesByYear(
 }
 
 export async function fetchGitHubReleases(): Promise<GitHubRelease[]> {
-  // Build-time archive crawling shares one snapshot; runtime requests must see
-  // newly published releases without restarting the server.
-  if (process.env.TSS_PRERENDERING !== 'true') return requestGitHubReleases();
-  releasesRequest ??= requestGitHubReleases().catch((error) => {
-    releasesRequest = undefined;
-    throw error;
-  });
-  return releasesRequest;
-}
-
-async function requestGitHubReleases(): Promise<GitHubRelease[]> {
   const res = await fetch(
     `${GITHUB_API}/repos/${gitConfig.user}/${gitConfig.repo}/releases?per_page=100`,
-    { headers: githubHeaders() },
+    { headers: githubHeaders },
   );
   if (!res.ok) {
     throw new Error(`GitHub API ${res.status}: ${await res.text()}`);
@@ -284,19 +264,9 @@ export async function fetchGitHubReleaseByTag(
 ): Promise<GitHubRelease | null> {
   if (!isDesktopReleaseTag(tag)) return null;
 
-  // TanStack's prerenderer crawls the entire release archive concurrently. Reuse
-  // the list response (which already contains complete bodies and assets) so a
-  // production build consumes one GitHub request instead of one per release.
-  if (process.env.TSS_PRERENDERING === 'true') {
-    return (
-      (await fetchGitHubReleases()).find((release) => release.tagName === tag) ??
-      null
-    );
-  }
-
   const res = await fetch(
     `${GITHUB_API}/repos/${gitConfig.user}/${gitConfig.repo}/releases/tags/${encodeURIComponent(tag)}`,
-    { headers: githubHeaders() },
+    { headers: githubHeaders },
   );
   if (res.status === 404) return null;
   if (!res.ok) {
@@ -314,9 +284,7 @@ export async function fetchGitHubReleaseByTag(
 export async function fetchLatestGitHubRelease(): Promise<GitHubRelease> {
   const res = await fetch(
     `${GITHUB_API}/repos/${gitConfig.user}/${gitConfig.repo}/releases/latest`,
-    {
-      headers: githubHeaders(),
-    },
+    { headers: githubHeaders },
   );
 
   if (!res.ok) {
