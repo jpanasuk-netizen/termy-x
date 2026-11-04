@@ -133,7 +133,9 @@ impl OpencliSilence {
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     silence_sweep(&baseline, &tracked);
-                    std::thread::sleep(Duration::from_millis(400));
+                    // 15 ms: park a fresh automation window before it is
+                    // seen (400 ms let it flash for ~0.3 s).
+                    std::thread::sleep(Duration::from_millis(15));
                 }
             })
         };
@@ -208,9 +210,12 @@ fn silence_sweep(baseline: &[isize], tracked: &Arc<Mutex<Vec<isize>>>) {
 
 #[cfg(windows)]
 fn minimize_window(hwnd: isize) {
-    // SW_MINIMIZE (6). Never touches focus or the window's contents.
+    // Park off-screen first (no activate, no resize) so neither the window
+    // nor the minimize animation is seen, then SW_SHOWMINNOACTIVE (7):
+    // minimized without moving focus off whatever the user is doing.
     unsafe {
-        win32::show_window(hwnd as win32::Hwnd, 6);
+        win32::park_offscreen(hwnd as win32::Hwnd);
+        win32::show_window(hwnd as win32::Hwnd, 7);
     }
 }
 
@@ -238,6 +243,15 @@ mod win32 {
         fn IsWindowVisible(hwnd: Hwnd) -> Bool;
         fn IsIconic(hwnd: Hwnd) -> Bool;
         fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
+        fn SetWindowPos(
+            hwnd: Hwnd,
+            after: Hwnd,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            flags: u32,
+        ) -> Bool;
         fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
         fn OpenProcess(access: u32, inherit: Bool, pid: u32) -> Hwnd;
@@ -256,6 +270,18 @@ mod win32 {
         unsafe {
             if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
                 ShowWindow(hwnd, cmd);
+            }
+        }
+    }
+
+    /// Move a visible, non-minimized window to (-32000, -32000) without
+    /// activating, resizing or re-ordering it.
+    pub unsafe fn park_offscreen(hwnd: Hwnd) {
+        // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
+        const FLAGS: u32 = 0x0001 | 0x0004 | 0x0010 | 0x0200;
+        unsafe {
+            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
+                SetWindowPos(hwnd, std::ptr::null_mut(), -32000, -32000, 0, 0, FLAGS);
             }
         }
     }
@@ -284,7 +310,10 @@ mod win32 {
             }
         }
         unsafe {
-            EnumWindows(Some(callback), found as *mut Vec<(isize, String)> as Lparam);
+            EnumWindows(
+                Some(callback),
+                std::ptr::from_mut::<Vec<(isize, String)>>(found) as Lparam,
+            );
         }
     }
 
@@ -350,12 +379,12 @@ fn find_in_dir(dir: &Path, program: &str, exts: &[String]) -> Option<ResolvedPro
             }
         }
         let bare = dir.join(program);
-        if let Some(found) = classify_existing(&bare) {
-            if found.kind != ProgramKind::Native || pe_executable(&bare) {
-                return Some(found);
-            }
+        if let Some(found) = classify_existing(&bare)
+            && (found.kind != ProgramKind::Native || pe_executable(&bare))
+        {
+            return Some(found);
         }
-        return None;
+        None
     }
     #[cfg(not(windows))]
     {
@@ -373,9 +402,8 @@ fn find_in_dir(dir: &Path, program: &str, exts: &[String]) -> Option<ResolvedPro
 
 #[cfg(windows)]
 fn pe_executable(path: &Path) -> bool {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
     };
     let mut magic = [0u8; 2];
     std::io::Read::read_exact(&mut file, &mut magic).is_ok() && &magic == b"MZ"
@@ -601,10 +629,7 @@ fn spawn_pipe_reader(
 fn collect_pipe(rx: &std::sync::mpsc::Receiver<Vec<u8>>, grace: Duration) -> Vec<u8> {
     let mut buffer = Vec::new();
     let deadline = Instant::now() + grace;
-    loop {
-        let Some(rest) = deadline.checked_duration_since(Instant::now()) else {
-            break;
-        };
+    while let Some(rest) = deadline.checked_duration_since(Instant::now()) {
         match rx.recv_timeout(rest) {
             Ok(chunk) => buffer.extend_from_slice(&chunk),
             Err(_) => break,

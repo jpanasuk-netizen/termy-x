@@ -85,6 +85,14 @@ pub trait XProvider: Send + Sync {
         })
     }
     fn search(&self, query: &str, recent: bool, limit: usize) -> Result<Served<Vec<Post>>, String>;
+    /// Tweets that mention `handle`. Default: OpenCLI search `@handle`.
+    fn mentions(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        self.search(&format!("@{handle}"), false, limit)
+    }
+    /// Replies directed at `handle` (inbox). Default: search `to:handle`.
+    fn inbox_replies(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        self.search(&format!("to:{handle}"), true, limit)
+    }
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String>;
     /// Feed-aware home timeline. Providers that cannot distinguish X's
     /// two home feeds must say so instead of faking one from the other.
@@ -274,6 +282,16 @@ impl Service {
         self.read(|reader| reader.search(query, recent, limit))
     }
 
+    pub fn mentions(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let handle = strip_handle(handle);
+        self.read(|reader| reader.mentions(handle, limit))
+    }
+
+    pub fn inbox_replies(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let handle = strip_handle(handle);
+        self.read(|reader| reader.inbox_replies(handle, limit))
+    }
+
     pub fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         self.read(|reader| reader.timeline(limit))
     }
@@ -396,8 +414,12 @@ impl XProvider for MockProvider {
                 handle: handle.to_string(),
                 name: format!("Fixture {handle}"),
                 bio: "Mock profile. No live session and no X API credits.".to_string(),
-                followers: 128,
-                following: 40,
+                followers: Some(128),
+                following: Some(40),
+                tweets: Some(2),
+                likes: None,
+                verified: None,
+                created_at: None,
                 avatar_url: None,
                 banner_url: None,
                 viewer_following: None,
@@ -422,14 +444,7 @@ impl XProvider for MockProvider {
         Ok(served(profile, "fixture profile"))
     }
     fn thread(&self, id: &str) -> Result<Served<Thread>, String> {
-        let posts = sample_posts();
-        let root = posts
-            .iter()
-            .find(|post| post.id == id)
-            .cloned()
-            .unwrap_or_else(|| posts[0].clone());
-        let replies = posts.into_iter().skip(1).take(2).collect();
-        Ok(served(Thread { root, replies }, "fixture thread"))
+        Ok(served(sample_thread(id), "fixture thread"))
     }
     fn search(
         &self,
@@ -452,6 +467,16 @@ impl XProvider for MockProvider {
         }
         posts.truncate(limit);
         Ok(served(posts, "fixture search"))
+    }
+    fn mentions(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let mut posts = sample_mentions(handle);
+        posts.truncate(limit);
+        Ok(served(posts, "fixture mentions"))
+    }
+    fn inbox_replies(&self, handle: &str, limit: usize) -> Result<Served<Vec<Post>>, String> {
+        let mut posts = sample_inbox(handle);
+        posts.truncate(limit);
+        Ok(served(posts, "fixture inbox"))
     }
     fn timeline(&self, limit: usize) -> Result<Served<Vec<Post>>, String> {
         let mut posts = sample_posts();
@@ -520,7 +545,7 @@ fn served<T>(value: T, note: &str) -> Served<T> {
 }
 
 pub fn sample_posts() -> Vec<Post> {
-    vec![
+    let mut posts = vec![
         post(
             "1001",
             "termy",
@@ -586,7 +611,115 @@ pub fn sample_posts() -> Vec<Post> {
             )));
             repost
         },
-    ]
+    ];
+    let stamps = [
+        "2026-10-01T12:00:00Z",
+        "2026-10-03T12:00:00Z",
+        "2026-10-05T12:00:00Z",
+        "2026-10-07T18:00:00Z",
+        "2026-10-08T09:00:00Z",
+    ];
+    for (post, stamp) in posts.iter_mut().zip(stamps) {
+        post.created_at = Some(stamp.into());
+        if let Some(inner) = post.retweeted.as_mut() {
+            inner.created_at = Some("2026-10-03T12:00:00Z".into());
+        }
+    }
+    posts
+}
+
+fn sample_mentions(handle: &str) -> Vec<Post> {
+    let handle = strip_handle(handle);
+    let tag = if handle.is_empty() { "termy" } else { handle };
+    mention_posts(
+        tag,
+        &[
+            (
+                "3101",
+                "blue_swift",
+                "Blue Swift",
+                120,
+                2,
+                "2026-09-01T10:00:00Z",
+                "popular mention of the panel",
+            ),
+            (
+                "3102",
+                "panel_notes",
+                "Panel Notes",
+                44,
+                1,
+                "2026-10-20T08:00:00Z",
+                "mid mention, fewer likes",
+            ),
+            (
+                "3103",
+                "draft_desk",
+                "Draft Desk",
+                6,
+                0,
+                "2026-10-27T16:30:00Z",
+                "newest mention, fewest likes",
+            ),
+        ],
+    )
+}
+
+fn sample_inbox(handle: &str) -> Vec<Post> {
+    let handle = strip_handle(handle);
+    let tag = if handle.is_empty() { "termy" } else { handle };
+    mention_posts(
+        tag,
+        &[
+            (
+                "4101",
+                "swift_fan",
+                "Swift Fan",
+                55,
+                4,
+                "2026-09-12T11:00:00Z",
+                "inbox reply with the most likes",
+            ),
+            (
+                "4102",
+                "blue_swift",
+                "Blue Swift",
+                18,
+                2,
+                "2026-10-18T09:00:00Z",
+                "mid inbox reply",
+            ),
+            (
+                "4103",
+                "panel_notes",
+                "Panel Notes",
+                3,
+                1,
+                "2026-10-27T17:00:00Z",
+                "newest inbox reply",
+            ),
+        ],
+    )
+}
+
+fn mention_posts(handle: &str, rows: &[(&str, &str, &str, u64, u64, &str, &str)]) -> Vec<Post> {
+    rows.iter()
+        .map(|(id, author, name, likes, replies, created, text)| {
+            let mut item = post(
+                id,
+                author,
+                name,
+                &format!("@{handle} {text}"),
+                *likes,
+                1,
+                *replies,
+                0,
+            );
+            item.created_at = Some((*created).into());
+            item.in_reply_to = Some("1001".into());
+            item
+        })
+        .collect()
 }
 
 fn fixtures() -> Vec<Profile> {
@@ -594,14 +727,116 @@ fn fixtures() -> Vec<Profile> {
         handle: "termy".into(),
         name: "Termy".into(),
         bio: "Native terminal. The X panel is a fork feature for Jeremy.".into(),
-        followers: 4096,
-        following: 120,
+        followers: Some(4096),
+        following: Some(120),
+        tweets: Some(5),
+        likes: Some(88),
+        verified: Some(false),
+        created_at: Some("2024-01-15T00:00:00Z".into()),
         avatar_url: None,
         banner_url: None,
         viewer_following: Some(false),
-        posts: sample_posts().into_iter().take(2).collect(),
+        posts: sample_posts(),
         pinned: Vec::new(),
     }]
+}
+
+/// Nested fixture used by [`MockProvider::thread`]. Direct replies plus
+/// a chain deep enough to exercise the indent cap.
+pub fn sample_thread(id: &str) -> Thread {
+    let posts = sample_posts();
+    let mut root = posts
+        .iter()
+        .find(|post| post.id == id)
+        .cloned()
+        .unwrap_or_else(|| {
+            let mut post = posts[0].clone();
+            post.id = id.to_string();
+            post.url = post_url(&post.author_handle, id);
+            post
+        });
+    root.in_reply_to = None;
+    Thread {
+        root: root.clone(),
+        replies: sample_nested_replies(&root.id),
+    }
+}
+
+fn sample_nested_replies(root_id: &str) -> Vec<Post> {
+    let reply = |id: &str,
+                 handle: &str,
+                 name: &str,
+                 text: &str,
+                 likes: u64,
+                 created: &str,
+                 parent: &str| {
+        let mut post = post(id, handle, name, text, likes, 1, 1, 0);
+        post.created_at = Some(created.into());
+        post.in_reply_to = Some(parent.into());
+        post
+    };
+    let mut liked = reply(
+        "2006",
+        "draft_desk",
+        "Draft Desk",
+        "Already-liked sibling (fewer likes, newer).",
+        20,
+        "2026-10-06T16:00:00Z",
+        root_id,
+    );
+    liked.viewer_liked = Some(true);
+    liked.viewer_follows_author = Some(true);
+    let mut popular = reply(
+        "2001",
+        "blue_swift",
+        "Blue Swift",
+        "Direct reply with the most likes.",
+        80,
+        "2026-10-06T14:00:00Z",
+        root_id,
+    );
+    popular.viewer_liked = Some(false);
+    popular.viewer_follows_author = Some(false);
+    vec![
+        popular,
+        reply(
+            "2002",
+            "panel_notes",
+            "Panel Notes",
+            "Nested under the popular reply.",
+            12,
+            "2026-10-06T14:30:00Z",
+            "2001",
+        ),
+        reply(
+            "2003",
+            "draft_desk",
+            "Draft Desk",
+            "Third level in the chain.",
+            4,
+            "2026-10-06T14:45:00Z",
+            "2002",
+        ),
+        reply(
+            "2004",
+            "swift_fan",
+            "Swift Fan",
+            "Fourth level.",
+            2,
+            "2026-10-06T14:50:00Z",
+            "2003",
+        ),
+        reply(
+            "2005",
+            "termy",
+            "Termy",
+            "Fifth level — indent caps at four.",
+            1,
+            "2026-10-06T14:55:00Z",
+            "2004",
+        ),
+        liked,
+    ]
 }
 
 fn post(
@@ -626,8 +861,12 @@ fn post(
         replies,
         bookmarks,
         views: likes.saturating_mul(20),
+        quotes: None,
         media: Vec::new(),
         retweeted: None,
+        in_reply_to: None,
+        viewer_liked: None,
+        viewer_follows_author: None,
     }
 }
 
@@ -1334,7 +1573,7 @@ impl OpenCliPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         use crate::publish::EngageAction;
-        let mut args: Vec<String> = vec![
+        let args: Vec<String> = vec![
             "twitter".into(),
             action.opencli_verb().into(),
             target_url.into(),
@@ -2632,14 +2871,18 @@ fn parse_profile(text: &str, fallback_handle: &str) -> Result<Profile, String> {
     let bio = first_str(node, &["description", "bio", "summary"])
         .unwrap_or("")
         .to_string();
-    let metrics = node.get("public_metrics").unwrap_or(node);
+    let totals = crate::stats::profile_totals_from_value(&value);
     let posts = posts_from_value(&value);
     Ok(Profile {
         handle,
         name,
         bio,
-        followers: number(metrics, &["followers_count", "followers"]),
-        following: number(metrics, &["following_count", "friends_count", "following"]),
+        followers: totals.followers,
+        following: totals.following,
+        tweets: totals.tweets,
+        likes: totals.likes,
+        verified: totals.verified,
+        created_at: totals.created_at,
         avatar_url: profile_image_str(
             node,
             &[
@@ -2795,13 +3038,41 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         replies: number(metrics, &["reply_count", "replies"]),
         bookmarks: number(metrics, &["bookmark_count", "bookmarks"]),
         views: number(metrics, &["impression_count", "views", "view_count"]),
+        quotes: crate::stats::quote_count_from_metrics(metrics, item),
         text,
         id,
         media: media_from_value(item),
         retweeted: first_embedded(item, &["retweeted", "retweeted_status", "retweeted_tweet"])
             .and_then(|inner| post_from_value(inner, &[]))
             .map(Box::new),
+        in_reply_to: in_reply_to_from(item),
+        viewer_liked: viewer_liked_from(item),
+        viewer_follows_author: author
+            .and_then(viewer_following_from)
+            .or_else(|| viewer_following_from(item)),
     })
+}
+
+fn in_reply_to_from(item: &Value) -> Option<String> {
+    const KEYS: &[&str] = &[
+        "in_reply_to_status_id_str",
+        "in_reply_to_status_id",
+        "in_reply_to_tweet_id",
+        "inReplyToStatusId",
+        "in_reply_to",
+        "reply_to",
+    ];
+    first_id(item, KEYS)
+        .or_else(|| item.get("legacy").and_then(in_reply_to_from))
+        .or_else(|| item.get("reply").and_then(|reply| first_id(reply, KEYS)))
+}
+
+fn viewer_liked_from(item: &Value) -> Option<bool> {
+    first_bool(
+        item,
+        &["favorited", "liked", "viewer_liked", "favorited_by_viewer"],
+    )
+    .or_else(|| item.get("legacy").and_then(viewer_liked_from))
 }
 
 /// First embedded-tweet object among `keys` (GraphQL eval rows emit
@@ -2883,7 +3154,7 @@ fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
                 },
             };
             let kind = match first_str(entry, &["type", "kind"]) {
-                Some("video") | Some("animated_gif") => {
+                Some("video" | "animated_gif") => {
                     if first_str(entry, &["type"]) == Some("animated_gif") {
                         MediaKind::Gif
                     } else {
@@ -3006,6 +3277,28 @@ fn first_str<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
         .find_map(|key| value.get(*key).and_then(Value::as_str))
 }
 
+fn first_id(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value.get(*key).and_then(|node| match node {
+            Value::String(text) => {
+                let text = text.trim();
+                (!text.is_empty() && text != "0").then(|| text.to_string())
+            }
+            Value::Number(n) => n
+                .as_u64()
+                .filter(|n| *n > 0)
+                .map(|n| n.to_string())
+                .or_else(|| n.as_i64().filter(|n| *n > 0).map(|n| n.to_string())),
+            _ => None,
+        })
+    })
+}
+
+fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_bool))
+}
+
 fn number(value: &Value, keys: &[&str]) -> u64 {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_u64))
@@ -3058,18 +3351,10 @@ mod tests {
     fn append_new_posts_only_appends_unseen_ids() {
         let mk = |id: &str| Post {
             id: id.into(),
-            url: String::new(),
             author_handle: "a".into(),
             author_name: "a".into(),
             text: "t".into(),
-            created_at: None,
-            likes: 0,
-            reposts: 0,
-            replies: 0,
-            bookmarks: 0,
-            views: 0,
-            media: Vec::new(),
-            retweeted: None,
+            ..Post::default()
         };
         let existing = vec![mk("300"), mk("200"), mk("100")];
         // Batch overlaps the loaded tail and extends below it.
@@ -3339,10 +3624,75 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.viewer_following, None);
-        assert_eq!(p.following, 120);
+        assert_eq!(p.following, Some(120));
         // No flag anywhere -> unknown, never guessed.
         let p = parse_profile(r#"{"username":"a"}"#, "a").unwrap();
         assert_eq!(p.viewer_following, None);
+    }
+
+    #[test]
+    fn parse_thread_reads_in_reply_to_and_payload_flags() {
+        let json = r#"[{"id":"1","username":"ada","text":"root","likes":3},{"id":"2","username":"bob","text":"reply","likes":1,"in_reply_to_status_id":"1","favorited":true,"user":{"username":"bob","name":"Bob","following":true}}]"#;
+        let thread = parse_thread(json, "1").unwrap();
+        assert_eq!(thread.root.id, "1");
+        assert_eq!(thread.replies.len(), 1);
+        assert_eq!(thread.replies[0].in_reply_to.as_deref(), Some("1"));
+        assert_eq!(thread.replies[0].viewer_liked, Some(true));
+        assert_eq!(thread.replies[0].viewer_follows_author, Some(true));
+        let numbered = r#"[{"id":"9","text":"root","username":"ada"},{"id":"10","text":"child","username":"bob","in_reply_to_status_id":9}]"#;
+        let numbered = parse_thread(numbered, "9").unwrap();
+        assert_eq!(numbered.replies[0].in_reply_to.as_deref(), Some("9"));
+    }
+
+    #[test]
+    fn mock_thread_returns_nested_replies_under_the_clicked_id() {
+        let served = MockProvider.thread("1001").unwrap();
+        assert_eq!(served.value.root.id, "1001");
+        assert!(
+            served
+                .value
+                .replies
+                .iter()
+                .any(|post| post.in_reply_to.as_deref() == Some("1001"))
+        );
+        assert!(
+            served
+                .value
+                .replies
+                .iter()
+                .any(|post| post.in_reply_to.as_deref() == Some("2001"))
+        );
+        let tree = crate::thread::build_reply_tree(
+            "1001",
+            &served.value.replies,
+            crate::sort::ResultSort::Popular,
+        );
+        assert_eq!(tree[0].post.id, "2001");
+        assert_eq!(tree[1].post.id, "2006");
+        assert_eq!(tree[0].children[0].post.id, "2002");
+        let deep = crate::thread::walk_thread(&tree);
+        let fifth = deep.iter().find(|node| node.post.id == "2005").unwrap();
+        assert_eq!(fifth.depth, 5);
+        assert_eq!(fifth.display_depth(), crate::thread::MAX_DISPLAY_DEPTH);
+    }
+
+    #[test]
+    fn mock_mentions_and_inbox_sort_popular_then_newest() {
+        let mentions = MockProvider.mentions("termy", 10).unwrap().value;
+        let popular = crate::sorted_posts(&mentions, crate::ResultSort::Popular);
+        let newest = crate::sorted_posts(&mentions, crate::ResultSort::Newest);
+        assert_eq!(popular[0].id, "3101");
+        assert_eq!(newest[0].id, "3103");
+        assert!(popular[0].likes > newest[0].likes);
+        let inbox = MockProvider.inbox_replies("termy", 10).unwrap().value;
+        assert_eq!(
+            crate::sorted_posts(&inbox, crate::ResultSort::Popular)[0].id,
+            "4101"
+        );
+        assert_eq!(
+            crate::sorted_posts(&inbox, crate::ResultSort::Newest)[0].id,
+            "4103"
+        );
     }
 
     #[test]
@@ -3355,21 +3705,14 @@ mod tests {
         assert_eq!(EngageAction::Quote.opencli_verb(), "quote");
     }
 
+    #[test]
     fn dedupe_posts_preserves_order_and_drops_later_dupes() {
         let mk = |id: &str, text: &str| Post {
             id: id.into(),
-            url: String::new(),
             author_handle: "ada".into(),
             author_name: "Ada".into(),
             text: text.into(),
-            created_at: None,
-            likes: 0,
-            reposts: 0,
-            replies: 0,
-            bookmarks: 0,
-            views: 0,
-            media: Vec::new(),
-            retweeted: None,
+            ..Post::default()
         };
         let out = dedupe_posts(vec![
             mk("1", "a"),
@@ -3880,6 +4223,20 @@ mod tests {
 
     #[test]
     fn opencli_array_profile_parses_name_bio_and_counts() {
+        let live = parse_profile(
+            r#"[{"screen_name":"Jasper_Black","name":"MAGABRO","bio":"links","followers":303,"following":426,"tweets":4391,"likes":998,"verified":true,"created_at":"Mon May 02 03:33:07 +0000 2011"}]"#,
+            "Jasper_Black",
+        )
+        .unwrap();
+        assert_eq!(live.followers, Some(303));
+        assert_eq!(live.following, Some(426));
+        assert_eq!(live.tweets, Some(4391));
+        assert_eq!(live.likes, Some(998));
+        assert_eq!(live.verified, Some(true));
+        assert_eq!(
+            live.created_at.as_deref(),
+            Some("Mon May 02 03:33:07 +0000 2011")
+        );
         let runner = Arc::new(ScriptedRunner::new());
         runner.script(
             "opencli",
@@ -3895,8 +4252,10 @@ mod tests {
         assert_eq!(profile.handle, "ada");
         assert_eq!(profile.name, "Ada Lovelace");
         assert_eq!(profile.bio, "first programmer");
-        assert_eq!(profile.followers, 293);
-        assert_eq!(profile.following, 404);
+        assert_eq!(profile.followers, Some(293));
+        assert_eq!(profile.following, Some(404));
+        assert_eq!(profile.tweets, None);
+        assert_eq!(profile.likes, None);
     }
 
     #[test]
@@ -4024,6 +4383,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn rss_titles_are_research_hits() {
         let runner = ScriptedRunner::new();
         runner.script(

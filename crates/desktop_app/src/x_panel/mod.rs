@@ -2,9 +2,11 @@
 //! `background_opacity` behind lists and at full strength on the empty splash.
 
 pub mod art;
+mod list_sort;
 mod media_fit;
 mod player;
 mod scroll_math;
+mod thread_view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,16 +60,20 @@ use termy_x::model::{
     filter_trends, group_trends, profile_sections, sort_trends, trend_rank,
 };
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
+use termy_x::publish::Publisher;
 use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XSection {
     Timeline,
     Search,
+    Mentions,
+    Inbox,
     Trends,
     Lookup,
     Compose,
     Research,
+    Help,
 }
 
 impl XSection {
@@ -75,20 +81,26 @@ impl XSection {
         match self {
             Self::Timeline => "Timeline",
             Self::Search => "Search",
+            Self::Mentions => "Mentions",
+            Self::Inbox => "Inbox",
             Self::Trends => "Trends",
             Self::Lookup => "Lookup",
             Self::Compose => "Compose",
             Self::Research => "Research",
+            Self::Help => "Help",
         }
     }
 
     pub fn from_command(name: &str) -> Self {
         match name {
             "search" => Self::Search,
+            "mentions" => Self::Mentions,
+            "inbox" => Self::Inbox,
             "trends" => Self::Trends,
             "lookup" => Self::Lookup,
             "compose" => Self::Compose,
             "research" => Self::Research,
+            "help" => Self::Help,
             _ => Self::Timeline,
         }
     }
@@ -309,6 +321,7 @@ struct Viewer {
     kind: MediaKind,
     url: String,
     poster: Option<String>,
+    #[allow(dead_code)]
     post_id: String,
 }
 
@@ -416,6 +429,9 @@ pub struct XPanel {
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
     search_posts: Vec<Post>,
+    mentions_posts: Vec<Post>,
+    inbox_posts: Vec<Post>,
+    list_sort: termy_x::sort::ResultSort,
     trends: Vec<Trend>,
     research: Vec<ResearchHit>,
     profile: Option<Profile>,
@@ -430,7 +446,7 @@ pub struct XPanel {
     picking: bool,
     /// Per-section single-flight guard: one OpenCLI/browser-session call at a time,
     /// so rapid clicks cannot spawn a storm of Chrome/OpenCLI processes.
-    fetching: [bool; 5],
+    fetching: [bool; 7],
     /// Last explicit browser open, for debounce (never reopen in a burst).
     last_browser_open: Option<Instant>,
     variants: Vec<Draft>,
@@ -455,7 +471,7 @@ pub struct XPanel {
     fetched_at: SectionTimes,
     /// Monotonic id so a slow OpenCLI reply cannot overwrite a newer tab's data.
     fetch_seq: u64,
-    inflight: [u64; 5],
+    inflight: [u64; 7],
     loading: bool,
     /// Focus the panel on next render (Compose needs keys; terminal steals focus).
     pending_focus: bool,
@@ -501,6 +517,22 @@ pub struct XPanel {
     replied_ids: Vec<String>,
     input_target: InputTarget,
     pick_target: PickTarget,
+    /// Thread overlay (click a tweet). Not a tab: Back/Esc restore the
+    /// list that was showing, including its scroll offset.
+    thread: Option<thread_view::ThreadView>,
+    thread_return_scroll: Option<f32>,
+    thread_seq: u64,
+    thread_leaving: bool,
+    /// Set while the confirm dialog is a reply (thread Reply). Compose
+    /// Publish leaves this None. post_now_async passes it as reply_to.
+    confirm_reply_to: Option<String>,
+    confirm_reply_author: String,
+    /// Per-run like-all / follow-all cap (clamped 25..=50).
+    bulk_cap: usize,
+    /// In-memory likes/follows for mock preview. Never talks to X.
+    mock_writes: termy_x::bulk::MockWriteLog,
+    bulk: Option<thread_view::BulkUi>,
+    bulk_seq: u64,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
@@ -516,6 +548,7 @@ const TIMELINE_INITIAL: usize = 420;
 const TIMELINE_MAX: usize = 1600;
 
 /// Next Load-more limit for a feed loaded to `current`, or None at cap.
+#[allow(dead_code)]
 fn next_timeline_limit(current: usize) -> Option<usize> {
     if current >= TIMELINE_MAX {
         None
@@ -549,6 +582,8 @@ struct SectionTimes {
     timeline: Option<Instant>,
     timeline_following: Option<Instant>,
     search: Option<Instant>,
+    mentions: Option<Instant>,
+    inbox: Option<Instant>,
     trends: Option<Instant>,
     lookup: Option<Instant>,
     research: Option<Instant>,
@@ -563,6 +598,7 @@ enum FetchPayload {
         /// Load-more fetch: append only unseen ids behind the loaded list.
         append: bool,
         /// The OpenCLI limit this batch was requested with.
+        #[allow(dead_code)]
         requested: usize,
         /// Bottom cursor for the next older page (cursor path only).
         next_cursor: Option<String>,
@@ -573,6 +609,14 @@ enum FetchPayload {
         failed: bool,
     },
     Search {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Mentions {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Inbox {
         posts: Vec<Post>,
         status: String,
     },
@@ -602,7 +646,9 @@ fn section_slot(section: XSection) -> Option<usize> {
         XSection::Trends => Some(2),
         XSection::Lookup => Some(3),
         XSection::Research => Some(4),
-        XSection::Compose => None,
+        XSection::Mentions => Some(5),
+        XSection::Inbox => Some(6),
+        XSection::Compose | XSection::Help => None,
     }
 }
 
@@ -694,6 +740,9 @@ impl XPanel {
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
             search_posts: Vec::new(),
+            mentions_posts: Vec::new(),
+            inbox_posts: Vec::new(),
+            list_sort: config.list_sort,
             trends: Vec::new(),
             research: Vec::new(),
             profile: None,
@@ -701,12 +750,12 @@ impl XPanel {
             lookup: if fill_window {
                 "termy".into()
             } else {
-                saved_handle.clone().unwrap_or_default()
+                saved_handle.unwrap_or_default()
             },
             media: Vec::new(),
             posting: false,
             picking: false,
-            fetching: [false; 5],
+            fetching: [false; 7],
             last_browser_open: None,
             compose: if fill_window {
                 "Termy X counts this URL as 23: https://termy.sh".into()
@@ -733,7 +782,7 @@ impl XPanel {
             queued_section: None,
             fetched_at: SectionTimes::default(),
             fetch_seq: 0,
-            inflight: [0; 5],
+            inflight: [0; 7],
             loading: false,
             pending_focus: false,
             suggesting: false,
@@ -761,6 +810,16 @@ impl XPanel {
             replied_ids: Vec::new(),
             input_target: InputTarget::Compose,
             pick_target: PickTarget::Compose,
+            thread: None,
+            thread_return_scroll: None,
+            thread_seq: 0,
+            thread_leaving: false,
+            confirm_reply_to: None,
+            confirm_reply_author: String::new(),
+            bulk_cap: termy_x::clamp_bulk_cap(config.bulk_cap),
+            mock_writes: termy_x::bulk::MockWriteLog::default(),
+            bulk: None,
+            bulk_seq: 0,
         };
         if fill_window {
             // Preview path fills via load_scene / open_section.
@@ -787,7 +846,7 @@ impl XPanel {
     /// never wipes a Compose draft, gives instant status feedback.
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
         let section = self.section;
-        if section == XSection::Compose {
+        if section == XSection::Compose || section == XSection::Help {
             self.notice = Some("Compose draft kept \u{b7} refresh does nothing here.".into());
             cx.notify();
             return;
@@ -812,10 +871,12 @@ impl XPanel {
                 TimelineFeed::Following => self.fetched_at.timeline_following = None,
             },
             XSection::Search => self.fetched_at.search = None,
+            XSection::Mentions => self.fetched_at.mentions = None,
+            XSection::Inbox => self.fetched_at.inbox = None,
             XSection::Trends => self.fetched_at.trends = None,
             XSection::Lookup => self.fetched_at.lookup = None,
             XSection::Research => self.fetched_at.research = None,
-            XSection::Compose => {}
+            XSection::Compose | XSection::Help => {}
         }
         self.last_refresh = Some(local_hms());
         self.pending_top = true;
@@ -847,6 +908,9 @@ impl XPanel {
     pub fn open_section(&mut self, section: XSection, cx: &mut Context<Self>) {
         let started = Instant::now();
         self.close_viewer();
+        if self.thread.is_some() {
+            self.abandon_thread();
+        }
         self.section = section;
         self.confirm = false;
         self.splash = false;
@@ -974,6 +1038,42 @@ impl XPanel {
                 self.focus_compose_editor();
             }
             "search" => self.open_section(XSection::Search, cx),
+            "search-popular" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Popular;
+                self.open_section(XSection::Search, cx);
+                self.searched_query = "swift".into();
+                self.search_input = "swift".into();
+                self.search_posts = MockProvider
+                    .search("swift", false, 8)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.input_target = InputTarget::Compose;
+                self.status = "search \u{b7} Popular".into();
+            }
+            "search-newest" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Newest;
+                self.open_section(XSection::Search, cx);
+                self.searched_query = "swift".into();
+                self.search_input = "swift".into();
+                self.search_posts = MockProvider
+                    .search("swift", true, 8)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.input_target = InputTarget::Compose;
+                self.status = "search \u{b7} Newest".into();
+            }
+            "mentions" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Popular;
+                self.open_section(XSection::Mentions, cx);
+                self.mentions_posts = MockProvider
+                    .mentions("termy", 10)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.status = "mentions \u{b7} Popular".into();
+            }
             "compose" => self.open_section(XSection::Compose, cx),
             // Dev-preview only: show the Posted burst state without
             // posting anything (the preview binary never publishes).
@@ -1000,6 +1100,8 @@ impl XPanel {
                 self.section = XSection::Timeline;
                 self.posts.clear();
                 self.search_posts.clear();
+                self.mentions_posts.clear();
+                self.inbox_posts.clear();
                 self.trends.clear();
                 self.research.clear();
                 self.profile = None;
@@ -1035,6 +1137,13 @@ impl XPanel {
                 self.lookup = "someone".into();
                 self.open_section(XSection::Lookup, cx);
             }
+            // Dev-preview only: Lookup stats card (profile totals + tweet window).
+            "stats" => {
+                self.load_mock_dashboard();
+                self.profile = MockProvider.lookup("termy").ok().map(|served| served.value);
+                self.lookup = "termy".into();
+                self.open_section(XSection::Lookup, cx);
+            }
             "trends" => {
                 self.load_mock_dashboard();
                 self.open_section(XSection::Trends, cx);
@@ -1047,6 +1156,39 @@ impl XPanel {
                 self.research_input = "gpui".into();
                 self.researched_query = "gpui".into();
                 self.open_section(XSection::Research, cx);
+            }
+            "thread" => self.show_mock_thread(termy_x::sort::ResultSort::Popular),
+            "thread-newest" => self.show_mock_thread(termy_x::sort::ResultSort::Newest),
+            "thread-reply" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                if let Some(thread) = &self.thread {
+                    let id = thread.root.id.clone();
+                    let author = thread.root.author_handle.clone();
+                    self.open_reply_parts(&id, &author);
+                    self.reply_text = "Mock reply. Nothing posts until Confirm.".into();
+                    self.arm_reply_confirm();
+                }
+            }
+            "thread-bulk" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                self.arm_bulk(termy_x::bulk::BulkKind::LikeReplies, cx);
+            }
+            "thread-progress" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                let replies = self.thread_replies_for_bulk();
+                let plan = termy_x::bulk::plan_bulk(
+                    termy_x::bulk::BulkKind::LikeReplies,
+                    &replies,
+                    self.own_handle(),
+                    self.bulk_cap,
+                );
+                let total = plan.action_count().max(1);
+                self.status = format!("bulk \u{b7} 1/{total}");
+                self.bulk = Some(thread_view::BulkUi::Running {
+                    plan,
+                    done: 1,
+                    stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
             }
             _ => self.open_section(XSection::Timeline, cx),
         }
@@ -1073,6 +1215,18 @@ impl XPanel {
         if self.search_posts.is_empty() {
             self.search_posts = MockProvider
                 .search(&self.query, false, 4)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.mentions_posts.is_empty() {
+            self.mentions_posts = MockProvider
+                .mentions("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.inbox_posts.is_empty() {
+            self.inbox_posts = MockProvider
+                .inbox_replies("termy", 10)
                 .map(|served| served.value)
                 .unwrap_or_default();
         }
@@ -1111,6 +1265,18 @@ impl XPanel {
         if self.search_posts.is_empty() {
             self.search_posts = MockProvider
                 .search(&self.query, false, 4)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.mentions_posts.is_empty() {
+            self.mentions_posts = MockProvider
+                .mentions("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.inbox_posts.is_empty() {
+            self.inbox_posts = MockProvider
+                .inbox_replies("termy", 10)
                 .map(|served| served.value)
                 .unwrap_or_default();
         }
@@ -1251,6 +1417,9 @@ impl XPanel {
         if feed == self.timeline_feed {
             return;
         }
+        if self.thread.is_some() {
+            self.abandon_thread();
+        }
         let old = Self::feed_index(self.timeline_feed);
         self.feed_offset[old] = self.list_scroll.offset().y.into();
         self.timeline_feed = feed;
@@ -1278,10 +1447,12 @@ impl XPanel {
                 TimelineFeed::Following => self.fetched_at.timeline_following,
             },
             XSection::Search => self.fetched_at.search,
+            XSection::Mentions => self.fetched_at.mentions,
+            XSection::Inbox => self.fetched_at.inbox,
             XSection::Trends => self.fetched_at.trends,
             XSection::Lookup => self.fetched_at.lookup,
             XSection::Research => self.fetched_at.research,
-            XSection::Compose => return true,
+            XSection::Compose | XSection::Help => return true,
         };
         matches!(
             at,
@@ -1293,10 +1464,12 @@ impl XPanel {
         match section {
             XSection::Timeline => !self.feed_posts().is_empty(),
             XSection::Search => !self.search_posts.is_empty(),
+            XSection::Mentions => !self.mentions_posts.is_empty(),
+            XSection::Inbox => !self.inbox_posts.is_empty(),
             XSection::Trends => !self.trends.is_empty(),
             XSection::Lookup => self.profile.is_some(),
             XSection::Research => !self.research.is_empty(),
-            XSection::Compose => true,
+            XSection::Compose | XSection::Help => true,
         }
     }
 
@@ -1305,10 +1478,13 @@ impl XPanel {
         for section in [
             XSection::Timeline,
             XSection::Search,
+            XSection::Mentions,
+            XSection::Inbox,
             XSection::Trends,
             XSection::Lookup,
             XSection::Compose,
             XSection::Research,
+            XSection::Help,
             XSection::Timeline,
         ] {
             self.open_section(section, cx);
@@ -1374,6 +1550,11 @@ impl XPanel {
 
         let query = self.query.clone();
         let lookup = self.lookup.clone();
+        let handle = match &self.connection {
+            ConnState::Connected { handle, .. } => handle.clone(),
+            _ => self.lookup.clone(),
+        };
+        let newest = self.list_sort == termy_x::sort::ResultSort::Newest;
         let live = self.live;
         let feed = self.timeline_feed;
         let (append, limit) = self
@@ -1396,6 +1577,8 @@ impl XPanel {
                         section,
                         query,
                         lookup,
+                        handle,
+                        newest,
                         live,
                         feed,
                         append,
@@ -1515,6 +1698,16 @@ impl XPanel {
                 self.status = status;
                 self.fetched_at.search = Some(now);
             }
+            FetchPayload::Mentions { posts, status } => {
+                self.mentions_posts = posts;
+                self.status = status;
+                self.fetched_at.mentions = Some(now);
+            }
+            FetchPayload::Inbox { posts, status } => {
+                self.inbox_posts = posts;
+                self.status = status;
+                self.fetched_at.inbox = Some(now);
+            }
             FetchPayload::Trends {
                 trends,
                 status,
@@ -1575,7 +1768,7 @@ impl XPanel {
             return;
         }
         let mut wanted: Vec<String> = Vec::new();
-        let mut scan = |posts: &[Post], wanted: &mut Vec<String>| {
+        let scan = |posts: &[Post], wanted: &mut Vec<String>| {
             for post in posts {
                 if post.bare_repost_handle().is_some()
                     && !self.repost_cache.contains_key(&post.id)
@@ -1588,6 +1781,8 @@ impl XPanel {
         scan(&self.posts, &mut wanted);
         scan(&self.following_posts, &mut wanted);
         scan(&self.search_posts, &mut wanted);
+        scan(&self.mentions_posts, &mut wanted);
+        scan(&self.inbox_posts, &mut wanted);
         if let Some(profile) = &self.profile {
             scan(&profile.posts, &mut wanted);
             scan(&profile.pinned, &mut wanted);
@@ -1622,6 +1817,8 @@ impl XPanel {
                         patch_repost_original(&mut panel.posts, &id, &original);
                         patch_repost_original(&mut panel.following_posts, &id, &original);
                         patch_repost_original(&mut panel.search_posts, &id, &original);
+                        patch_repost_original(&mut panel.mentions_posts, &id, &original);
+                        patch_repost_original(&mut panel.inbox_posts, &id, &original);
                         if let Some(profile) = &mut panel.profile {
                             patch_repost_original(&mut profile.posts, &id, &original);
                             patch_repost_original(&mut profile.pinned, &id, &original);
@@ -1702,6 +1899,8 @@ impl XPanel {
         let _ = termy_x::connect::disconnect(&config);
         self.posts.clear();
         self.search_posts.clear();
+        self.mentions_posts.clear();
+        self.inbox_posts.clear();
         self.trends.clear();
         self.research.clear();
         self.profile = None;
@@ -1951,6 +2150,8 @@ impl XPanel {
             self.confirm = false;
             return;
         }
+        self.confirm_reply_to = None;
+        self.confirm_reply_author.clear();
         self.intent_urls = termy_x::publish::intent_urls(&parts, None);
         self.intent_index = 0;
         if self.media.is_empty() {
@@ -1972,6 +2173,40 @@ impl XPanel {
                 names.join(", ")
             ));
         }
+        self.confirm = true;
+        self.compose_focused = false;
+        self.ui_focus = UiFocus::ConfirmNext;
+        self.pending_focus = true;
+    }
+
+    /// Thread Reply: open the existing confirm dialog with reply_to set.
+    /// Never posts. Preview/mock still cannot send.
+    fn arm_reply_confirm(&mut self) {
+        let Some(target_id) = self.reply_post_id.clone() else {
+            return;
+        };
+        let text = self.reply_text.trim();
+        if text.is_empty() {
+            self.notice = Some(
+                "Type a reply first \u{2014} confirm shows the exact text before anything posts."
+                    .into(),
+            );
+            return;
+        }
+        let parts = split_thread_limited(&self.reply_text, self.char_limit);
+        let parts = if parts.is_empty() {
+            vec![text.to_string()]
+        } else {
+            parts
+        };
+        self.confirm_reply_to = Some(target_id);
+        self.confirm_reply_author = self.reply_author.clone();
+        self.intent_urls = termy_x::publish::intent_urls(&parts, self.confirm_reply_to.as_deref());
+        self.intent_index = 0;
+        self.notice = Some(format!(
+            "Reply to @{} \u{2014} nothing posts until you confirm.",
+            self.reply_author
+        ));
         self.confirm = true;
         self.compose_focused = false;
         self.ui_focus = UiFocus::ConfirmNext;
@@ -2053,17 +2288,39 @@ impl XPanel {
                 cx.notify();
                 return;
             }
+            if matches!(self.bulk, Some(thread_view::BulkUi::Confirm(_))) {
+                self.bulk = None;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(thread_view::BulkUi::Running { stop, .. }) = &self.bulk {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.status = "bulk \u{b7} stopping\u{2026}".into();
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            if self.confirm {
+                self.confirm = false;
+                self.confirm_reply_to = None;
+                self.confirm_reply_author.clear();
+                self.focus_compose_editor();
+                self.pending_focus = true;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             if self.reply_post_id.is_some() {
                 self.close_reply();
                 cx.stop_propagation();
                 cx.notify();
                 return;
             }
-            if self.confirm {
-                self.confirm = false;
-                self.focus_compose_editor();
-                self.pending_focus = true;
-                cx.notify();
+            if self.thread.is_some() {
+                self.dismiss_thread(cx);
+                cx.stop_propagation();
+                return;
             }
             // Never leak Esc into the terminal while the X panel has the key stream.
             cx.stop_propagation();
@@ -2159,6 +2416,15 @@ impl XPanel {
         }
         if self.input_target == InputTarget::Quote && self.quote_post_id.is_some() {
             self.on_text_input_key(event, TextField::Quote, cx);
+            return;
+        }
+
+        if key.eq_ignore_ascii_case(termy_x::LIST_SORT_KEY)
+            && !mods.modified()
+            && self.shows_list_sort()
+        {
+            self.toggle_list_sort(cx);
+            cx.stop_propagation();
             return;
         }
 
@@ -2664,7 +2930,7 @@ impl XPanel {
         self.reply_opened_at = Some(Instant::now());
         self.reply_key_logged = false;
         perf_log(&format!("open_reply id={post_id} (local only, no fetch)"));
-        self.status = format!("reply to @{} \u{b7} type below, then Post", author_handle);
+        self.status = format!("reply to @{author_handle} \u{b7} type below, then Post");
     }
 
     /// Start the Posted burst in the editor a post just succeeded
@@ -3035,11 +3301,6 @@ impl XPanel {
         if self.follow_pending.is_some() {
             return;
         }
-        if !self.live {
-            self.notice = Some("Preview/mock never follows anyone.".into());
-            cx.notify();
-            return;
-        }
         let current = self
             .follow_overrides
             .get(handle)
@@ -3056,20 +3317,27 @@ impl XPanel {
         self.follow_pending = Some((handle.clone(), target));
         cx.notify();
         let handle_for_call = handle.clone();
+        let live = self.live;
+        let mock = self.mock_writes.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let service = XPanel::service_free();
-                    let publishers = service.publishers;
-                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
-                    else {
-                        return Err(
-                            "No in-app posting path found. Connect X first, then try again."
-                                .to_string(),
-                        );
-                    };
-                    publisher.set_follow(&handle_for_call, target)
+                    if live {
+                        let service = XPanel::service_free();
+                        let publishers = service.publishers;
+                        let Some(publisher) =
+                            termy_x::publish::first_available(publishers.as_slice())
+                        else {
+                            return Err(
+                                "No in-app posting path found. Connect X first, then try again."
+                                    .to_string(),
+                            );
+                        };
+                        publisher.set_follow(&handle_for_call, target)
+                    } else {
+                        mock.set_follow(&handle_for_call, target)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
@@ -3077,11 +3345,12 @@ impl XPanel {
                 match result {
                     Ok(message) => {
                         panel.follow_overrides.insert(handle.clone(), target);
-                        if let Some(profile) = &mut panel.profile {
-                            if profile.handle.eq_ignore_ascii_case(&handle) {
-                                profile.viewer_following = Some(target);
-                            }
+                        if let Some(profile) = &mut panel.profile
+                            && profile.handle.eq_ignore_ascii_case(&handle)
+                        {
+                            profile.viewer_following = Some(target);
                         }
+                        panel.apply_follow_to_thread(&handle, target);
                         panel.status = message;
                     }
                     Err(error) => {
@@ -3110,41 +3379,40 @@ impl XPanel {
         if self.engage_pending.iter().any(|p| p == &id) {
             return;
         }
-        if !self.live {
-            self.notice = Some("Preview/mock never likes or retweets.".into());
-            cx.notify();
-            return;
-        }
         let url = url.to_string();
         let author = author.to_string();
         let engage_started = Instant::now();
         let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
-        let now_active = match action {
-            EngageAction::Like | EngageAction::Retweet => true,
-            _ => false,
-        };
+        let now_active = matches!(action, EngageAction::Like | EngageAction::Retweet);
         self.set_engage_state(&id, is_like, now_active);
         self.engage_pending.push(id.clone());
         cx.notify();
+        let live = self.live;
+        let mock = self.mock_writes.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let probe_started = Instant::now();
-                    let service = XPanel::service_free();
-                    let publishers = service.publishers;
-                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
-                    else {
-                        return Err(
-                            "No in-app posting path found. Connect X first, then try again."
-                                .to_string(),
-                        );
-                    };
-                    perf_log(&format!(
-                        "engage probe_ms={}",
-                        probe_started.elapsed().as_millis()
-                    ));
-                    publisher.engage(action, &url, None, &[]).map_err(|e| e)
+                    if live {
+                        let service = XPanel::service_free();
+                        let publishers = service.publishers;
+                        let Some(publisher) =
+                            termy_x::publish::first_available(publishers.as_slice())
+                        else {
+                            return Err(
+                                "No in-app posting path found. Connect X first, then try again."
+                                    .to_string(),
+                            );
+                        };
+                        perf_log(&format!(
+                            "engage probe_ms={}",
+                            probe_started.elapsed().as_millis()
+                        ));
+                        publisher.engage(action, &url, None, &[])
+                    } else {
+                        mock.engage(action, &url, None, &[])
+                    }
                 })
                 .await;
             perf_log(&format!(
@@ -3205,18 +3473,53 @@ impl XPanel {
             return;
         }
         let delta: i64 = if active { 1 } else { -1 };
+        let apply = |post: &mut Post| {
+            if post.id == id {
+                if is_like {
+                    post.likes = (post.likes as i64 + delta).max(0) as u64;
+                    post.viewer_liked = Some(active);
+                } else {
+                    post.reposts = (post.reposts as i64 + delta).max(0) as u64;
+                }
+            }
+        };
         for list in [
             &mut self.posts,
             &mut self.following_posts,
             &mut self.search_posts,
+            &mut self.mentions_posts,
+            &mut self.inbox_posts,
         ] {
             for post in list.iter_mut() {
-                if post.id == id {
-                    if is_like {
-                        post.likes = (post.likes as i64 + delta).max(0) as u64;
-                    } else {
-                        post.reposts = (post.reposts as i64 + delta).max(0) as u64;
-                    }
+                apply(post);
+            }
+        }
+        if let Some(thread) = self.thread.as_mut() {
+            apply(&mut thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &mut thread.load {
+                for post in replies {
+                    apply(post);
+                }
+            }
+        }
+    }
+
+    fn apply_follow_to_thread(&mut self, handle: &str, following: bool) {
+        let needle = handle.trim_start_matches('@');
+        let apply = |post: &mut Post| {
+            if post
+                .author_handle
+                .trim_start_matches('@')
+                .eq_ignore_ascii_case(needle)
+            {
+                post.viewer_follows_author = Some(following);
+            }
+        };
+        if let Some(thread) = self.thread.as_mut() {
+            apply(&mut thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &mut thread.load {
+                for post in replies {
+                    apply(post);
                 }
             }
         }
@@ -3234,10 +3537,7 @@ impl XPanel {
         self.quote_author = author_handle.to_string();
         self.input_target = InputTarget::Quote;
         self.pending_focus = true;
-        self.status = format!(
-            "quote @{} \u{b7} your words on their tweet, then Post",
-            author_handle
-        );
+        self.status = format!("quote @{author_handle} \u{b7} your words on their tweet, then Post");
     }
 
     fn close_quote(&mut self) {
@@ -3287,6 +3587,8 @@ impl XPanel {
             .iter()
             .chain(self.following_posts.iter())
             .chain(self.search_posts.iter())
+            .chain(self.mentions_posts.iter())
+            .chain(self.inbox_posts.iter())
             .find(|post| post.id == target_id);
         let Some(target_post) = target_post else {
             self.notice =
@@ -3311,8 +3613,7 @@ impl XPanel {
         let author = self.quote_author.clone();
         self.quote_posting = true;
         self.notice = Some(format!(
-            "Quoting @{} in-app, silently in the background\u{2026} no browser will open.",
-            author
+            "Quoting @{author} in-app, silently in the background\u{2026} no browser will open."
         ));
         cx.notify();
         let submit_started = Instant::now();
@@ -3358,10 +3659,9 @@ impl XPanel {
                         panel.quote_text.clear();
                         panel.quote_media.clear();
                         panel.notice = Some(format!(
-                            "Quoted @{} \u{b7} posted in-app, no browser opened.",
-                            author
+                            "Quoted @{author} \u{b7} posted in-app, no browser opened."
                         ));
-                        panel.status = format!("quoted @{}", author);
+                        panel.status = format!("quoted @{author}");
                         panel.begin_post_burst(BurstTarget::Quote, cx);
                         panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
@@ -3668,10 +3968,13 @@ fn patch_repost_original(posts: &mut [Post], repost_id: &str, original: &Post) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn fetch_section(
     section: XSection,
     query: String,
     lookup: String,
+    handle: String,
+    newest: bool,
     live: bool,
     feed: TimelineFeed,
     append: bool,
@@ -3731,8 +4034,34 @@ fn fetch_section(
                 }
             }
             XSection::Search => {
-                if let Ok(served) = service.search(&query, false, 15) {
+                if let Ok(served) = service.search(&query, newest, 15) {
                     return FetchPayload::Search {
+                        posts: served.value,
+                        status: live_status(&served.status),
+                    };
+                }
+            }
+            XSection::Mentions => {
+                let who = if handle.trim().is_empty() {
+                    lookup.as_str()
+                } else {
+                    handle.as_str()
+                };
+                if let Ok(served) = service.mentions(who, 20) {
+                    return FetchPayload::Mentions {
+                        posts: served.value,
+                        status: live_status(&served.status),
+                    };
+                }
+            }
+            XSection::Inbox => {
+                let who = if handle.trim().is_empty() {
+                    lookup.as_str()
+                } else {
+                    handle.as_str()
+                };
+                if let Ok(served) = service.inbox_replies(who, 20) {
+                    return FetchPayload::Inbox {
                         posts: served.value,
                         status: live_status(&served.status),
                     };
@@ -3797,7 +4126,7 @@ fn fetch_section(
                     ),
                 };
             }
-            XSection::Compose => {}
+            XSection::Compose | XSection::Help => {}
         }
     }
 
@@ -3817,11 +4146,39 @@ fn fetch_section(
         },
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
-                .search(&query, false, 15)
+                .search(&query, newest, 15)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
         },
+        XSection::Mentions => {
+            let who = if handle.trim().is_empty() {
+                "termy"
+            } else {
+                handle.as_str()
+            };
+            FetchPayload::Mentions {
+                posts: MockProvider
+                    .mentions(who, 20)
+                    .map(|served| served.value)
+                    .unwrap_or_default(),
+                status: "mock Â· mentions Â· no X API credits".into(),
+            }
+        }
+        XSection::Inbox => {
+            let who = if handle.trim().is_empty() {
+                "termy"
+            } else {
+                handle.as_str()
+            };
+            FetchPayload::Inbox {
+                posts: MockProvider
+                    .inbox_replies(who, 20)
+                    .map(|served| served.value)
+                    .unwrap_or_default(),
+                status: "mock Â· inbox Â· no X API credits".into(),
+            }
+        }
         XSection::Trends => FetchPayload::Trends {
             trends: MockProvider
                 .trends(Some("worldwide"), 50)
@@ -3851,7 +4208,7 @@ fn fetch_section(
             }],
             status: "research Â· fixture Â· no X API credits".into(),
         },
-        XSection::Compose => FetchPayload::Timeline {
+        XSection::Compose | XSection::Help => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
             feed,
@@ -3883,10 +4240,15 @@ impl Render for XPanel {
         let char_limit = self.char_limit;
         // Off the Compose tab the thread math is never displayed; skip it
         // so Timeline/Search keystrokes and blink frames stay cheap.
+        let confirm_text = if self.confirm_reply_to.is_some() {
+            self.reply_text.as_str()
+        } else {
+            self.compose.as_str()
+        };
         let (count, parts) =
             if self.section == XSection::Compose || self.confirm || self.fill_window {
-                let count = weighted_len_limited(&self.compose, char_limit);
-                let parts = split_thread_limited(&self.compose, char_limit);
+                let count = weighted_len_limited(confirm_text, char_limit);
+                let parts = split_thread_limited(confirm_text, char_limit);
                 (count, parts)
             } else {
                 (weighted_len_limited("", char_limit), Vec::new())
@@ -3933,10 +4295,13 @@ impl Render for XPanel {
                     .child(self.connection_bar(cx))
                     .child(self.status_line())
                     .children(
-                        (columns == 1 && self.section == XSection::Timeline)
-                            .then(|| self.feed_switch(cx)),
+                        (columns == 1
+                            && self.section == XSection::Timeline
+                            && self.thread.is_none())
+                        .then(|| self.feed_switch(cx)),
                     )
-                    .child(if columns == 1 {
+                    .children(self.shows_list_sort().then(|| self.list_sort_bar(cx)))
+                    .child(if columns == 1 || self.thread.is_some() {
                         div()
                             .relative()
                             .flex_1()
@@ -4049,6 +4414,7 @@ impl Render for XPanel {
             .children(self.confirm.then(|| {
                 self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)
             }))
+            .children(self.bulk_overlay(dialog_width, cx))
             .children(self.viewer_overlay(cx));
         let elapsed = render_started.elapsed();
         if elapsed.as_millis() > 12
@@ -4359,6 +4725,7 @@ enum SubmitKind {
 struct PostBurst {
     target: BurstTarget,
     seq: u64,
+    #[allow(dead_code)]
     started: Instant,
     /// For BurstTarget::Card: the tweet whose card shows the burst.
     card_id: Option<String>,
@@ -4407,8 +4774,8 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
                     // Break at the last space in this visual line if
                     // there is one past the line start, else hard-break.
                     let mut space_at: Option<usize> = None;
-                    for j in line_start..i {
-                        if chars[j].1 == ' ' {
+                    for (j, ch) in chars.iter().enumerate().take(i).skip(line_start) {
+                        if ch.1 == ' ' {
                             space_at = Some(j);
                         }
                     }
@@ -4436,7 +4803,7 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
 /// Which visual line (0-based) a byte caret lands on, given the wrap.
 fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
     let ranges = soft_wrap_ranges(text, max_chars);
-    for (idx, &(start, end)) in ranges.iter().enumerate() {
+    for (idx, &(_start, end)) in ranges.iter().enumerate() {
         if caret <= end {
             return idx;
         }
@@ -4656,10 +5023,13 @@ impl XPanel {
                 [
                     XSection::Timeline,
                     XSection::Search,
+                    XSection::Mentions,
+                    XSection::Inbox,
                     XSection::Trends,
                     XSection::Lookup,
                     XSection::Compose,
                     XSection::Research,
+                    XSection::Help,
                 ]
                 .into_iter()
                 .map(move |section| {
@@ -5001,7 +5371,16 @@ impl XPanel {
         }
         let sorted = sort_trends(&self.trends);
         let filtering = !self.trends_filter.trim().is_empty();
-        let visible = filter_trends(&self.trends, &self.trends_filter);
+        let ranked = filter_trends(&self.trends, &self.trends_filter);
+        let visible = match self.list_sort {
+            termy_x::sort::ResultSort::Newest => self
+                .trends
+                .iter()
+                .filter(|trend| ranked.iter().any(|hit| hit.query == trend.query))
+                .cloned()
+                .collect::<Vec<_>>(),
+            termy_x::sort::ResultSort::Popular => ranked,
+        };
         if filtering {
             rows.push(
                 div()
@@ -5033,7 +5412,8 @@ impl XPanel {
             );
         } else {
             rows.push(hint(format!(
-                "{total} unique trends \u{b7} Top 20 first, then grouped by the category X reports \u{b7} X no longer publishes trend post counts"
+                "{total} unique trends \u{b7} {} \u{b7} Top 20 first, then grouped by the category X reports \u{b7} X no longer publishes trend post counts",
+                self.list_sort.label()
             )));
         }
         if visible.is_empty() {
@@ -5118,9 +5498,14 @@ impl XPanel {
         if let Some(notice) = &self.notice {
             rows.push(hint(notice.clone()));
         }
+        if self.thread.is_some() {
+            rows.extend(self.thread_rows(cx));
+            return rows;
+        }
         if self.live
             && matches!(self.connection, ConnState::NotConnected { .. })
             && self.section != XSection::Compose
+            && self.section != XSection::Help
         {
             rows.push(card(
                 "Not connected yet".into(),
@@ -5152,7 +5537,7 @@ impl XPanel {
                 } else if self.loading {
                     rows.push(hint("Refreshing timeline...".into()));
                 }
-                for post in self.feed_posts() {
+                for post in self.sorted_posts(self.feed_posts()) {
                     rows.push(self.tweet_card(post, cx));
                 }
                 if !self.feed_posts().is_empty() {
@@ -5181,14 +5566,31 @@ impl XPanel {
                     ));
                 } else {
                     rows.push(hint(format!(
-                        "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} click a tweet to reply in place",
+                        "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} {} \u{b7} click a tweet to open the thread",
                         self.searched_query,
-                        self.search_posts.len()
+                        self.search_posts.len(),
+                        self.list_sort.label()
                     )));
-                    for post in &self.search_posts {
+                    for post in self.sorted_posts(&self.search_posts) {
                         rows.push(self.tweet_card(post, cx));
                     }
                 }
+            }
+            XSection::Mentions => {
+                rows.extend(self.named_post_list(
+                    "Mentions",
+                    "Tweets that mention you. OpenCLI search @you \u{b7} nothing posts.",
+                    &self.mentions_posts,
+                    cx,
+                ));
+            }
+            XSection::Inbox => {
+                rows.extend(self.named_post_list(
+                    "Inbox",
+                    "Replies directed at you. OpenCLI search to:you \u{b7} nothing posts.",
+                    &self.inbox_posts,
+                    cx,
+                ));
             }
             XSection::Trends => {
                 rows.extend(self.trends_rows(cx));
@@ -5242,27 +5644,24 @@ impl XPanel {
                         }
                     }
                     if !sections.top.is_empty() {
-                        rows.push(section_label(&if sections.top_ranked {
-                            format!(
-                                "Top {} \u{b7} ranked by engagement (likes + 3\u{d7} reposts + 2\u{d7} replies + 5\u{d7} bookmarks)",
-                                sections.top.len()
-                            )
-                        } else {
-                            format!(
-                                "Top {} \u{b7} latest \u{b7} no engagement counts in the returned posts, so no ranking is claimed",
-                                sections.top.len()
-                            )
-                        }));
-                        for post in &sections.top {
+                        let top = self.sorted_posts(&sections.top);
+                        rows.push(section_label(&format!(
+                            "{} \u{b7} {} shown",
+                            self.list_sort.label(),
+                            top.len()
+                        )));
+                        for post in top {
                             rows.push(self.tweet_card_scoped(post, "top", cx));
                         }
                     }
                     if !sections.all.is_empty() {
+                        let all = self.sorted_posts(&sections.all);
                         rows.push(section_label(&format!(
-                            "All tweets \u{b7} {} returned \u{b7} up to 120 deep",
-                            sections.all.len()
+                            "All tweets \u{b7} {} returned \u{b7} {}",
+                            all.len(),
+                            self.list_sort.label()
                         )));
-                        for post in &sections.all {
+                        for post in all {
                             rows.push(self.tweet_card_scoped(post, "all", cx));
                         }
                     }
@@ -5363,6 +5762,27 @@ impl XPanel {
             XSection::Compose => {
                 rows.push(self.compose_block(weighted, limit, parts, cx));
             }
+            XSection::Help => {
+                rows.push(card(
+                    "Keys".into(),
+                    format!(
+                        "{key}  Popular / Newest sort (every list, including nested replies)\nEsc  Back / close overlay / cancel confirm\nTab  Cycle compose controls\nEnter  Run Search / Lookup / Research\nCtrl+Shift+X  Open / close this panel",
+                        key = termy_x::LIST_SORT_KEY
+                    ),
+                ));
+                rows.push(card(
+                    "Sort".into(),
+                    "Popular = likes, then engagement. Newest = created_at descending. The last choice is stored in x.toml as list_sort and restored on launch.".into(),
+                ));
+                rows.push(card(
+                    "Writes".into(),
+                    "Nothing posts, likes, or follows until you Confirm. Preview/mock never writes.".into(),
+                ));
+                rows.push(card(
+                    "Stats".into(),
+                    "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. Follower count is the profile payload, never len() of a capped followers page.".into(),
+                ));
+            }
         }
         rows
     }
@@ -5421,6 +5841,8 @@ impl XPanel {
         collect(&self.posts, &mut urls);
         collect(&self.following_posts, &mut urls);
         collect(&self.search_posts, &mut urls);
+        collect(&self.mentions_posts, &mut urls);
+        collect(&self.inbox_posts, &mut urls);
         if let Some(profile) = &self.profile {
             collect(&profile.posts, &mut urls);
             collect(&profile.pinned, &mut urls);
@@ -5691,15 +6113,7 @@ impl XPanel {
                     .text_color(rgb(0xe7eefc))
                     .child(profile.bio.clone())
             }))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x9ad7ff))
-                    .child(format!(
-                        "{} followers \u{b7} {} following",
-                        profile.followers, profile.following
-                    )),
-            );
+            .children(profile_stats_rows(profile));
         // Follow/Unfollow (hidden on your own profile). Label follows
         // the payload flag / verified session state; while a write is
         // in flight the label shows progress and clicks are ignored.
@@ -5733,6 +6147,7 @@ impl XPanel {
         card_el.into_any_element()
     }
 
+    #[allow(dead_code)]
     fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         self.media_box_scoped(post, "main", cx)
     }
@@ -5851,6 +6266,10 @@ impl XPanel {
     /// rect is derived from the window viewport (panel is the rightmost
     /// 480px, viewer header 56px + controls 72px), so the native surface
     /// tracks Termy moves/resizes and never changes Termy's geometry.
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "linux")),
+        allow(unused_variables)
+    )]
     fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(viewer) = self.viewer.clone() else {
             return;
@@ -6307,8 +6726,8 @@ impl XPanel {
         Some(el.into_any_element())
     }
 
-    /// One tweet in Timeline / Search / Trends. Clicking it expands an
-    /// inline reply box right underneath; a sent reply marks it Replied.
+    /// One tweet in Timeline / Search / Lookup. Clicking the card opens
+    /// the thread overlay; Like / Retweet / Quote / Reply keep working.
     /// Thin draggable scrollbar overlaid on the list's right edge.
     /// Geometry comes from the shared scroll handle, so wheel scrolling,
     /// middle-click autoscroll and this thumb never disagree. Track
@@ -6447,6 +6866,7 @@ impl XPanel {
     /// while the cursor is held away from the anchor — no further mouse
     /// movement needed — tracking the GLOBAL cursor so leaving the
     /// window neither pauses nor disengages; only a click or Esc exits.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))]
     fn toggle_autoscroll(
         &mut self,
         event: &MouseDownEvent,
@@ -6552,7 +6972,12 @@ impl XPanel {
         // style) under a "reposted" header; reply/engage target the
         // original tweet, exactly as on X.
         let display = post.engage_target();
-        let selected = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let reply_open = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let selected = reply_open
+            || self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.focus_id == display.id);
         let replied = self.replied_ids.iter().any(|id| id == &display.id);
         // Click handlers capture only the two small strings they need:
         // cloning the whole Post (text + media) for every card on every
@@ -6610,7 +7035,7 @@ impl XPanel {
                     .text_size(px(13.0))
                     .text_color(rgb(0xd7fbff))
                     .child(format!(
-                        "@{} \u{b7} {} likes{} \u{b7} click to reply",
+                        "@{} \u{b7} {} likes{} \u{b7} click to open thread",
                         display.author_handle,
                         display.likes,
                         if replied {
@@ -6683,14 +7108,10 @@ impl XPanel {
                                         .into(),
                                 );
                             } else if was_drag {
-                                // Plain click on the text: same action the
-                                // card click has always done.
-                                if this.reply_post_id.as_deref() == Some(up_id.as_str()) {
-                                    this.input_target = InputTarget::Reply;
-                                    this.pending_focus = true;
-                                } else {
-                                    this.open_reply_parts(&up_id, &up_author);
-                                }
+                                // Plain click on the text opens the thread.
+                                // Reply is a button on the card so it cannot
+                                // be confused with this.
+                                this.open_thread(&up_id, &up_author, cx);
                             }
                             cx.stop_propagation();
                             cx.notify();
@@ -6712,18 +7133,12 @@ impl XPanel {
                     this.card_copy_focus = false;
                     this.card_text_selection = None;
                     this.card_drag_start = None;
-                    if this.reply_post_id.as_deref() == Some(click_id.as_str()) {
-                        // Second click on the open tweet just refocuses it.
-                        this.input_target = InputTarget::Reply;
-                        this.pending_focus = true;
-                    } else {
-                        this.open_reply_parts(&click_id, &click_author);
-                    }
+                    this.open_thread(&click_id, &click_author, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
             );
-        if selected {
+        if reply_open {
             el = el.child(self.reply_box(display, cx));
         }
         if self.quote_post_id.as_deref() == Some(display.id.as_str()) {
@@ -6752,12 +7167,30 @@ impl XPanel {
         let liked = self.liked_ids.iter().any(|p| p == &post.id);
         let retweeted = self.retweeted_ids.iter().any(|p| p == &post.id);
         let pending = self.engage_pending.iter().any(|p| p == &post.id);
-        let (like_id, rt_id) = (id.clone(), id.clone());
-        let (like_url, rt_url) = (url.clone(), url.clone());
-        let (like_author, rt_author) = (author.clone(), author.clone());
+        let (like_id, rt_id) = (id.clone(), id);
+        let (like_url, rt_url) = (url.clone(), url);
+        let (like_author, rt_author) = (author.clone(), author);
         let quote_id = post.id.clone();
         let quote_author = post.author_handle.clone();
-        div()
+        let reply_id = post.id.clone();
+        let reply_author = post.author_handle.clone();
+        let follow_handle = post.author_handle.clone();
+        let following = self
+            .follow_overrides
+            .get(&post.author_handle)
+            .copied()
+            .or(post.viewer_follows_author)
+            == Some(true);
+        let follow_pending = self
+            .follow_pending
+            .as_ref()
+            .is_some_and(|(h, _)| h.eq_ignore_ascii_case(&post.author_handle));
+        let own = match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+            _ => None,
+        };
+        let show_follow = scope == "thread" && !is_own_profile(&post.author_handle, own);
+        let mut row = div()
             .mt(px(8.0))
             .flex()
             .gap(px(8.0))
@@ -6820,7 +7253,37 @@ impl XPanel {
                     cx.notify();
                 })
             ))
-            .into_any_element()
+            .child(x_button!(
+                format!("x-reply-{scope}-{}", post.id),
+                "Reply",
+                cx.listener(move |this, _, _, cx| {
+                    this.open_reply_parts(&reply_id, &reply_author);
+                    if this.thread.is_some() && !this.reply_text.trim().is_empty() {
+                        this.arm_reply_confirm();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        if show_follow {
+            row = row.child(x_button!(
+                format!("x-follow-{scope}-{}", post.id),
+                if follow_pending {
+                    "\u{2026}"
+                } else if following {
+                    "Following"
+                } else {
+                    "Follow"
+                },
+                following,
+                cx.listener(move |this, _, _, cx| {
+                    this.toggle_follow(&follow_handle, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        }
+        row.into_any_element()
     }
 
     /// Inline quote composer under a card: retweet with your own words.
@@ -7193,11 +7656,18 @@ impl XPanel {
                     "x-reply-send",
                     if self.reply_posting {
                         "Posting\u{2026}"
+                    } else if self.thread.is_some() {
+                        "Confirm\u{2026}"
                     } else {
                         "Post"
                     },
                     cx.listener(|this, _, _, cx| {
-                        this.submit_reply(cx);
+                        if this.thread.is_some() {
+                            this.arm_reply_confirm();
+                            cx.notify();
+                        } else {
+                            this.submit_reply(cx);
+                        }
                         cx.stop_propagation();
                     })
                 ))
@@ -7987,7 +8457,14 @@ impl XPanel {
                         div()
                             .text_size(px(16.0))
                             .text_color(rgb(0xffd0ea))
-                            .child("Confirm - nothing posts until you say yes"),
+                            .child(if self.confirm_reply_to.is_some() {
+                                format!(
+                                    "Confirm reply to @{} \u{2014} nothing posts until you say yes",
+                                    self.confirm_reply_author
+                                )
+                            } else {
+                                "Confirm - nothing posts until you say yes".into()
+                            }),
                     )
                     .child(media_block)
                     .child(
@@ -8022,6 +8499,8 @@ impl XPanel {
                                 cancel_active,
                                 cx.listener(|this, _, _, cx| {
                                     this.confirm = false;
+                                    this.confirm_reply_to = None;
+                                    this.confirm_reply_author.clear();
                                     this.focus_compose_editor();
                                     this.pending_focus = true;
                                     cx.stop_propagation();
@@ -8070,9 +8549,14 @@ impl XPanel {
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
         let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
             .char_limit_or_fallback();
-        let parts = split_thread_limited(&self.compose, char_limit);
+        let source = if self.confirm_reply_to.is_some() {
+            self.reply_text.as_str()
+        } else {
+            self.compose.as_str()
+        };
+        let parts = split_thread_limited(source, char_limit);
         let text = if parts.is_empty() {
-            self.compose.clone()
+            source.to_string()
         } else {
             let index = self.intent_index.min(parts.len() - 1);
             parts[index].clone()
@@ -8096,18 +8580,27 @@ impl XPanel {
             cx.notify();
             return;
         }
-        if let Err(error) = termy_x::publish::validate_media_paths(&self.media) {
+        let reply_to = self.confirm_reply_to.clone();
+        let media = if reply_to.is_some() {
+            self.reply_media.clone()
+        } else {
+            self.media.clone()
+        };
+        if let Err(error) = termy_x::publish::validate_media_paths(&media) {
             self.notice = Some(error);
             cx.notify();
             return;
         }
-        let text = self.compose.trim().to_string();
+        let text = if reply_to.is_some() {
+            self.reply_text.trim().to_string()
+        } else {
+            self.compose.trim().to_string()
+        };
         if text.is_empty() {
             self.notice = Some("Type something before Publish.".into());
             cx.notify();
             return;
         }
-        let media = self.media.clone();
         self.posting = true;
         self.notice = Some(if media.is_empty() {
             "Posting in-app via your X session… no browser will open.".into()
@@ -8147,7 +8640,7 @@ impl XPanel {
                             .char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
-                        None,
+                        reply_to.as_deref(),
                         termy_x::publish::ConfirmDecision::Yes,
                         false,
                         publisher,
@@ -8170,16 +8663,30 @@ impl XPanel {
                 match result {
                     Ok(receipt) => {
                         panel.confirm = false;
-                        panel.media.clear();
-                        panel.compose.clear();
-                        panel.caret = 0;
-                        panel.sel_anchor = None;
-                        panel.notice = Some(format!(
-                            "Posted in-app — no browser opened. {receipt}"
-                        ));
-                        panel.focus_compose_editor();
-                        panel.pending_focus = true;
-                        panel.begin_post_burst(BurstTarget::Compose, cx);
+                        if let Some(id) = panel.confirm_reply_to.take() {
+                            if !panel.replied_ids.contains(&id) {
+                                panel.replied_ids.push(id);
+                            }
+                            panel.reply_text.clear();
+                            panel.reply_media.clear();
+                            panel.confirm_reply_author.clear();
+                            panel.close_reply();
+                            panel.notice = Some(format!(
+                                "Replied in-app \u{2014} no browser opened. {receipt}"
+                            ));
+                            panel.begin_post_burst(BurstTarget::Reply, cx);
+                        } else {
+                            panel.media.clear();
+                            panel.compose.clear();
+                            panel.caret = 0;
+                            panel.sel_anchor = None;
+                            panel.notice = Some(format!(
+                                "Posted in-app — no browser opened. {receipt}"
+                            ));
+                            panel.focus_compose_editor();
+                            panel.pending_focus = true;
+                            panel.begin_post_burst(BurstTarget::Compose, cx);
+                        }
                     }
                     Err(error) => {
                         // Stay on confirm so the user can retry or explicitly
@@ -8293,6 +8800,58 @@ fn section_label(text: &str) -> gpui_kit::AnyElement {
         .text_color(rgb(0xd7fbff))
         .child(text.to_string())
         .into_any_element()
+}
+
+/// Profile totals from the OpenCLI profile payload, plus sums over the
+/// loaded tweet window. Missing fields render as n/a — never a guessed
+/// `len()` of a capped followers page.
+fn profile_stats_rows(profile: &Profile) -> Vec<gpui_kit::AnyElement> {
+    let stats = termy_x::account_stats_from_profile(profile);
+    let totals = &stats.totals;
+    let window = &stats.window;
+    let line = |text: String| {
+        div()
+            .text_size(px(12.0))
+            .text_color(rgb(0x9ad7ff))
+            .child(text)
+            .into_any_element()
+    };
+    let dim = |text: String| {
+        div()
+            .text_size(px(11.0))
+            .text_color(rgb(0x93a4c3))
+            .child(text)
+            .into_any_element()
+    };
+    vec![
+        line(format!(
+            "{} followers \u{b7} {} following \u{b7} {} posts \u{b7} {} likes",
+            termy_x::fmt_count(totals.followers),
+            termy_x::fmt_count(totals.following),
+            termy_x::fmt_count(totals.tweets),
+            termy_x::fmt_count(totals.likes),
+        )),
+        line(format!(
+            "verified {} \u{b7} created_at {}",
+            termy_x::fmt_verified(totals.verified),
+            termy_x::fmt_created(totals.created_at.as_deref()),
+        )),
+        dim(window.window_note()),
+        line(format!(
+            "views {} \u{b7} likes {} \u{b7} replies {} \u{b7} reposts {} \u{b7} quotes {} \u{b7} bookmarks {}",
+            termy_x::fmt_count(window.views),
+            termy_x::fmt_count(window.likes),
+            termy_x::fmt_count(window.replies),
+            termy_x::fmt_count(window.reposts),
+            termy_x::fmt_count(window.quotes),
+            termy_x::fmt_count(window.bookmarks),
+        )),
+        line(format!(
+            "engagement {} \u{b7} rate {}",
+            termy_x::fmt_count(window.engagement),
+            termy_x::fmt_rate(window.engagement_rate),
+        )),
+    ]
 }
 
 fn hint(text: String) -> gpui_kit::AnyElement {

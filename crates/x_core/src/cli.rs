@@ -45,6 +45,11 @@ struct Cli {
 enum Cmd {
     /// Look up a user
     Lookup { handle: String },
+    /// Profile totals from OpenCLI plus sums over the loaded tweet window
+    Stats {
+        /// Handle to read. Omit to use the connected account.
+        handle: Option<String>,
+    },
     /// Read a post and its thread
     Thread { id_or_url: String },
     /// Publish text after you type yes. `--dry-run` prints the plan and never posts.
@@ -64,11 +69,11 @@ enum Cmd {
     /// Search posts
     Search {
         query: String,
-        /// Latest posts instead of top
-        #[arg(long)]
+        /// Latest posts instead of popular
+        #[arg(long, alias = "newest")]
         recent: bool,
-        /// Top posts (the default)
-        #[arg(long)]
+        /// Popular posts (the default)
+        #[arg(long, alias = "popular")]
         top: bool,
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -96,11 +101,11 @@ enum Cmd {
         /// Subject to search. Omit for the home timeline.
         #[arg(long)]
         topic: Option<String>,
-        /// Rank by engagement, then newer posts
-        #[arg(long)]
+        /// Rank by likes, then engagement (Popular)
+        #[arg(long, alias = "popular")]
         hot: bool,
-        /// Rank by recency, then engagement (the default)
-        #[arg(long)]
+        /// Rank by created_at descending (Newest)
+        #[arg(long, alias = "newest")]
         upcoming: bool,
         #[arg(long, default_value_t = 10)]
         limit: usize,
@@ -201,7 +206,12 @@ fn print_help_guide() {
     println!();
     println!("GUI");
     println!("  Ctrl+Shift+X          Open / close the X panel");
-    println!("  Tabs                  Timeline, Search, Trends, Lookup, Compose, Research, Help");
+    println!(
+        "  Tabs                  Timeline, Search, Mentions, Inbox, Trends, Lookup, Compose, Research, Help"
+    );
+    println!(
+        "  s                     Popular / Newest sort (every list, including nested replies)"
+    );
     println!("  Compose               Click the cyan box (caret blinks). Ctrl+V pastes in-box.");
     println!("  Attach image          Section under the compose box. Up to 4 JPG/PNG/GIF/WEBP.");
     println!("                        Thumbnails + filenames. Remove one or Clear all.");
@@ -215,14 +225,15 @@ fn print_help_guide() {
     println!("CLI  (from the termy-x folder: ./target/release/termy-xcli \u{2026})");
     println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
     println!("  x splash              Print the Termy X bird");
-    println!("  x search \"query\" [--recent|--top] [--limit N]");
-    println!("  x feed [--topic \"subject\"] [--hot|--upcoming] [--limit N]");
-    println!("    j/k move  h hot  u upcoming  /subject search");
+    println!("  x search \"query\" [--recent|--newest|--top|--popular] [--limit N]");
+    println!("  x feed [--topic \"subject\"] [--hot|--popular|--upcoming|--newest] [--limit N]");
+    println!("    j/k move  s popular/newest  h popular  u newest  /subject search");
     println!("    r reply box  type a line  p preview  y post  esc cancel  q quit");
     println!("  x feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
     println!("  x timeline [--limit N]");
     println!("  x trends [--place NAME] [--limit N]");
     println!("  x lookup handle");
+    println!("  x stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
     println!("  x post \"text\"");
     println!("  x post --dry-run \"text\"          Plan only - never posts");
     println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
@@ -350,6 +361,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                 .lookup(&handle)
                 .map(|served| (served.status.render(), json_value(served))),
         ),
+        Cmd::Stats { handle } => cmd_stats(handle, json, &service, &io.config),
         Cmd::Thread { id_or_url } => emit(
             json,
             service
@@ -879,6 +891,44 @@ fn plan_json(plan: &crate::publish::PublishPlan, dry_run: bool) -> String {
     .to_string()
 }
 
+fn cmd_stats(handle: Option<String>, json: bool, service: &Service, config: &XConfig) -> i32 {
+    let handle = handle
+        .filter(|h| !h.trim().is_empty())
+        .or_else(|| crate::connect::load_connected_handle(config));
+    let Some(handle) = handle.filter(|h| !h.trim().is_empty()) else {
+        eprintln!("give a username. Example: x stats yourname");
+        return 2;
+    };
+    match service.lookup(&handle) {
+        Ok(served) => {
+            let stats = crate::stats::account_stats_from_profile(&served.value);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "status": served.status.render(),
+                        "credits": "none",
+                        "data": stats,
+                    })
+                );
+            } else {
+                println!("{}", served.status.render());
+                println!("{}", crate::stats::render_account_stats(&stats));
+            }
+            0
+        }
+        Err(error) => {
+            if json {
+                println!("{}", serde_json::json!({"ok": false, "error": error}));
+            } else {
+                eprintln!("{error}");
+            }
+            1
+        }
+    }
+}
+
 fn emit<T: serde::Serialize>(json: bool, result: Result<(String, T), String>) -> i32 {
     match result {
         Ok((status, value)) => {
@@ -1009,6 +1059,7 @@ mod tests {
         );
         // Empty lookup.
         assert_eq!(execute(&["lookup".into(), "".into()], &mut io, false), 2);
+        assert_eq!(execute(&["stats".into()], &mut io, false), 2);
         // Connect instructions are printable with no account set up.
         assert_eq!(execute(&["connect".into()], &mut io, false), 0);
     }
@@ -1040,6 +1091,14 @@ mod tests {
         assert_eq!(
             execute(
                 &["lookup".into(), "@termy".into(), "--json".into()],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &["stats".into(), "termy".into(), "--json".into()],
                 &mut io,
                 false
             ),

@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::model::ProviderId;
+use crate::sort::ResultSort;
 
 /// Bird opacity behind content: dimmed into the 15-25% band by default.
 pub const DEFAULT_BACKGROUND_OPACITY: f32 = 0.18;
@@ -36,6 +37,10 @@ pub struct XConfig {
     /// default stays implicit so a dead Ollama falls back to templates.
     pub ai_explicit: bool,
     pub min_interval_ms: u64,
+    /// Per-run cap for thread "like all" / "follow all" (clamped 25..=50).
+    pub bulk_cap: usize,
+    /// Last Popular/Newest choice, restored on launch.
+    pub list_sort: ResultSort,
     pub post_read_usd: f64,
     pub user_read_usd: f64,
     pub post_write_usd: f64,
@@ -68,6 +73,8 @@ impl Default for XConfig {
             ai_model: String::new(),
             ai_explicit: false,
             min_interval_ms: 1500,
+            bulk_cap: crate::bulk::DEFAULT_BULK_CAP,
+            list_sort: ResultSort::Popular,
             post_read_usd: 0.005,
             user_read_usd: 0.010,
             post_write_usd: 0.010,
@@ -175,6 +182,16 @@ impl XConfig {
                     self.min_interval_ms = ms;
                 }
             }
+            "bulk_cap" | "thread.bulk_cap" => {
+                if let Ok(n) = value.parse::<usize>() {
+                    self.bulk_cap = crate::bulk::clamp_bulk_cap(n);
+                }
+            }
+            "list_sort" | "ui.list_sort" => {
+                if let Some(sort) = ResultSort::parse(value) {
+                    self.list_sort = sort;
+                }
+            }
             "shell.opencli_bin" => self.opencli_bin = value.to_string(),
             "shell.twitter_bin" => self.twitter_bin = value.to_string(),
             "shell.agent_reach_bin" => self.agent_reach_bin = value.to_string(),
@@ -272,6 +289,20 @@ impl XConfig {
     }
 
     pub fn save_background_art(&self) -> Result<(), String> {
+        self.upsert_config_assignment(
+            "background_art",
+            &format!("background_art = {}", self.background_art),
+        )
+    }
+
+    pub fn save_list_sort(&self) -> Result<(), String> {
+        self.upsert_config_assignment(
+            "list_sort",
+            &format!("list_sort = \"{}\"", self.list_sort.as_str()),
+        )
+    }
+
+    fn upsert_config_assignment(&self, key: &str, line: &str) -> Result<(), String> {
         fs::create_dir_all(&self.config_dir).map_err(|error| error.to_string())?;
         let path = self.config_dir.join("x.toml");
         let mut text = if path.exists() {
@@ -279,19 +310,7 @@ impl XConfig {
         } else {
             String::new()
         };
-        let line = format!("background_art = {}", self.background_art);
-        if let Some(start) = text.find("background_art") {
-            let end = text[start..]
-                .find('\n')
-                .map_or(text.len(), |index| start + index);
-            text.replace_range(start..end, &line);
-        } else {
-            if !text.is_empty() && !text.ends_with('\n') {
-                text.push('\n');
-            }
-            text.push_str(&line);
-            text.push('\n');
-        }
+        upsert_assignment(&mut text, key, line);
         fs::write(path, text).map_err(|error| error.to_string())
     }
 
@@ -356,6 +375,32 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn upsert_assignment(text: &mut String, key: &str, line: &str) {
+    let mut out = String::new();
+    let mut found = false;
+    for raw in text.lines() {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        let matches = code
+            .split_once('=')
+            .is_some_and(|(left, _)| left.trim() == key);
+        if matches {
+            out.push_str(line);
+            found = true;
+        } else {
+            out.push_str(raw);
+        }
+        out.push('\n');
+    }
+    if !found {
+        if !text.is_empty() && !text.ends_with('\n') && out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    *text = out;
+}
+
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2
@@ -398,6 +443,13 @@ post_write_usd = 0.010
 base_url_env = "TERMY_X_AI_BASE_URL"
 model_env = "TERMY_X_AI_MODEL"
 api_key_env = "TERMY_X_AI_API_KEY"
+
+# Popular (likes, then engagement) or Newest (created_at desc). Restored on launch.
+list_sort = "popular"
+
+[thread]
+# Like-all / follow-all cap per run. Clamped to 25..=50. Default 30.
+bulk_cap = 30
 
 [shell]
 min_interval_ms = 1500
@@ -478,5 +530,37 @@ mod tests {
         assert_eq!(config.char_limit, Some(PREMIUM_CHAR_LIMIT));
         config.apply_text("char_limit = auto\n");
         assert_eq!(config.char_limit, None);
+    }
+
+    #[test]
+    fn bulk_cap_parses_and_clamps_to_25_50() {
+        let mut config = XConfig::default();
+        assert_eq!(config.bulk_cap, crate::bulk::DEFAULT_BULK_CAP);
+        config.apply_text("thread.bulk_cap = 40\n");
+        assert_eq!(config.bulk_cap, 40);
+        config.apply_text("bulk_cap = 10\n");
+        assert_eq!(config.bulk_cap, 25);
+        config.apply_text("[thread]\nbulk_cap = 99\n");
+        assert_eq!(config.bulk_cap, 50);
+    }
+
+    #[test]
+    fn list_sort_parses_and_round_trips_through_x_toml() {
+        let mut config = XConfig::default();
+        assert_eq!(config.list_sort, ResultSort::Popular);
+        config.apply_text("list_sort = \"newest\"\n");
+        assert_eq!(config.list_sort, ResultSort::Newest);
+        config.apply_text("ui.list_sort = top\n");
+        assert_eq!(config.list_sort, ResultSort::Popular);
+        let dir = tempfile::tempdir().expect("temp dir");
+        config.config_dir = dir.path().to_path_buf();
+        config.list_sort = ResultSort::Newest;
+        config.save_list_sort().expect("write list_sort");
+        let loaded = XConfig::load(dir.path());
+        assert_eq!(loaded.list_sort, ResultSort::Newest);
+        config.list_sort = ResultSort::Popular;
+        config.save_list_sort().expect("rewrite list_sort");
+        let loaded = XConfig::load(dir.path());
+        assert_eq!(loaded.list_sort, ResultSort::Popular);
     }
 }

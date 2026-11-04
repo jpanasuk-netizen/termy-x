@@ -547,7 +547,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let media_calls = Arc::new(Mutex::new(Vec::new()));
         let publisher = RecordingPublisher {
-            calls: calls.clone(),
+            calls,
             media_calls: media_calls.clone(),
         };
         // Dry-run: publisher must not be called at all.

@@ -177,7 +177,7 @@ pub fn dims_from_media_url(url: &str) -> Option<(u32, u32)> {
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Post {
     pub id: String,
     pub url: String,
@@ -190,6 +190,11 @@ pub struct Post {
     pub replies: u64,
     pub bookmarks: u64,
     pub views: u64,
+    /// Quote count when the provider payload carries `quotes` /
+    /// `quote_count`. `None` means the field was missing (show n/a),
+    /// never a guessed zero.
+    #[serde(default)]
+    pub quotes: Option<u64>,
     /// Attached photos/videos/GIFs (empty for text-only posts).
     #[serde(default)]
     pub media: Vec<MediaItem>,
@@ -200,6 +205,21 @@ pub struct Post {
     /// tweet (GraphQL `retweeted_status_result`); never invented.
     #[serde(default)]
     pub retweeted: Option<Box<Post>>,
+    /// Parent tweet id when this post is a reply. Taken only from the
+    /// provider payload (`in_reply_to_status_id_str` and siblings);
+    /// never invented. Used to build nested reply trees.
+    #[serde(default)]
+    pub in_reply_to: Option<String>,
+    /// Whether the connected account liked this tweet, ONLY when the
+    /// payload carries a real boolean (`favorited` / `liked` /
+    /// `viewer_liked`). `None` = payload silent.
+    #[serde(default)]
+    pub viewer_liked: Option<bool>,
+    /// Whether the connected account follows this post's author, ONLY
+    /// when the payload's user object carries a real `following` bool.
+    /// `None` = payload silent.
+    #[serde(default)]
+    pub viewer_follows_author: Option<bool>,
 }
 
 impl Post {
@@ -260,8 +280,23 @@ pub struct Profile {
     pub handle: String,
     pub name: String,
     pub bio: String,
-    pub followers: u64,
-    pub following: u64,
+    /// Account totals from the profile payload (`followers` /
+    /// `followers_count`). `None` when the payload omitted the field
+    /// (show n/a). Never derived from `len()` of a followers page.
+    #[serde(default)]
+    pub followers: Option<u64>,
+    #[serde(default)]
+    pub following: Option<u64>,
+    /// Profile `tweets` / `statuses_count` / `tweet_count`.
+    #[serde(default)]
+    pub tweets: Option<u64>,
+    /// Profile `likes` / `favourites_count` (account likes, not post likes).
+    #[serde(default)]
+    pub likes: Option<u64>,
+    #[serde(default)]
+    pub verified: Option<bool>,
+    #[serde(default)]
+    pub created_at: Option<String>,
     /// Avatar image URL when the provider payload carries one
     /// (`profile_image_url_https` etc). Never invented: `None` renders
     /// an initials placeholder, not a guessed CDN URL.
@@ -576,8 +611,7 @@ pub fn trend_rank(trend: &Trend, sorted: &[Trend]) -> u64 {
         sorted
             .iter()
             .position(|t| t.name == trend.name && t.query == trend.query)
-            .map(|i| i as u64 + 1)
-            .unwrap_or(0)
+            .map_or(0, |i| i as u64 + 1)
     })
 }
 
@@ -1009,12 +1043,7 @@ mod profile_section_tests {
             text: format!("t{id}"),
             created_at: None,
             likes,
-            reposts: 0,
-            replies: 0,
-            bookmarks: 0,
-            views: 0,
-            media: Vec::new(),
-            retweeted: None,
+            ..Post::default()
         }
     }
 
@@ -1023,8 +1052,12 @@ mod profile_section_tests {
             handle: "a".into(),
             name: "A".into(),
             bio: String::new(),
-            followers: 0,
-            following: 0,
+            followers: None,
+            following: None,
+            tweets: None,
+            likes: None,
+            verified: None,
+            created_at: None,
             avatar_url: None,
             banner_url: None,
             viewer_following: None,

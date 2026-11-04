@@ -86,7 +86,7 @@ mod tests {
     fn thumb_geometry_and_inverse_round_trip() {
         let (y, h) = thumb_geometry(600.0, 5400.0, 0.0);
         assert_eq!(y, 0.0);
-        assert!(h >= 28.0 && h < 600.0);
+        assert!((28.0..600.0).contains(&h));
         let (y2, _) = thumb_geometry(600.0, 5400.0, -5400.0);
         assert_eq!(y2, 600.0 - h);
         let off = offset_for_thumb_y(600.0, 5400.0, y2);
