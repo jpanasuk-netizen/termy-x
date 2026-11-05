@@ -19,7 +19,7 @@ use crate::model::Post;
 
 pub const TREG_BASE: &str = "https://treg.to";
 /// Where a user signs in to Treg and creates their own API key.
-pub const TREG_KEYS_URL: &str = "https://treg.to/dashboard/api-keys";
+pub const TREG_KEYS_URL: &str = "https://treg.to/login";
 /// Treg catalog `anyapi.x.search.posts` (upstream AnyAPI twitter.search).
 pub const TREG_SEARCH_URL: &str =
     "https://treg.to/call/https://api.getanyapi.com/v1/run/twitter.search";
