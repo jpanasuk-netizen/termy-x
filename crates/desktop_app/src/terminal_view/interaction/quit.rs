@@ -164,6 +164,19 @@ impl TerminalView {
             .as_deref()
             .and_then(|command| command.split_whitespace().next())
             .is_some_and(super::super::x_host::is_agent_process);
+        // Windows often reports the hosting shell (pwsh) or a runtime
+        // (node/bun) instead of the agent binary, and agent TUIs use the
+        // alternate screen. Fall back to the tab's titles naming an agent.
+        let title_is_agent = [
+            tab.current_command.as_deref(),
+            tab.shell_title.as_deref(),
+            tab.explicit_title.as_deref(),
+            Some(tab.title.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(Self::title_names_agent);
+        let command_is_agent = command_is_agent || title_is_agent;
         let mut saw_agent = false;
         let all_ok = tab.panes.iter().all(|pane| {
             let process = pane
@@ -182,10 +195,37 @@ impl TerminalView {
                     saw_agent = true;
                     true
                 }
+                Some(name)
+                    if command_is_agent
+                        && (super::super::x_host::is_shell(Some(name))
+                            || Self::is_agent_runtime(name)) =>
+                {
+                    saw_agent = true;
+                    true
+                }
                 _ => false,
             }
         });
         all_ok && saw_agent
+    }
+
+    fn title_names_agent(title: &str) -> bool {
+        title
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '.')
+            .any(super::super::x_host::is_agent_process)
+    }
+
+    fn is_agent_runtime(process: &str) -> bool {
+        let base = process
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(process)
+            .to_ascii_lowercase();
+        let stem = base.strip_suffix(".exe").unwrap_or(&base);
+        matches!(
+            stem,
+            "node" | "bun" | "deno" | "python" | "python3" | "conhost" | "openconsole"
+        )
     }
 
     fn tab_title_for_warning(

@@ -845,9 +845,16 @@ impl XPanel {
 
     pub(super) fn reply_guy_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
         let mut rows = Vec::new();
-        rows.push(hint(
-            "Reply Guy: Treg finds fresh posts for your niche, Grok drafts replies, you pick and edit. Reply opens Confirm. Nothing auto-posts.".into(),
-        ));
+        let ready = self.desk.rg.ready().is_ok();
+        rows.push(hint(format!(
+            "REPLY GUY \u{b7} {} \u{b7} Ask: {} \u{b7} replies go through Confirm",
+            if ready {
+                "ready \u{2713}"
+            } else {
+                "setup needed"
+            },
+            self.rg_ask_agent().label()
+        )));
         rows.push(self.rg_key_row(Secret::Treg, cx));
         rows.push(self.rg_key_row(Secret::Grok, cx));
         if self.input_target == InputTarget::RgKey {
@@ -908,6 +915,7 @@ impl XPanel {
                 .flex()
                 .gap(px(8.0))
                 .flex_wrap()
+                .items_center()
                 .child(x_button!(
                     "x-rg-popular",
                     "Popular",
@@ -936,14 +944,11 @@ impl XPanel {
                         cx.stop_propagation();
                     })
                 ))
+                .child(hint(self.desk.rg.cost.clone().unwrap_or_else(|| {
+                    format!("~${:.4}/fetch", rg::TREG_SEARCH_COST_USD)
+                })))
                 .into_any_element(),
         );
-        rows.push(hint(self.desk.rg.cost.clone().unwrap_or_else(|| {
-            format!(
-                "Treg est. ~${:.5} per fetch (your Treg balance)",
-                rg::TREG_SEARCH_COST_USD
-            )
-        })));
         if !self.desk.rg.trends.is_empty() {
             let mut chips = div().flex().gap(px(6.0)).flex_wrap();
             for (index, name) in self.desk.rg.trends.iter().take(12).enumerate() {
@@ -960,49 +965,19 @@ impl XPanel {
             }
             rows.push(chips.into_any_element());
         }
-        let topic = self.desk.rg_topic.trim().to_string();
-        if !topic.is_empty() {
-            let trend_key = format!("trend:{topic}");
-            let for_prompt = topic;
-            rows.push(self.rg_handoff_row(
-                "x-rg-trend-to".into(),
-                trend_key.clone(),
-                move |panel: &Self| panel.rg_prompt_for_trend(&for_prompt),
-                cx,
-            ));
-            if let Some(options) = self.desk.rg.drafts.get(&trend_key) {
-                for (index, option) in options.iter().enumerate() {
-                    rows.push(card(format!("Post option {}", index + 1), option.clone()));
-                    let text_use = option.clone();
-                    rows.push(
-                        div()
-                            .flex()
-                            .gap(px(6.0))
-                            .child(x_button!(
-                                SharedString::from(format!("x-rg-trend-use-{index}")),
-                                "Edit in Compose",
-                                cx.listener(move |this, _, _, cx| {
-                                    this.compose = text_use.clone();
-                                    this.caret = this.compose.len();
-                                    this.desk.rg.reply_to = None;
-                                    this.notice = Some(
-                                        "Edit it in Compose; Post opens Confirm before anything posts.".into(),
-                                    );
-                                    this.open_section(XSection::Compose, cx);
-                                    cx.stop_propagation();
-                                })
-                            ))
-                            .into_any_element(),
-                    );
-                }
-            }
-        }
         if let Some(error) = &self.desk.rg.error {
-            rows.push(hint(error.clone()));
+            rows.push(card("Fetch failed".into(), error.clone()));
         }
         let mut posts = self.desk.rg_posts.clone();
         posts.sort_by(|left, right| termy_x::sort::cmp_posts(left, right, self.list_sort));
-        if posts.is_empty() && !self.desk.rg.busy {
+        if !posts.is_empty() {
+            rows.push(hint(format!(
+                "RESULTS \u{b7} {} posts \u{b7} {}",
+                posts.len(),
+                self.desk.rg_topic.trim()
+            )));
+        }
+        if posts.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {
             rows.push(empty_state(
                 "No posts yet",
                 "Type a niche (e.g. rust, indie hackers) and press Enter, or pick a trend.",
@@ -1011,10 +986,13 @@ impl XPanel {
         for post in posts {
             rows.push(self.tweet_card(&post, cx));
             let post_draft = post.clone();
+            let post_prompt = post.clone();
             let drafting = self.desk.rg.drafting.as_deref() == Some(post.id.as_str());
             rows.push(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .items_center()
                     .gap(px(6.0))
                     .child(x_button!(
                         SharedString::from(format!("x-rg-draft-{}", post.id)),
@@ -1028,15 +1006,14 @@ impl XPanel {
                             cx.stop_propagation();
                         })
                     ))
+                    .child(self.rg_handoff_row(
+                        format!("x-rg-to-{}", post.id),
+                        post.engage_target().id.clone(),
+                        move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
+                        cx,
+                    ))
                     .into_any_element(),
             );
-            let post_prompt = post.clone();
-            rows.push(self.rg_handoff_row(
-                format!("x-rg-to-{}", post.id),
-                post.engage_target().id.clone(),
-                move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
-                cx,
-            ));
             let target = post.engage_target().id.clone();
             if let Some(options) = self.desk.rg.drafts.get(&post.engage_target().id) {
                 for (index, option) in options.iter().enumerate() {
@@ -1080,6 +1057,46 @@ impl XPanel {
                                     this.arm_confirm_reply(&text, &to_reply, None);
                                     cx.stop_propagation();
                                     cx.notify();
+                                })
+                            ))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if !self.desk.rg_topic.trim().is_empty() {
+            rows.push(hint("POST ABOUT THIS TOPIC".into()));
+        }
+        let topic = self.desk.rg_topic.trim().to_string();
+        if !topic.is_empty() {
+            let trend_key = format!("trend:{topic}");
+            let for_prompt = topic;
+            rows.push(self.rg_handoff_row(
+                "x-rg-trend-to".into(),
+                trend_key.clone(),
+                move |panel: &Self| panel.rg_prompt_for_trend(&for_prompt),
+                cx,
+            ));
+            if let Some(options) = self.desk.rg.drafts.get(&trend_key) {
+                for (index, option) in options.iter().enumerate() {
+                    rows.push(card(format!("Post option {}", index + 1), option.clone()));
+                    let text_use = option.clone();
+                    rows.push(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                SharedString::from(format!("x-rg-trend-use-{index}")),
+                                "Edit in Compose",
+                                cx.listener(move |this, _, _, cx| {
+                                    this.compose = text_use.clone();
+                                    this.caret = this.compose.len();
+                                    this.desk.rg.reply_to = None;
+                                    this.notice = Some(
+                                        "Edit it in Compose; Post opens Confirm before anything posts.".into(),
+                                    );
+                                    this.open_section(XSection::Compose, cx);
+                                    cx.stop_propagation();
                                 })
                             ))
                             .into_any_element(),
