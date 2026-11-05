@@ -125,7 +125,14 @@ const SHELLS: &[&str] = &[
     "conhost",
 ];
 
-fn is_shell(process: Option<&str>) -> bool {
+/// Foreground program is one of the Ask here agent CLIs.
+pub(super) fn is_agent_process(process: &str) -> bool {
+    Agent::ALL
+        .into_iter()
+        .any(|agent| agents::process_matches(agent, process))
+}
+
+pub(super) fn is_shell(process: Option<&str>) -> bool {
     process.is_none_or(|process| {
         let base = process
             .rsplit(['/', '\\'])
@@ -361,6 +368,16 @@ mod ask_here_tests {
         assert!(is_shell(None));
         assert!(!is_shell(Some("grok.exe")));
         assert!(!is_shell(Some("vim.exe")));
+    }
+
+    #[test]
+    fn agent_clis_skip_the_close_prompt_others_do_not() {
+        use super::is_agent_process;
+        assert!(is_agent_process("grok.exe"));
+        assert!(is_agent_process("grok"));
+        assert!(is_agent_process(r"C:\x\hermes.exe"));
+        assert!(!is_agent_process("cargo.exe"));
+        assert!(!is_agent_process("vim.exe"));
     }
 
     #[test]

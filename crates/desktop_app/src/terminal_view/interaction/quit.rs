@@ -148,11 +148,44 @@ impl TerminalView {
     }
 
     pub(in super::super) fn tab_is_busy(tab: &TerminalTab) -> bool {
-        tab.running_process
+        let busy = tab.running_process
             || tab
                 .panes
                 .iter()
-                .any(|pane| pane.terminal().alternate_screen_mode())
+                .any(|pane| pane.terminal().alternate_screen_mode());
+        // An agent CLI (grok/agy/hermes/muse) holds no work worth a
+        // close prompt; anything else (long builds, vim, ...) still warns.
+        busy && !Self::tab_only_runs_agents(tab)
+    }
+
+    fn tab_only_runs_agents(tab: &TerminalTab) -> bool {
+        let command_is_agent = tab
+            .current_command
+            .as_deref()
+            .and_then(|command| command.split_whitespace().next())
+            .is_some_and(super::super::x_host::is_agent_process);
+        let mut saw_agent = false;
+        let all_ok = tab.panes.iter().all(|pane| {
+            let process = pane
+                .terminal()
+                .child_pid()
+                .and_then(termy_core::foreground_process_name_of_pid);
+            match process.as_deref() {
+                Some(name) if super::super::x_host::is_agent_process(name) => {
+                    saw_agent = true;
+                    true
+                }
+                Some(name) if super::super::x_host::is_shell(Some(name)) => {
+                    !pane.terminal().alternate_screen_mode()
+                }
+                None if command_is_agent => {
+                    saw_agent = true;
+                    true
+                }
+                _ => false,
+            }
+        });
+        all_ok && saw_agent
     }
 
     fn tab_title_for_warning(
