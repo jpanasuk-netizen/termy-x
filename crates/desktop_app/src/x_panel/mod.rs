@@ -573,6 +573,8 @@ pub struct XPanel {
     ui_focus: UiFocus,
     /// Dedup KeyDown + action Paste within the same chord.
     last_edit_chord_at: Option<Instant>,
+    /// Ctrl+A / double-click selected the whole single-line field.
+    field_all_selected: Option<TextField>,
     /// Search tab: what the user typed, and the last query actually run
     /// (empty = never searched yet, so the tab shows a prompt, not posts).
     search_input: String,
@@ -883,6 +885,7 @@ impl XPanel {
             card_copy_focus: false,
             ui_focus: UiFocus::Compose,
             last_edit_chord_at: None,
+            field_all_selected: None,
             search_input: String::new(),
             searched_query: String::new(),
             trends_filter: String::new(),
@@ -3444,6 +3447,12 @@ impl XPanel {
             return;
         }
         let clean = text.trim_end_matches(['\r', '\n']);
+        if let Some(field) = self.field_all_selected.take()
+            && single_line_field_for(self.input_target) == Some(field)
+            && let Some(target) = self.single_line_text_mut(field)
+        {
+            target.clear();
+        }
         if self.bearer_mode {
             self.bearer_input.push_str(clean.trim());
         } else {
@@ -3503,6 +3512,9 @@ impl XPanel {
     pub fn select_all_active(&mut self) {
         if self.input_target == InputTarget::Compose && !self.bearer_mode {
             self.select_all_compose();
+        } else if let Some(field) = single_line_field_for(self.input_target) {
+            self.field_all_selected = Some(field);
+            self.mark_edit_chord();
         } else if !self.chord_already_applied() {
             self.mark_edit_chord();
         }
@@ -3605,7 +3617,17 @@ impl XPanel {
         } else {
             None
         };
+        let ctrl = mods.control || mods.platform;
+        if ctrl && key.eq_ignore_ascii_case("a") {
+            self.field_all_selected = Some(field);
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let selected = self.field_all_selected == Some(field);
         let mut pasted = false;
+        let mut edited = true;
         let target = match field {
             TextField::Search => &mut self.search_input,
             TextField::Reply => &mut self.reply_text,
@@ -3621,21 +3643,44 @@ impl XPanel {
             TextField::RgTopic => &mut self.desk.rg_topic,
             TextField::RgKey => &mut self.desk.rg_key_input,
         };
-        if key == "backspace" {
-            target.pop();
+        if key == "backspace" || key == "delete" {
+            if selected {
+                target.clear();
+            } else if key == "backspace" && ctrl {
+                delete_last_word(target);
+            } else if key == "backspace" {
+                target.pop();
+            }
         } else if is_paste {
             // If TerminalView's Paste action already inserted this chord
             // (it routes here via `paste_active_text`), do not insert twice.
             if let Some(text) = &clip_text {
+                if selected {
+                    target.clear();
+                }
                 target.push_str(text);
                 pasted = true;
+            } else {
+                edited = false;
             }
         } else if !(mods.control || mods.alt || mods.platform || mods.function)
             && let Some(ch) = event.keystroke.key_char.as_deref()
         {
+            if selected {
+                target.clear();
+            }
             target.push_str(ch);
+        } else if matches!(key, "left" | "right" | "home" | "end") {
+            // End-caret field: arrows just drop the selection.
+            self.field_all_selected = None;
+            cx.stop_propagation();
+            cx.notify();
+            return;
         } else {
             return;
+        }
+        if edited {
+            self.field_all_selected = None;
         }
         if pasted {
             self.mark_edit_chord();
@@ -9215,6 +9260,7 @@ impl XPanel {
             text
         };
         let focused = self.input_target == target;
+        let all_selected = focused && !text.is_empty() && self.field_all_selected == Some(field);
         let content = if text.is_empty() {
             if focused {
                 div()
@@ -9273,12 +9319,23 @@ impl XPanel {
                 .cursor_pointer()
                 .text_size(px(13.0))
                 .text_color(rgb(0xf8fbff))
-                .child(content)
+                .child(if all_selected {
+                    div()
+                        .rounded(px(3.0))
+                        .bg(tint(0x2f6fd6, 200))
+                        .child(content)
+                        .into_any_element()
+                } else {
+                    content
+                })
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                         this.input_target = target;
-                        this.pending_focus = true;
+                        // Focus now (not next frame) so the very next key lands here.
+                        this.focus.focus(window, cx);
+                        this.pending_focus = false;
+                        this.field_all_selected = (event.click_count >= 2).then_some(field);
                         cx.stop_propagation();
                         cx.notify();
                     }),
@@ -10726,5 +10783,84 @@ mod masked_secret_tests {
             super::masked_secret("abc"),
             "\u{2022}\u{2022}\u{2022} (3 chars)"
         );
+    }
+}
+
+impl XPanel {
+    fn single_line_text_mut(&mut self, field: TextField) -> Option<&mut String> {
+        Some(match field {
+            TextField::Search => &mut self.search_input,
+            TextField::Trends => &mut self.trends_filter,
+            TextField::Research => &mut self.research_input,
+            TextField::Lookup => &mut self.lookup,
+            TextField::FeedQuery => &mut self.desk.feed_query,
+            TextField::FeedFilter => &mut self.desk.feed_filter,
+            TextField::QueueText => &mut self.desk.queue_text,
+            TextField::QueueReplyTo => &mut self.desk.queue_reply_to,
+            TextField::Analyze => &mut self.desk.analyze_handle,
+            TextField::RgTopic => &mut self.desk.rg_topic,
+            TextField::RgKey => &mut self.desk.rg_key_input,
+            _ => return None,
+        })
+    }
+}
+
+/// The single-line text field an input target edits, if any.
+fn single_line_field_for(target: InputTarget) -> Option<TextField> {
+    Some(match target {
+        InputTarget::Search => TextField::Search,
+        InputTarget::Trends => TextField::Trends,
+        InputTarget::Research => TextField::Research,
+        InputTarget::Lookup => TextField::Lookup,
+        InputTarget::FeedQuery => TextField::FeedQuery,
+        InputTarget::FeedFilter => TextField::FeedFilter,
+        InputTarget::QueueText => TextField::QueueText,
+        InputTarget::QueueReplyTo => TextField::QueueReplyTo,
+        InputTarget::Analyze => TextField::Analyze,
+        InputTarget::RgTopic => TextField::RgTopic,
+        InputTarget::RgKey => TextField::RgKey,
+        _ => return None,
+    })
+}
+
+/// Ctrl+Backspace: drop trailing spaces, then the last word.
+fn delete_last_word(text: &mut String) {
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
+    let cut = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    text.truncate(cut);
+}
+
+#[cfg(test)]
+mod single_line_edit_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_backspace_deletes_the_last_word() {
+        let mut text = "rust build in public  ".to_string();
+        delete_last_word(&mut text);
+        assert_eq!(text, "rust build in ");
+        delete_last_word(&mut text);
+        assert_eq!(text, "rust build ");
+        let mut one = "word".to_string();
+        delete_last_word(&mut one);
+        assert_eq!(one, "");
+    }
+
+    #[test]
+    fn reply_guy_topic_is_a_single_line_field() {
+        assert_eq!(
+            single_line_field_for(InputTarget::RgTopic),
+            Some(TextField::RgTopic)
+        );
+        assert_eq!(
+            single_line_field_for(InputTarget::RgKey),
+            Some(TextField::RgKey)
+        );
+        assert_eq!(single_line_field_for(InputTarget::Compose), None);
     }
 }

@@ -153,6 +153,7 @@ impl XPanel {
         });
         if present {
             self.input_target = InputTarget::RgTopic;
+            self.pending_focus = true;
         } else {
             // Keep it so the user can retry Save.
             self.desk.rg_key_input = value;
