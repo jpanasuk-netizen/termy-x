@@ -481,7 +481,10 @@ impl TerminalView {
             .tabs
             .get(self.session.active_tab)
             .map_or(0, |tab| tab.panes.len());
-        let total_sidebar_width = sidebar_width + self.workspace_sidebar_width();
+        // The docked X panel reserves width on the right like the sidebars, so
+        // toggling it (Ctrl+Shift+X) reflows the grid instead of painting over it.
+        let total_sidebar_width =
+            sidebar_width + self.workspace_sidebar_width() + self.x_panel_reserved_width();
         let resize_signature = self.terminal_resize_signature(
             viewport_width,
             viewport_height,
