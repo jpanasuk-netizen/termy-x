@@ -9197,8 +9197,8 @@ impl XPanel {
         };
         // Never render a secret: the key field shows bullets only.
         let masked;
-        let text = if field == TextField::RgKey {
-            masked = "\u{2022}".repeat(text.chars().count());
+        let text = if field == TextField::RgKey && !text.is_empty() {
+            masked = masked_secret(text);
             masked.as_str()
         } else {
             text
@@ -9242,6 +9242,10 @@ impl XPanel {
             div()
                 .id(element_id)
                 .flex_1()
+                // Never wider than the panel: long text must not push
+                // the row's buttons (e.g. Save) off-screen.
+                .min_w(px(0.0))
+                .overflow_hidden()
                 .p(px(10.0))
                 .rounded(px(8.0))
                 .bg(if focused {
@@ -10691,3 +10695,25 @@ mod edit_keys_tests {
 
 mod reply_guy_ui;
 pub use reply_guy_ui::XAskEvent;
+
+/// Fixed-width bullets for a pasted secret: a 100+ char API key must not
+/// grow the field past the panel (it pushed Save off-screen). Shows only
+/// the length, never any characters.
+fn masked_secret(text: &str) -> String {
+    let count = text.chars().count();
+    format!("{} ({count} chars)", "\u{2022}".repeat(count.min(12)))
+}
+
+#[cfg(test)]
+mod masked_secret_tests {
+    #[test]
+    fn long_keys_mask_to_a_short_fixed_width() {
+        let shown = super::masked_secret(&"k".repeat(200));
+        assert_eq!(shown, format!("{} (200 chars)", "\u{2022}".repeat(12)));
+        assert!(!shown.contains('k'));
+        assert_eq!(
+            super::masked_secret("abc"),
+            "\u{2022}\u{2022}\u{2022} (3 chars)"
+        );
+    }
+}
