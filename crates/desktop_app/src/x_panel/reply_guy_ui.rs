@@ -8,6 +8,41 @@ use super::*;
 use termy_x::agents::{self, Agent, AgentCommand};
 use termy_x::handoff::{self, Subject, Target};
 use termy_x::reply_guy::{self as rg, Secret, Sort};
+use termy_x::reply_guy_multi::{self as rgm, RgHit, Source};
+
+
+/// Compact Reply Guy chrome for the ~480px ultrawide X panel.
+macro_rules! rg_button {
+    ($id:expr, $label:expr, $handler:expr) => {
+        rg_button!($id, $label, false, $handler)
+    };
+    ($id:expr, $label:expr, $active:expr, $handler:expr) => {{
+        let active = $active;
+        div()
+            .id($id)
+            .px(px(5.0))
+            .py(px(2.0))
+            .rounded(px(4.0))
+            .border_1()
+            .border_color(if active {
+                rgb(0xff4fa3)
+            } else {
+                rgb(0x7af6ff)
+            })
+            .bg(if active { rgb(0x3a0a4a) } else { rgb(0x0d1f6e) })
+            .text_size(px(10.0))
+            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xe9fdff) })
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x1a3cff))
+                    .border_color(rgb(0xff4fa3))
+                    .text_color(rgb(0xffffff))
+            })
+            .child($label)
+            .on_mouse_down(MouseButton::Left, $handler)
+    }};
+}
 
 pub struct RgState {
     pub key_for: Secret,
@@ -38,6 +73,8 @@ pub struct RgState {
     pub ask: Option<(String, String)>,
     /// Consecutive auto-grabs that returned the same options.
     pub grab_stable: u8,
+    /// None = All sources tab.
+    pub source_tab: Option<Source>,
 }
 
 /// Panel -> terminal host requests for Ask here. The host owns the panes.
@@ -82,6 +119,7 @@ impl RgState {
             probing: false,
             ask: None,
             grab_stable: 0,
+            source_tab: None,
         }
     }
 
@@ -220,7 +258,7 @@ impl XPanel {
         }
         self.desk.rg.busy = true;
         self.desk.rg.error = None;
-        self.status = format!("reply guy \u{b7} fetching {topic}\u{2026}");
+        self.status = format!("reply guy \u{b7} multi-source fetch {topic}\u{2026}");
         cx.notify();
         let live = self.live;
         let sort = to_sort(self.list_sort);
@@ -233,9 +271,21 @@ impl XPanel {
                         let token = rg::load_secret(&config, Secret::Treg)
                             .ok_or_else(|| "Treg key missing".to_string())?;
                         let http = termy_x::io::UreqHttp::default();
-                        rg::fetch_posts(&http, &token, &topic, sort, 20)
+                        rgm::fetch_multi(&http, &token, &topic, sort, 20)
                     } else {
-                        rg::parse_search(MOCK_SEARCH)
+                        let fetched = rg::parse_search(MOCK_SEARCH)?;
+                        Ok(rgm::MultiFetched {
+                            hits: fetched
+                                .posts
+                                .into_iter()
+                                .map(|post| RgHit {
+                                    source: Source::X,
+                                    post,
+                                })
+                                .collect(),
+                            cost_usd: fetched.cost_usd,
+                            notes: Vec::new(),
+                        })
                     }
                 })
                 .await;
@@ -243,14 +293,17 @@ impl XPanel {
                 panel.desk.rg.busy = false;
                 match result {
                     Ok(fetched) => {
-                        panel.desk.rg.cost =
-                            Some(rg::cost_label(fetched.cost_usd, rg::TREG_SEARCH_COST_USD));
+                        panel.desk.rg.cost = Some(rgm::multi_cost_label(fetched.cost_usd));
+                        if !fetched.notes.is_empty() {
+                            panel.desk.rg.error = Some(fetched.notes.join(" · "));
+                        }
                         panel.status = format!(
-                            "reply guy \u{b7} {} posts \u{b7} {}",
-                            fetched.posts.len(),
+                            "reply guy \u{b7} {} hits \u{b7} {}",
+                            fetched.hits.len(),
                             panel.desk.rg.cost.clone().unwrap_or_default()
                         );
-                        panel.desk.rg_posts = fetched.posts;
+                        panel.desk.rg_hits = fetched.hits;
+                        panel.desk.rg.source_tab = None;
                     }
                     Err(error) => {
                         panel.desk.rg.error = Some(termy_x::publish::humanize_error(&error));
@@ -272,6 +325,7 @@ impl XPanel {
             return;
         }
         self.desk.rg.busy = true;
+        self.status = "reply guy \u{b7} trends (multi-source)\u{2026}".into();
         cx.notify();
         let live = self.live;
         let config = self.live_config();
@@ -283,11 +337,11 @@ impl XPanel {
                         let token = rg::load_secret(&config, Secret::Treg)
                             .ok_or_else(|| "Treg key missing".to_string())?;
                         let http = termy_x::io::UreqHttp::default();
-                        rg::fetch_trends(&http, &token, "")
+                        rgm::fetch_trends_multi(&http, &token)
                     } else {
                         Ok((
                             vec!["Rust".to_string(), "Build in public".to_string()],
-                            None,
+                            rgm::MultiFetched::default(),
                         ))
                     }
                 })
@@ -295,9 +349,21 @@ impl XPanel {
             let _ = this.update(cx, |panel, cx| {
                 panel.desk.rg.busy = false;
                 match result {
-                    Ok((names, cost)) => {
+                    Ok((names, multi)) => {
                         panel.desk.rg.trends = names;
-                        panel.desk.rg.cost = Some(rg::cost_label(cost, rg::TREG_TRENDS_COST_USD));
+                        panel.desk.rg.cost = Some(rgm::multi_cost_label(multi.cost_usd));
+                        if !multi.hits.is_empty() {
+                            panel.desk.rg_hits = multi.hits;
+                            panel.desk.rg.source_tab = None;
+                        }
+                        if !multi.notes.is_empty() {
+                            panel.desk.rg.error = Some(multi.notes.join(" · "));
+                        }
+                        panel.status = format!(
+                            "reply guy \u{b7} trends \u{b7} {} chips \u{b7} {} hits",
+                            panel.desk.rg.trends.len(),
+                            panel.desk.rg_hits.len()
+                        );
                     }
                     Err(error) => {
                         panel.desk.rg.error = Some(termy_x::publish::humanize_error(&error));
@@ -593,12 +659,12 @@ impl XPanel {
         prompt: impl Fn(&Self) -> String + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Div {
-        let mut row = div().flex().gap(px(6.0)).flex_wrap();
+        let mut row = div().flex().gap(px(3.0)).flex_wrap();
         let running = self.desk.rg.running.filter(|_| !self.desk.rg.picking);
         if let Some(agent) = running {
             let (key, prompt) = (key.to_string(), prompt);
             row = row
-                .child(x_button!(
+                .child(rg_button!(
                     SharedString::from(format!("{id_prefix}-ask")),
                     "Ask here",
                     true,
@@ -609,7 +675,7 @@ impl XPanel {
                     })
                 ))
                 .child(hint(format!("using: {}", agent.label())))
-                .child(x_button!(
+                .child(rg_button!(
                     SharedString::from(format!("{id_prefix}-ask-change")),
                     "change",
                     cx.listener(|this, _, _, cx| {
@@ -641,7 +707,7 @@ impl XPanel {
                     continue;
                 }
                 let (key, prompt) = (key.to_string(), prompt.clone());
-                row = row.child(x_button!(
+                row = row.child(rg_button!(
                     id,
                     agent.label(),
                     agent == self.desk.rg.agent,
@@ -654,7 +720,7 @@ impl XPanel {
             }
         }
         let asked_here = self.desk.rg.ask.as_ref().map(|(k, _)| k.as_str()) == Some(key);
-        row.child(x_button!(
+        row.child(rg_button!(
             SharedString::from(format!("{id_prefix}-grab")),
             "Grab replies",
             asked_here,
@@ -718,7 +784,7 @@ impl XPanel {
         for target in Target::ALL {
             let key = key.clone();
             let prompt = prompt.clone();
-            row = row.child(x_button!(
+            row = row.child(rg_button!(
                 SharedString::from(format!("{id_prefix}-{}", target.tag())),
                 target.label(),
                 cx.listener(move |this, _, _, cx| {
@@ -729,7 +795,7 @@ impl XPanel {
             ));
         }
         let paste_key = key.clone();
-        row = row.child(x_button!(
+        row = row.child(rg_button!(
             SharedString::from(format!("{id_prefix}-paste")),
             "Paste replies",
             self.desk.rg.paste_for.as_deref() == Some(key.as_str()),
@@ -757,7 +823,7 @@ impl XPanel {
         let saved = mask.is_some();
         let mut row = div()
             .flex()
-            .gap(px(6.0))
+            .gap(px(3.0))
             .flex_wrap()
             .child(hint(match &mask {
                 Some(mask) => format!("{} \u{b7} saved \u{2713} {mask}", which.label()),
@@ -766,7 +832,7 @@ impl XPanel {
         if saved {
             // Already have a key (env, keychain or file): no sign-in prompt.
             return row
-                .child(x_button!(
+                .child(rg_button!(
                     SharedString::from(format!("x-rg-test-{tag}")),
                     "Test connection",
                     cx.listener(move |this, _, _, cx| {
@@ -774,7 +840,7 @@ impl XPanel {
                         cx.stop_propagation();
                     })
                 ))
-                .child(x_button!(
+                .child(rg_button!(
                     SharedString::from(format!("x-rg-paste-{tag}")),
                     "Change key",
                     cx.listener(move |this, _, _, cx| {
@@ -785,7 +851,7 @@ impl XPanel {
                         cx.notify();
                     })
                 ))
-                .child(x_button!(
+                .child(rg_button!(
                     SharedString::from(format!("x-rg-remove-{tag}")),
                     "Remove",
                     cx.listener(move |this, _, _, cx| {
@@ -796,7 +862,7 @@ impl XPanel {
                 .into_any_element();
         }
         row = row
-            .child(x_button!(
+            .child(rg_button!(
                 SharedString::from(format!("x-rg-signin-{tag}")),
                 sign_in,
                 cx.listener(move |this, _, _, cx| {
@@ -812,7 +878,7 @@ impl XPanel {
                     cx.notify();
                 })
             ))
-            .child(x_button!(
+            .child(rg_button!(
                 SharedString::from(format!("x-rg-paste-{tag}")),
                 "Paste key",
                 self.input_target == InputTarget::RgKey && self.desk.rg.key_for == which,
@@ -824,7 +890,7 @@ impl XPanel {
                     cx.notify();
                 })
             ))
-            .child(x_button!(
+            .child(rg_button!(
                 SharedString::from(format!("x-rg-test-{tag}")),
                 "Test connection",
                 cx.listener(move |this, _, _, cx| {
@@ -832,7 +898,7 @@ impl XPanel {
                     cx.stop_propagation();
                 })
             ))
-            .child(x_button!(
+            .child(rg_button!(
                 SharedString::from(format!("x-rg-remove-{tag}")),
                 "Remove",
                 cx.listener(move |this, _, _, cx| {
@@ -841,6 +907,79 @@ impl XPanel {
                 })
             ));
         row.into_any_element()
+    }
+
+
+    fn rg_source_tabs(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let counts = {
+            let mut map = std::collections::HashMap::<Source, usize>::new();
+            for hit in &self.desk.rg_hits {
+                *map.entry(hit.source).or_default() += 1;
+            }
+            map
+        };
+        let mut row = div().flex().gap(px(3.0)).flex_wrap().items_center();
+        let all_n = self.desk.rg_hits.len();
+        let all_active = self.desk.rg.source_tab.is_none();
+        row = row.child(rg_button!(
+            "x-rg-src-all",
+            format!("All {all_n}"),
+            all_active,
+            cx.listener(|this, _, _, cx| {
+                this.desk.rg.source_tab = None;
+                cx.stop_propagation();
+                cx.notify();
+            })
+        ));
+        for source in Source::ALL {
+            let n = counts.get(&source).copied().unwrap_or(0);
+            if n == 0 && !self.desk.rg_hits.is_empty() {
+                continue;
+            }
+            let label = if n > 0 {
+                format!("{} {n}", source.tab())
+            } else {
+                source.tab().to_string()
+            };
+            let active = self.desk.rg.source_tab == Some(source);
+            row = row.child(rg_button!(
+                SharedString::from(format!("x-rg-src-{}", source.tab())),
+                label,
+                active,
+                cx.listener(move |this, _, _, cx| {
+                    this.desk.rg.source_tab = Some(source);
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        }
+        row.into_any_element()
+    }
+
+    fn rg_quote_to_x(&mut self, hit: &RgHit, cx: &mut Context<Self>) {
+        let body = rgm::quote_to_x_body(hit);
+        self.compose = body;
+        self.caret = self.compose.len();
+        self.desk.rg.reply_to = None;
+        self.notice = Some(format!(
+            "Quoted {} into Compose \u{2014} edit, then Post opens Confirm (nothing posts yet).",
+            hit.source.label()
+        ));
+        self.open_section(XSection::Compose, cx);
+    }
+
+    fn rg_source_badge(&self, source: Source) -> gpui_kit::AnyElement {
+        div()
+            .px(px(5.0))
+            .py(px(1.0))
+            .rounded(px(3.0))
+            .bg(tint(source.accent_rgb(), 55))
+            .border_1()
+            .border_color(rgb(source.accent_rgb()))
+            .text_size(px(9.0))
+            .text_color(rgb(0xffffff))
+            .child(source.label())
+            .into_any_element()
     }
 
     pub(super) fn reply_guy_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
@@ -861,9 +1000,9 @@ impl XPanel {
             rows.push(
                 div()
                     .flex()
-                    .gap(px(8.0))
+                    .gap(px(4.0))
                     .child(self.single_line_field(TextField::RgKey, cx))
-                    .child(x_button!(
+                    .child(rg_button!(
                         "x-rg-key-save",
                         "Save",
                         cx.listener(|this, _, _, cx| {
@@ -893,15 +1032,15 @@ impl XPanel {
         rows.push(
             div()
                 .flex()
-                .gap(px(8.0))
+                .gap(px(4.0))
                 .items_center()
                 .child(self.single_line_field(TextField::RgTopic, cx))
-                .child(x_button!(
+                .child(rg_button!(
                     "x-rg-fetch",
                     if self.desk.rg.busy {
                         "Fetching\u{2026}"
                     } else {
-                        "Fetch posts"
+                        "Fetch"
                     },
                     cx.listener(|this, _, _, cx| {
                         this.rg_fetch(cx);
@@ -913,10 +1052,10 @@ impl XPanel {
         rows.push(
             div()
                 .flex()
-                .gap(px(8.0))
+                .gap(px(4.0))
                 .flex_wrap()
                 .items_center()
-                .child(x_button!(
+                .child(rg_button!(
                     "x-rg-popular",
                     "Popular",
                     self.list_sort == termy_x::sort::ResultSort::Popular,
@@ -926,7 +1065,7 @@ impl XPanel {
                         cx.notify();
                     })
                 ))
-                .child(x_button!(
+                .child(rg_button!(
                     "x-rg-newest",
                     "Newest",
                     self.list_sort == termy_x::sort::ResultSort::Newest,
@@ -936,7 +1075,7 @@ impl XPanel {
                         cx.notify();
                     })
                 ))
-                .child(x_button!(
+                .child(rg_button!(
                     "x-rg-trends",
                     "Trends",
                     cx.listener(|this, _, _, cx| {
@@ -945,15 +1084,15 @@ impl XPanel {
                     })
                 ))
                 .child(hint(self.desk.rg.cost.clone().unwrap_or_else(|| {
-                    format!("~${:.4}/fetch", rg::TREG_SEARCH_COST_USD)
+                    format!("multi · cost {}", rgm::TREG_COST_VARIES)
                 })))
                 .into_any_element(),
         );
         if !self.desk.rg.trends.is_empty() {
-            let mut chips = div().flex().gap(px(6.0)).flex_wrap();
+            let mut chips = div().flex().gap(px(3.0)).flex_wrap();
             for (index, name) in self.desk.rg.trends.iter().take(12).enumerate() {
                 let topic = name.clone();
-                chips = chips.child(x_button!(
+                chips = chips.child(rg_button!(
                     SharedString::from(format!("x-rg-trend-{index}")),
                     name.clone(),
                     cx.listener(move |this, _, _, cx| {
@@ -966,54 +1105,115 @@ impl XPanel {
             rows.push(chips.into_any_element());
         }
         if let Some(error) = &self.desk.rg.error {
-            rows.push(card("Fetch failed".into(), error.clone()));
+            rows.push(card("Fetch notes".into(), error.clone()));
         }
-        let mut posts = self.desk.rg_posts.clone();
-        posts.sort_by(|left, right| termy_x::sort::cmp_posts(left, right, self.list_sort));
-        if !posts.is_empty() {
+        if !self.desk.rg_hits.is_empty() {
+            rows.push(self.rg_source_tabs(cx));
+        }
+        let mut hits: Vec<RgHit> = self
+            .desk
+            .rg_hits
+            .iter()
+            .filter(|hit| {
+                self.desk
+                    .rg
+                    .source_tab
+                    .map(|tab| hit.source == tab)
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        hits.sort_by(|left, right| {
+            termy_x::sort::cmp_posts(&left.post, &right.post, self.list_sort)
+        });
+        if !self.desk.rg_hits.is_empty() {
             rows.push(hint(format!(
-                "RESULTS \u{b7} {} posts \u{b7} {}",
-                posts.len(),
+                "RESULTS \u{b7} showing {} / {} \u{b7} {}",
+                hits.len(),
+                self.desk.rg_hits.len(),
                 self.desk.rg_topic.trim()
             )));
         }
-        if posts.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {
+        if self.desk.rg_hits.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {
             rows.push(empty_state(
                 "No posts yet",
-                "Type a niche (e.g. rust, indie hackers) and press Enter, or pick a trend.",
+                "Type a niche and Fetch (X, Reddit, TikTok, IG, YT, LinkedIn, FB). HN/Threads/PH/Bluesky not on this Treg org yet.",
             ));
         }
-        for post in posts {
-            rows.push(self.tweet_card(&post, cx));
-            let post_draft = post.clone();
-            let post_prompt = post.clone();
-            let drafting = self.desk.rg.drafting.as_deref() == Some(post.id.as_str());
+        for hit in hits {
+            let post = hit.post.clone();
             rows.push(
                 div()
                     .flex()
-                    .flex_wrap()
                     .items_center()
-                    .gap(px(6.0))
-                    .child(x_button!(
-                        SharedString::from(format!("x-rg-draft-{}", post.id)),
-                        if drafting {
-                            "Drafting\u{2026}"
-                        } else {
-                            "Grok drafts"
-                        },
-                        cx.listener(move |this, _, _, cx| {
-                            this.rg_draft(&post_draft, cx);
-                            cx.stop_propagation();
-                        })
-                    ))
-                    .child(self.rg_handoff_row(
-                        format!("x-rg-to-{}", post.id),
-                        post.engage_target().id.clone(),
-                        move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
-                        cx,
-                    ))
+                    .gap(px(3.0))
+                    .child(self.rg_source_badge(hit.source))
+                    .child(hint(if post.url.is_empty() {
+                        String::new()
+                    } else {
+                        post.url.clone()
+                    }))
                     .into_any_element(),
             );
+            rows.push(self.tweet_card(&post, cx));
+            let post_draft = post.clone();
+            let post_prompt = post.clone();
+            let hit_quote = hit.clone();
+            let drafting = self.desk.rg.drafting.as_deref() == Some(post.id.as_str());
+            let mut actions = div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(3.0));
+            if hit.is_x() {
+                actions = actions.child(rg_button!(
+                    SharedString::from(format!("x-rg-draft-{}", post.id)),
+                    if drafting {
+                        "Drafting\u{2026}"
+                    } else {
+                        "Grok drafts"
+                    },
+                    cx.listener(move |this, _, _, cx| {
+                        this.rg_draft(&post_draft, cx);
+                        cx.stop_propagation();
+                    })
+                ));
+                actions = actions.child(self.rg_handoff_row(
+                    format!("x-rg-to-{}", post.id),
+                    post.engage_target().id.clone(),
+                    move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
+                    cx,
+                ));
+            } else {
+                actions = actions.child(rg_button!(
+                    SharedString::from(format!("x-rg-quote-{}", post.id)),
+                    "Quote on X",
+                    true,
+                    cx.listener(move |this, _, _, cx| {
+                        this.rg_quote_to_x(&hit_quote, cx);
+                        cx.stop_propagation();
+                    })
+                ));
+                actions = actions.child(rg_button!(
+                    SharedString::from(format!("x-rg-draft-{}", post.id)),
+                    if drafting {
+                        "Drafting\u{2026}"
+                    } else {
+                        "Grok drafts"
+                    },
+                    cx.listener(move |this, _, _, cx| {
+                        this.rg_draft(&post_draft, cx);
+                        cx.stop_propagation();
+                    })
+                ));
+                actions = actions.child(self.rg_handoff_row(
+                    format!("x-rg-to-{}", post.id),
+                    post.engage_target().id.clone(),
+                    move |panel: &Self| panel.rg_prompt_for_post(&post_prompt),
+                    cx,
+                ));
+            }
+            rows.push(actions.into_any_element());
             let target = post.engage_target().id.clone();
             if let Some(options) = self.desk.rg.drafts.get(&post.engage_target().id) {
                 for (index, option) in options.iter().enumerate() {
@@ -1022,43 +1222,49 @@ impl XPanel {
                     let text_reply = option.clone();
                     let to_use = target.clone();
                     let to_reply = target.clone();
+                    let is_x = hit.is_x();
                     rows.push(
                         div()
                             .flex()
-                            .gap(px(6.0))
-                            .child(x_button!(
+                            .gap(px(3.0))
+                            .child(rg_button!(
                                 SharedString::from(format!("x-rg-use-{target}-{index}")),
                                 "Edit in Compose",
                                 cx.listener(move |this, _, _, cx| {
                                     this.compose = text_use.clone();
                                     this.caret = this.compose.len();
-                                    this.desk.rg.reply_to = Some(to_use.clone());
+                                    this.desk.rg.reply_to = if is_x {
+                                        Some(to_use.clone())
+                                    } else {
+                                        None
+                                    };
                                     this.notice = Some(
-                                        "Edit it, then come back and click Reply \u{2014} Confirm shows before anything posts."
+                                        "Edit it, then Confirm shows before anything posts."
                                             .into(),
                                     );
                                     this.open_section(XSection::Compose, cx);
                                     cx.stop_propagation();
                                 })
                             ))
-                            .child(x_button!(
-                                SharedString::from(format!("x-rg-reply-{target}-{index}")),
-                                "Reply\u{2026}",
-                                cx.listener(move |this, _, _, cx| {
-                                    // Use the edited Compose text when it was edited for this post.
-                                    let text = if this.desk.rg.reply_to.as_deref()
-                                        == Some(to_reply.as_str())
-                                        && !this.compose.trim().is_empty()
-                                    {
-                                        this.compose.clone()
-                                    } else {
-                                        text_reply.clone()
-                                    };
-                                    this.arm_confirm_reply(&text, &to_reply, None);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })
-                            ))
+                            .children(is_x.then(|| {
+                                rg_button!(
+                                    SharedString::from(format!("x-rg-reply-{target}-{index}")),
+                                    "Reply\u{2026}",
+                                    cx.listener(move |this, _, _, cx| {
+                                        let text = if this.desk.rg.reply_to.as_deref()
+                                            == Some(to_reply.as_str())
+                                            && !this.compose.trim().is_empty()
+                                        {
+                                            this.compose.clone()
+                                        } else {
+                                            text_reply.clone()
+                                        };
+                                        this.arm_confirm_reply(&text, &to_reply, None);
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    })
+                                )
+                            }))
                             .into_any_element(),
                     );
                 }
@@ -1084,8 +1290,8 @@ impl XPanel {
                     rows.push(
                         div()
                             .flex()
-                            .gap(px(6.0))
-                            .child(x_button!(
+                            .gap(px(3.0))
+                            .child(rg_button!(
                                 SharedString::from(format!("x-rg-trend-use-{index}")),
                                 "Edit in Compose",
                                 cx.listener(move |this, _, _, cx| {

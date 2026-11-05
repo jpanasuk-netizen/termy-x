@@ -31,24 +31,24 @@ macro_rules! x_button {
         let active = $active;
         div()
             .id($id)
-            .px(px(10.0))
-            .py(px(6.0))
-            .rounded(px(8.0))
+            .px(px(5.0))
+            .py(px(2.0))
+            .rounded(px(4.0))
             .border_1()
             .border_color(if active {
                 rgb(0xff4fa3)
             } else {
-                tint(0x7af6ff, 55)
+                rgb(0x7af6ff)
             })
-            .bg(if active { rgb(0x2a0f3a) } else { rgb(0x1636c9) })
-            .text_size(px(12.0))
-            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xf8fbff) })
+            .bg(if active { rgb(0x3a0a4a) } else { rgb(0x0d1f6e) })
+            .text_size(px(10.0))
+            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xe9fdff) })
             .cursor_pointer()
             .hover(|style| {
                 style
-                    .bg(rgb(0x1f4fff))
-                    .border_color(rgb(0x7af6ff))
-                    .text_color(rgb(0xe9fdff))
+                    .bg(rgb(0x1a3cff))
+                    .border_color(rgb(0xff4fa3))
+                    .text_color(rgb(0xffffff))
             })
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
@@ -1659,7 +1659,7 @@ impl XPanel {
             XSection::Followers => self.desk.follower_diff.is_some(),
             XSection::Queue => !self.desk.queue.is_empty(),
             XSection::Analyze => self.desk.analyze.is_some(),
-            XSection::ReplyGuy => !self.desk.rg_posts.is_empty(),
+            XSection::ReplyGuy => !self.desk.rg_hits.is_empty(),
         }
     }
 
@@ -5819,7 +5819,7 @@ impl XPanel {
             .child(
                 div().flex().flex_col().child(
                     div()
-                        .text_size(px(18.0))
+                        .text_size(px(14.0))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                         .text_color(rgb(0x7af6ff))
                         .child("Termy X"),
@@ -5829,8 +5829,8 @@ impl XPanel {
                 let art_focus = self.ui_focus == UiFocus::Art;
                 div()
                     .id("x-art-toggle")
-                    .px(px(10.0))
-                    .py(px(4.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
                     .rounded(px(999.0))
                     .border_1()
                     .border_color(if art_focus {
@@ -5838,14 +5838,14 @@ impl XPanel {
                     } else if self.background_art {
                         rgb(0x7af6ff)
                     } else {
-                        tint(0x7af6ff, 40)
+                        rgb(0x7af6ff)
                     })
                     .bg(if art_focus {
                         rgb(0x2a0f3a)
                     } else {
                         tint(0x102033, 180)
                     })
-                    .text_size(px(12.0))
+                    .text_size(px(10.0))
                     .text_color(if art_focus {
                         rgb(0xffd0ea)
                     } else {
@@ -5881,28 +5881,28 @@ impl XPanel {
             let refreshing = self.loading;
             div()
                 .id("x-refresh")
-                .px(px(9.0))
-                .py(px(5.0))
-                .rounded(px(8.0))
-                .text_size(px(13.0))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(4.0))
+                .text_size(px(11.0))
                 .cursor_pointer()
                 .border_1()
                 .border_color(if refreshing {
                     rgb(0xff4fa3)
                 } else {
-                    tint(0x7af6ff, 45)
+                    rgb(0x7af6ff)
                 })
                 .bg(if refreshing {
-                    rgb(0x2a0f3a)
+                    rgb(0x3a0a4a)
                 } else {
-                    tint(0x101826, 170)
+                    rgb(0x0a1838)
                 })
                 .text_color(if refreshing {
                     rgb(0xffd0ea)
                 } else {
                     rgb(0x7af6ff)
                 })
-                .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0x7af6ff)))
+                .hover(|style| style.bg(rgb(0x1a1040)).border_color(rgb(0xff4fa3)))
                 .child(if refreshing {
                     "\u{21bb}\u{2026}"
                 } else {
@@ -5919,32 +5919,32 @@ impl XPanel {
         };
         div()
             .flex()
-            .gap(px(6.0))
+            .gap(px(3.0))
             .flex_wrap()
             .children(XSection::all().into_iter().map(move |section| {
                 let active = section == current;
                 div()
                     .id(SharedString::from(format!("x-tab-{}", section.label())))
-                    .px(px(10.0))
-                    .py(px(5.0))
-                    .rounded(px(8.0))
-                    .text_size(px(12.0))
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(4.0))
+                    .text_size(px(10.0))
                     .cursor_pointer()
                     .border_1()
                     .border_color(if active {
                         rgb(0x7af6ff)
                     } else {
-                        tint(0x7af6ff, 25)
+                        tint(0x7af6ff, 55)
                     })
                     .bg(if active {
-                        rgb(0x122a55)
+                        rgb(0x0a2048)
                     } else {
-                        tint(0x101826, 170)
+                        tint(0x070b18, 200)
                     })
-                    .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
+                    .text_color(if active { rgb(0x7af6ff) } else { rgb(0xc5d6f5) })
                     .hover(|style| {
                         style
-                            .bg(rgb(0x1a3050))
+                            .bg(rgb(0x1a1040))
                             .border_color(rgb(0xff4fa3))
                             .text_color(rgb(0xffd0ea))
                     })
@@ -5977,8 +5977,8 @@ impl XPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
-            .text_size(px(11.0))
+            .gap(px(4.0))
+            .text_size(px(10.0))
             .text_color(rgb(0x93a4c3));
         if self.loading {
             row = row.child(breathing_bird());
@@ -8470,21 +8470,21 @@ impl XPanel {
         let mut el = div()
             .id(SharedString::from(format!("x-tweet-{scope}-{}", post.id)))
             .relative()
-            .p(px(12.0))
-            .rounded(px(12.0))
+            .p(px(8.0))
+            .rounded(px(6.0))
             .bg(if selected {
-                tint(0x1a1030, 240)
+                tint(0x2a0a3a, 245)
             } else {
-                tint(0x0c1422, 225)
+                tint(0x070b18, 235)
             })
             .border_1()
             .border_color(if selected {
                 rgb(0xff4fa3)
             } else {
-                tint(0x7af6ff, 40)
+                tint(0x7af6ff, 70)
             })
             .cursor_pointer()
-            .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+            .hover(|style| style.bg(tint(0x12102a, 250)).border_color(rgb(0xff4fa3)))
             .children(
                 if post.retweeted.is_some() {
                     Some(format!("@{} reposted", post.author_handle))
@@ -8503,8 +8503,8 @@ impl XPanel {
             )
             .child(
                 div()
-                    .mt(px(2.0))
-                    .text_size(px(13.0))
+                    .mt(px(1.0))
+                    .text_size(px(11.0))
                     .text_color(rgb(0xd7fbff))
                     .child(format!(
                         "@{} \u{b7} {} likes{} \u{b7} click to open thread",
@@ -8520,10 +8520,10 @@ impl XPanel {
             .child(
                 div()
                     .id(SharedString::from(format!("x-tweet-text-{scope}-{}", post.id)))
-                    .mt(px(4.0))
+                    .mt(px(3.0))
                     .px(px(2.0))
                     .rounded(px(4.0))
-                    .text_size(px(13.0))
+                    .text_size(px(11.0))
                     .text_color(rgb(0xe7eefc))
                     .bg(if text_selected { tint(0xff4fa3, 90) } else { tint(0xff4fa3, 0) })
                     .child(post.card_text().to_string())
@@ -10409,22 +10409,22 @@ impl XPanel {
 
 fn card(title: String, body: String) -> gpui_kit::AnyElement {
     div()
-        .p(px(12.0))
-        .rounded(px(12.0))
-        .bg(tint(0x0c1422, 225))
+        .p(px(8.0))
+        .rounded(px(6.0))
+        .bg(tint(0x080e1c, 235))
         .border_1()
-        .border_color(tint(0x7af6ff, 40))
-        .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+        .border_color(rgb(0x7af6ff))
+        .hover(|style| style.bg(tint(0x12102a, 245)).border_color(rgb(0xff4fa3)))
         .child(
             div()
-                .text_size(px(13.0))
-                .text_color(rgb(0xd7fbff))
+                .text_size(px(11.0))
+                .text_color(rgb(0x7af6ff))
                 .child(title),
         )
         .child(
             div()
-                .mt(px(4.0))
-                .text_size(px(13.0))
+                .mt(px(3.0))
+                .text_size(px(11.0))
                 .text_color(rgb(0xe7eefc))
                 .child(body),
         )
@@ -10434,8 +10434,8 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
 /// Small section header used by Lookup (Pinned / Latest) and friends.
 fn section_label(text: &str) -> gpui_kit::AnyElement {
     div()
-        .mt(px(4.0))
-        .text_size(px(13.0))
+        .mt(px(2.0))
+        .text_size(px(11.0))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
         .text_color(rgb(0xd7fbff))
         .child(text.to_string())
@@ -10496,8 +10496,8 @@ fn profile_stats_rows(profile: &Profile) -> Vec<gpui_kit::AnyElement> {
 
 fn hint(text: String) -> gpui_kit::AnyElement {
     div()
-        .text_size(px(12.0))
-        .text_color(rgb(0xf0a8d0))
+        .text_size(px(10.0))
+        .text_color(rgb(0xff7ac8))
         .child(text)
         .into_any_element()
 }
@@ -10506,23 +10506,23 @@ fn empty_state(title: &str, detail: impl Into<String>) -> gpui_kit::AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .p(px(16.0))
-        .rounded_xl()
+        .gap(px(4.0))
+        .p(px(10.0))
+        .rounded(px(6.0))
         .border_1()
-        .border_color(rgb(0x2f7bff))
-        .bg(tint(0x0b1220, 0xcc))
+        .border_color(rgb(0x7af6ff))
+        .bg(tint(0x070b18, 0xdd))
         .child(
             div()
-                .text_size(px(16.0))
+                .text_size(px(12.0))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                 .text_color(rgb(0x7af6ff))
                 .child(title.to_string()),
         )
         .child(
             div()
-                .text_size(px(12.0))
-                .text_color(rgb(0xc5d2ea))
+                .text_size(px(10.0))
+                .text_color(rgb(0xff7ac8))
                 .child(detail.into()),
         )
         .into_any_element()

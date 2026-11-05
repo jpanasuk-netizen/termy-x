@@ -6,6 +6,7 @@ use termy_x::feeds::{EngageFeed, FeedStore};
 use termy_x::followers::{FollowerDiff, FollowerLog};
 use termy_x::inbox::{InboxState, InboxStore};
 use termy_x::model::Post;
+use termy_x::reply_guy_multi::RgHit;
 use termy_x::queue::QueuedReply;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +48,7 @@ pub struct DeskState {
     pub rg: super::reply_guy_ui::RgState,
     pub rg_topic: String,
     pub rg_key_input: String,
-    pub rg_posts: Vec<Post>,
+    pub rg_hits: Vec<RgHit>,
 }
 
 impl DeskState {
@@ -89,7 +90,7 @@ impl DeskState {
             rg: super::reply_guy_ui::RgState::new(config),
             rg_topic: String::new(),
             rg_key_input: String::new(),
-            rg_posts: Vec::new(),
+            rg_hits: Vec::new(),
         }
     }
 

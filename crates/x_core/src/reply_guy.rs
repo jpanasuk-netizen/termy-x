@@ -177,7 +177,7 @@ pub fn ready(grok: Option<&str>, treg: Option<&str>) -> Result<(), String> {
     }
 }
 
-fn treg_request(method: &'static str, url: &str, token: &str, body: Option<String>) -> HttpRequest {
+pub(crate) fn treg_request(method: &'static str, url: &str, token: &str, body: Option<String>) -> HttpRequest {
     HttpRequest {
         method,
         url: url.to_string(),

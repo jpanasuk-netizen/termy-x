@@ -28,6 +28,7 @@ pub mod providers;
 pub mod publish;
 pub mod queue;
 pub mod reply_guy;
+pub mod reply_guy_multi;
 pub mod sort;
 pub mod splash;
 pub mod stats;
