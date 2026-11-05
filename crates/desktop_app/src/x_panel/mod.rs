@@ -5126,6 +5126,11 @@ impl Drop for XPanel {
 impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_spawn_mention_check(cx);
+        // Reply Guy restored at launch: read saved keys once so a stored
+        // Treg key shows as saved instead of prompting again.
+        if self.section == XSection::ReplyGuy && !self.desk.rg.checked {
+            self.rg_refresh_keys();
+        }
         self.sync_video_player(window, cx);
         if self.pending_focus {
             self.focus.focus(window, cx);

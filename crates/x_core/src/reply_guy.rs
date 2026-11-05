@@ -20,12 +20,12 @@ use crate::model::Post;
 pub const TREG_BASE: &str = "https://treg.to";
 /// Where a user signs in to Treg and creates their own API key.
 pub const TREG_KEYS_URL: &str = "https://treg.to/login";
-/// Treg catalog `anyapi.x.search.posts` (upstream AnyAPI twitter.search).
-pub const TREG_SEARCH_URL: &str =
-    "https://treg.to/call/https://api.getanyapi.com/v1/run/twitter.search";
-/// Treg catalog `anyapi.twitter.trends`.
-pub const TREG_TRENDS_URL: &str =
-    "https://treg.to/call/https://api.getanyapi.com/v1/run/twitter.trends";
+/// Treg catalog tool `anyapi.x.search.posts`, called by id. (The
+/// `/call/<upstream url>` form only works for a team's own tools; for a
+/// catalog tool it returns 404 `{"detail":"Not Found"}`.)
+pub const TREG_SEARCH_URL: &str = "https://treg.to/call/anyapi.x.search.posts";
+/// Treg catalog tool `anyapi.twitter.trends`, called by id.
+pub const TREG_TRENDS_URL: &str = "https://treg.to/call/anyapi.twitter.trends";
 /// Free identity check for a Treg token.
 pub const TREG_ME_URL: &str = "https://treg.to/auth/me";
 /// Catalog cost blocks (p90 observed, USD per successful call). The
@@ -246,9 +246,38 @@ pub fn fetch_posts(
     parse_search(&response)
 }
 
+/// Treg/provider error text when a body is not a result envelope
+/// (`{"detail":"Not Found"}`, `{"error":...}`), so a failed call is shown
+/// as an error and never as "no posts".
+fn envelope_error(value: &serde_json::Value) -> Option<String> {
+    if value
+        .pointer("/output/data/items")
+        .is_some_and(|v| v.is_array())
+    {
+        return None;
+    }
+    let text = ["/detail", "/error/message", "/error", "/message", "/hint"]
+        .iter()
+        .find_map(|path| {
+            value.pointer(path).and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Null => None,
+                other => Some(other.to_string()),
+            })
+        })
+        .unwrap_or_else(|| "unexpected response shape".into());
+    Some(format!(
+        "treg: {}",
+        text.chars().take(300).collect::<String>()
+    ))
+}
+
 pub fn parse_search(body: &str) -> Result<Fetched, String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("treg: bad response ({e})"))?;
+    if let Some(error) = envelope_error(&value) {
+        return Err(error);
+    }
     let items = value
         .pointer("/output/data/items")
         .and_then(|v| v.as_array())
@@ -311,6 +340,9 @@ pub fn fetch_trends(
     ))?;
     let value: serde_json::Value =
         serde_json::from_str(&response).map_err(|e| format!("treg: bad response ({e})"))?;
+    if let Some(error) = envelope_error(&value) {
+        return Err(error);
+    }
     let names = value
         .pointer("/output/data/items")
         .and_then(|v| v.as_array())
@@ -389,6 +421,31 @@ pub fn cost_label(cost: Option<f64>, estimate: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn treg_errors_are_errors_not_empty_results() {
+        let err = super::parse_search(r#"{"detail":"Not Found"}"#).unwrap_err();
+        assert_eq!(err, "treg: Not Found");
+        assert!(
+            super::parse_search(r#"{"error":{"message":"insufficient balance"}}"#)
+                .unwrap_err()
+                .contains("insufficient balance")
+        );
+        let empty = super::parse_search(r#"{"output":{"data":{"items":[]}}}"#).unwrap();
+        assert!(empty.posts.is_empty());
+    }
+
+    #[test]
+    fn treg_calls_catalog_tools_by_id() {
+        assert_eq!(
+            super::TREG_SEARCH_URL,
+            "https://treg.to/call/anyapi.x.search.posts"
+        );
+        assert_eq!(
+            super::TREG_TRENDS_URL,
+            "https://treg.to/call/anyapi.twitter.trends"
+        );
+    }
+
     use super::*;
     use crate::io::MapHttp;
 

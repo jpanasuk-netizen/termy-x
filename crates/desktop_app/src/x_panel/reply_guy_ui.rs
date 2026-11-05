@@ -754,15 +754,48 @@ impl XPanel {
             Secret::Grok => "Sign in to Grok",
             Secret::Treg => "Sign in to Treg",
         };
-        div()
+        let saved = mask.is_some();
+        let mut row = div()
             .flex()
             .gap(px(6.0))
             .flex_wrap()
-            .child(hint(format!(
-                "{} \u{b7} {}",
-                which.label(),
-                mask.unwrap_or_else(|| "not set".into())
-            )))
+            .child(hint(match &mask {
+                Some(mask) => format!("{} \u{b7} saved \u{2713} {mask}", which.label()),
+                None => format!("{} \u{b7} not set", which.label()),
+            }));
+        if saved {
+            // Already have a key (env, keychain or file): no sign-in prompt.
+            return row
+                .child(x_button!(
+                    SharedString::from(format!("x-rg-test-{tag}")),
+                    "Test connection",
+                    cx.listener(move |this, _, _, cx| {
+                        this.rg_test(which, cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    SharedString::from(format!("x-rg-paste-{tag}")),
+                    "Change key",
+                    cx.listener(move |this, _, _, cx| {
+                        this.desk.rg.key_for = which;
+                        this.input_target = InputTarget::RgKey;
+                        this.pending_focus = true;
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    SharedString::from(format!("x-rg-remove-{tag}")),
+                    "Remove",
+                    cx.listener(move |this, _, _, cx| {
+                        this.rg_remove_key(which, cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element();
+        }
+        row = row
             .child(x_button!(
                 SharedString::from(format!("x-rg-signin-{tag}")),
                 sign_in,
@@ -806,8 +839,8 @@ impl XPanel {
                     this.rg_remove_key(which, cx);
                     cx.stop_propagation();
                 })
-            ))
-            .into_any_element()
+            ));
+        row.into_any_element()
     }
 
     pub(super) fn reply_guy_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
@@ -838,9 +871,11 @@ impl XPanel {
                 self.desk.rg.key_for.label()
             )));
         }
-        rows.push(hint(
+        if self.desk.rg.treg_mask.is_none() {
+            rows.push(hint(
             "Grok: xAI has no sign-in for third-party apps to use, so Sign in to Grok opens console.x.ai to create an API key. Treg: use your own key from treg.to (or `treg login`).".into(),
-        ));
+            ));
+        }
         if let Some(test) = &self.desk.rg.test {
             rows.push(hint(test.clone()));
         }
@@ -852,7 +887,7 @@ impl XPanel {
             div()
                 .flex()
                 .gap(px(8.0))
-                .flex_wrap()
+                .items_center()
                 .child(self.single_line_field(TextField::RgTopic, cx))
                 .child(x_button!(
                     "x-rg-fetch",
@@ -866,6 +901,13 @@ impl XPanel {
                         cx.stop_propagation();
                     })
                 ))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .flex_wrap()
                 .child(x_button!(
                     "x-rg-popular",
                     "Popular",
