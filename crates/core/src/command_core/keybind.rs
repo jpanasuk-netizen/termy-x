@@ -99,6 +99,7 @@ const WINDOWS_DEFAULT_KEYBINDS: &[(&str, CommandId)] = &[
     ("f3", CommandId::SearchNext),
     ("shift-f3", CommandId::SearchPrevious),
     ("secondary-alt-i", CommandId::ToggleInspector),
+    ("ctrl-shift-x", CommandId::ToggleXPanel),
     ("ctrl-shift-c", CommandId::Copy),
     ("ctrl-insert", CommandId::Copy),
     ("secondary-c", CommandId::Copy),
@@ -575,6 +576,28 @@ pub fn resolve_keybinds(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn x_panel_toggle_has_a_default_on_every_platform() {
+        for platform in [
+            KeybindPlatform::MacOs,
+            KeybindPlatform::Windows,
+            KeybindPlatform::Linux,
+        ] {
+            assert!(
+                default_keybinds_for_platform(platform)
+                    .iter()
+                    .any(|binding| binding.action == CommandId::ToggleXPanel),
+                "no X panel shortcut on {platform:?}"
+            );
+        }
+        assert!(
+            default_keybinds_for_platform(KeybindPlatform::Windows)
+                .iter()
+                .any(|binding| binding.trigger == "ctrl-shift-x"
+                    && binding.action == CommandId::ToggleXPanel)
+        );
+    }
     use super::{
         KeybindDirective, KeybindLineRef, KeybindPlatform, KeybindWarning, ResolvedKeybind,
         canonicalize_keybind_trigger, default_keybinds_for_current_platform,
