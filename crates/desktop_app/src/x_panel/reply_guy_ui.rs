@@ -123,21 +123,40 @@ impl XPanel {
     }
 
     pub(super) fn rg_save_key(&mut self, cx: &mut Context<Self>) {
+        self.rg_save_key_now();
+        cx.notify();
+    }
+
+    /// Save the pasted key (Enter, Save, or right after a paste) and
+    /// confirm it reads back, so the key row flips to the masked value.
+    pub(super) fn rg_save_key_now(&mut self) {
         let value = std::mem::take(&mut self.desk.rg_key_input);
         let which = self.desk.rg.key_for;
         if value.trim().is_empty() {
             self.notice = Some(format!("Paste your {} first.", which.label()));
-            cx.notify();
             return;
         }
         let config = self.live_config();
-        self.notice = Some(match rg::store_secret(&config, which, &value) {
-            Ok(()) => format!("Saved {}. Click Test to check it.", which.label()),
+        let saved = rg::store_secret(&config, which, &value);
+        self.rg_refresh_keys();
+        let present = match which {
+            Secret::Grok => self.desk.rg.grok_mask.is_some(),
+            Secret::Treg => self.desk.rg.treg_mask.is_some(),
+        };
+        self.notice = Some(match saved {
+            Ok(()) if present => format!(
+                "Saved {}. Click Test connection to check it.",
+                which.label()
+            ),
+            Ok(()) => format!("{} was written but could not be read back.", which.label()),
             Err(error) => format!("Could not save {}: {error}", which.label()),
         });
-        self.input_target = InputTarget::RgTopic;
-        self.rg_refresh_keys();
-        cx.notify();
+        if present {
+            self.input_target = InputTarget::RgTopic;
+        } else {
+            // Keep it so the user can retry Save.
+            self.desk.rg_key_input = value;
+        }
     }
 
     fn rg_remove_key(&mut self, which: Secret, cx: &mut Context<Self>) {

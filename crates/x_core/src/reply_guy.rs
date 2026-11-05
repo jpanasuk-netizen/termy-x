@@ -108,6 +108,7 @@ pub fn store_secret(config: &XConfig, which: Secret, value: &str) -> Result<(), 
     if config.token_store == "keychain"
         && let Ok(entry) = keyring::Entry::new("termy-x", which.account())
         && entry.set_password(value).is_ok()
+        && entry.get_password().is_ok_and(|stored| stored == value)
     {
         return Ok(());
     }

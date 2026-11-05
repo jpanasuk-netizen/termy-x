@@ -3200,6 +3200,12 @@ impl XPanel {
         }
         if self.section == XSection::ReplyGuy && self.input_target == InputTarget::RgKey {
             self.on_text_input_key(event, TextField::RgKey, cx);
+            let mods = &event.keystroke.modifiers;
+            let pasted =
+                (mods.control || mods.platform) && event.keystroke.key.eq_ignore_ascii_case("v");
+            if pasted && !self.desk.rg_key_input.trim().is_empty() {
+                self.rg_save_key(cx);
+            }
             return;
         }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
@@ -3458,7 +3464,12 @@ impl XPanel {
                 InputTarget::QueueReplyTo => self.desk.queue_reply_to.push_str(clean),
                 InputTarget::Analyze => self.desk.analyze_handle.push_str(clean),
                 InputTarget::RgTopic => self.desk.rg_topic.push_str(clean),
-                InputTarget::RgKey => self.desk.rg_key_input.push_str(clean.trim()),
+                InputTarget::RgKey => {
+                    // A pasted key is complete: save it right away
+                    // (Enter/Save also work).
+                    self.desk.rg_key_input.push_str(clean.trim());
+                    self.rg_save_key_now();
+                }
             }
         }
         match self.input_target {
