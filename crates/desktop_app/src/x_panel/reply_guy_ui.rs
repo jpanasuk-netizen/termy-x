@@ -11,7 +11,7 @@ use termy_x::reply_guy::{self as rg, Secret, Sort};
 use termy_x::reply_guy_multi::{self as rgm, RgHit, Source};
 
 
-/// Compact Reply Guy chrome for the ~480px ultrawide X panel.
+/// Compact secondary control (Apple calm neutrals).
 macro_rules! rg_button {
     ($id:expr, $label:expr, $handler:expr) => {
         rg_button!($id, $label, false, $handler)
@@ -20,24 +20,49 @@ macro_rules! rg_button {
         let active = $active;
         div()
             .id($id)
-            .px(px(5.0))
-            .py(px(2.0))
-            .rounded(px(4.0))
+            .px(px(7.0))
+            .py(px(4.0))
+            .rounded(px(8.0))
             .border_1()
             .border_color(if active {
-                rgb(0xff4fa3)
+                rgb(0x0a84ff)
             } else {
-                rgb(0x7af6ff)
+                rgb(0x3a3a3c)
             })
-            .bg(if active { rgb(0x3a0a4a) } else { rgb(0x0d1f6e) })
-            .text_size(px(10.0))
-            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xe9fdff) })
+            .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
+            .text_size(px(11.0))
+            .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
             .cursor_pointer()
             .hover(|style| {
                 style
-                    .bg(rgb(0x1a3cff))
-                    .border_color(rgb(0xff4fa3))
+                    .bg(rgb(0x3a3a3c))
+                    .border_color(rgb(0x636366))
                     .text_color(rgb(0xffffff))
+            })
+            .child($label)
+            .on_mouse_down(MouseButton::Left, $handler)
+    }};
+}
+
+/// Primary CTA — system blue only.
+macro_rules! rg_cta {
+    ($id:expr, $label:expr, $handler:expr) => {{
+        div()
+            .id($id)
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(0x0a84ff))
+            .bg(rgb(0x0a84ff))
+            .text_size(px(11.0))
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+            .text_color(rgb(0xffffff))
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x409cff))
+                    .border_color(rgb(0x409cff))
             })
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
@@ -970,14 +995,14 @@ impl XPanel {
 
     fn rg_source_badge(&self, source: Source) -> gpui_kit::AnyElement {
         div()
-            .px(px(5.0))
-            .py(px(1.0))
-            .rounded(px(3.0))
-            .bg(tint(source.accent_rgb(), 55))
+            .px(px(6.0))
+            .py(px(2.0))
+            .rounded(px(6.0))
+            .bg(rgb(0x2c2c2e))
             .border_1()
-            .border_color(rgb(source.accent_rgb()))
-            .text_size(px(9.0))
-            .text_color(rgb(0xffffff))
+            .border_color(rgb(0x3a3a3c))
+            .text_size(px(10.0))
+            .text_color(rgb(0xaeaeb2))
             .child(source.label())
             .into_any_element()
     }
@@ -986,13 +1011,8 @@ impl XPanel {
         let mut rows = Vec::new();
         let ready = self.desk.rg.ready().is_ok();
         rows.push(hint(format!(
-            "REPLY GUY \u{b7} {} \u{b7} Ask: {} \u{b7} replies go through Confirm",
-            if ready {
-                "ready \u{2713}"
-            } else {
-                "setup needed"
-            },
-            self.rg_ask_agent().label()
+            "Reply Guy \u{b7} {}",
+            if ready { "Ready" } else { "Setup" }
         )));
         rows.push(self.rg_key_row(Secret::Treg, cx));
         rows.push(self.rg_key_row(Secret::Grok, cx));
@@ -1012,14 +1032,11 @@ impl XPanel {
                     ))
                     .into_any_element(),
             );
-            rows.push(hint(format!(
-                "Saving your {} \u{b7} kept in the OS keychain, never shown or logged.",
-                self.desk.rg.key_for.label()
-            )));
+            rows.push(hint(format!("Paste {} then Save.", self.desk.rg.key_for.label())));
         }
         if self.desk.rg.treg_mask.is_none() {
             rows.push(hint(
-            "Grok: xAI has no sign-in for third-party apps to use, so Sign in to Grok opens console.x.ai to create an API key. Treg: use your own key from treg.to (or `treg login`).".into(),
+            "Add a Treg key to turn this on.".into(),
             ));
         }
         if let Some(test) = &self.desk.rg.test {
@@ -1035,7 +1052,7 @@ impl XPanel {
                 .gap(px(4.0))
                 .items_center()
                 .child(self.single_line_field(TextField::RgTopic, cx))
-                .child(rg_button!(
+                .child(rg_cta!(
                     "x-rg-fetch",
                     if self.desk.rg.busy {
                         "Fetching\u{2026}"
@@ -1084,7 +1101,7 @@ impl XPanel {
                     })
                 ))
                 .child(hint(self.desk.rg.cost.clone().unwrap_or_else(|| {
-                    format!("multi · cost {}", rgm::TREG_COST_VARIES)
+                    format!("cost {}", rgm::TREG_COST_VARIES)
                 })))
                 .into_any_element(),
         );
@@ -1105,7 +1122,7 @@ impl XPanel {
             rows.push(chips.into_any_element());
         }
         if let Some(error) = &self.desk.rg.error {
-            rows.push(card("Fetch notes".into(), error.clone()));
+            rows.push(card("Notes".into(), error.clone()));
         }
         if !self.desk.rg_hits.is_empty() {
             rows.push(self.rg_source_tabs(cx));
@@ -1128,7 +1145,7 @@ impl XPanel {
         });
         if !self.desk.rg_hits.is_empty() {
             rows.push(hint(format!(
-                "RESULTS \u{b7} showing {} / {} \u{b7} {}",
+                "{} of {} \u{b7} {}",
                 hits.len(),
                 self.desk.rg_hits.len(),
                 self.desk.rg_topic.trim()
@@ -1137,7 +1154,7 @@ impl XPanel {
         if self.desk.rg_hits.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {
             rows.push(empty_state(
                 "No posts yet",
-                "Type a niche and Fetch (X, Reddit, TikTok, IG, YT, LinkedIn, FB). HN/Threads/PH/Bluesky not on this Treg org yet.",
+                "Enter a topic, then Fetch.",
             ));
         }
         for hit in hits {
@@ -1185,10 +1202,9 @@ impl XPanel {
                     cx,
                 ));
             } else {
-                actions = actions.child(rg_button!(
+                actions = actions.child(rg_cta!(
                     SharedString::from(format!("x-rg-quote-{}", post.id)),
                     "Quote on X",
-                    true,
                     cx.listener(move |this, _, _, cx| {
                         this.rg_quote_to_x(&hit_quote, cx);
                         cx.stop_propagation();
@@ -1271,7 +1287,7 @@ impl XPanel {
             }
         }
         if !self.desk.rg_topic.trim().is_empty() {
-            rows.push(hint("POST ABOUT THIS TOPIC".into()));
+            rows.push(hint("Compose about this topic".into()));
         }
         let topic = self.desk.rg_topic.trim().to_string();
         if !topic.is_empty() {
