@@ -41,3 +41,5 @@ screenshots/*.png
 *.swp
 *~
 Thumbs.db
+notes/_*
+notes/_*/
