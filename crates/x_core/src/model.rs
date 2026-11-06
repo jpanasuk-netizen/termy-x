@@ -205,6 +205,16 @@ pub struct Post {
     /// tweet (GraphQL `retweeted_status_result`); never invented.
     #[serde(default)]
     pub retweeted: Option<Box<Post>>,
+    /// Quote tweet embedded by the provider. The outer post is the
+    /// quoter's own words. Not a repost.
+    #[serde(default)]
+    pub quoted: Option<Box<Post>>,
+    /// Original status id when the payload only referenced it.
+    #[serde(default)]
+    pub referenced_status_id: Option<String>,
+    /// Real status URL when that original could not be loaded.
+    #[serde(default)]
+    pub unavailable_original_url: Option<String>,
     /// Parent tweet id when this post is a reply. Taken only from the
     /// provider payload (`in_reply_to_status_id_str` and siblings);
     /// never invented. Used to build nested reply trees.
@@ -222,13 +232,64 @@ pub struct Post {
     pub viewer_follows_author: Option<bool>,
 }
 
+fn status_id_in_text(text: &str) -> Option<&str> {
+    status_url_in_text(text).and_then(|url| url.rsplit('/').next())
+}
+
+fn status_url_in_text(text: &str) -> Option<&str> {
+    for token in text.split_whitespace() {
+        let token = token.trim_matches(|c: char| matches!(c, ')' | '(' | ',' | '.' | '"' | '\''));
+        let lower = token.to_ascii_lowercase();
+        let host = lower.contains("://x.com/")
+            || lower.contains("://twitter.com/")
+            || lower.contains("://mobile.x.com/")
+            || lower.contains("://mobile.twitter.com/");
+        if host && lower.contains("/status/") {
+            return Some(token);
+        }
+    }
+    None
+}
+
 impl Post {
     /// The tweet Like/Retweet/Quote/Reply should act on: for a repost
     /// that's the original (embedded) tweet, matching native X, where
     /// engaging a repost engages the original. For a normal post it's
     /// the post itself.
     pub fn engage_target(&self) -> &Post {
+        // A quote is its own tweet. A repost acts on the original.
+        if self.quoted.is_some() && self.retweeted.is_none() {
+            return self;
+        }
         self.retweeted.as_deref().unwrap_or(self)
+    }
+
+    /// Id to fetch when the original was not embedded. The outer post id
+    /// stays the timeline row so two reposts of one tweet do not collapse.
+    pub fn original_fetch_id(&self) -> Option<&str> {
+        self.referenced_status_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .or_else(|| status_id_in_text(&self.text))
+    }
+
+    pub fn original_link(&self) -> Option<String> {
+        if let Some(url) = self
+            .unavailable_original_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+        {
+            return Some(url.to_string());
+        }
+        if let Some(id) = self.referenced_status_id.as_deref().filter(|id| !id.is_empty())
+        {
+            return Some(format!("https://x.com/i/status/{id}"));
+        }
+        status_url_in_text(&self.text).map(str::to_string)
+    }
+
+    pub fn shows_unavailable_original(&self) -> bool {
+        self.retweeted.is_none() && self.unavailable_original_url.is_some()
     }
 
     /// Handle of the original author when this post is a *bare*
@@ -260,11 +321,27 @@ impl Post {
         if let Some(inner) = &self.retweeted {
             return &inner.text;
         }
+        if self.shows_unavailable_original() {
+            return "";
+        }
         if let Some(handle) = self.bare_repost_handle() {
             let prefix_len = "RT @".len() + handle.len() + 1;
             return self.text[prefix_len..].trim_start();
         }
         &self.text
+    }
+
+    /// A fetched row becomes the embedded original only when it is that
+    /// original, not the same truncated wrapper.
+    pub fn adopt_fetched_original(wrapper_id: &str, fetched: Post) -> Option<Post> {
+        if let Some(inner) = fetched.retweeted {
+            return Some(*inner);
+        }
+        if fetched.id != wrapper_id && fetched.bare_repost_handle().is_none() && !fetched.text.is_empty()
+        {
+            return Some(fetched);
+        }
+        None
     }
 
     pub fn engagement(&self) -> u64 {

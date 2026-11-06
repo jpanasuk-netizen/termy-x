@@ -125,6 +125,16 @@ struct RawPost<'a> {
     images: Option<serde::de::IgnoredAny>,
     #[serde(borrow, alias = "retweeted_status", alias = "retweeted_tweet")]
     retweeted: Option<Box<RawPost<'a>>>,
+    #[serde(borrow, alias = "quoted_status", alias = "quoted_tweet")]
+    quoted: Option<Box<RawPost<'a>>>,
+    #[serde(
+        borrow,
+        alias = "retweeted_status_id_str",
+        alias = "retweeted_status_id"
+    )]
+    referenced_status_id: Option<&'a str>,
+    #[serde(borrow)]
+    unavailable_original_url: Option<&'a str>,
     #[serde(
         borrow,
         alias = "in_reply_to_status_id_str",
@@ -143,6 +153,7 @@ fn raw_post_supported(raw: &RawPost<'_>) -> bool {
         return false;
     }
     raw.retweeted.as_deref().is_none_or(raw_post_supported)
+        && raw.quoted.as_deref().is_none_or(raw_post_supported)
 }
 
 /// Media kind from a URL, case-insensitively, without allocating a
@@ -272,6 +283,18 @@ fn raw_post_to_post(raw: RawPost<'_>, users: &[(&str, &str, &str)]) -> Option<Po
             .retweeted
             .and_then(|inner| raw_post_to_post(*inner, &[]))
             .map(Box::new),
+        quoted: raw
+            .quoted
+            .and_then(|inner| raw_post_to_post(*inner, &[]))
+            .map(Box::new),
+        referenced_status_id: raw
+            .referenced_status_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        unavailable_original_url: raw
+            .unavailable_original_url
+            .filter(|url| !url.is_empty())
+            .map(str::to_string),
         in_reply_to: raw
             .in_reply_to
             .map(str::trim)

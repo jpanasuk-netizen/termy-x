@@ -2080,14 +2080,19 @@ impl XPanel {
         if self.repost_resolving {
             return;
         }
-        let mut wanted: Vec<String> = Vec::new();
-        let scan = |posts: &[Post], wanted: &mut Vec<String>| {
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        let scan = |posts: &[Post], wanted: &mut Vec<(String, String)>| {
             for post in posts {
-                if post.bare_repost_handle().is_some()
-                    && !self.repost_cache.contains_key(&post.id)
-                    && !wanted.contains(&post.id)
+                let needs = post.retweeted.is_none()
+                    && post.unavailable_original_url.is_none()
+                    && (post.bare_repost_handle().is_some() || post.referenced_status_id.is_some());
+                if needs && !self.repost_cache.contains_key(&post.id) && !wanted.iter().any(|(id, _)| id == &post.id)
                 {
-                    wanted.push(post.id.clone());
+                    let fetch = post
+                        .original_fetch_id()
+                        .unwrap_or(post.id.as_str())
+                        .to_string();
+                    wanted.push((post.id.clone(), fetch));
                 }
             }
         };
@@ -2112,11 +2117,10 @@ impl XPanel {
                     let service = XPanel::service_free();
                     wanted
                         .iter()
-                        .map(|id| {
-                            let original = service
-                                .post_by_id(id)
-                                .ok()
-                                .and_then(|served| served.value.retweeted.map(|inner| *inner));
+                        .map(|(id, fetch_id)| {
+                            let original = service.post_by_id(fetch_id).ok().and_then(|served| {
+                                termy_x::model::Post::adopt_fetched_original(id, served.value)
+                            });
                             (id.clone(), original)
                         })
                         .collect::<Vec<(String, Option<Post>)>>()
@@ -2135,6 +2139,16 @@ impl XPanel {
                         if let Some(profile) = &mut panel.profile {
                             patch_repost_original(&mut profile.posts, &id, &original);
                             patch_repost_original(&mut profile.pinned, &id, &original);
+                        }
+                    } else {
+                        patch_repost_unavailable(&mut panel.posts, &id);
+                        patch_repost_unavailable(&mut panel.following_posts, &id);
+                        patch_repost_unavailable(&mut panel.search_posts, &id);
+                        patch_repost_unavailable(&mut panel.mentions_posts, &id);
+                        patch_repost_unavailable(&mut panel.inbox_posts, &id);
+                        if let Some(profile) = &mut panel.profile {
+                            patch_repost_unavailable(&mut profile.posts, &id);
+                            patch_repost_unavailable(&mut profile.pinned, &id);
                         }
                     }
                 }
@@ -4868,6 +4882,16 @@ fn patch_repost_original(posts: &mut [Post], repost_id: &str, original: &Post) {
     for post in posts.iter_mut() {
         if post.id == repost_id && post.retweeted.is_none() {
             post.retweeted = Some(Box::new(original.clone()));
+            post.unavailable_original_url = None;
+        }
+    }
+}
+
+fn patch_repost_unavailable(posts: &mut [Post], repost_id: &str) {
+    for post in posts.iter_mut() {
+        if post.id == repost_id && post.retweeted.is_none() && post.unavailable_original_url.is_none()
+        {
+            post.unavailable_original_url = post.original_link();
         }
     }
 }
@@ -8901,6 +8925,39 @@ impl XPanel {
                     .text_size(px(11.0))
                     .text_color(rgb(0xf0a8d0))
                     .child("Selected \u{b7} Ctrl+C copies this tweet")
+            }))
+            .children(post.shows_unavailable_original().then(|| {
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(
+                        post.original_link()
+                            .map(|url| format!("Original post unavailable \u{b7} {url}"))
+                            .unwrap_or_else(|| "Original post unavailable".to_string()),
+                    )
+            }))
+            .children(post.quoted.as_ref().map(|quoted| {
+                div()
+                    .mt(px(6.0))
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0x3a3a3c))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(format!("Quote of @{}", quoted.author_handle)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xf5f5f7))
+                            .child(quoted.text.clone()),
+                    )
+                    .children(self.media_box_scoped(quoted, &format!("{scope}-quote"), cx))
             }))
             .children(self.media_box_scoped(display, scope, cx))
             .child(self.tweet_actions_scoped(display, scope, cx))

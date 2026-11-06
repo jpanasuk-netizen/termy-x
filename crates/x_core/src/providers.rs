@@ -354,7 +354,10 @@ impl Service {
         let mut filled = 0;
         let mut fetches = 0;
         for post in posts.iter_mut() {
-            if post.bare_repost_handle().is_none() {
+            if post.retweeted.is_some() || post.unavailable_original_url.is_some() {
+                continue;
+            }
+            if post.bare_repost_handle().is_none() && post.referenced_status_id.is_none() {
                 continue;
             }
             if !cache.contains_key(&post.id) {
@@ -362,15 +365,25 @@ impl Service {
                     continue;
                 }
                 fetches += 1;
-                let resolved = self
-                    .post_by_id(&post.id)
-                    .ok()
-                    .and_then(|served| served.value.retweeted.map(|inner| *inner));
+                let fetch_id = post.original_fetch_id().unwrap_or(post.id.as_str()).to_string();
+                let resolved = self.post_by_id(&fetch_id).ok().and_then(|served| {
+                    Post::adopt_fetched_original(&post.id, served.value)
+                });
+                if resolved.is_none() {
+                    post.unavailable_original_url = post.original_link();
+                }
                 cache.insert(post.id.clone(), resolved);
             }
-            if let Some(Some(original)) = cache.get(&post.id) {
-                post.retweeted = Some(Box::new(original.clone()));
-                filled += 1;
+            match cache.get(&post.id) {
+                Some(Some(original)) => {
+                    post.retweeted = Some(Box::new(original.clone()));
+                    post.unavailable_original_url = None;
+                    filled += 1;
+                }
+                Some(None) if post.unavailable_original_url.is_none() => {
+                    post.unavailable_original_url = post.original_link();
+                }
+                _ => {}
             }
         }
         filled
@@ -1107,6 +1120,9 @@ fn post(
         quotes: None,
         media: Vec::new(),
         retweeted: None,
+        quoted: None,
+        referenced_status_id: None,
+        unavailable_original_url: None,
         in_reply_to: None,
         viewer_liked: None,
         viewer_follows_author: None,
@@ -2149,6 +2165,19 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     }}
     return {{has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations}};
   }}
+  function unwrapTweet(node) {{
+    let cur = node;
+    for (let i = 0; i < 4 && cur; i++) {{
+      if (cur.result) cur = cur.result;
+      else if (cur.tweet && !cur.legacy && !cur.rest_id) cur = cur.tweet;
+      else break;
+    }}
+    return cur;
+  }}
+  function tombstone(node) {{
+    const t = (node && (node.__typename || node.typename)) || "";
+    return t.indexOf("Unavailable") >= 0 || t.indexOf("Tombstone") >= 0;
+  }}
   function extract(result, seen) {{
     if (!result) return null;
     const tw = result.tweet || result;
@@ -2158,8 +2187,10 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
-    return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)}};
+    const rtNode = unwrapTweet(tw.retweeted_status_result) || unwrapTweet(l.retweeted_status_result);
+    const qtNode = unwrapTweet(tw.quoted_status_result) || unwrapTweet(l.quoted_status_result);
+    const rtId = String((l && (l.retweeted_status_id_str || l.retweeted_status_id)) || "");
+    return {{id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: (rtNode && !tombstone(rtNode) && (rtNode.legacy || rtNode.tweet || rtNode.rest_id)) ? extract(rtNode, new Set()) : null, quoted: (qtNode && !tombstone(qtNode) && (qtNode.legacy || qtNode.tweet || qtNode.rest_id)) ? extract(qtNode, new Set()) : null, referenced_status_id: rtId || null, unavailable_original_url: (tombstone(rtNode) && rtId) ? ("https://x.com/i/status/" + rtId) : null, ...mediaOf(l)}};
   }}
   function parsePage(data, seen) {{
     const tweets = [];
@@ -2340,6 +2371,19 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
     }
     return {has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations};
   }
+  function unwrapTweet(node) {
+    let cur = node;
+    for (let i = 0; i < 4 && cur; i++) {
+      if (cur.result) cur = cur.result;
+      else if (cur.tweet && !cur.legacy && !cur.rest_id) cur = cur.tweet;
+      else break;
+    }
+    return cur;
+  }
+  function tombstone(node) {
+    const t = (node && (node.__typename || node.typename)) || "";
+    return t.indexOf("Unavailable") >= 0 || t.indexOf("Tombstone") >= 0;
+  }
   function extract(result, seen) {
     if (!result) return null;
     const tw = result.tweet || result;
@@ -2349,8 +2393,10 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || HANDLE;
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
-    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
+    const rtNode = unwrapTweet(tw.retweeted_status_result) || unwrapTweet(l.retweeted_status_result);
+    const qtNode = unwrapTweet(tw.quoted_status_result) || unwrapTweet(l.quoted_status_result);
+    const rtId = String((l && (l.retweeted_status_id_str || l.retweeted_status_id)) || "");
+    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: (rtNode && !tombstone(rtNode) && (rtNode.legacy || rtNode.tweet || rtNode.rest_id)) ? extract(rtNode, new Set()) : null, quoted: (qtNode && !tombstone(qtNode) && (qtNode.legacy || qtNode.tweet || qtNode.rest_id)) ? extract(qtNode, new Set()) : null, referenced_status_id: rtId || null, unavailable_original_url: (tombstone(rtNode) && rtId) ? ("https://x.com/i/status/" + rtId) : null, ...mediaOf(l)};
   }
   // Pinned extraction, the mechanism that actually works against the
   // live client: the profile page renders the pinned post first with a
@@ -2488,6 +2534,19 @@ const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
     }
     return {has_media: urls.length > 0, media_urls: urls, media_posters: posters, media_durations: durations};
   }
+  function unwrapTweet(node) {
+    let cur = node;
+    for (let i = 0; i < 4 && cur; i++) {
+      if (cur.result) cur = cur.result;
+      else if (cur.tweet && !cur.legacy && !cur.rest_id) cur = cur.tweet;
+      else break;
+    }
+    return cur;
+  }
+  function tombstone(node) {
+    const t = (node && (node.__typename || node.typename)) || "";
+    return t.indexOf("Unavailable") >= 0 || t.indexOf("Tombstone") >= 0;
+  }
   function extract(result, seen) {
     if (!result) return null;
     const tw = result.tweet || result;
@@ -2497,8 +2556,10 @@ const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
     const u = tw.core && tw.core.user_results && tw.core.user_results.result;
     const screenName = (u && u.legacy && u.legacy.screen_name) || (u && u.core && u.core.screen_name) || "unknown";
     const noteText = tw.note_tweet && tw.note_tweet.note_tweet_results && tw.note_tweet.note_tweet_results.result && tw.note_tweet.note_tweet_results.result.text;
-    const rt = ((tw.retweeted_status_result && tw.retweeted_status_result.result) || (l.retweeted_status_result && l.retweeted_status_result.result)) || null;
-    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: rt && (rt.legacy || rt.tweet) ? extract(rt, new Set()) : null, ...mediaOf(l)};
+    const rtNode = unwrapTweet(tw.retweeted_status_result) || unwrapTweet(l.retweeted_status_result);
+    const qtNode = unwrapTweet(tw.quoted_status_result) || unwrapTweet(l.quoted_status_result);
+    const rtId = String((l && (l.retweeted_status_id_str || l.retweeted_status_id)) || "");
+    return {id: tw.rest_id, author: screenName, author_verified: Boolean((u && u.is_blue_verified) || (u && u.legacy && u.legacy.verified)), text: noteText || l.full_text || "", likes: l.favorite_count || 0, retweets: l.retweet_count || 0, replies: l.reply_count || 0, views: tw.views && tw.views.count ? parseInt(tw.views.count, 10) : 0, created_at: l.created_at || "", url: "https://x.com/" + screenName + "/status/" + tw.rest_id, retweeted: (rtNode && !tombstone(rtNode) && (rtNode.legacy || rtNode.tweet || rtNode.rest_id)) ? extract(rtNode, new Set()) : null, quoted: (qtNode && !tombstone(qtNode) && (qtNode.legacy || qtNode.tweet || qtNode.rest_id)) ? extract(qtNode, new Set()) : null, referenced_status_id: rtId || null, unavailable_original_url: (tombstone(rtNode) && rtId) ? ("https://x.com/i/status/" + rtId) : null, ...mediaOf(l)};
   }
   const one = await gql("TweetResultByRestId", {tweetId: TWEET_ID, withCommunity: false, includePromotedContent: false, withVoice: false});
   const tr = one && one.data && one.data.tweetResult && one.data.tweetResult.result;
@@ -3303,7 +3364,9 @@ fn users_by_id(value: &Value) -> Vec<(String, String, String)> {
 }
 
 fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<Post> {
-    let text = first_str(item, &["text", "full_text", "rawContent", "content"])?.to_string();
+    let text = first_str(item, &["text", "full_text", "rawContent", "content"])
+        .unwrap_or("")
+        .to_string();
     let id = first_str(item, &["id", "id_str", "rest_id"])
         .unwrap_or("0")
         .to_string();
@@ -3340,6 +3403,9 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
     if name.is_empty() {
         name = handle.clone();
     }
+    if text.is_empty() && (id.is_empty() || id == "0") && handle.is_empty() {
+        return None;
+    }
     let metrics = item
         .get("public_metrics")
         .or_else(|| item.get("metrics"))
@@ -3358,9 +3424,10 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         text,
         id,
         media: media_from_value(item),
-        retweeted: first_embedded(item, &["retweeted", "retweeted_status", "retweeted_tweet"])
-            .and_then(|inner| post_from_value(inner, &[]))
-            .map(Box::new),
+        retweeted: embedded_post(item, &["retweeted", "retweeted_status", "retweeted_tweet", "retweeted_status_result"]),
+        quoted: embedded_post(item, &["quoted", "quoted_status", "quoted_tweet", "quoted_status_result"]),
+        referenced_status_id: first_id(item, &["retweeted_status_id_str", "retweeted_status_id", "referenced_status_id"]),
+        unavailable_original_url: tombstone_url(item),
         in_reply_to: in_reply_to_from(item),
         viewer_liked: viewer_liked_from(item),
         viewer_follows_author: author
@@ -3397,6 +3464,59 @@ fn first_embedded<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter()
         .filter_map(|key| item.get(*key))
         .find(|value| value.is_object())
+}
+
+fn unwrap_tweet(value: &Value) -> &Value {
+    let mut cur = value;
+    for _ in 0..4 {
+        let next = cur
+            .get("result")
+            .filter(|inner| inner.is_object())
+            .or_else(|| {
+                let wrapped = cur.get("tweet").filter(|inner| inner.is_object())?;
+                if cur.get("text").is_some() || cur.get("full_text").is_some() {
+                    None
+                } else {
+                    Some(wrapped)
+                }
+            });
+        match next {
+            Some(inner) => cur = inner,
+            None => break,
+        }
+    }
+    cur
+}
+
+fn is_tombstone(value: &Value) -> bool {
+    first_str(value, &["__typename", "typename"])
+        .is_some_and(|kind| kind.contains("Unavailable") || kind.contains("Tombstone"))
+        || value.get("tombstone").is_some()
+}
+
+fn embedded_post(item: &Value, keys: &[&str]) -> Option<Box<Post>> {
+    let raw = first_embedded(item, keys)?;
+    let inner = unwrap_tweet(raw);
+    if is_tombstone(inner) {
+        return None;
+    }
+    post_from_value(inner, &[]).map(Box::new)
+}
+
+fn tombstone_url(item: &Value) -> Option<String> {
+    for key in ["retweeted_status_result", "retweeted", "retweeted_status"] {
+        let Some(raw) = item.get(key).filter(|value| value.is_object()) else {
+            continue;
+        };
+        let inner = unwrap_tweet(raw);
+        if !is_tombstone(inner) {
+            continue;
+        }
+        let id = first_id(inner, &["id", "id_str", "rest_id"])
+            .or_else(|| first_id(item, &["retweeted_status_id_str", "retweeted_status_id"]))?;
+        return Some(format!("https://x.com/i/status/{id}"));
+    }
+    None
 }
 
 /// Media from provider payloads. Verified live against OpenCLI
@@ -4396,6 +4516,103 @@ mod tests {
         assert_eq!(repost.engage_target().id, "40");
         assert_eq!(posts[1].engage_target().id, "51");
         assert!(posts[1].retweeted.is_none());
+    }
+
+    #[test]
+    fn repost_keeps_outer_id_and_original_media_quote_stays_distinct() {
+        let json = r##"[
+          {"id":"50","author":"reposter","text":"RT @orig: hello https://t.co/x","likes":1,
+           "retweeted":{"id":"40","author":"orig","text":"hello from the original","likes":9,
+             "media_urls":["https://video.twimg.com/amplify_video/9/vid/avc1/320x568/a.mp4"],
+             "media_posters":["https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg"]}},
+          {"id":"51","author":"other","text":"RT @orig: hello https://t.co/x","likes":2,
+           "retweeted":{"id":"40","author":"orig","text":"hello from the original","likes":9,
+             "media_urls":["https://pbs.twimg.com/media/still.jpg"]}},
+          {"id":"70","author":"quoter","text":"my words on their post","likes":3,
+           "quoted":{"id":"40","author":"orig","text":"hello from the original","likes":9,
+             "media_urls":["https://pbs.twimg.com/media/q.jpg"]}}
+        ]"##;
+        let posts = parse_posts(json).unwrap();
+        let kept = dedupe_posts(posts);
+        assert_eq!(kept.len(), 3, "two reposts of one tweet stay two rows");
+        assert_eq!(kept[0].id, "50");
+        assert_eq!(kept[0].engage_target().id, "40");
+        assert_eq!(kept[0].engage_target().author_handle, "orig");
+        assert_eq!(kept[0].card_text(), "hello from the original");
+        assert_eq!(kept[0].engage_target().media.len(), 1);
+        assert_eq!(kept[1].id, "51");
+        assert_eq!(kept[1].engage_target().id, "40");
+        assert_ne!(kept[0].id, kept[1].id);
+        let quote = &kept[2];
+        assert!(quote.retweeted.is_none(), "a quote is not a repost");
+        assert_eq!(quote.engage_target().id, "70");
+        assert_eq!(quote.card_text(), "my words on their post");
+        let quoted = quote.quoted.as_ref().expect("quoted original");
+        assert_eq!(quoted.author_handle, "orig");
+        assert_eq!(quoted.media.len(), 1);
+    }
+
+    #[test]
+    fn referenced_original_hydrates_and_deleted_original_stays_a_link() {
+        struct ById;
+        impl XProvider for ById {
+            fn id(&self) -> ProviderId { ProviderId::Mock }
+            fn available(&self) -> bool { true }
+            fn lookup(&self, _: &str) -> Result<Served<Profile>, String> { Err("stub".into()) }
+            fn thread(&self, _: &str) -> Result<Served<Thread>, String> { Err("stub".into()) }
+            fn search(&self, _: &str, _: bool, _: usize) -> Result<Served<Vec<Post>>, String> { Err("stub".into()) }
+            fn timeline(&self, _: usize) -> Result<Served<Vec<Post>>, String> { Err("stub".into()) }
+            fn trends(&self, _: Option<&str>, _: usize) -> Result<Served<Vec<Trend>>, String> { Err("stub".into()) }
+            fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
+                if id == "40" {
+                    return Ok(served(
+                        post("40", "orig", "Orig", "full original with a photo", 4, 0, 0, 0),
+                        "by original id",
+                    ));
+                }
+                Err(format!("unavailable {id}"))
+            }
+        }
+        let service = Service { readers: vec![Box::new(ById)], publishers: Vec::new() };
+        let live = post_from_value(
+            &serde_json::json!({
+                "id": "50",
+                "author": "reposter",
+                "text": "RT @orig: https://t.co/abc",
+                "referenced_status_id": "40"
+            }),
+            &[],
+        ).unwrap();
+        assert!(live.retweeted.is_none());
+        let mut posts = vec![live.clone()];
+        let mut cache = std::collections::HashMap::new();
+        assert_eq!(service.resolve_bare_reposts(&mut posts, &mut cache, 4), 1);
+        assert_eq!(posts[0].id, "50", "row id stays the repost");
+        assert_eq!(posts[0].engage_target().id, "40");
+        assert_eq!(posts[0].card_text(), "full original with a photo");
+        assert!(cache.contains_key("40") || cache.contains_key("50"));
+
+        let gone = post_from_value(
+            &serde_json::json!({
+                "id": "80",
+                "author": "reposter",
+                "text": "RT @gone: https://t.co/zzz",
+                "retweeted_status_id_str": "99",
+                "retweeted_status_result": {"__typename": "TweetUnavailable", "rest_id": "99"}
+            }),
+            &[],
+        ).unwrap();
+        assert!(gone.retweeted.is_none(), "tombstone is not a fabricated tweet");
+        assert_eq!(gone.unavailable_original_url.as_deref(), Some("https://x.com/i/status/99"));
+        assert_eq!(gone.card_text(), "");
+        let mut missing = vec![gone.clone()];
+        let mut missing_cache = std::collections::HashMap::new();
+        assert_eq!(service.resolve_bare_reposts(&mut missing, &mut missing_cache, 4), 0);
+        assert!(missing[0].retweeted.is_none());
+        assert_eq!(missing[0].unavailable_original_url.as_deref(), Some("https://x.com/i/status/99"));
+        assert!(missing[0].card_text().is_empty());
+        let _ = live;
+        let _ = gone;
     }
 
     #[test]
