@@ -137,12 +137,36 @@ pub trait XProvider: Send + Sync {
     }
 }
 
+/// One home-timeline request. X's logged-in home GraphQL accepts about
+/// this many tweets per call; asking for hundreds in one shot either
+/// fails or comes back as a short first screen. Load more continues
+/// with the cursor from the previous page.
+pub const HOME_PAGE_SIZE: usize = 20;
+
 /// A page of timeline posts plus the opaque bottom cursor that fetches
 /// the next (older) page. `next_cursor: None` means the source is dry.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelinePage {
     pub posts: Vec<Post>,
     pub next_cursor: Option<String>,
+}
+
+/// Slice `posts` at an `off:N` cursor. `count` is clamped to
+/// [`HOME_PAGE_SIZE`]. A full page returns the next offset; a short
+/// page returns no cursor.
+pub fn slice_timeline(posts: &[Post], cursor: Option<&str>, count: usize) -> TimelinePage {
+    let count = count.clamp(1, HOME_PAGE_SIZE);
+    let start = cursor
+        .and_then(|token| token.strip_prefix("off:"))
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(posts.len());
+    let end = (start + count).min(posts.len());
+    let next_cursor = (end < posts.len()).then(|| format!("off:{end}"));
+    TimelinePage {
+        posts: posts[start..end].to_vec(),
+        next_cursor,
+    }
 }
 
 pub struct Service {
@@ -555,13 +579,26 @@ impl XProvider for MockProvider {
         Ok(served(posts, "fixture timeline"))
     }
     fn timeline_feed(&self, feed: TimelineFeed, limit: usize) -> Result<Served<Vec<Post>>, String> {
-        let mut posts = sample_posts();
-        posts.truncate(limit);
+        let page = slice_timeline(&home_fixture(feed), None, limit);
         Ok(served(
-            posts,
+            page.posts,
             match feed {
                 TimelineFeed::ForYou => "fixture timeline (for you)",
                 TimelineFeed::Following => "fixture timeline (following)",
+            },
+        ))
+    }
+    fn timeline_page(
+        &self,
+        feed: TimelineFeed,
+        cursor: Option<&str>,
+        count: usize,
+    ) -> Result<Served<TimelinePage>, String> {
+        Ok(served(
+            slice_timeline(&home_fixture(feed), cursor, count),
+            match feed {
+                TimelineFeed::ForYou => "fixture timeline page (for you)",
+                TimelineFeed::Following => "fixture timeline page (following)",
             },
         ))
     }
@@ -739,6 +776,34 @@ pub fn sample_posts() -> Vec<Post> {
         }
     }
     posts
+}
+
+/// Longer than a single five-post screen, with likes and dates that
+/// disagree, so Popular and Newest are different orders and a second
+/// page exists after [`HOME_PAGE_SIZE`].
+pub fn home_fixture(feed: TimelineFeed) -> Vec<Post> {
+    let tag = match feed {
+        TimelineFeed::ForYou => "fy",
+        TimelineFeed::Following => "fl",
+    };
+    (0..45)
+        .map(|index| {
+            let id = format!("{tag}-{index:03}");
+            let mut item = post(
+                &id,
+                "blue_swift",
+                "Blue Swift",
+                &format!("{tag} home post {index}"),
+                (45 - index) as u64 * 4,
+                1,
+                0,
+                0,
+            );
+            let day = 1 + (index % 28);
+            item.created_at = Some(format!("2026-09-{day:02}T12:00:00Z"));
+            item
+        })
+        .collect()
 }
 
 fn sample_mentions(handle: &str) -> Vec<Post> {
@@ -1066,6 +1131,7 @@ impl OpenCliProvider {
         cursor: Option<&str>,
         count: usize,
     ) -> Result<TimelinePage, String> {
+        let count = count.clamp(1, HOME_PAGE_SIZE);
         let stdout = self.eval_js("https://x.com/home", &timeline_eval_js(feed, cursor, count))?;
         parse_timeline_eval(&stdout)
     }
@@ -1565,6 +1631,10 @@ impl Publisher for OpenCliPublisher {
         true
     }
 
+    fn supports_follow(&self) -> bool {
+        true
+    }
+
     fn publish(
         &self,
         parts: &[String],
@@ -2021,7 +2091,9 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     for (const inst of instructions) {{
       for (const entry of inst.entries || []) {{
         const c = entry.content || {{}};
-        if (c.cursorType === "Bottom" || (entry.entryId || "").startsWith("cursor-bottom-")) {{ if (c.value) next = c.value; continue; }}
+        const cursorValue = c.value || (c.itemContent && c.itemContent.value) || "";
+        const cursorType = c.cursorType || (c.itemContent && c.itemContent.cursorType) || "";
+        if (cursorType === "Bottom" || String(entry.entryId || "").indexOf("cursor-bottom") === 0) {{ if (cursorValue) next = cursorValue; continue; }}
         const tr = c.itemContent && c.itemContent.tweet_results && c.itemContent.tweet_results.result;
         if (tr) {{ if (!c.itemContent.promotedMetadata) {{ const tw = extract(tr, seen); if (tw) tweets.push(tw); }} continue; }}
         for (const item of c.items || []) {{
@@ -2035,7 +2107,7 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
   const seen = new Set();
   const out = [];
   let resolved = false;
-  for (let page = 0; page < 14 && out.length < WANT; page++) {{
+  for (let page = 0; page < 1 && out.length < WANT; page++) {{
     const vars = {{count: Math.min(40, WANT - out.length + 5), includePromotedContent: false, latestControlAvailable: true, requestContext: "launch"}};
     if (FEED === "for-you") vars.withCommunity = true; else vars.seenTweetIds = [];
     if (cursor) vars.cursor = cursor;
@@ -3430,6 +3502,56 @@ mod borrowed_parse_tests {
         let (latest, pinned) = parse_profile_eval(prof).unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(pinned[0].id, "20");
+    }
+
+    #[test]
+    fn home_pages_are_longer_than_five_and_keep_a_cursor() {
+        let posts = home_fixture(TimelineFeed::ForYou);
+        assert!(posts.len() > HOME_PAGE_SIZE);
+        let mut cursor = None;
+        let mut got = Vec::new();
+        for _ in 0..6 {
+            let page = slice_timeline(&posts, cursor.as_deref(), HOME_PAGE_SIZE);
+            assert!(!page.posts.is_empty());
+            if cursor.is_none() {
+                assert!(page.posts.len() > 5);
+            }
+            for post in &page.posts {
+                assert!(
+                    !got.iter().any(|id: &String| id == &post.id),
+                    "duplicate {}",
+                    post.id
+                );
+                got.push(post.id.clone());
+            }
+            let again = append_new_posts(
+                posts
+                    .iter()
+                    .filter(|post| got.contains(&post.id))
+                    .cloned()
+                    .collect(),
+                page.posts.clone(),
+            );
+            assert_eq!(again.len(), got.len());
+            match page.next_cursor {
+                Some(token) => cursor = Some(token),
+                None => {
+                    cursor = None;
+                    break;
+                }
+            }
+        }
+        assert!(cursor.is_none());
+        assert_eq!(got.len(), posts.len());
+        let mut popular = posts.clone();
+        popular.sort_by(|left, right| {
+            crate::sort::cmp_posts(left, right, crate::sort::ResultSort::Popular)
+        });
+        let mut newest = posts.clone();
+        newest.sort_by(|left, right| {
+            crate::sort::cmp_posts(left, right, crate::sort::ResultSort::Newest)
+        });
+        assert_ne!(popular[0].id, newest[0].id);
     }
 }
 

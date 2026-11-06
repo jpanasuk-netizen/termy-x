@@ -294,6 +294,34 @@ pub struct CardTextSelection {
 /// selection instead of a click.
 pub const CARD_DRAG_PX: f32 = 6.0;
 
+/// What a Follow click is allowed to do. A write happens only after
+/// [`FollowStep::Confirm`] is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowStep {
+    ConnectFirst,
+    OwnAccount,
+    Confirm { handle: String, follow: bool },
+}
+
+pub fn follow_step(
+    connected: bool,
+    own_account: bool,
+    currently_following: bool,
+    handle: &str,
+) -> FollowStep {
+    let handle = handle.trim().trim_start_matches('@').to_string();
+    if handle.is_empty() || own_account {
+        return FollowStep::OwnAccount;
+    }
+    if !connected {
+        return FollowStep::ConnectFirst;
+    }
+    FollowStep::Confirm {
+        handle,
+        follow: !currently_following,
+    }
+}
+
 /// Follow button label from the payload's real following flag plus
 /// an in-flight target. `None` flag = payload silent: show Follow and
 /// let only a verified action change the state (never fake Following).
@@ -514,6 +542,9 @@ pub struct XPanel {
     engage_pending: Vec<String>,
     /// (handle, target state) while a follow/unfollow write is in flight.
     follow_pending: Option<(String, bool)>,
+    /// Waiting for Confirm before any follow write. Nothing is sent until
+    /// the person confirms.
+    follow_ask: Option<(String, bool)>,
     /// Session-verified follow states (set only on write success).
     follow_overrides: std::collections::HashMap<String, bool>,
     /// Inline quote composer state (quote = retweet with your own words).
@@ -663,24 +694,21 @@ pub struct XPanel {
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
-/// Deep timeline: one OpenCLI call per feed returns this many unique
-/// tweets (verified live; no pagination flag exists or is needed).
-const TIMELINE_LIMIT: usize = 160;
-/// Posts fetched up front per feed (Jeremy's depth ask: land at 420
-/// real posts, then Load more pages older from there).
-const TIMELINE_INITIAL: usize = 420;
-/// Load more grows the OpenCLI limit by one batch (+160) at a time.
-/// The real end is data-driven (a fetch that returns no new tweets);
-/// this is only a high perf safety ceiling.
+/// One home page. Matches [`termy_x::providers::HOME_PAGE_SIZE`]: the
+/// first screen and every Load more are a single provider call.
+const TIMELINE_PAGE: usize = termy_x::providers::HOME_PAGE_SIZE;
+/// Posts fetched up front per feed.
+const TIMELINE_INITIAL: usize = TIMELINE_PAGE;
+/// Safety ceiling on how many posts a feed will keep. Load more stops
+/// here even if the provider still has a cursor.
 const TIMELINE_MAX: usize = 1600;
 
-/// Next Load-more limit for a feed loaded to `current`, or None at cap.
-#[allow(dead_code)]
+/// Another page is allowed while the loaded list is under the ceiling.
 fn next_timeline_limit(current: usize) -> Option<usize> {
     if current >= TIMELINE_MAX {
         None
     } else {
-        Some((current + TIMELINE_LIMIT).min(TIMELINE_MAX))
+        Some(TIMELINE_PAGE)
     }
 }
 
@@ -856,6 +884,7 @@ impl XPanel {
             repost_resolving: false,
             engage_pending: Vec::new(),
             follow_pending: None,
+            follow_ask: None,
             follow_overrides: std::collections::HashMap::new(),
             quote_post_id: None,
             quote_author: String::new(),
@@ -1552,15 +1581,15 @@ impl XPanel {
             cx.notify();
             return;
         }
-        // Cursor-backed list: fetch just the next older batch from the
-        // stored bottom cursor. Legacy-backed list (cursor path was
-        // unavailable at load): establish the chain by walking from the
-        // top past everything already loaded, once.
-        let next = if self.feed_cursor_ok[idx] {
-            TIMELINE_LIMIT
-        } else {
-            (self.feed_depth[idx] + TIMELINE_LIMIT).min(TIMELINE_MAX)
-        };
+        if !self.feed_cursor_ok[idx] || self.feed_cursor[idx].is_none() {
+            self.status = format!(
+                "no next-page cursor \u{b7} {} shown \u{b7} this provider cannot continue",
+                self.feed_posts().len()
+            );
+            cx.notify();
+            return;
+        }
+        let next = TIMELINE_PAGE;
         self.next_fetch = Some((true, next));
         self.append_inflight = true;
         self.loading = true;
@@ -1577,6 +1606,12 @@ impl XPanel {
                 "No more older tweets \u{b7} {} shown \u{b7} \u{21bb} refreshes to the newest {}",
                 self.feed_posts().len(),
                 TIMELINE_INITIAL
+            ));
+        }
+        if !self.feed_cursor_ok[idx] || self.feed_cursor[idx].is_none() {
+            return hint(format!(
+                "No next-page cursor \u{b7} {} shown \u{b7} this provider cannot continue",
+                self.feed_posts().len()
             ));
         }
         if self.feed_posts().len() >= TIMELINE_MAX {
@@ -4185,6 +4220,51 @@ impl XPanel {
     /// engage in the background. Failure reverts the flip and says why;
     /// counts move locally with the flip, never via a re-fetch, so the
     /// scroll position cannot jump.
+    fn following_now(&self, handle: &str) -> bool {
+        self.follow_overrides
+            .get(handle)
+            .copied()
+            .or_else(|| {
+                self.profile
+                    .as_ref()
+                    .filter(|profile| profile.handle.eq_ignore_ascii_case(handle))
+                    .and_then(|profile| profile.viewer_following)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Ask before any follow write. Not connected and your own account
+    /// never reach the publisher.
+    fn request_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
+        if self.follow_pending.is_some() {
+            return;
+        }
+        let own = match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+            _ => None,
+        };
+        let connected = !self.live || matches!(self.connection, ConnState::Connected { .. });
+        match follow_step(
+            connected,
+            is_own_profile(handle, own),
+            self.following_now(handle),
+            handle,
+        ) {
+            FollowStep::ConnectFirst => {
+                self.notice = Some(
+                    "Connect X before following anyone. Nothing was changed.".into(),
+                );
+            }
+            FollowStep::OwnAccount => {
+                self.notice = Some("That's your account. Nothing was changed.".into());
+            }
+            FollowStep::Confirm { handle, follow } => {
+                self.follow_ask = Some((handle, follow));
+            }
+        }
+        cx.notify();
+    }
+
     /// Follow/unfollow the profile on screen. State shown is the
     /// payload's real flag or a session-verified override — never a
     /// guess; on failure nothing flips and the error is humanized.
@@ -4218,10 +4298,10 @@ impl XPanel {
                         let service = XPanel::service_free();
                         let publishers = service.publishers;
                         let Some(publisher) =
-                            termy_x::publish::first_available(publishers.as_slice())
+                            termy_x::publish::first_that_follows(publishers.as_slice())
                         else {
                             return Err(
-                                "No in-app posting path found. Connect X first, then try again."
+                                "No follow path. OpenCLI can follow and unfollow; this posting path cannot. Nothing was changed."
                                     .to_string(),
                             );
                         };
@@ -4806,10 +4886,13 @@ fn fetch_section(
                         }
                         // Fresh load: legacy one-shot fetch still works
                         // when the cursor session cannot start.
-                        if let Ok(served) = service.timeline_feed(feed, limit) {
+                        if let Ok(served) = service.timeline_feed(feed, limit.min(TIMELINE_PAGE)) {
                             return FetchPayload::Timeline {
                                 posts: served.value,
-                                status: live_status(&served.status),
+                                status: format!(
+                                    "{} \u{b7} no next-page cursor from this path",
+                                    live_status(&served.status)
+                                ),
                                 feed,
                                 append,
                                 requested: limit,
@@ -4818,6 +4901,19 @@ fn fetch_section(
                                 failed: false,
                             };
                         }
+                        return FetchPayload::Timeline {
+                            posts: Vec::new(),
+                            status: format!(
+                                "could not load {} \u{2014} {error}",
+                                feed.label()
+                            ),
+                            feed,
+                            append,
+                            requested: limit,
+                            next_cursor: None,
+                            cursor_ok: false,
+                            failed: true,
+                        };
                     }
                 }
             }
@@ -4926,19 +5022,31 @@ fn fetch_section(
     }
 
     match section {
-        XSection::Timeline => FetchPayload::Timeline {
-            posts: MockProvider
-                .timeline_feed(feed, limit)
+        XSection::Timeline => {
+            let page = MockProvider
+                .timeline_page(feed, cursor.as_deref(), limit)
                 .map(|served| served.value)
-                .unwrap_or_default(),
-            feed,
-            status: "mock Â· fixture data Â· no X API credits".into(),
-            append,
-            requested: limit,
-            next_cursor: None,
-            cursor_ok: false,
-            failed: false,
-        },
+                .unwrap_or(termy_x::providers::TimelinePage {
+                    posts: Vec::new(),
+                    next_cursor: None,
+                });
+            let more = page.next_cursor.is_some();
+            FetchPayload::Timeline {
+                posts: page.posts,
+                feed,
+                status: if more {
+                    "mock \u{b7} fixture page \u{b7} Load more continues \u{b7} no X API credits"
+                        .into()
+                } else {
+                    "mock \u{b7} fixture page \u{b7} end of fixture \u{b7} no X API credits".into()
+                },
+                append,
+                requested: limit,
+                next_cursor: page.next_cursor,
+                cursor_ok: true,
+                failed: false,
+            }
+        }
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
                 .search(&query, newest, 15)
@@ -5018,7 +5126,7 @@ fn fetch_section(
             cursor_ok: false,
             failed: false,
             append: false,
-            requested: TIMELINE_LIMIT,
+            requested: TIMELINE_PAGE,
         },
     }
 }
@@ -6810,6 +6918,40 @@ impl XPanel {
         if let Some(notice) = &self.notice {
             rows.push(hint(notice.clone()));
         }
+        if let Some((handle, follow)) = self.follow_ask.clone() {
+            let verb = if follow { "Follow" } else { "Unfollow" };
+            rows.push(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(hint(format!(
+                        "{verb} @{handle} on X? Nothing happens until you confirm."
+                    )))
+                    .child(x_button!(
+                        "x-follow-confirm",
+                        verb,
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some((handle, _)) = this.follow_ask.take() {
+                                this.toggle_follow(&handle, cx);
+                            }
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .child(x_button!(
+                        "x-follow-cancel",
+                        "Cancel",
+                        cx.listener(|this, _, _, cx| {
+                            this.follow_ask = None;
+                            this.notice = Some("Follow cancelled. Nothing was changed.".into());
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        }
         if self.thread.is_some() {
             rows.extend(self.thread_rows(cx));
             return rows;
@@ -7449,7 +7591,7 @@ impl XPanel {
                 label,
                 viewer == Some(true),
                 cx.listener(move |this, _, _, cx| {
-                    this.toggle_follow(&click_handle, cx);
+                    this.request_follow(&click_handle, cx);
                     cx.stop_propagation();
                 })
             )));
@@ -8499,7 +8641,7 @@ impl XPanel {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
         };
-        let show_follow = scope == "thread" && !is_own_profile(&post.author_handle, own);
+        let show_follow = !post.author_handle.is_empty() && !is_own_profile(&post.author_handle, own);
         let mut row = div()
             .mt(px(8.0))
             .flex()
@@ -8587,7 +8729,7 @@ impl XPanel {
                 },
                 following,
                 cx.listener(move |this, _, _, cx| {
-                    this.toggle_follow(&follow_handle, cx);
+                    this.request_follow(&follow_handle, cx);
                     cx.stop_propagation();
                     cx.notify();
                 })
@@ -10189,9 +10331,11 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 mod edit_keys_tests {
     use super::next_timeline_limit;
     use super::{
-        BURST_MS, burst_style_at, caret_visual_line, follow_button_label, is_own_profile,
-        soft_wrap_ranges,
+        BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
+        XSection, burst_style_at, caret_visual_line, fetch_section, follow_button_label,
+        follow_step, is_own_profile, soft_wrap_ranges,
     };
+    use termy_x::providers::TimelineFeed;
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
@@ -10300,17 +10444,114 @@ mod edit_keys_tests {
     }
 
     #[test]
-    fn load_more_limit_grows_by_batch_to_cap() {
-        assert_eq!(next_timeline_limit(160), Some(320));
-        assert_eq!(next_timeline_limit(320), Some(480));
-        assert_eq!(next_timeline_limit(1440), Some(1600));
-        assert_eq!(next_timeline_limit(1600), None);
-        assert_eq!(next_timeline_limit(9999), None);
+    fn load_more_asks_for_one_page_until_the_ceiling() {
+        assert_eq!(next_timeline_limit(0), Some(TIMELINE_PAGE));
+        assert_eq!(next_timeline_limit(20), Some(TIMELINE_PAGE));
+        assert_eq!(next_timeline_limit(TIMELINE_MAX), None);
+        assert!(TIMELINE_PAGE > 5);
+        assert_eq!(TIMELINE_INITIAL, TIMELINE_PAGE);
+    }
+
+    #[test]
+    fn mock_home_feed_pages_past_five_and_dedups() {
+        let first = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            TimelineFeed::ForYou,
+            false,
+            TIMELINE_PAGE,
+            None,
+        );
+        let FetchPayload::Timeline {
+            posts,
+            next_cursor,
+            cursor_ok,
+            failed,
+            ..
+        } = first
+        else {
+            panic!("timeline payload");
+        };
+        assert!(!failed);
+        assert!(cursor_ok);
+        assert!(posts.len() > 5, "first page {}", posts.len());
+        let cursor = next_cursor.expect("fixture has another page");
+        let second = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            TimelineFeed::ForYou,
+            true,
+            TIMELINE_PAGE,
+            Some(cursor),
+        );
+        let FetchPayload::Timeline {
+            posts: more,
+            next_cursor: next,
+            ..
+        } = second
+        else {
+            panic!("second page");
+        };
+        assert!(!more.is_empty());
+        let mut seen = std::collections::BTreeSet::new();
+        for post in posts.iter().chain(more.iter()) {
+            assert!(seen.insert(post.id.clone()), "duplicate {}", post.id);
+        }
+        assert!(next.is_some() || seen.len() < 45);
+        let popular = {
+            let mut ranked = posts.clone();
+            ranked.sort_by(|left, right| {
+                termy_x::sort::cmp_posts(left, right, termy_x::sort::ResultSort::Popular)
+            });
+            ranked
+        };
+        let newest = {
+            let mut ranked = posts.clone();
+            ranked.sort_by(|left, right| {
+                termy_x::sort::cmp_posts(left, right, termy_x::sort::ResultSort::Newest)
+            });
+            ranked
+        };
+        assert_ne!(popular[0].id, newest[0].id);
+    }
+
+    #[test]
+    fn follow_requires_confirm_and_refuses_self_or_logged_out() {
+        assert_eq!(
+            follow_step(false, false, false, "ada"),
+            FollowStep::ConnectFirst
+        );
+        assert_eq!(
+            follow_step(true, true, false, "me"),
+            FollowStep::OwnAccount
+        );
+        assert_eq!(
+            follow_step(true, false, false, "@ada"),
+            FollowStep::Confirm {
+                handle: "ada".into(),
+                follow: true
+            }
+        );
+        assert_eq!(
+            follow_step(true, false, true, "ada"),
+            FollowStep::Confirm {
+                handle: "ada".into(),
+                follow: false
+            }
+        );
     }
 
     use super::{CardTextSelection, card_drag_promotes, copy_text_for_focus};
     use super::{
-        EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel, edit_keys_owned,
+        EnterAction, InputTarget, TextField, edit_action_goes_to_panel, edit_keys_owned,
         enter_action,
     };
 

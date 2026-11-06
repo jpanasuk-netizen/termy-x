@@ -87,6 +87,12 @@ pub trait Publisher: Send + Sync {
     fn set_follow(&self, _handle: &str, _follow: bool) -> Result<String, String> {
         Err("this posting path cannot follow / unfollow".into())
     }
+    /// OpenCLI's `twitter follow|unfollow` is the only path that writes
+    /// a follow. Other publishers must stay false so the UI does not
+    /// pick them and then report a fake or impossible success.
+    fn supports_follow(&self) -> bool {
+        false
+    }
     fn publish(
         &self,
         parts: &[String],
@@ -451,6 +457,16 @@ pub fn first_available(publishers: &[Box<dyn Publisher>]) -> Option<&dyn Publish
     publishers
         .iter()
         .find(|publisher| publisher.available())
+        .map(|publisher| publisher.as_ref())
+}
+
+/// The first publisher that can actually follow. Posting order is not
+/// enough: a web-intent or official publisher may be available and still
+/// refuse follows.
+pub fn first_that_follows(publishers: &[Box<dyn Publisher>]) -> Option<&dyn Publisher> {
+    publishers
+        .iter()
+        .find(|publisher| publisher.available() && publisher.supports_follow())
         .map(|publisher| publisher.as_ref())
 }
 

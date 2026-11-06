@@ -296,7 +296,7 @@ impl XPanel {
                         let token = rg::load_secret(&config, Secret::Treg)
                             .ok_or_else(|| "Treg key missing".to_string())?;
                         let http = termy_x::io::UreqHttp::default();
-                        rgm::fetch_multi(&http, &token, &topic, sort, 20)
+                        rgm::fetch_multi(&http, &token, &topic, sort, rg::TREG_X_PAGE)
                     } else {
                         let fetched = rg::parse_search(MOCK_SEARCH)?;
                         Ok(rgm::MultiFetched {
@@ -1145,10 +1145,11 @@ impl XPanel {
         });
         if !self.desk.rg_hits.is_empty() {
             rows.push(hint(format!(
-                "{} of {} \u{b7} {}",
+                "{} of {} \u{b7} {} \u{b7} re-ranked locally \u{b7} Fetch asks Treg once (max {}, no next cursor)",
                 hits.len(),
                 self.desk.rg_hits.len(),
-                self.desk.rg_topic.trim()
+                self.desk.rg_topic.trim(),
+                rg::TREG_X_PAGE
             )));
         }
         if self.desk.rg_hits.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {

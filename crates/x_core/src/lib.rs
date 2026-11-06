@@ -15,6 +15,7 @@ pub mod connect;
 pub mod doctor;
 pub mod draft_edit;
 pub mod drafts;
+pub mod feature_line;
 pub mod feed;
 pub mod feeds;
 pub mod followers;

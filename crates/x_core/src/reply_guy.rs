@@ -31,6 +31,9 @@ pub const TREG_ME_URL: &str = "https://treg.to/auth/me";
 /// Catalog cost blocks (p90 observed, USD per successful call). The
 /// response's own `costUsd` is shown instead whenever it is present.
 pub const TREG_SEARCH_COST_USD: f64 = 0.00075;
+/// `anyapi.x.search.posts` accepts `limit` up to 50 and does not return
+/// a next-page cursor. One Fetch is one paid call at that max.
+pub const TREG_X_PAGE: usize = 50;
 pub const TREG_TRENDS_COST_USD: f64 = 0.00075;
 
 pub const XAI_BASE_URL: &str = "https://api.x.ai/v1";
@@ -177,7 +180,12 @@ pub fn ready(grok: Option<&str>, treg: Option<&str>) -> Result<(), String> {
     }
 }
 
-pub(crate) fn treg_request(method: &'static str, url: &str, token: &str, body: Option<String>) -> HttpRequest {
+pub(crate) fn treg_request(
+    method: &'static str,
+    url: &str,
+    token: &str,
+    body: Option<String>,
+) -> HttpRequest {
     HttpRequest {
         method,
         url: url.to_string(),
