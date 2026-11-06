@@ -8282,6 +8282,40 @@ impl XPanel {
                         })
                     )),
             )
+            .child(
+                div()
+                    .id("x-viewer-corner-close")
+                    .absolute()
+                    .top(px(60.0))
+                    .right(px(12.0))
+                    .w(px(36.0))
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0xff4fa3))
+                    .bg(rgb(0x2a0f1a))
+                    .text_size(px(16.0))
+                    .text_color(rgb(0xffd0ea))
+                    .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0xff4fa3))
+                            .border_color(rgb(0xffd0ea))
+                            .text_color(rgb(0x1a0a10))
+                    })
+                    .child("\u{2715}")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.close_viewer();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
             .child(div().flex_1().min_h(px(0.0)).child(middle))
             .child(controls)
             .on_mouse_down(

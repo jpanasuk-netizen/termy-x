@@ -22,9 +22,15 @@ use std::process::{Child, Command, Stdio};
 /// Logical rect (x, y, w, h) in the parent window's client area.
 pub type Rect = (f32, f32, f32, f32);
 
+/// Clear strip above the native video. The video window covers whatever
+/// is behind it, so the close X lives in this strip, not under mpv.
+pub const CLOSE_BAND: f32 = 44.0;
+pub const CLOSE_BUTTON: f32 = 36.0;
+
 /// The embedded surface, in logical pixels, over the X panel's viewer.
 /// Returns None until the window has a real viewport, so the player is
 /// never created at a placeholder full-screen size and then shrunk.
+/// The top [`CLOSE_BAND`] under the header is left for the close X.
 pub fn embed_rect(viewport_w: f32, viewport_h: f32, fill_window: bool) -> Option<Rect> {
     if !viewport_w.is_finite() || !viewport_h.is_finite() {
         return None;
@@ -37,9 +43,25 @@ pub fn embed_rect(viewport_w: f32, viewport_h: f32, fill_window: bool) -> Option
     } else {
         480.0_f32.min(viewport_w)
     };
-    let height = (viewport_h - 160.0).clamp(80.0, viewport_h);
+    let height = (viewport_h - 160.0 - CLOSE_BAND).clamp(80.0, viewport_h);
     let x = (viewport_w - panel_w).max(0.0);
-    Some((x, 56.0, panel_w, height))
+    Some((x, 56.0 + CLOSE_BAND, panel_w, height))
+}
+
+/// Top-right X, in the band the video window does not cover.
+pub fn close_button_rect(viewport_w: f32, viewport_h: f32, fill_window: bool) -> Option<Rect> {
+    let video = embed_rect(viewport_w, viewport_h, fill_window)?;
+    let x = video.0 + video.2 - CLOSE_BUTTON - 8.0;
+    let y = video.1 - CLOSE_BAND + 4.0;
+    Some((x, y, CLOSE_BUTTON, CLOSE_BUTTON))
+}
+
+pub fn rects_overlap(a: Rect, b: Rect) -> bool {
+    let ax2 = a.0 + a.2;
+    let ay2 = a.1 + a.3;
+    let bx2 = b.0 + b.2;
+    let by2 = b.1 + b.3;
+    a.0 < bx2 && ax2 > b.0 && a.1 < by2 && ay2 > b.1
 }
 
 /// Playback generation. Open and dismiss each bump it. A callback that
@@ -641,7 +663,10 @@ mod win {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayGen, begin_playback, callback_is_current, dismiss_playback, embed_rect};
+    use super::{
+        CLOSE_BAND, PlayGen, begin_playback, callback_is_current, close_button_rect,
+        dismiss_playback, embed_rect, rects_overlap,
+    };
 
     #[test]
     fn embed_rect_is_the_panel_and_waits_for_a_real_viewport() {
@@ -650,10 +675,16 @@ mod tests {
         let rect = embed_rect(1600.0, 900.0, false).unwrap();
         assert_eq!(rect.2, 480.0);
         assert_eq!(rect.0, 1120.0);
+        assert_eq!(rect.1, 56.0 + CLOSE_BAND);
         assert!(rect.2 < 1600.0);
-        assert!((rect.3 - 740.0).abs() < 0.1);
+        assert!((rect.3 - (740.0 - CLOSE_BAND)).abs() < 0.1);
         let again = embed_rect(1600.0, 900.0, false).unwrap();
         assert_eq!(rect, again);
+        let close = close_button_rect(1600.0, 900.0, false).unwrap();
+        assert!(!rects_overlap(rect, close));
+        assert!(close.2 >= 36.0 && close.3 >= 36.0);
+        assert!(close.0 + close.2 <= 1600.0);
+        assert!(close.1 >= 56.0);
         let filled = embed_rect(1600.0, 900.0, true).unwrap();
         assert_eq!(filled.2, 1600.0);
         assert!(filled.3 <= 900.0);
@@ -670,5 +701,15 @@ mod tests {
         assert_ne!(opened, closed);
         let _ = PlayGen(generation);
         assert!(!callback_is_current(generation, opened));
+    }
+
+    #[test]
+    fn close_button_uses_the_same_dismiss_as_escape() {
+        let mut generation = 0u64;
+        let opened = begin_playback(&mut generation);
+        let closed = dismiss_playback(&mut generation);
+        assert!(!callback_is_current(generation, opened));
+        assert!(callback_is_current(generation, closed));
+        assert!(close_button_rect(1280.0, 800.0, false).is_some());
     }
 }
