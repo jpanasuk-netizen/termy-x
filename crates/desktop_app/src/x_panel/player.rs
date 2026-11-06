@@ -178,6 +178,22 @@ pub fn host_create_style() -> u32 {
     HOST_STYLE_POPUP | HOST_STYLE_CLIP_SIBLINGS | HOST_STYLE_CLIP_CHILDREN
 }
 
+/// Drawable for libVLC: a child of the Termy window, in the parent's
+/// client coordinates, clipped, and not visible until it is placed.
+/// This is not VLC's own top-level window.
+pub fn host_child_style() -> u32 {
+    WS_CHILD | HOST_STYLE_CLIP_SIBLINGS | HOST_STYLE_CLIP_CHILDREN
+}
+
+pub fn client_pixels(scale: f32, rect: Rect) -> (i32, i32, i32, i32) {
+    (
+        (rect.0 * scale).round() as i32,
+        (rect.1 * scale).round() as i32,
+        (rect.2 * scale).max(1.0).round() as i32,
+        (rect.3 * scale).max(1.0).round() as i32,
+    )
+}
+
 pub fn host_style_starts_hidden(style: u32) -> bool {
     style & HOST_STYLE_VISIBLE == 0 && style & HOST_STYLE_CLIP_CHILDREN != 0
 }
@@ -427,19 +443,37 @@ pub fn callback_is_current(live: u64, captured: PlayGen) -> bool {
 /// not `Command::new("vlc")`, because VLC is not on PATH.
 pub const VLC_CANONICAL_WINDOWS: &str = r"C:\Program Files\VideoLAN\VLC\vlc.exe";
 
-pub const VLC_NOT_FOUND: &str = "VLC was not found at C:\\Program Files\\VideoLAN\\VLC\\vlc.exe (or beside Termy). Nothing was opened. Images stay in Termy.";
+pub const VLC_NOT_FOUND: &str = "VLC was not found at C:\\Program Files\\VideoLAN\\VLC\\vlc.exe. No window was opened. Images stay in Termy.";
+
+pub const VLC_ENGINE_MISSING: &str = "VLC's 64-bit engine (libvlc.dll) was not found beside C:\\Program Files\\VideoLAN\\VLC\\vlc.exe. No window was opened.";
+
+pub const VLC_WRONG_ARCH: &str = "VLC's library beside C:\\Program Files\\VideoLAN\\VLC\\vlc.exe is not 64-bit, so Termy cannot load it. No window was opened.";
+
+pub const VLC_PLUGINS_MISSING: &str = "VLC's plugins folder is missing or empty beside C:\\Program Files\\VideoLAN\\VLC. No window was opened.";
+
+/// `LoadLibraryExW` search limited to the DLL's own directory and System32.
+pub const DLL_LOAD_FLAGS: u32 = 0x0000_0100 | 0x0000_0800;
+
+pub const WS_CHILD: u32 = 0x4000_0000;
 
 pub const NO_PLAYABLE_MEDIA: &str = "No playable video or audio file was attached. The image stays in Termy. VLC was not opened.";
 
-pub const VLC_OPEN_NOTICE: &str = "Playing in VLC. Esc or \u{2715} here stops only the VLC window Termy opened. Esc inside VLC leaves fullscreen and does not always quit.";
+pub const VLC_OPEN_NOTICE: &str = "Playing inside Termy with VLC's engine. Esc or \u{2715} stops it. Volume and seek here are Termy's controls. VLC's own window is not opened.";
 
-pub const VLC_CONTROLS_NOTE: &str = "Volume, seek, play, and close are VLC's own controls in its window. Termy does not resize. Esc or \u{2715} here stops only the VLC Termy started. Esc inside VLC leaves fullscreen and does not always quit.";
+pub const VLC_CONTROLS_NOTE: &str = "Volume, seek, and pause are Termy's controls on VLC's engine. VLC's own buttons are not inside this panel.";
+
+pub const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
+pub const IMAGE_FILE_MACHINE_I386: u16 = 0x14c;
+
+/// libVLC event types from VLC 3.0 `libvlc_events.h`.
+pub const LIBVLC_EVENT_END: u32 = 0x109;
+pub const LIBVLC_EVENT_ERROR: u32 = 0x10a;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaDispatch {
     /// In-app photo viewer. Never VLC.
     StillImage,
-    /// Separate VLC process. Not the embedded mpv surface.
+    /// Playable video or audio. Windows draws it with libVLC inside the panel.
     Vlc,
     /// No still and no playable file.
     Unplayable,
@@ -452,9 +486,146 @@ enum MediaUrlClass {
     Reject,
 }
 
+/// The visible `vlc.exe` window is not a fallback. Windows uses libVLC.
 pub fn launches_external_vlc() -> bool {
-    cfg!(target_os = "windows")
+    false
 }
+
+pub fn reap_video_hosts() {
+    #[cfg(windows)]
+    vlc_embed::reap_hosts();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnginePlan {
+    Embed,
+    Refuse(&'static str),
+}
+
+pub fn pe_machine(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 0x40 || bytes[0] != b'M' || bytes[1] != b'Z' {
+        return None;
+    }
+    let pe_off = u32::from_le_bytes(bytes[0x3c..0x40].try_into().ok()?) as usize;
+    if bytes.len() < pe_off.saturating_add(6) {
+        return None;
+    }
+    if &bytes[pe_off..pe_off + 4] != b"PE\0\0" {
+        return None;
+    }
+    Some(u16::from_le_bytes(
+        bytes[pe_off + 4..pe_off + 6].try_into().ok()?,
+    ))
+}
+
+/// Passing `--plugin-path` does not prove the folder exists. `plugins`
+/// is a count of `*_plugin.dll` files, and `plugins_all_amd64` is false
+/// when any of those files is not a 64-bit image.
+pub fn engine_files_plan(
+    libvlc: Option<u16>,
+    core: Option<u16>,
+    plugins: usize,
+    plugins_all_amd64: bool,
+) -> EnginePlan {
+    if libvlc.is_none() {
+        return EnginePlan::Refuse(VLC_ENGINE_MISSING);
+    }
+    if libvlc != Some(IMAGE_FILE_MACHINE_AMD64) || core != Some(IMAGE_FILE_MACHINE_AMD64) {
+        return EnginePlan::Refuse(if core.is_none() && libvlc == Some(IMAGE_FILE_MACHINE_AMD64) {
+            VLC_ENGINE_MISSING
+        } else {
+            VLC_WRONG_ARCH
+        });
+    }
+    if plugins == 0 {
+        return EnginePlan::Refuse(VLC_PLUGINS_MISSING);
+    }
+    if !plugins_all_amd64 {
+        return EnginePlan::Refuse(VLC_WRONG_ARCH);
+    }
+    EnginePlan::Embed
+}
+
+/// 64-bit libVLC inside our window, or a refusal. Never `vlc.exe`.
+pub fn engine_plan(machine: Option<u16>, playable: bool) -> EnginePlan {
+    if !playable {
+        return EnginePlan::Refuse(NO_PLAYABLE_MEDIA);
+    }
+    match machine {
+        Some(IMAGE_FILE_MACHINE_AMD64) => EnginePlan::Embed,
+        Some(_) => EnginePlan::Refuse(VLC_WRONG_ARCH),
+        None => EnginePlan::Refuse(VLC_ENGINE_MISSING),
+    }
+}
+
+pub fn libvlc_instance_args(plugin_path: &str) -> Vec<String> {
+    vec![
+        "--intf=dummy".to_string(),
+        "--dummy-quiet".to_string(),
+        "--ignore-config".to_string(),
+        "--no-video-title-show".to_string(),
+        format!("--plugin-path={plugin_path}"),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnginePhase {
+    Idle,
+    HostReady,
+    Playing,
+    Stopping,
+    Released,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStep {
+    PlaceHost,
+    Play,
+    Stop,
+    Release,
+}
+
+pub fn engine_step(phase: EnginePhase, step: EngineStep) -> Result<EnginePhase, &'static str> {
+    use EnginePhase::{HostReady, Idle, Playing, Released, Stopping};
+    use EngineStep::{PlaceHost, Play, Release, Stop};
+    match (phase, step) {
+        (Idle, PlaceHost) => Ok(HostReady),
+        (HostReady, Play) => Ok(Playing),
+        (Idle, Play) => Err("play before the panel surface exists"),
+        (Playing, Stop) | (HostReady, Stop) => Ok(Stopping),
+        (Stopping, Release) | (Released, Stop) | (Released, Release) => Ok(Released),
+        _ => Err("invalid engine transition"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EngineFlags {
+    pub ended: bool,
+    pub failed: bool,
+}
+
+/// LibVLC callbacks may run on a VLC thread. They record state only when
+/// the generation still matches, and they do not call back into the UI.
+pub fn apply_engine_callback(live: u64, event_gen: u64, kind: u32, flags: &mut EngineFlags) {
+    if live != event_gen {
+        return;
+    }
+    if kind == LIBVLC_EVENT_END {
+        flags.ended = true;
+    } else if kind == LIBVLC_EVENT_ERROR {
+        flags.failed = true;
+    }
+}
+
+pub const ENGINE_RELEASE_ORDER: &[&str] = &[
+    "hide-host",
+    "detach-callback",
+    "pause-audio",
+    "clear-hwnd",
+    "blocking-stop",
+    "release-player",
+    "destroy-host",
+];
 
 pub fn dispatch_media(kind: MediaKind, url: &str) -> MediaDispatch {
     if kind == MediaKind::Photo {
@@ -657,9 +828,11 @@ pub fn find_player() -> Option<PathBuf> {
 }
 
 pub struct VideoPlayer {
-    /// Windows: the VLC process Termy started. Linux: external mpv.
-    /// Neither path embeds a surface or resizes Termy.
-    #[cfg(any(windows, target_os = "linux"))]
+    /// Windows: libVLC drawing into a panel-sized host. Not `vlc.exe`.
+    #[cfg(windows)]
+    inner: vlc_embed::Player,
+    /// Linux keeps an external mpv process. It is not the Windows path.
+    #[cfg(target_os = "linux")]
     child: Option<Child>,
     #[cfg(not(any(windows, target_os = "linux")))]
     _priv: (),
@@ -675,10 +848,8 @@ impl VideoPlayer {
     ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let _ = (parent_hwnd, scale, rect, volume);
-            let bin = find_vlc().ok_or_else(|| VLC_NOT_FOUND.to_string())?;
-            let child = spawn_vlc(&bin, url)?;
-            Ok(Self { child: Some(child) })
+            let inner = vlc_embed::Player::start(parent_hwnd, scale, rect, url, volume)?;
+            Ok(Self { inner })
         }
         #[cfg(target_os = "linux")]
         {
@@ -706,41 +877,57 @@ impl VideoPlayer {
         }
     }
     pub fn reposition(&mut self, scale: f32, rect: Rect) {
+        #[cfg(windows)]
+        self.inner.reposition(scale, rect);
+        #[cfg(not(windows))]
         let _ = (scale, rect);
     }
     pub fn toggle_pause(&mut self) {
-        self.command(r#"{"command":["cycle","pause"]}"#);
+        #[cfg(windows)]
+        self.inner.toggle_pause();
+        #[cfg(not(windows))]
+        let _ = self;
     }
     pub fn seek_relative(&mut self, seconds: i32) {
-        self.command(&format!(r#"{{"command":["seek",{seconds},"relative"]}}"#));
+        #[cfg(windows)]
+        self.inner.seek_relative(seconds);
+        #[cfg(not(windows))]
+        let _ = (self, seconds);
     }
     pub fn seek_absolute(&mut self, seconds: f64) {
-        self.command(&format!(
-            r#"{{"command":["seek",{seconds:.3},"absolute"]}}"#
-        ));
+        #[cfg(windows)]
+        self.inner.seek_absolute(seconds);
+        #[cfg(not(windows))]
+        let _ = (self, seconds);
     }
-    /// VLC keeps its own timeline. Termy does not scrape it.
     pub fn progress(&self) -> (f64, f64) {
-        (0.0, 0.0)
+        #[cfg(windows)]
+        {
+            self.inner.progress()
+        }
+        #[cfg(not(windows))]
+        {
+            (0.0, 0.0)
+        }
     }
     pub fn set_muted(&mut self, muted: bool) {
-        self.command(&format!(
-            r#"{{"command":["set_property","mute",{}]}}"#,
-            if muted { "true" } else { "false" }
-        ));
+        #[cfg(windows)]
+        self.inner.set_muted(muted);
+        #[cfg(not(windows))]
+        let _ = (self, muted);
     }
 
     pub fn set_volume(&mut self, percent: u8) {
-        for command in volume_commands(percent) {
-            self.command(&command);
-        }
-    }
-    fn command(&mut self, json: &str) {
-        let _ = json;
+        #[cfg(windows)]
+        self.inner.set_volume(percent);
+        #[cfg(not(windows))]
+        let _ = (self, percent);
     }
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
     pub fn stop(mut self) {
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(windows)]
+        self.inner.stop();
+        #[cfg(target_os = "linux")]
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             std::thread::spawn(move || {
@@ -748,10 +935,23 @@ impl VideoPlayer {
             });
         }
     }
-    /// False once the mpv process has exited (EOF quit, crash, or its
-    /// window closed) — the panel polls this to clear playing state.
+    pub fn take_failure(&mut self) -> Option<&'static str> {
+        #[cfg(windows)]
+        {
+            self.inner.take_failure()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+    /// False once playback has ended or the engine reported an error.
     pub fn is_alive(&mut self) -> bool {
-        #[cfg(any(windows, target_os = "linux"))]
+        #[cfg(windows)]
+        {
+            self.inner.is_alive()
+        }
+        #[cfg(target_os = "linux")]
         {
             match self.child.as_mut() {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
@@ -761,6 +961,749 @@ impl VideoPlayer {
         #[cfg(not(any(windows, target_os = "linux")))]
         {
             false
+        }
+    }
+}
+
+#[cfg(windows)]
+mod vlc_embed {
+    use super::{
+        client_pixels, engine_files_plan, find_vlc, host_child_style, libvlc_instance_args,
+        media_url_class, pe_machine, EnginePlan, MediaUrlClass, Rect, DLL_LOAD_FLAGS,
+        IMAGE_FILE_MACHINE_AMD64, LIBVLC_EVENT_END, LIBVLC_EVENT_ERROR,
+    };
+    use std::ffi::CString;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Instant;
+
+    type Hwnd = *mut core::ffi::c_void;
+    type Hmodule = *mut core::ffi::c_void;
+
+    const SW_HIDE: i32 = 0;
+    const SW_SHOWNA: i32 = 8;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    const SWP_NOZORDER: u32 = 0x0004;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MAXIMIZE: usize = 0xF030;
+
+    #[repr(C)]
+    struct WndClass {
+        cb_size: u32,
+        style: u32,
+        lpfn: Option<unsafe extern "system" fn(Hwnd, u32, usize, isize) -> isize>,
+        cb_cls_extra: i32,
+        cb_wnd_extra: i32,
+        h_instance: Hwnd,
+        h_icon: Hwnd,
+        h_cursor: Hwnd,
+        hbr_background: Hwnd,
+        lpsz_menu_name: *const u16,
+        lpsz_class_name: *const u16,
+        h_icon_sm: Hwnd,
+    }
+    #[repr(C)]
+    struct Msg {
+        hwnd: Hwnd,
+        message: u32,
+        _pad: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt_x: i32,
+        pt_y: i32,
+        lprivate: u32,
+    }
+    #[repr(C)]
+    struct LibvlcEvent {
+        kind: i32,
+        object: *mut core::ffi::c_void,
+    }
+
+    unsafe extern "system" {
+        fn RegisterClassExW(c: *const WndClass) -> u16;
+        fn CreateWindowExW(
+            ex: u32, class: *const u16, name: *const u16, style: u32, x: i32, y: i32, w: i32,
+            h: i32, parent: Hwnd, menu: Hwnd, inst: Hwnd, param: *mut core::ffi::c_void,
+        ) -> Hwnd;
+        fn DestroyWindow(h: Hwnd) -> i32;
+        fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
+        fn SetWindowPos(h: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
+        fn DefWindowProcW(h: Hwnd, m: u32, w: usize, l: isize) -> isize;
+        fn GetModuleHandleW(name: *const u16) -> Hwnd;
+        fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> isize;
+        fn LoadLibraryExW(name: *const u16, file: Hwnd, flags: u32) -> Hmodule;
+        fn GetProcAddress(module: Hmodule, name: *const i8) -> *mut core::ffi::c_void;
+    }
+
+    type Cb = unsafe extern "system" fn(*const LibvlcEvent, *mut core::ffi::c_void);
+    struct Api {
+        new: unsafe extern "system" fn(i32, *const *const i8) -> *mut core::ffi::c_void,
+        release: unsafe extern "system" fn(*mut core::ffi::c_void),
+        media_new: unsafe extern "system" fn(*mut core::ffi::c_void, *const i8) -> *mut core::ffi::c_void,
+        media_release: unsafe extern "system" fn(*mut core::ffi::c_void),
+        player_new: unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
+        player_release: unsafe extern "system" fn(*mut core::ffi::c_void),
+        play: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+        set_pause: unsafe extern "system" fn(*mut core::ffi::c_void, i32),
+        stop: unsafe extern "system" fn(*mut core::ffi::c_void),
+        set_hwnd: unsafe extern "system" fn(*mut core::ffi::c_void, Hwnd),
+        set_volume: unsafe extern "system" fn(*mut core::ffi::c_void, i32) -> i32,
+        set_mute: unsafe extern "system" fn(*mut core::ffi::c_void, i32),
+        get_time: unsafe extern "system" fn(*mut core::ffi::c_void) -> i64,
+        get_length: unsafe extern "system" fn(*mut core::ffi::c_void) -> i64,
+        set_time: unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> i32,
+        get_position: unsafe extern "system" fn(*mut core::ffi::c_void) -> f32,
+        is_seekable: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+        set_mouse: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32,
+        set_key: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32,
+        event_manager: unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
+        event_attach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void) -> i32,
+        event_detach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void),
+        get_state: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
+    }
+
+    struct Slot {
+        generation: u64,
+        closed: AtomicBool,
+        ended: AtomicBool,
+        failed: AtomicBool,
+        released: AtomicBool,
+        time_ms: AtomicU64,
+        length_ms: AtomicU64,
+        seekable: AtomicBool,
+        audio_stop_ms: AtomicU64,
+    }
+
+    struct Handles {
+        instance: usize,
+        media: usize,
+        player: usize,
+        generation: u64,
+        slot: Arc<Slot>,
+    }
+
+    enum Job {
+        Start {
+            url: CString,
+            volume: i32,
+            hwnd: usize,
+            generation: u64,
+            slot: Arc<Slot>,
+            reply: std::sync::mpsc::Sender<Result<(), String>>,
+        },
+        Pause { generation: u64, paused: bool },
+        Seek { generation: u64, ms: i64 },
+        Volume { generation: u64, percent: i32 },
+        Mute { generation: u64, muted: bool },
+        Query { generation: u64 },
+        Stop { generation: u64, slot: Arc<Slot> },
+    }
+
+    struct Reap {
+        host: usize,
+        slot: Arc<Slot>,
+    }
+
+    fn events() -> &'static Mutex<Vec<(u64, u32)>> {
+        static EVENTS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+        &EVENTS
+    }
+    fn current() -> &'static Mutex<Option<Handles>> {
+        static CURRENT: Mutex<Option<Handles>> = Mutex::new(None);
+        &CURRENT
+    }
+    fn reaps() -> &'static Mutex<Vec<Reap>> {
+        static REAPS: Mutex<Vec<Reap>> = Mutex::new(Vec::new());
+        &REAPS
+    }
+    fn job_queue() -> &'static (Mutex<Vec<Job>>, Condvar) {
+        static Q: std::sync::OnceLock<(Mutex<Vec<Job>>, Condvar)> = std::sync::OnceLock::new();
+        Q.get_or_init(|| (Mutex::new(Vec::new()), Condvar::new()))
+    }
+
+    unsafe extern "system" fn on_event(event: *const LibvlcEvent, data: *mut core::ffi::c_void) {
+        if event.is_null() || data.is_null() {
+            return;
+        }
+        let slot = unsafe { &*(data as *const Slot) };
+        if slot.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let kind = unsafe { (*event).kind } as u32;
+        if let Ok(mut queue) = events().lock() {
+            queue.push((slot.generation, kind));
+        }
+    }
+
+    unsafe extern "system" fn wndproc(h: Hwnd, m: u32, w: usize, l: isize) -> isize {
+        if m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_MAXIMIZE {
+            return 0;
+        }
+        unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        text.encode_wide().chain(Some(0)).collect()
+    }
+
+    fn proc_of<T>(module: Hmodule, name: &str) -> Result<T, String> {
+        let c = CString::new(name).map_err(|_| "bad libvlc name".to_string())?;
+        let ptr = unsafe { GetProcAddress(module, c.as_ptr()) };
+        if ptr.is_null() {
+            return Err("VLC's engine is missing a required entry. No window was opened.".into());
+        }
+        Ok(unsafe { std::mem::transmute_copy(&ptr) })
+    }
+
+    fn read_machine(path: &Path) -> Option<u16> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut prefix = [0u8; 4096];
+        use std::io::Read;
+        let n = file.read(&mut prefix).ok()?;
+        pe_machine(&prefix[..n])
+    }
+
+    fn scan_plugins(dir: &Path) -> (usize, bool) {
+        let mut count = 0usize;
+        let mut all_64 = true;
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else { continue };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                if !name.ends_with("_plugin.dll") {
+                    continue;
+                }
+                match read_machine(&path) {
+                    Some(IMAGE_FILE_MACHINE_AMD64) => count += 1,
+                    Some(_) => {
+                        count += 1;
+                        all_64 = false;
+                    }
+                    None => all_64 = false,
+                }
+            }
+        }
+        (count, all_64 && count > 0)
+    }
+
+    fn validate_tree(dir: &Path) -> Result<(), String> {
+        let libvlc = read_machine(&dir.join("libvlc.dll"));
+        let core = read_machine(&dir.join("libvlccore.dll"));
+        let (plugins, all_64) = scan_plugins(&dir.join("plugins"));
+        match engine_files_plan(libvlc, core, plugins, all_64) {
+            EnginePlan::Embed => Ok(()),
+            EnginePlan::Refuse(text) => Err(text.to_string()),
+        }
+    }
+
+    fn load_api(dir: &Path) -> Result<&'static Api, String> {
+        static API: std::sync::OnceLock<Api> = std::sync::OnceLock::new();
+        if let Some(api) = API.get() {
+            return Ok(api);
+        }
+        validate_tree(dir)?;
+        let dll = dir.join("libvlc.dll");
+        let dll_w = wide(dll.as_os_str());
+        let module = unsafe { LoadLibraryExW(dll_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
+        if module.is_null() {
+            return Err(super::VLC_ENGINE_MISSING.into());
+        }
+        let api = Api {
+            new: proc_of(module, "libvlc_new")?,
+            release: proc_of(module, "libvlc_release")?,
+            media_new: proc_of(module, "libvlc_media_new_location")?,
+            media_release: proc_of(module, "libvlc_media_release")?,
+            player_new: proc_of(module, "libvlc_media_player_new_from_media")?,
+            player_release: proc_of(module, "libvlc_media_player_release")?,
+            play: proc_of(module, "libvlc_media_player_play")?,
+            set_pause: proc_of(module, "libvlc_media_player_set_pause")?,
+            stop: proc_of(module, "libvlc_media_player_stop")?,
+            set_hwnd: proc_of(module, "libvlc_media_player_set_hwnd")?,
+            set_volume: proc_of(module, "libvlc_audio_set_volume")?,
+            set_mute: proc_of(module, "libvlc_audio_set_mute")?,
+            get_time: proc_of(module, "libvlc_media_player_get_time")?,
+            get_length: proc_of(module, "libvlc_media_player_get_length")?,
+            set_time: proc_of(module, "libvlc_media_player_set_time")?,
+            get_position: proc_of(module, "libvlc_media_player_get_position")?,
+            is_seekable: proc_of(module, "libvlc_media_player_is_seekable")?,
+            set_mouse: proc_of(module, "libvlc_video_set_mouse_input")?,
+            set_key: proc_of(module, "libvlc_video_set_key_input")?,
+            event_manager: proc_of(module, "libvlc_media_player_event_manager")?,
+            event_attach: proc_of(module, "libvlc_event_attach")?,
+            event_detach: proc_of(module, "libvlc_event_detach")?,
+            get_state: proc_of(module, "libvlc_media_player_get_state")?,
+        };
+        let _ = module;
+        Ok(API.get_or_init(|| api))
+    }
+
+    fn enqueue(job: Job) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = std::thread::Builder::new().name("termy-vlc".into()).spawn(worker_loop);
+        });
+        let (lock, cv) = job_queue();
+        if let Ok(mut queue) = lock.lock() {
+            queue.push(job);
+            cv.notify_one();
+        }
+    }
+
+    fn worker_loop() {
+        loop {
+            let job = {
+                let (lock, cv) = job_queue();
+                let mut queue = lock.lock().unwrap_or_else(|e| e.into_inner());
+                while queue.is_empty() {
+                    queue = cv.wait(queue).unwrap_or_else(|e| e.into_inner());
+                }
+                queue.remove(0)
+            };
+            match job {
+                Job::Start { url, volume, hwnd, generation, slot, reply } => {
+                    let _ = reply.send(worker_start(url, volume, hwnd, generation, slot));
+                }
+                Job::Pause { generation, paused } => worker_pause(generation, paused),
+                Job::Seek { generation, ms } => worker_seek(generation, ms),
+                Job::Volume { generation, percent } => worker_volume(generation, percent),
+                Job::Mute { generation, muted } => worker_mute(generation, muted),
+                Job::Query { generation } => worker_query(generation),
+                Job::Stop { generation, slot } => worker_stop(generation, slot),
+            }
+        }
+    }
+
+    fn with_player<T>(generation: u64, f: impl FnOnce(&Api, *mut core::ffi::c_void) -> T) -> Option<T> {
+        let cur = current().lock().ok()?;
+        let cur = cur.as_ref()?;
+        if cur.generation != generation {
+            return None;
+        }
+        let api = load_api(Path::new(".")).ok()?;
+        Some(f(api, cur.player as *mut core::ffi::c_void))
+    }
+
+    fn worker_start(url: CString, volume: i32, hwnd: usize, generation: u64, slot: Arc<Slot>) -> Result<(), String> {
+        let exe = find_vlc().ok_or_else(|| super::VLC_NOT_FOUND.to_string())?;
+        let Some(dir) = exe.parent() else {
+            return Err(super::VLC_ENGINE_MISSING.into());
+        };
+        let api = load_api(dir)?;
+        if let Some(old) = current().lock().ok().and_then(|mut g| g.take()) {
+            release_handles(api, old);
+        }
+        let plugins = dir.join("plugins");
+        let args = libvlc_instance_args(&plugins.to_string_lossy());
+        let c_args: Vec<CString> = args.iter().map(|arg| CString::new(arg.as_str()).unwrap_or_else(|_| CString::new("").unwrap())).collect();
+        let ptrs: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+        let instance = unsafe { (api.new)(ptrs.len() as i32, ptrs.as_ptr()) };
+        if instance.is_null() {
+            return Err("VLC's engine did not start. No window was opened.".into());
+        }
+        let media = unsafe { (api.media_new)(instance, url.as_ptr()) };
+        if media.is_null() {
+            unsafe { (api.release)(instance) };
+            return Err("VLC's engine could not open this media. No window was opened.".into());
+        }
+        let player = unsafe { (api.player_new)(media) };
+        if player.is_null() {
+            unsafe {
+                (api.media_release)(media);
+                (api.release)(instance);
+            }
+            return Err("VLC's engine could not create playback. No window was opened.".into());
+        }
+        unsafe {
+            (api.set_hwnd)(player, hwnd as Hwnd);
+            let _ = (api.set_mouse)(player, 0);
+            let _ = (api.set_key)(player, 0);
+            let _ = (api.set_volume)(player, volume);
+            (api.set_mute)(player, if volume == 0 { 1 } else { 0 });
+            let manager = (api.event_manager)(player);
+            if !manager.is_null() {
+                let user = Arc::as_ptr(&slot) as *mut core::ffi::c_void;
+                let _ = (api.event_attach)(manager, LIBVLC_EVENT_END as i32, on_event, user);
+                let _ = (api.event_attach)(manager, LIBVLC_EVENT_ERROR as i32, on_event, user);
+            }
+            if (api.play)(player) != 0 {
+                (api.player_release)(player);
+                (api.media_release)(media);
+                (api.release)(instance);
+                return Err("VLC's engine could not play this file. No window was opened.".into());
+            }
+        }
+        if let Ok(mut guard) = current().lock() {
+            *guard = Some(Handles {
+                instance: instance as usize,
+                media: media as usize,
+                player: player as usize,
+                generation,
+                slot,
+            });
+        }
+        Ok(())
+    }
+
+    fn worker_pause(generation: u64, paused: bool) {
+        let _ = with_player(generation, |api, player| unsafe {
+            (api.set_pause)(player, if paused { 1 } else { 0 });
+        });
+    }
+
+    fn worker_seek(generation: u64, ms: i64) {
+        let _ = with_player(generation, |api, player| unsafe {
+            if (api.is_seekable)(player) != 0 {
+                let _ = (api.set_time)(player, ms);
+            }
+        });
+    }
+
+    fn worker_volume(generation: u64, percent: i32) {
+        let _ = with_player(generation, |api, player| unsafe {
+            let _ = (api.set_volume)(player, percent);
+            (api.set_mute)(player, if percent == 0 { 1 } else { 0 });
+        });
+    }
+
+    fn worker_mute(generation: u64, muted: bool) {
+        let _ = with_player(generation, |api, player| unsafe {
+            (api.set_mute)(player, if muted { 1 } else { 0 });
+        });
+    }
+
+    fn worker_query(generation: u64) {
+        let looked = current().lock().ok().and_then(|guard| {
+            let cur = guard.as_ref()?;
+            if cur.generation != generation {
+                None
+            } else {
+                Some((cur.player, Arc::clone(&cur.slot)))
+            }
+        });
+        let Some((player, slot)) = looked else {
+            return;
+        };
+        let Ok(api) = load_api(Path::new(".")) else {
+            return;
+        };
+        let player = player as *mut core::ffi::c_void;
+        unsafe {
+            let time = (api.get_time)(player).max(0) as u64;
+            let length = (api.get_length)(player).max(0) as u64;
+            let _position = (api.get_position)(player);
+            slot.time_ms.store(time, Ordering::Release);
+            slot.length_ms.store(length, Ordering::Release);
+            slot.seekable
+                .store((api.is_seekable)(player) != 0, Ordering::Release);
+            let state = (api.get_state)(player);
+            if state == 6 {
+                slot.ended.store(true, Ordering::Release);
+            } else if state == 7 {
+                slot.failed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    fn release_handles(api: &Api, handles: Handles) {
+        handles.slot.closed.store(true, Ordering::Release);
+        let player = handles.player as *mut core::ffi::c_void;
+        let media = handles.media as *mut core::ffi::c_void;
+        let instance = handles.instance as *mut core::ffi::c_void;
+        let user = Arc::as_ptr(&handles.slot) as *mut core::ffi::c_void;
+        unsafe {
+            let manager = (api.event_manager)(player);
+            if !manager.is_null() {
+                (api.event_detach)(manager, LIBVLC_EVENT_END as i32, on_event, user);
+                (api.event_detach)(manager, LIBVLC_EVENT_ERROR as i32, on_event, user);
+            }
+            let started = Instant::now();
+            (api.set_pause)(player, 1);
+            let ms = started.elapsed().as_millis() as u64;
+            handles.slot.audio_stop_ms.store(ms.max(1), Ordering::Release);
+            (api.set_hwnd)(player, std::ptr::null_mut());
+            (api.stop)(player);
+            (api.player_release)(player);
+            (api.media_release)(media);
+            (api.release)(instance);
+        }
+        if let Ok(mut queue) = events().lock() {
+            queue.retain(|(generation, _)| *generation != handles.generation);
+        }
+        handles.slot.released.store(true, Ordering::Release);
+        let _ = note_audio_stop(handles.slot.audio_stop_ms.load(Ordering::Acquire));
+    }
+
+    fn note_audio_stop(ms: u64) -> std::io::Result<()> {
+        let line = format!("termy-video event=audio-stop ms={ms}");
+        let path = std::env::temp_dir().join("termy-video-hwnd.log");
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        use std::io::Write;
+        writeln!(file, "{line}")
+    }
+
+    fn worker_stop(generation: u64, slot: Arc<Slot>) {
+        let exe = find_vlc();
+        let api = exe.as_ref().and_then(|exe| exe.parent()).and_then(|dir| load_api(dir).ok());
+        let handles = current().lock().ok().and_then(|mut guard| {
+            if guard.as_ref().is_some_and(|cur| cur.generation == generation) {
+                guard.take()
+            } else {
+                None
+            }
+        });
+        if let (Some(api), Some(handles)) = (api, handles) {
+            release_handles(api, handles);
+        } else {
+            slot.released.store(true, Ordering::Release);
+        }
+    }
+
+    fn pump_until(rx: &std::sync::mpsc::Receiver<Result<(), String>>) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            match rx.try_recv() {
+                Ok(result) => return result,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err("VLC's engine stopped responding. No window was opened.".into());
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if started.elapsed().as_secs() > 12 {
+                        return Err("VLC's engine did not start in time. No window was opened.".into());
+                    }
+                    unsafe {
+                        let mut msg = std::mem::zeroed::<Msg>();
+                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 1) != 0 {
+                            TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(8));
+                }
+            }
+        }
+    }
+
+    pub struct Player {
+        host: Hwnd,
+        parent: Hwnd,
+        scale: f32,
+        rect: Rect,
+        generation: u64,
+        slot: Arc<Slot>,
+        paused: bool,
+        hidden: bool,
+    }
+    unsafe impl Send for Player {}
+
+    impl Player {
+        pub fn start(parent: isize, scale: f32, rect: Rect, url: &str, volume: u8) -> Result<Self, String> {
+            reap_hosts();
+            if parent == 0 {
+                return Err("Termy window is not ready. No window was opened.".into());
+            }
+            if media_url_class(url) != MediaUrlClass::Playable {
+                return Err(super::NO_PLAYABLE_MEDIA.into());
+            }
+            let location = CString::new(url.trim()).map_err(|_| super::NO_PLAYABLE_MEDIA.to_string())?;
+            let (x, y, w, h) = client_pixels(scale, rect);
+            let class = wide(std::ffi::OsStr::new("TermyXVlcHost"));
+            let host = unsafe {
+                let wc = WndClass {
+                    cb_size: std::mem::size_of::<WndClass>() as u32,
+                    style: 0,
+                    lpfn: Some(wndproc),
+                    cb_cls_extra: 0,
+                    cb_wnd_extra: 0,
+                    h_instance: GetModuleHandleW(std::ptr::null()),
+                    h_icon: std::ptr::null_mut(),
+                    h_cursor: std::ptr::null_mut(),
+                    hbr_background: std::ptr::null_mut(),
+                    lpsz_menu_name: std::ptr::null(),
+                    lpsz_class_name: class.as_ptr(),
+                    h_icon_sm: std::ptr::null_mut(),
+                };
+                let _ = RegisterClassExW(&wc);
+                CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    wide(std::ffi::OsStr::new("")).as_ptr(),
+                    host_child_style(),
+                    x, y, w, h,
+                    parent as Hwnd,
+                    std::ptr::null_mut(),
+                    GetModuleHandleW(std::ptr::null()),
+                    std::ptr::null_mut(),
+                )
+            };
+            if host.is_null() {
+                return Err("Could not place the video inside Termy. No window was opened.".into());
+            }
+            static GEN: AtomicU64 = AtomicU64::new(1);
+            let generation = GEN.fetch_add(1, Ordering::Relaxed);
+            let slot = Arc::new(Slot {
+                generation,
+                closed: AtomicBool::new(false),
+                ended: AtomicBool::new(false),
+                failed: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                time_ms: AtomicU64::new(0),
+                length_ms: AtomicU64::new(0),
+                seekable: AtomicBool::new(false),
+                audio_stop_ms: AtomicU64::new(0),
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            enqueue(Job::Start {
+                url: location,
+                volume: i32::from(volume.min(100)),
+                hwnd: host as usize,
+                generation,
+                slot: Arc::clone(&slot),
+                reply: tx,
+            });
+            if let Err(err) = pump_until(&rx) {
+                slot.closed.store(true, Ordering::Release);
+                if let Ok(mut guard) = reaps().lock() {
+                    guard.push(Reap {
+                        host: host as usize,
+                        slot: Arc::clone(&slot),
+                    });
+                }
+                enqueue(Job::Stop {
+                    generation,
+                    slot,
+                });
+                return Err(err);
+            }
+            unsafe { ShowWindow(host, SW_SHOWNA) };
+            Ok(Self { host, parent: parent as Hwnd, scale, rect, generation, slot, paused: false, hidden: false })
+        }
+
+        pub fn reposition(&mut self, scale: f32, rect: Rect) {
+            self.scale = scale;
+            self.rect = rect;
+            if self.host.is_null() || self.hidden {
+                return;
+            }
+            let (x, y, w, h) = client_pixels(scale, rect);
+            unsafe {
+                SetWindowPos(self.host, std::ptr::null_mut(), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+            }
+        }
+
+        pub fn toggle_pause(&mut self) {
+            self.paused = !self.paused;
+            enqueue(Job::Pause { generation: self.generation, paused: self.paused });
+        }
+
+        pub fn seek_relative(&mut self, seconds: i32) {
+            let (pos, _) = self.progress();
+            self.seek_absolute((pos + f64::from(seconds)).max(0.0));
+        }
+
+        pub fn seek_absolute(&mut self, seconds: f64) {
+            if !self.slot.seekable.load(Ordering::Acquire) && self.slot.time_ms.load(Ordering::Acquire) == 0 {
+                enqueue(Job::Query { generation: self.generation });
+            }
+            let ms = (seconds.max(0.0) * 1000.0) as i64;
+            enqueue(Job::Seek { generation: self.generation, ms });
+        }
+
+        pub fn progress(&self) -> (f64, f64) {
+            enqueue(Job::Query { generation: self.generation });
+            let time = self.slot.time_ms.load(Ordering::Acquire);
+            let length = self.slot.length_ms.load(Ordering::Acquire);
+            (time as f64 / 1000.0, length as f64 / 1000.0)
+        }
+
+        pub fn set_volume(&mut self, percent: u8) {
+            enqueue(Job::Volume { generation: self.generation, percent: i32::from(percent.min(100)) });
+        }
+
+        pub fn set_muted(&mut self, muted: bool) {
+            enqueue(Job::Mute { generation: self.generation, muted });
+        }
+
+        pub fn take_failure(&mut self) -> Option<&'static str> {
+            self.drain_events();
+            if self.slot.failed.load(Ordering::Acquire) {
+                Some("VLC's engine could not play this file. No window was opened.")
+            } else {
+                None
+            }
+        }
+
+        fn drain_events(&self) {
+            let queued = events().lock().ok().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+            let mut flags = super::EngineFlags::default();
+            for (generation, kind) in queued {
+                super::apply_engine_callback(self.generation, generation, kind, &mut flags);
+            }
+            if flags.ended {
+                self.slot.ended.store(true, Ordering::Release);
+            }
+            if flags.failed {
+                self.slot.failed.store(true, Ordering::Release);
+            }
+        }
+
+        pub fn is_alive(&mut self) -> bool {
+            self.drain_events();
+            !self.hidden && !self.slot.ended.load(Ordering::Acquire) && !self.slot.failed.load(Ordering::Acquire)
+        }
+
+        pub fn stop(&mut self) {
+            if self.hidden {
+                return;
+            }
+            self.hidden = true;
+            self.slot.closed.store(true, Ordering::Release);
+            if !self.host.is_null() {
+                unsafe { ShowWindow(self.host, SW_HIDE) };
+                if let Ok(mut guard) = reaps().lock() {
+                    guard.push(Reap { host: self.host as usize, slot: Arc::clone(&self.slot) });
+                }
+                self.host = std::ptr::null_mut();
+            }
+            enqueue(Job::Stop { generation: self.generation, slot: Arc::clone(&self.slot) });
+        }
+    }
+
+    pub fn reap_hosts() {
+        let ready = {
+            let Ok(mut guard) = reaps().lock() else { return };
+            let mut left = Vec::new();
+            let mut ready = Vec::new();
+            for reap in guard.drain(..) {
+                if reap.slot.released.load(Ordering::Acquire) {
+                    ready.push(reap.host);
+                } else {
+                    left.push(reap);
+                }
+            }
+            *guard = left;
+            ready
+        };
+        for host in ready {
+            if host != 0 {
+                unsafe { DestroyWindow(host as Hwnd) };
+            }
+        }
+    }
+
+    impl Drop for Player {
+        fn drop(&mut self) {
+            self.stop();
         }
     }
 }
@@ -2133,13 +3076,19 @@ mod win {
 mod tests {
     use super::{
         CLOSE_BAND, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE, HostGate, HostPhase,
-        MediaDispatch, NO_PLAYABLE_MEDIA, PlayGen, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP,
+        DLL_LOAD_FLAGS, EngineFlags, EnginePhase, EnginePlan, EngineStep, HOST_STYLE_POPUP,
+        MediaDispatch, NO_PLAYABLE_MEDIA, VLC_PLUGINS_MISSING, WS_CHILD,
+        PlayGen, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, VLC_ENGINE_MISSING, VLC_WRONG_ARCH,
         TRACE_OTHER_CAP, VLC_CANONICAL_WINDOWS, VLC_NOT_FOUND, admit_trace_line, begin_playback,
         callback_is_current, choose_variant_url, clamp_window_change, close_button_rect,
         dismiss_playback, dispatch_media, embed_rect, event_name, format_obs_line,
         host_create_style, host_style_starts_hidden, keep_main_window, live_size_differs_half,
         marker_name, playback_args, pos_is_noop, rect_changed, rects_overlap, sanitize_token,
         select_vlc, swp_names, vlc_candidates, vlc_playback_args, volume_commands, volume_percent,
+        apply_engine_callback, client_pixels, engine_files_plan, engine_plan, engine_step,
+        host_child_style, launches_external_vlc, libvlc_instance_args, pe_machine,
+        ENGINE_RELEASE_ORDER, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, LIBVLC_EVENT_END,
+        LIBVLC_EVENT_ERROR,
     };
     use std::path::{Path, PathBuf};
     use termy_x::model::MediaKind;
@@ -2379,5 +3328,89 @@ mod tests {
             Some("https://video.twimg.com/a.m4a")
         );
         assert_eq!(choose_variant_url(&[]), None);
+    }
+
+    #[test]
+    fn libvlc_embed_refuses_a_bad_library_and_does_not_spawn_vlc() {
+        let mut pe = vec![0u8; 0x80];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c] = 0x40;
+        pe[0x40] = b'P';
+        pe[0x41] = b'E';
+        pe[0x44] = (IMAGE_FILE_MACHINE_AMD64 & 0xff) as u8;
+        pe[0x45] = (IMAGE_FILE_MACHINE_AMD64 >> 8) as u8;
+        assert_eq!(pe_machine(&pe), Some(IMAGE_FILE_MACHINE_AMD64));
+        pe[0x44] = (IMAGE_FILE_MACHINE_I386 & 0xff) as u8;
+        pe[0x45] = (IMAGE_FILE_MACHINE_I386 >> 8) as u8;
+        assert_eq!(pe_machine(&pe), Some(IMAGE_FILE_MACHINE_I386));
+        assert_eq!(engine_plan(Some(IMAGE_FILE_MACHINE_AMD64), true), EnginePlan::Embed);
+        assert_eq!(
+            engine_plan(Some(IMAGE_FILE_MACHINE_I386), true),
+            EnginePlan::Refuse(VLC_WRONG_ARCH)
+        );
+        assert_eq!(engine_plan(None, true), EnginePlan::Refuse(VLC_ENGINE_MISSING));
+        assert_eq!(
+            engine_plan(Some(IMAGE_FILE_MACHINE_AMD64), false),
+            EnginePlan::Refuse(NO_PLAYABLE_MEDIA)
+        );
+        assert!(!VLC_WRONG_ARCH.contains("http"));
+        assert!(!VLC_ENGINE_MISSING.contains("vlc.exe --"));
+        let args = libvlc_instance_args(r"C:\Program Files\VideoLAN\VLC\plugins");
+        assert!(args.iter().any(|arg| arg == "--intf=dummy"));
+        assert!(args.iter().any(|arg| arg == "--dummy-quiet"));
+        assert!(args.iter().any(|arg| arg == "--ignore-config"));
+        assert!(args.iter().all(|arg| arg != "--fullscreen" && !arg.contains("http")));
+        assert_eq!(args.iter().filter(|arg| arg.starts_with("--plugin-path=")).count(), 1);
+        assert_eq!(engine_step(EnginePhase::Idle, EngineStep::Play), Err("play before the panel surface exists"));
+        assert_eq!(
+            engine_step(EnginePhase::Idle, EngineStep::PlaceHost).unwrap(),
+            EnginePhase::HostReady
+        );
+        let playing = engine_step(EnginePhase::HostReady, EngineStep::Play).unwrap();
+        assert_eq!(playing, EnginePhase::Playing);
+        assert_eq!(
+            engine_step(playing, EngineStep::Stop).and_then(|phase| engine_step(phase, EngineStep::Release)).unwrap(),
+            EnginePhase::Released
+        );
+        assert_eq!(
+            engine_step(EnginePhase::Released, EngineStep::Stop).unwrap(),
+            EnginePhase::Released
+        );
+        let mut flags = EngineFlags::default();
+        apply_engine_callback(2, 1, LIBVLC_EVENT_END, &mut flags);
+        assert!(!flags.ended);
+        apply_engine_callback(1, 1, LIBVLC_EVENT_END, &mut flags);
+        assert!(flags.ended);
+        apply_engine_callback(1, 1, LIBVLC_EVENT_ERROR, &mut flags);
+        assert!(flags.failed);
+        assert_eq!(ENGINE_RELEASE_ORDER[0], "hide-host");
+        assert_eq!(ENGINE_RELEASE_ORDER.last().copied(), Some("destroy-host"));
+        assert!(!launches_external_vlc());
+        let child = host_child_style();
+        assert_ne!(child & WS_CHILD, 0);
+        assert_ne!(child & HOST_STYLE_CLIP_CHILDREN, 0);
+        assert_eq!(child & HOST_STYLE_POPUP, 0);
+        assert_eq!(child & HOST_STYLE_VISIBLE, 0);
+        assert_eq!(client_pixels(1.25, (0.0, 0.0, 480.0, 616.0)), (0, 0, 600, 770));
+        assert_eq!(DLL_LOAD_FLAGS, 0x0000_0100 | 0x0000_0800);
+        assert_eq!(
+            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 4, true),
+            EnginePlan::Embed
+        );
+        assert_eq!(
+            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 0, true),
+            EnginePlan::Refuse(VLC_PLUGINS_MISSING)
+        );
+        assert_eq!(
+            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_I386), 4, true),
+            EnginePlan::Refuse(VLC_WRONG_ARCH)
+        );
+        let flags_only = libvlc_instance_args(r"C:\Program Files\VideoLAN\VLC\plugins");
+        assert!(flags_only.iter().any(|arg| arg.starts_with("--plugin-path=")));
+        assert_ne!(
+            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 0, true),
+            EnginePlan::Embed
+        );
     }
 }

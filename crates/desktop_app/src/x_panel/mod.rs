@@ -7785,8 +7785,8 @@ impl XPanel {
         let (fit_w, fit_h) = media_fit::contain_size(424.0, box_h, aspect);
         let extra = post.media.len().saturating_sub(1);
         let badge = match kind {
-            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play in VLC",
-            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play in VLC",
+            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play",
+            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play",
             MediaKind::Photo => "\u{1f50d} tap to view",
         };
         let mut area = div()
@@ -7884,6 +7884,7 @@ impl XPanel {
         allow(unused_variables)
     )]
     fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
+        player::reap_video_hosts();
         let Some(viewer) = self.viewer.clone() else {
             return;
         };
@@ -7967,6 +7968,16 @@ impl XPanel {
                                         .video_player
                                         .as_ref()
                                         .map_or((0.0, 0.0), |pl| pl.progress());
+                                    if let Some(err) = panel
+                                        .video_player
+                                        .as_mut()
+                                        .and_then(|pl| pl.take_failure())
+                                    {
+                                        panel.player_error = Some(err.to_string());
+                                        panel.stop_video_player();
+                                        cx.notify();
+                                        return false;
+                                    }
                                     let player_gone = panel
                                         .video_player
                                         .as_mut()
@@ -8109,8 +8120,8 @@ impl XPanel {
         let is_video = viewer.kind != MediaKind::Photo;
         let title = match viewer.kind {
             MediaKind::Photo => "Photo \u{b7} in Termy",
-            MediaKind::Video => "Video \u{b7} playing in VLC",
-            MediaKind::Gif => "GIF \u{b7} playing in VLC",
+            MediaKind::Video => "Video \u{b7} in Termy",
+            MediaKind::Gif => "GIF \u{b7} in Termy",
         };
         // Middle: photo image (contain, whole) or the native video host area.
         let middle: gpui_kit::AnyElement = if is_video {
@@ -8400,7 +8411,11 @@ impl XPanel {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close"),
+                            .child(if cfg!(windows) {
+                                "Drag to scrub \u{b7} Space pause \u{b7} Esc close. VLC's engine draws in this panel; these buttons are Termy's."
+                            } else {
+                                "Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close"
+                            }),
                     ),
             );
         } else {
