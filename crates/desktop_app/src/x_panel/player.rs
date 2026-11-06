@@ -181,6 +181,17 @@ pub fn host_style_starts_hidden(style: u32) -> bool {
     style & HOST_STYLE_VISIBLE == 0 && style & HOST_STYLE_CLIP_CHILDREN != 0
 }
 
+/// mpv's Windows flip present paints a black full-screen frame when the
+/// swap chain is created and when it is destroyed. The host rectangle
+/// does not change. This switch turns that present off.
+pub const D3D11_FLIP_OFF: &str = "--d3d11-flip=no";
+
+/// Restored placement used before a window is destroyed. Show command 0
+/// is SW_HIDE. The rect stays the panel, not the monitor.
+pub fn hidden_restore(panel: ScreenRect) -> (u32, ScreenRect) {
+    (0, panel)
+}
+
 /// Flags for one playback. `--media-controls=no` stops mpv from opening
 /// the extra top-level `mpv-smtc` window (the 2304×1243 window seen on
 /// the live desktop). Mute and volume are mpv's own, not the OS mixer.
@@ -228,6 +239,8 @@ pub fn playback_args(
     } else {
         "--mute=no".to_string()
     });
+    #[cfg(windows)]
+    args.push(D3D11_FLIP_OFF.to_string());
     args
 }
 
@@ -541,6 +554,76 @@ mod win {
         fn GetWindowRect(h: Hwnd, r: *mut RectWin) -> i32;
         fn IsIconic(h: Hwnd) -> i32;
         fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
+        fn GetWindow(h: Hwnd, cmd: u32) -> Hwnd;
+        fn GetClassNameW(h: Hwnd, buf: *mut u16, max: i32) -> i32;
+        fn SetWindowPlacement(h: Hwnd, place: *const WindowPlacement) -> i32;
+    }
+    #[repr(C)]
+    struct WindowPlacement {
+        length: u32,
+        flags: u32,
+        show_cmd: u32,
+        pt_min: Point,
+        pt_max: Point,
+        rc_normal: RectWin,
+    }
+    fn bury_window(hwnd: Hwnd, panel: super::ScreenRect) {
+        if hwnd.is_null() {
+            return;
+        }
+        let mut class = [0u16; 48];
+        let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), 48) };
+        let class_name = if n > 0 {
+            String::from_utf16_lossy(&class[..n as usize])
+        } else {
+            String::new()
+        };
+        let mut was = RectWin {
+            l: 0,
+            t: 0,
+            r: 0,
+            b: 0,
+        };
+        unsafe { GetWindowRect(hwnd, &mut was) };
+        trace_hwnd(
+            hwnd as isize,
+            &format!(
+                "bury class={class_name} was={},{},{},{}",
+                was.l,
+                was.t,
+                was.r - was.l,
+                was.b - was.t
+            ),
+            panel,
+        );
+        let (show_cmd, rect) = super::hidden_restore(panel);
+        let place = WindowPlacement {
+            length: std::mem::size_of::<WindowPlacement>() as u32,
+            flags: 0,
+            show_cmd,
+            pt_min: Point { x: 0, y: 0 },
+            pt_max: Point { x: 0, y: 0 },
+            rc_normal: RectWin {
+                l: rect.0,
+                t: rect.1,
+                r: rect.0 + rect.2,
+                b: rect.1 + rect.3,
+            },
+        };
+        unsafe {
+            SetWindowPlacement(hwnd, &place);
+            ShowWindow(hwnd, SW_HIDE);
+        }
+    }
+    fn bury_children(parent: Hwnd, panel: super::ScreenRect) {
+        let mut child = unsafe { GetWindow(parent, 5) };
+        let mut guard = 0;
+        while !child.is_null() && guard < 16 {
+            let next = unsafe { GetWindow(child, 2) };
+            bury_window(child, panel);
+            child = next;
+            guard += 1;
+        }
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -952,8 +1035,9 @@ mod win {
                 slot.closing = true;
             }
             if !self.host.is_null() {
+                bury_children(self.host, self.last_rect);
+                bury_window(self.host, self.last_rect);
                 trace_hwnd(hwnd, "hide", self.last_rect);
-                unsafe { ShowWindow(self.host, SW_HIDE) };
             }
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
@@ -982,7 +1066,8 @@ mod tests {
         CLOSE_BAND, HostGate, HostPhase, PlayGen, begin_playback, callback_is_current,
         clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
         host_create_style, host_style_starts_hidden, playback_args, rects_overlap,
-        volume_commands, volume_percent, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE,
+        volume_commands, volume_percent, D3D11_FLIP_OFF, hidden_restore,
+        HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE,
     };
 
     #[test]
@@ -1083,5 +1168,15 @@ mod tests {
         let quiet = playback_args(None, None, None, 0);
         assert!(quiet.iter().any(|arg| arg == "--mute=yes"));
         assert!(quiet.iter().any(|arg| arg == "--volume=0"));
+    }
+
+    #[test]
+    fn stop_restores_the_panel_rect_hidden() {
+        let panel = (2276, 655, 600, 770);
+        let (show_cmd, rect) = hidden_restore(panel);
+        assert_eq!(show_cmd, 0);
+        assert_eq!(rect, panel);
+        assert!(rect.2 < 1920 && rect.3 < 1080);
+        assert_eq!(D3D11_FLIP_OFF, "--d3d11-flip=no");
     }
 }
