@@ -13,6 +13,7 @@ pub mod cli;
 pub mod config;
 pub mod connect;
 pub mod doctor;
+pub mod draft_edit;
 pub mod drafts;
 pub mod feed;
 pub mod feeds;

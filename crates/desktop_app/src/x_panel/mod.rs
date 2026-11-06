@@ -3,6 +3,7 @@
 
 pub mod art;
 mod desk;
+mod editor_surface;
 mod list_sort;
 mod media_fit;
 mod player;
@@ -362,8 +363,8 @@ fn enter_action(field: TextField) -> EnterAction {
     }
 }
 
-/// The two simple end-caret text fields (Search query, inline reply).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Panel text fields. Reply and Quote are multiline; the rest are one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum TextField {
     Search,
     Reply,
@@ -378,6 +379,14 @@ enum TextField {
     Analyze,
     RgTopic,
     RgKey,
+}
+
+/// Compose, or one of the shared draft fields. The masked key box is not
+/// a caret editor: its glyphs are not the secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EditorId {
+    Compose,
+    Field(TextField),
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -588,6 +597,14 @@ pub struct XPanel {
     caret: usize,
     /// Selection anchor; range is between anchor and caret when set.
     sel_anchor: Option<usize>,
+    /// Grapheme column remembered across Up/Down in the compose box.
+    compose_preferred: Option<usize>,
+    /// Caret + selection for reply, quote, and the shared single-line fields.
+    field_carets: HashMap<TextField, termy_x::draft_edit::DraftCaret>,
+    /// Last shaped layout, keyed by editor, used to map a click to a byte.
+    editor_paint: HashMap<EditorId, editor_surface::EditorPaint>,
+    /// Field currently extending a selection by mouse drag.
+    text_drag: Option<EditorId>,
     /// Tweet text selected by dragging across a card (see
     /// [`CardTextSelection`]), plus the in-progress drag start
     /// `(post_id, text, x, y)` and whether the card currently owns
@@ -906,6 +923,10 @@ impl XPanel {
             compose_focused: false,
             caret: 0,
             sel_anchor: None,
+            compose_preferred: None,
+            field_carets: HashMap::new(),
+            editor_paint: HashMap::new(),
+            text_drag: None,
             card_text_selection: None,
             card_drag_start: None,
             card_copy_focus: false,
@@ -3320,18 +3341,15 @@ impl XPanel {
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("a") {
-            self.sel_anchor = Some(0);
-            self.caret = self.compose.len();
+            self.editor_select_all(EditorId::Compose);
             self.mark_edit_chord();
             cx.stop_propagation();
             cx.notify();
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("c") {
-            if let Some((a, b)) = self.selection_range() {
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                    self.compose[a..b].to_string(),
-                ));
+            if let Some(selected) = self.editor_selection_text(EditorId::Compose) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -3339,13 +3357,8 @@ impl XPanel {
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("x") {
-            if let Some((a, b)) = self.selection_range() {
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                    self.compose[a..b].to_string(),
-                ));
-                self.compose.replace_range(a..b, "");
-                self.caret = a;
-                self.clear_selection();
+            if let Some(selected) = self.editor_cut(EditorId::Compose) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -3353,26 +3366,12 @@ impl XPanel {
             return;
         }
 
-        if key == "left" {
-            self.move_caret(CaretMove::Left, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "right" {
-            self.move_caret(CaretMove::Right, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "up" || key == "home" {
-            self.move_caret(CaretMove::LineStart, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "down" || key == "end" {
-            self.move_caret(CaretMove::LineEnd, mods.shift);
+        if let Some(motion) = editor_surface::navigation_motion(key, mods.control || mods.platform)
+        {
+            // Up/Down walk visual lines (including soft wraps). Home/End
+            // stay on the current visual line. Ctrl+Home/End cover the draft.
+            // Swallowed so the terminal behind the panel never sees arrows.
+            self.editor_motion(EditorId::Compose, motion, mods.shift);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -3386,9 +3385,9 @@ impl XPanel {
             return;
         }
         if key == "backspace" {
-            self.backspace();
+            self.editor_backspace(EditorId::Compose, mods.control || mods.platform);
         } else if key == "delete" {
-            self.delete_forward();
+            self.editor_delete_forward(EditorId::Compose);
         } else if key == "space" {
             self.insert_text(" ");
         } else if key == "enter" {
@@ -3413,12 +3412,14 @@ impl XPanel {
         self.card_copy_focus = false;
         self.card_text_selection = None;
         self.card_drag_start = None;
+        self.input_target = InputTarget::Compose;
         self.compose_focused = true;
         self.ui_focus = UiFocus::Compose;
         if self.compose.is_empty() {
             // Empty draft: caret at left (index 0), never a phantom selection.
             self.caret = 0;
             self.sel_anchor = None;
+            self.compose_preferred = None;
         } else {
             self.caret = self.caret.min(self.compose.len());
         }
@@ -3474,57 +3475,35 @@ impl XPanel {
         }
         let clean = text.trim_end_matches(['\r', '\n']);
         if let Some(field) = self.field_all_selected.take()
-            && single_line_field_for(self.input_target) == Some(field)
-            && let Some(target) = self.single_line_text_mut(field)
+            && field == TextField::RgKey
+            && self.input_target == InputTarget::RgKey
         {
-            target.clear();
+            self.desk.rg_key_input.clear();
         }
         if self.bearer_mode {
             self.bearer_input.push_str(clean.trim());
-        } else {
-            match self.input_target {
-                InputTarget::Compose => {
-                    self.focus_compose_editor();
-                    self.insert_text(clean);
-                }
-                InputTarget::Search => self.search_input.push_str(clean),
-                InputTarget::Reply => self.reply_text.push_str(clean),
-                InputTarget::Quote => self.quote_text.push_str(clean),
-                InputTarget::Trends => self.trends_filter.push_str(clean),
-                InputTarget::Research => self.research_input.push_str(clean),
-                InputTarget::Lookup => self.lookup.push_str(clean),
-                InputTarget::FeedQuery => self.desk.feed_query.push_str(clean),
-                InputTarget::FeedFilter => self.desk.feed_filter.push_str(clean),
-                InputTarget::QueueText => self.desk.queue_text.push_str(clean),
-                InputTarget::QueueReplyTo => self.desk.queue_reply_to.push_str(clean),
-                InputTarget::Analyze => self.desk.analyze_handle.push_str(clean),
-                InputTarget::RgTopic => self.desk.rg_topic.push_str(clean),
-                InputTarget::RgKey => {
-                    // A pasted key is complete: save it right away
-                    // (Enter/Save also work).
-                    self.desk.rg_key_input.push_str(clean.trim());
-                    self.rg_save_key_now();
-                }
+        } else if let Some(id) = self.active_editor() {
+            if id == EditorId::Compose {
+                self.focus_compose_editor();
             }
-        }
-        match self.input_target {
-            InputTarget::Reply => self.scroll_small_editor_to_end(TextField::Reply),
-            InputTarget::Quote => self.scroll_small_editor_to_end(TextField::Quote),
-            _ => {}
+            self.editor_insert(id, clean);
+        } else if self.input_target == InputTarget::RgKey {
+            // A pasted key is complete: save it right away
+            // (Enter/Save also work).
+            self.desk.rg_key_input.push_str(clean.trim());
+            self.rg_save_key_now();
         }
         self.mark_edit_chord();
     }
 
-    /// Text a Copy action should take, if the active field has a
-    /// selection. Search/reply fields are end-caret only (no selection),
-    /// so they return None; the action is still swallowed by the caller
-    /// so the terminal selection is never copied over the clipboard.
+    /// Text a Copy action should take. A focused card selection beats the
+    /// draft selection. The masked key field never copies (the bullets are
+    /// not the secret). An empty selection returns None; the caller still
+    /// swallows the chord so the terminal selection is not copied.
     pub fn active_copy_text(&self) -> Option<String> {
-        let editor = if self.input_target == InputTarget::Compose {
-            self.compose_selection_text()
-        } else {
-            None
-        };
+        let editor = self
+            .active_editor()
+            .and_then(|id| self.editor_selection_text(id));
         copy_text_for_focus(
             self.card_copy_focus,
             self.card_text_selection.as_ref(),
@@ -3532,14 +3511,18 @@ impl XPanel {
         )
     }
 
-    /// SelectAll for the active field. Search/reply fields have no
-    /// selection model, so this just marks the chord (the caller swallows
-    /// the action, keeping it out of the terminal).
+    /// SelectAll for the active field. Single-line fields (Reply Guy topic
+    /// included) and the multiline writers select the whole draft. The
+    /// masked key field keeps its select-all highlight.
     pub fn select_all_active(&mut self) {
-        if self.input_target == InputTarget::Compose && !self.bearer_mode {
-            self.select_all_compose();
-        } else if let Some(field) = single_line_field_for(self.input_target) {
-            self.field_all_selected = Some(field);
+        if self.input_target == InputTarget::RgKey {
+            self.field_all_selected = Some(TextField::RgKey);
+            self.mark_edit_chord();
+        } else if let Some(id) = self.active_editor() {
+            if self.chord_already_applied() {
+                return;
+            }
+            self.editor_select_all(id);
             self.mark_edit_chord();
         } else if !self.chord_already_applied() {
             self.mark_edit_chord();
@@ -3559,16 +3542,14 @@ impl XPanel {
     }
 
     pub fn compose_selection_text(&self) -> Option<String> {
-        let (a, b) = self.selection_range()?;
-        Some(self.compose[a..b].to_string())
+        self.editor_selection_text(EditorId::Compose)
     }
 
     pub fn select_all_compose(&mut self) {
         if self.chord_already_applied() {
             return;
         }
-        self.sel_anchor = Some(0);
-        self.caret = self.compose.len();
+        self.editor_select_all(EditorId::Compose);
         self.mark_edit_chord();
     }
 
@@ -3581,17 +3562,159 @@ impl XPanel {
             .is_some_and(|t| t.elapsed() < Duration::from_millis(80))
     }
 
-    /// Shared keyboard handling for the Search query and inline reply
-    /// fields: plain text appends at the end, Backspace deletes, Ctrl+V
-    /// pastes. Enter runs a search; in a reply Enter adds a line and
-    /// never sends (only the Post button does). Everything is swallowed so the terminal behind
-    /// the panel never sees these keys.
+    /// Shared keyboard handling for the Search query, inline reply, quote,
+    /// and the other single-line fields. The masked key box keeps the
+    /// older end-caret path (`on_text_input_key` below). Every other field
+    /// has a real caret. Enter still runs a search in a filter box and
+    /// inserts a newline in a reply or quote — it never posts.
+    fn on_draft_field_key(
+        &mut self,
+        event: &KeyDownEvent,
+        field: TextField,
+        cx: &mut Context<Self>,
+    ) {
+        let id = EditorId::Field(field);
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let word = mods.control || mods.platform;
+        if key == "escape"
+            && field == TextField::Trends
+            && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
+        {
+            self.trends_filter.clear();
+            self.trends_bucket = None;
+            self.field_carets.remove(&TextField::Trends);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "enter" {
+            match enter_action(field) {
+                EnterAction::RunSearch => match field {
+                    TextField::Trends => self.enter_trends_filter(cx),
+                    TextField::Research => self.run_research(cx),
+                    TextField::Lookup => self.run_lookup(cx),
+                    TextField::FeedQuery | TextField::FeedFilter => self.add_feed_from_fields(cx),
+                    TextField::Analyze => self.run_analyze(cx),
+                    TextField::RgTopic => self.rg_fetch(cx),
+                    TextField::RgKey => self.rg_save_key(cx),
+                    TextField::QueueText | TextField::QueueReplyTo => {
+                        self.queue_add_from_fields(cx);
+                    }
+                    _ => self.run_search(cx),
+                },
+                EnterAction::Newline => {
+                    self.editor_insert(id, "\n");
+                }
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if let Some(motion) = editor_surface::navigation_motion(key, word) {
+            self.editor_motion(id, motion, mods.shift);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if word && key.eq_ignore_ascii_case("a") {
+            self.editor_select_all(id);
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if word && key.eq_ignore_ascii_case("c") {
+            if let Some(selected) = self.editor_selection_text(id) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if word && key.eq_ignore_ascii_case("x") {
+            if let Some(selected) = self.editor_cut(id) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if word && key.eq_ignore_ascii_case("v") {
+            if !self.chord_already_applied()
+                && let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                let clean = clip.trim_end_matches(['\r', '\n']);
+                self.editor_insert(id, clean);
+                self.mark_edit_chord();
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "backspace" {
+            self.editor_backspace(id, word);
+            self.note_reply_first_key(field);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "delete" {
+            self.editor_delete_forward(id);
+            self.note_reply_first_key(field);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if !(mods.control || mods.alt || mods.platform || mods.function) {
+            if let Some(ch) = event
+                .keystroke
+                .key_char
+                .as_deref()
+                .filter(|ch| !ch.is_empty())
+            {
+                self.editor_insert(id, ch);
+                self.note_reply_first_key(field);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.chars().count() == 1 {
+                self.editor_insert(id, key);
+                self.note_reply_first_key(field);
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }
+    }
+
+    fn note_reply_first_key(&mut self, field: TextField) {
+        if field == TextField::Reply && !self.reply_key_logged {
+            self.reply_key_logged = true;
+            if let Some(opened) = self.reply_opened_at {
+                perf_log(&format!(
+                    "reply first-key after {}ms",
+                    opened.elapsed().as_millis()
+                ));
+            }
+        }
+    }
+
+    /// Masked Treg/Grok key box: end caret, select-all, and immediate save.
+    /// The displayed bullets are not the secret, so a mid-text caret would lie.
     fn on_text_input_key(
         &mut self,
         event: &KeyDownEvent,
         field: TextField,
         cx: &mut Context<Self>,
     ) {
+        if field != TextField::RgKey {
+            self.on_draft_field_key(event, field, cx);
+            return;
+        }
         self.mention_dirty_at = Some(std::time::Instant::now());
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
@@ -3696,8 +3819,10 @@ impl XPanel {
                 target.clear();
             }
             target.push_str(ch);
-        } else if matches!(key, "left" | "right" | "home" | "end") {
-            // End-caret field: arrows just drop the selection.
+        } else if termy_x::draft_edit::is_navigation_key(key) {
+            // Masked key field has no mid-text caret. Swallow the arrows
+            // so the terminal behind the panel does not take them, and
+            // drop a select-all highlight.
             self.field_all_selected = None;
             cx.stop_propagation();
             cx.notify();
@@ -4130,30 +4255,9 @@ impl XPanel {
         (((panel_w - 70.0) / 6.8) as usize).clamp(24, 240)
     }
 
-    /// Keep the end caret of a reply/quote draft visible: scroll the
-    /// fixed-height editor so the last visual line is in view.
+    /// Keep the reply/quote caret's visual line inside the fixed editor.
     fn scroll_small_editor_to_end(&mut self, field: TextField) {
-        let (text, handle) = match field {
-            TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
-            TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
-            TextField::Search
-            | TextField::Trends
-            | TextField::Research
-            | TextField::Lookup
-            | TextField::FeedQuery
-            | TextField::FeedFilter
-            | TextField::QueueText
-            | TextField::QueueReplyTo
-            | TextField::Analyze
-            | TextField::RgTopic
-            | TextField::RgKey => return,
-        };
-        let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
-        let overflow = lines as f32 * 19.0 - 44.0;
-        handle.set_offset(point(
-            px(0.0),
-            px(if overflow > 0.0 { -overflow } else { 0.0 }),
-        ));
+        self.follow_small_caret(field);
     }
 
     /// Keep the Compose caret's visual line inside the scroll view.
@@ -4710,86 +4814,8 @@ impl XPanel {
         .detach();
     }
 
-    fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.sel_anchor?;
-        let a = anchor.min(self.caret);
-        let b = anchor.max(self.caret);
-        if a == b { None } else { Some((a, b)) }
-    }
-
-    fn clear_selection(&mut self) {
-        self.sel_anchor = None;
-    }
-
     fn insert_text(&mut self, text: &str) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, text);
-            self.caret = a + text.len();
-        } else {
-            let at = self.caret.min(self.compose.len());
-            self.compose.insert_str(at, text);
-            self.caret = at + text.len();
-        }
-        self.clear_selection();
-        self.follow_compose_caret();
-    }
-
-    fn backspace(&mut self) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, "");
-            self.caret = a;
-            self.clear_selection();
-            self.follow_compose_caret();
-            return;
-        }
-        if self.caret == 0 {
-            return;
-        }
-        let prev = prev_boundary(&self.compose, self.caret);
-        self.compose.replace_range(prev..self.caret, "");
-        self.caret = prev;
-        self.follow_compose_caret();
-    }
-
-    fn delete_forward(&mut self) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, "");
-            self.caret = a;
-            self.clear_selection();
-            return;
-        }
-        if self.caret >= self.compose.len() {
-            return;
-        }
-        let next = next_boundary(&self.compose, self.caret);
-        self.compose.replace_range(self.caret..next, "");
-        self.follow_compose_caret();
-    }
-
-    fn move_caret(&mut self, motion: CaretMove, extend: bool) {
-        if extend && self.sel_anchor.is_none() {
-            self.sel_anchor = Some(self.caret);
-        } else if !extend {
-            self.clear_selection();
-        }
-        match motion {
-            CaretMove::Left => self.caret = prev_boundary(&self.compose, self.caret),
-            CaretMove::Right => self.caret = next_boundary(&self.compose, self.caret),
-            CaretMove::LineStart => {
-                let head = self.compose[..self.caret].rfind('\n').map_or(0, |i| i + 1);
-                self.caret = head;
-            }
-            CaretMove::LineEnd => {
-                let tail = self.compose[self.caret..]
-                    .find('\n')
-                    .map_or(self.compose.len(), |i| self.caret + i);
-                self.caret = tail;
-            }
-        }
-        self.follow_compose_caret();
+        self.editor_insert(EditorId::Compose, text);
     }
 
     fn cycle_ui_focus(&mut self, reverse: bool) {
@@ -4823,35 +4849,6 @@ impl XPanel {
         self.ui_focus = order[next];
         self.compose_focused = self.ui_focus == UiFocus::Compose && !self.confirm;
     }
-}
-
-#[derive(Clone, Copy)]
-enum CaretMove {
-    Left,
-    Right,
-    LineStart,
-    LineEnd,
-}
-
-fn prev_boundary(text: &str, offset: usize) -> usize {
-    if offset == 0 {
-        return 0;
-    }
-    let offset = offset.min(text.len());
-    text[..offset]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(i, _)| i)
-}
-
-fn next_boundary(text: &str, offset: usize) -> usize {
-    if offset >= text.len() {
-        return text.len();
-    }
-    text[offset..]
-        .chars()
-        .next()
-        .map_or(text.len(), |c| offset + c.len_utf8())
 }
 
 fn live_status(status: &termy_x::StatusLine) -> String {
@@ -5520,39 +5517,6 @@ fn fmt_volume(volume: u64) -> String {
     format!("{text}{suffix}")
 }
 
-/// Split `text[a..b]` at entity edges into chunk divs: @mentions,
-/// #hashtags, and $cashtags in X blue, the rest in the default color.
-/// Shared by every editor surface (Compose rows, small editors, and the
-/// single-line fields) so token rendering is identical everywhere.
-fn entity_chunk_divs(
-    text: &str,
-    a: usize,
-    b: usize,
-    entities: &[(usize, usize, termy_x::text::EntityKind)],
-) -> Vec<gpui_kit::AnyElement> {
-    let mut cuts: Vec<usize> = vec![a, b];
-    for (es, ee, _) in entities {
-        for edge in [*es, *ee] {
-            if edge > a && edge < b {
-                cuts.push(edge);
-            }
-        }
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-    cuts.windows(2)
-        .map(|w| {
-            let (cs, ce) = (w[0], w[1]);
-            let in_entity = entities.iter().any(|(es, ee, _)| cs >= *es && ce <= *ee);
-            let mut chunk = div().child(text[cs..ce].to_string());
-            if in_entity {
-                chunk = chunk.text_color(rgb(ENTITY_BLUE));
-            }
-            chunk.into_any_element()
-        })
-        .collect()
-}
-
 /// Red<->blue glow colour at breath phase `v` (0 = warm red, 1 = blue).
 fn glow_rgba(v: f32) -> gpui_kit::Rgba {
     let mix = |a: f32, b: f32| (a + (b - a) * v).round() as u32;
@@ -5662,8 +5626,6 @@ struct PostBurst {
 }
 
 const BURST_MS: u64 = 1_150;
-/// X brand blue for @mentions / #hashtags / $cashtags in editors.
-const ENTITY_BLUE: u32 = 0x1d9bf0;
 
 /// Burst look at animation progress `v` (0..1): (font px, opacity).
 /// First ~55%: "Posted" grows small -> big at full opacity. Rest:
@@ -5730,17 +5692,7 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
 
 /// Which visual line (0-based) a byte caret lands on, given the wrap.
 fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
-    let ranges = soft_wrap_ranges(text, max_chars);
-    for (idx, &(_start, end)) in ranges.iter().enumerate() {
-        if caret <= end {
-            return idx;
-        }
-        // Caret on a skipped wrap-space: it belongs to the next line.
-        if caret > end && ranges.get(idx + 1).is_some_and(|&(ns, _)| caret < ns) {
-            return idx + 1;
-        }
-    }
-    ranges.len().saturating_sub(1)
+    termy_x::draft_edit::line_index(&soft_wrap_ranges(text, max_chars), caret)
 }
 
 /// The centered "Posted" burst element (one scoped animated element).
@@ -8779,61 +8731,6 @@ impl XPanel {
     }
 
     /// Inline quote composer under a card: retweet with your own words.
-    /// Same shape as the reply box (fixed height, breathing caret from
-    /// the first focused frame, Post button, Esc/Cancel, 1 image).
-    /// Body of a small (reply/quote) editor: soft-wrapped visual
-    /// lines of the draft, end caret on the last line when focused.
-    /// Rendering only — the stored text is untouched.
-    fn small_editor_body(
-        &self,
-        text: &str,
-        focused: bool,
-        caret_id: &'static str,
-        placeholder: &'static str,
-    ) -> gpui_kit::AnyElement {
-        if text.is_empty() {
-            return div()
-                .text_size(px(13.0))
-                .text_color(rgb(0x93a4c3))
-                .child(if focused {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(caret_element(caret_id))
-                        .child(placeholder)
-                        .into_any_element()
-                } else {
-                    div().child(placeholder).into_any_element()
-                })
-                .into_any_element();
-        }
-        let ranges = soft_wrap_ranges(text, self.editor_max_chars());
-        let entities = entity_spans(text);
-        let last = ranges.len() - 1;
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .text_size(px(13.0))
-            .text_color(rgb(0xf8fbff));
-        for (idx, (a, b)) in ranges.iter().enumerate() {
-            let seg = &text[*a..*b];
-            let mut row = div().flex().flex_row().items_center().min_h(px(19.0));
-            if seg.is_empty() {
-                row = row.child(" ".to_string());
-            } else {
-                for chunk in entity_chunk_divs(text, *a, *b, &entities) {
-                    row = row.child(chunk);
-                }
-            }
-            if focused && idx == last {
-                row = row.child(caret_element(caret_id));
-            }
-            col = col.child(row);
-        }
-        col.into_any_element()
-    }
-
     fn quote_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.quote_text, char_limit);
@@ -8853,11 +8750,13 @@ impl XPanel {
             .child(if let Some(burst) = self.burst_for(BurstTarget::Quote) {
                 posted_burst_element(burst.seq, burst.label)
             } else {
-                self.small_editor_body(
-                    &self.quote_text,
+                self.editor_canvas(
+                    EditorId::Field(TextField::Quote),
                     focused,
-                    "caret-quote",
                     "Add your words\u{2026} (Post button sends the quote)",
+                    editor_surface::FIELD_FONT,
+                    editor_surface::FIELD_LINE,
+                    cx,
                 )
             })
             .on_mouse_down(
@@ -9059,11 +8958,13 @@ impl XPanel {
                     .child(if let Some(burst) = self.burst_for(BurstTarget::Reply) {
                         posted_burst_element(burst.seq, burst.label)
                     } else {
-                        self.small_editor_body(
-                            &self.reply_text,
+                        self.editor_canvas(
+                            EditorId::Field(TextField::Reply),
                             focused,
-                            "caret-reply",
                             "Write your reply\u{2026} (Post button sends)",
+                            editor_surface::FIELD_FONT,
+                            editor_surface::FIELD_LINE,
+                            cx,
                         )
                     })
                     .on_mouse_down(
@@ -9285,37 +9186,50 @@ impl XPanel {
             text
         };
         let focused = self.input_target == target;
-        let all_selected = focused && !text.is_empty() && self.field_all_selected == Some(field);
-        let content = if text.is_empty() {
-            if focused {
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(2.0))
-                    .child(caret_element(caret_id))
-                    .child(
-                        div()
-                            .text_color(rgb(0x93a4c3))
-                            .child(placeholder.to_string()),
-                    )
-                    .into_any_element()
+        let all_selected = field == TextField::RgKey
+            && focused
+            && !text.is_empty()
+            && self.field_all_selected == Some(field);
+        // The key box stays a masked end-caret field. Every other single-line
+        // box (Reply Guy topic included) is the shared caret editor.
+        let content = if field == TextField::RgKey {
+            if text.is_empty() {
+                if focused {
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(caret_element(caret_id))
+                        .child(
+                            div()
+                                .text_color(rgb(0x93a4c3))
+                                .child(placeholder.to_string()),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_color(rgb(0x93a4c3))
+                        .child(placeholder.to_string())
+                        .into_any_element()
+                }
             } else {
-                div()
-                    .text_color(rgb(0x93a4c3))
-                    .child(placeholder.to_string())
-                    .into_any_element()
+                let mut row = div().flex().flex_row().items_center();
+                row = row.child(text.to_string());
+                if focused {
+                    row = row.child(caret_element(caret_id));
+                }
+                row.into_any_element()
             }
         } else {
-            let entities = entity_spans(text);
-            let mut row = div().flex().flex_row().items_center();
-            for chunk in entity_chunk_divs(text, 0, text.len(), &entities) {
-                row = row.child(chunk);
-            }
-            if focused {
-                row = row.child(caret_element(caret_id));
-            }
-            row.into_any_element()
+            self.editor_canvas(
+                EditorId::Field(field),
+                focused,
+                placeholder,
+                editor_surface::FIELD_FONT,
+                editor_surface::FIELD_LINE,
+                cx,
+            )
         };
         focus_glow(
             glow_id,
@@ -9356,13 +9270,19 @@ impl XPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        this.input_target = target;
-                        // Focus now (not next frame) so the very next key lands here.
-                        this.focus.focus(window, cx);
-                        this.pending_focus = false;
-                        this.field_all_selected = (event.click_count >= 2).then_some(field);
-                        cx.stop_propagation();
-                        cx.notify();
+                        if field == TextField::RgKey {
+                            this.input_target = target;
+                            // Focus now (not next frame) so the very next key lands here.
+                            this.focus.focus(window, cx);
+                            this.pending_focus = false;
+                            this.field_all_selected = (event.click_count >= 2).then_some(field);
+                            cx.stop_propagation();
+                            cx.notify();
+                        } else {
+                            // Padding around the shaped text. The canvas overlay
+                            // handles clicks on the glyphs themselves.
+                            this.editor_pointer_down(EditorId::Field(field), event, window, cx);
+                        }
                     }),
                 )
                 .into_any_element(),
@@ -9699,23 +9619,15 @@ impl XPanel {
                             .h(px(132.0))
                             .overflow_y_scroll()
                             .track_scroll(&self.compose_scroll)
-                            .child(self.render_compose_editor()),
+                            .child(self.render_compose_editor(cx)),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.focus.focus(window, cx);
-                            this.focus_compose_editor();
-                            // Empty draft: caret at left (0). Non-empty: jump to end.
-                            if this.compose.is_empty() {
-                                this.caret = 0;
-                            } else {
-                                this.caret = this.compose.len();
-                            }
-                            this.sel_anchor = None;
-                            this.pending_focus = false;
-                            cx.stop_propagation();
-                            cx.notify();
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // Clicks on the label or padding focus the draft.
+                            // Clicks on the shaped text are handled by the
+                            // editor overlay, which places the caret.
+                            this.editor_pointer_down(EditorId::Compose, event, window, cx);
                         }))
                     .into_any_element(),
             ))
@@ -9775,144 +9687,31 @@ impl XPanel {
             .into_any_element()
     }
 
-    fn render_compose_editor(&self) -> gpui_kit::AnyElement {
+    fn render_compose_editor(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
-        let show_caret = focused;
-        let caret = self.caret.min(self.compose.len());
-        let sel = self.selection_range();
-
         if let Some(burst) = self.burst_for(BurstTarget::Compose) {
             return div()
                 .mt(px(8.0))
                 .child(posted_burst_element(burst.seq, burst.label))
                 .into_any_element();
         }
-
-        if self.compose.is_empty() {
-            // Caret at LEFT (index 0). Hint only when empty AND unfocused —
-            // once the caret blinks, the placeholder must disappear.
-            return div()
-                .mt(px(8.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .children(show_caret.then(|| self.caret_bar()))
-                .children((!focused).then(|| {
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(
-                            "Click here - caret blinks, hint vanishes. Ctrl+V pastes. Premium counts to 25,000.",
-                        )
-                }))
-                .into_any_element();
-        }
-
-        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
-        let text = self.compose.as_str();
-        let entities = entity_spans(text);
-        let mut offset = 0usize;
-        let parts: Vec<&str> = text.split('\n').collect();
-        let max_chars = self.editor_max_chars();
-        for (idx, hard_line) in parts.iter().enumerate() {
-            for (sub_start, sub_end) in soft_wrap_ranges(hard_line, max_chars) {
-                let line = &hard_line[sub_start..sub_end];
-                let line_start = offset + sub_start;
-                let line_end = line_start + line.len();
-                let caret_on_line = caret >= line_start && caret <= line_end;
-                let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
-
-                // Build character runs: [start, end, selected]
-                let mut marks = vec![0usize, line.len()];
-                if caret_on_line {
-                    marks.push((caret - line_start).min(line.len()));
-                }
-                if let Some((sa, sb)) = sel {
-                    marks.push(sa.saturating_sub(line_start).min(line.len()));
-                    marks.push(sb.saturating_sub(line_start).min(line.len()));
-                }
-                // Entity edges split chunks so mentions/tags render blue.
-                for (es, ee, _) in &entities {
-                    for edge in [*es, *ee] {
-                        if edge > line_start && edge < line_end {
-                            marks.push(edge - line_start);
-                        }
-                    }
-                }
-                marks.sort_unstable();
-                marks.dedup();
-
-                let mut caret_drawn = false;
-                for window in marks.windows(2) {
-                    let (s, e) = (window[0], window[1]);
-                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == s {
-                        row = row.child(self.caret_bar());
-                        caret_drawn = true;
-                    }
-                    if s < e {
-                        let abs_s = line_start + s;
-                        let abs_e = line_start + e;
-                        let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
-                        let in_entity = entities
-                            .iter()
-                            .any(|(es, ee, _)| abs_s >= *es && abs_e <= *ee);
-                        let chunk = &line[s..e];
-                        let mut el = div().text_size(px(14.0));
-                        if selected {
-                            el = el
-                                .px(px(1.0))
-                                .rounded(px(3.0))
-                                .bg(tint(0xff4fa3, 130))
-                                .text_color(rgb(0xffe8f5));
-                        } else if in_entity {
-                            el = el.text_color(rgb(ENTITY_BLUE));
-                        } else {
-                            el = el.text_color(rgb(0xf8fbff));
-                        }
-                        row = row.child(el.child(chunk.to_string()));
-                    }
-                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == e {
-                        row = row.child(self.caret_bar());
-                        caret_drawn = true;
-                    }
-                }
-                if show_caret && caret_on_line && !caret_drawn {
-                    row = row.child(self.caret_bar());
-                }
-                if line.is_empty() && !(show_caret && caret_on_line) {
-                    row = row.child(
-                        div()
-                            .text_size(px(14.0))
-                            .text_color(rgb(0xf8fbff))
-                            .child(" "),
-                    );
-                }
-
-                rows.push(row.into_any_element());
-            }
-            offset += hard_line.len() + if idx + 1 < parts.len() { 1 } else { 0 };
-        }
-
+        // Hint only while the empty box is unfocused. Once it has the
+        // caret, the placeholder goes away (same rule as before).
+        let placeholder = if focused {
+            ""
+        } else {
+            "Click here and type. Ctrl+V pastes. Premium counts to 25,000."
+        };
         div()
             .mt(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn caret_bar(&self) -> gpui_kit::AnyElement {
-        div()
-            .w(px(2.0))
-            .h(px(16.0))
-            .rounded(px(1.0))
-            .bg(rgb(0x7af6ff))
-            .flex_none()
-            .with_animation("caret-compose", breath_animation(2_300), |el, v| {
-                el.opacity(0.12 + 0.88 * v)
-            })
+            .child(self.editor_canvas(
+                EditorId::Compose,
+                focused,
+                placeholder,
+                editor_surface::COMPOSE_FONT,
+                editor_surface::COMPOSE_LINE,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -10632,6 +10431,31 @@ mod edit_keys_tests {
     }
 
     #[test]
+    fn wrapped_arrow_motion_moves_by_visual_line_and_grapheme() {
+        use termy_x::draft_edit::{DraftCaret, Motion};
+        let text = "hello world this is a long line";
+        let lines = soft_wrap_ranges(text, 10);
+        assert!(lines.len() > 1);
+        let mut caret = DraftCaret::collapsed(0);
+        caret.move_by(text, &lines, Motion::End, false);
+        let (start, end) = lines[0];
+        assert_eq!(caret.caret, end);
+        assert!(end > start);
+        caret.move_by(text, &lines, Motion::Down, false);
+        assert_eq!(caret_visual_line(text, caret.caret, 10), 1);
+        caret.move_by(text, &lines, Motion::Home, false);
+        assert_eq!(caret.caret, lines[1].0);
+        caret.move_by(text, &lines, Motion::Right, true);
+        assert_eq!(
+            caret.selection(),
+            Some((
+                lines[1].0,
+                termy_x::draft_edit::next_grapheme(text, lines[1].0)
+            ))
+        );
+    }
+
+    #[test]
     fn burst_grows_then_explodes_and_fades() {
         assert_eq!(BURST_MS, 1_150);
         let (f0, o0) = burst_style_at(0.0);
@@ -10813,9 +10637,11 @@ mod masked_secret_tests {
 }
 
 impl XPanel {
-    fn single_line_text_mut(&mut self, field: TextField) -> Option<&mut String> {
+    fn field_text_mut(&mut self, field: TextField) -> Option<&mut String> {
         Some(match field {
             TextField::Search => &mut self.search_input,
+            TextField::Reply => &mut self.reply_text,
+            TextField::Quote => &mut self.quote_text,
             TextField::Trends => &mut self.trends_filter,
             TextField::Research => &mut self.research_input,
             TextField::Lookup => &mut self.lookup,
@@ -10826,7 +10652,6 @@ impl XPanel {
             TextField::Analyze => &mut self.desk.analyze_handle,
             TextField::RgTopic => &mut self.desk.rg_topic,
             TextField::RgKey => &mut self.desk.rg_key_input,
-            _ => return None,
         })
     }
 }
