@@ -627,6 +627,52 @@ pub const ENGINE_RELEASE_ORDER: &[&str] = &[
     "destroy-host",
 ];
 
+/// libVLC setup runs on the thread that created the drawable.
+pub const START_ON_WINDOW_THREAD: bool = true;
+
+/// `Player::start` is called from a GPUI update, which still holds the
+/// panel borrow. Pumping the thread queue there re-enters GPUI through
+/// `DispatchMessage`. A panic on that path cannot unwind out of the
+/// Win32 frame and `abort()`s. Windows records that as `0xc0000409`
+/// in `ucrtbase.dll` (the installed 0278d94 crashes).
+pub const DISPATCH_DURING_START: bool = false;
+
+pub const LIBVLC_START_ORDER: &[&str] = &[
+    "place-child",
+    "require-clip-children",
+    "libvlc-new-on-window-thread",
+    "set-hwnd",
+    "play",
+    "show-host",
+];
+
+/// True when this start would take the fail-fast path seen on the
+/// installed build: dispatching window messages during start, or
+/// handing VLC 3.0.24 a drawable without `WS_CLIPCHILDREN` (the vout
+/// asserts that style and aborts when the assert is compiled in).
+pub fn start_would_abort_in_ucrt(dispatch_during_start: bool, clip_children: bool) -> bool {
+    dispatch_during_start || !clip_children
+}
+
+pub fn surface_style_for_libvlc(style: u32) -> Result<(), &'static str> {
+    if style & HOST_STYLE_POPUP != 0 || style & WS_CHILD == 0 {
+        return Err("video surface must stay a child of the Termy window");
+    }
+    if style & HOST_STYLE_CLIP_CHILDREN == 0 {
+        return Err("video surface is missing WS_CLIPCHILDREN, so VLC would abort");
+    }
+    Ok(())
+}
+
+/// `argc` counts real arguments. The pointer list also ends in NULL so
+/// a libVLC build that walks `argv` cannot run off the end into ucrt.
+pub fn libvlc_argc(argument_count: usize, terminator_present: bool) -> Result<i32, &'static str> {
+    if !terminator_present {
+        return Err("libvlc argv is missing its NULL terminator");
+    }
+    i32::try_from(argument_count).map_err(|_| "libvlc argc does not fit")
+}
+
 pub fn dispatch_media(kind: MediaKind, url: &str) -> MediaDispatch {
     if kind == MediaKind::Photo {
         return MediaDispatch::StillImage;
@@ -988,6 +1034,9 @@ mod vlc_embed {
     const SWP_NOZORDER: u32 = 0x0004;
     const WM_SYSCOMMAND: u32 = 0x0112;
     const SC_MAXIMIZE: usize = 0xF030;
+    const WS_EX_NOPARENTNOTIFY: u32 = 0x0000_0004;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const GWL_STYLE: i32 = -16;
 
     #[repr(C)]
     struct WndClass {
@@ -1003,18 +1052,6 @@ mod vlc_embed {
         lpsz_menu_name: *const u16,
         lpsz_class_name: *const u16,
         h_icon_sm: Hwnd,
-    }
-    #[repr(C)]
-    struct Msg {
-        hwnd: Hwnd,
-        message: u32,
-        _pad: u32,
-        wparam: usize,
-        lparam: isize,
-        time: u32,
-        pt_x: i32,
-        pt_y: i32,
-        lprivate: u32,
     }
     #[repr(C)]
     struct LibvlcEvent {
@@ -1033,12 +1070,11 @@ mod vlc_embed {
         fn SetWindowPos(h: Hwnd, after: Hwnd, x: i32, y: i32, w: i32, h: i32, flags: u32) -> i32;
         fn DefWindowProcW(h: Hwnd, m: u32, w: usize, l: isize) -> isize;
         fn GetModuleHandleW(name: *const u16) -> Hwnd;
-        fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
-        fn TranslateMessage(msg: *const Msg) -> i32;
-        fn DispatchMessageW(msg: *const Msg) -> isize;
         fn LoadLibraryExW(name: *const u16, file: Hwnd, flags: u32) -> Hmodule;
         fn GetProcAddress(module: Hmodule, name: *const i8) -> *mut core::ffi::c_void;
         fn SetPropW(hwnd: Hwnd, name: *const u16, data: *mut core::ffi::c_void) -> i32;
+        fn GetWindowLongW(hwnd: Hwnd, index: i32) -> i32;
+        fn SetWindowLongW(hwnd: Hwnd, index: i32, value: i32) -> i32;
     }
 
     type Cb = unsafe extern "system" fn(*const LibvlcEvent, *mut core::ffi::c_void);
@@ -1060,8 +1096,8 @@ mod vlc_embed {
         set_time: unsafe extern "system" fn(*mut core::ffi::c_void, i64) -> i32,
         get_position: unsafe extern "system" fn(*mut core::ffi::c_void) -> f32,
         is_seekable: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
-        set_mouse: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32,
-        set_key: unsafe extern "system" fn(*mut core::ffi::c_void, u32) -> i32,
+        set_mouse: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
+        set_key: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
         event_manager: unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
         event_attach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void) -> i32,
         event_detach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void),
@@ -1089,14 +1125,6 @@ mod vlc_embed {
     }
 
     enum Job {
-        Start {
-            url: CString,
-            volume: i32,
-            hwnd: usize,
-            generation: u64,
-            slot: Arc<Slot>,
-            reply: std::sync::mpsc::Sender<Result<(), String>>,
-        },
         Pause { generation: u64, paused: bool },
         Seek { generation: u64, ms: i64 },
         Volume { generation: u64, percent: i32 },
@@ -1128,24 +1156,30 @@ mod vlc_embed {
     }
 
     unsafe extern "system" fn on_event(event: *const LibvlcEvent, data: *mut core::ffi::c_void) {
-        if event.is_null() || data.is_null() {
-            return;
-        }
-        let slot = unsafe { &*(data as *const Slot) };
-        if slot.closed.load(Ordering::Acquire) {
-            return;
-        }
-        let kind = unsafe { (*event).kind } as u32;
-        if let Ok(mut queue) = events().lock() {
-            queue.push((slot.generation, kind));
-        }
+        // A panic here would unwind through libVLC and abort the process.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if event.is_null() || data.is_null() {
+                return;
+            }
+            let slot = unsafe { &*(data as *const Slot) };
+            if slot.closed.load(Ordering::Acquire) {
+                return;
+            }
+            let kind = unsafe { (*event).kind } as u32;
+            if let Ok(mut queue) = events().lock() {
+                queue.push((slot.generation, kind));
+            }
+        }));
     }
 
     unsafe extern "system" fn wndproc(h: Hwnd, m: u32, w: usize, l: isize) -> isize {
-        if m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_MAXIMIZE {
-            return 0;
-        }
-        unsafe { DefWindowProcW(h, m, w, l) }
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_MAXIMIZE {
+                return 0;
+            }
+            unsafe { DefWindowProcW(h, m, w, l) }
+        }))
+        .unwrap_or(0)
     }
 
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
@@ -1214,6 +1248,13 @@ mod vlc_embed {
             return Ok(api);
         }
         validate_tree(dir)?;
+        let core = dir.join("libvlccore.dll");
+        let core_w = wide(core.as_os_str());
+        let core_module = unsafe { LoadLibraryExW(core_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
+        if core_module.is_null() {
+            return Err(super::VLC_ENGINE_MISSING.into());
+        }
+        let _ = core_module;
         let dll = dir.join("libvlc.dll");
         let dll_w = wide(dll.as_os_str());
         let module = unsafe { LoadLibraryExW(dll_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
@@ -1272,9 +1313,6 @@ mod vlc_embed {
                 queue.remove(0)
             };
             match job {
-                Job::Start { url, volume, hwnd, generation, slot, reply } => {
-                    let _ = reply.send(worker_start(url, volume, hwnd, generation, slot));
-                }
                 Job::Pause { generation, paused } => worker_pause(generation, paused),
                 Job::Seek { generation, ms } => worker_seek(generation, ms),
                 Job::Volume { generation, percent } => worker_volume(generation, percent),
@@ -1295,20 +1333,41 @@ mod vlc_embed {
         Some(f(api, cur.player as *mut core::ffi::c_void))
     }
 
-    fn worker_start(url: CString, volume: i32, hwnd: usize, generation: u64, slot: Arc<Slot>) -> Result<(), String> {
+    fn ensure_clip_children(host: Hwnd) -> Result<(), String> {
+        let current = unsafe { GetWindowLongW(host, GWL_STYLE) } as u32;
+        let next = current | super::HOST_STYLE_CLIP_CHILDREN;
+        unsafe { SetWindowLongW(host, GWL_STYLE, next as i32); }
+        let after = unsafe { GetWindowLongW(host, GWL_STYLE) } as u32;
+        if super::start_would_abort_in_ucrt(false, after & super::HOST_STYLE_CLIP_CHILDREN != 0) {
+            return Err("video surface is missing WS_CLIPCHILDREN, so VLC would abort. No window was opened.".into());
+        }
+        super::surface_style_for_libvlc(after).map_err(str::to_string)
+    }
+
+    /// Called on the window thread. Does not pump messages: the caller is
+    /// inside a GPUI update, and `DispatchMessage` from here abort()s.
+    fn open_embedded(url: CString, volume: i32, hwnd: usize, generation: u64, slot: Arc<Slot>) -> Result<(), String> {
+        if !super::START_ON_WINDOW_THREAD || super::start_would_abort_in_ucrt(super::DISPATCH_DURING_START, true) {
+            return Err("video start would abort before playback. No window was opened.".into());
+        }
+        ensure_clip_children(hwnd as Hwnd)?;
         let exe = find_vlc().ok_or_else(|| super::VLC_NOT_FOUND.to_string())?;
         let Some(dir) = exe.parent() else {
             return Err(super::VLC_ENGINE_MISSING.into());
         };
         let api = load_api(dir)?;
-        if let Some(old) = current().lock().ok().and_then(|mut g| g.take()) {
+        let old = current().lock().ok().and_then(|mut g| g.take());
+        if let Some(old) = old {
             release_handles(api, old);
         }
         let plugins = dir.join("plugins");
         let args = libvlc_instance_args(&plugins.to_string_lossy());
         let c_args: Vec<CString> = args.iter().map(|arg| CString::new(arg.as_str()).unwrap_or_else(|_| CString::new("").unwrap())).collect();
-        let ptrs: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
-        let instance = unsafe { (api.new)(ptrs.len() as i32, ptrs.as_ptr()) };
+        let mut ptrs: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
+        ptrs.push(std::ptr::null());
+        let argc = super::libvlc_argc(c_args.len(), ptrs.last().is_some_and(|ptr| ptr.is_null()))
+            .map_err(str::to_string)?;
+        let instance = unsafe { (api.new)(argc, ptrs.as_ptr()) };
         if instance.is_null() {
             return Err("VLC's engine did not start. No window was opened.".into());
         }
@@ -1327,8 +1386,8 @@ mod vlc_embed {
         }
         unsafe {
             (api.set_hwnd)(player, hwnd as Hwnd);
-            let _ = (api.set_mouse)(player, 0);
-            let _ = (api.set_key)(player, 0);
+            (api.set_mouse)(player, 0);
+            (api.set_key)(player, 0);
             let _ = (api.set_volume)(player, volume);
             (api.set_mute)(player, if volume == 0 { 1 } else { 0 });
             let manager = (api.event_manager)(player);
@@ -1338,22 +1397,31 @@ mod vlc_embed {
                 let _ = (api.event_attach)(manager, LIBVLC_EVENT_ERROR as i32, on_event, user);
             }
             if (api.play)(player) != 0 {
+                (api.set_hwnd)(player, std::ptr::null_mut());
+                (api.stop)(player);
                 (api.player_release)(player);
                 (api.media_release)(media);
                 (api.release)(instance);
                 return Err("VLC's engine could not play this file. No window was opened.".into());
             }
         }
-        if let Ok(mut guard) = current().lock() {
-            *guard = Some(Handles {
-                instance: instance as usize,
-                media: media as usize,
-                player: player as usize,
-                generation,
-                slot,
-            });
+        let handles = Handles {
+            instance: instance as usize,
+            media: media as usize,
+            player: player as usize,
+            generation,
+            slot,
+        };
+        match current().lock() {
+            Ok(mut guard) => {
+                *guard = Some(handles);
+                Ok(())
+            }
+            Err(_) => {
+                release_handles(api, handles);
+                Err("VLC's engine could not keep this playback. No window was opened.".into())
+            }
         }
-        Ok(())
     }
 
     fn worker_pause(generation: u64, paused: bool) {
@@ -1470,31 +1538,6 @@ mod vlc_embed {
         }
     }
 
-    fn pump_until(rx: &std::sync::mpsc::Receiver<Result<(), String>>) -> Result<(), String> {
-        let started = Instant::now();
-        loop {
-            match rx.try_recv() {
-                Ok(result) => return result,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("VLC's engine stopped responding. No window was opened.".into());
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    if started.elapsed().as_secs() > 12 {
-                        return Err("VLC's engine did not start in time. No window was opened.".into());
-                    }
-                    unsafe {
-                        let mut msg = std::mem::zeroed::<Msg>();
-                        while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 1) != 0 {
-                            TranslateMessage(&msg);
-                            DispatchMessageW(&msg);
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(8));
-                }
-            }
-        }
-    }
-
     pub struct Player {
         host: Hwnd,
         parent: Hwnd,
@@ -1536,7 +1579,7 @@ mod vlc_embed {
                 };
                 let _ = RegisterClassExW(&wc);
                 CreateWindowExW(
-                    0,
+                    WS_EX_NOPARENTNOTIFY | WS_EX_NOACTIVATE,
                     class.as_ptr(),
                     wide(std::ffi::OsStr::new("")).as_ptr(),
                     host_child_style(),
@@ -1565,27 +1608,20 @@ mod vlc_embed {
                 seekable: AtomicBool::new(false),
                 audio_stop_ms: AtomicU64::new(0),
             });
-            let (tx, rx) = std::sync::mpsc::channel();
-            enqueue(Job::Start {
-                url: location,
-                volume: i32::from(volume.min(100)),
-                hwnd: host as usize,
+            // No PeekMessage/DispatchMessage here. This runs inside a GPUI
+            // update; pumping the thread queue re-enters that borrow and
+            // abort()s (0xc0000409 in ucrtbase). libVLC runs on this thread,
+            // then GPUI's own loop runs after the update returns.
+            if let Err(err) = open_embedded(
+                location,
+                i32::from(volume.min(100)),
+                host as usize,
                 generation,
-                slot: Arc::clone(&slot),
-                reply: tx,
-            });
-            if let Err(err) = pump_until(&rx) {
+                Arc::clone(&slot),
+            ) {
                 slot.closed.store(true, Ordering::Release);
-                if let Ok(mut guard) = reaps().lock() {
-                    guard.push(Reap {
-                        host: host as usize,
-                        slot: Arc::clone(&slot),
-                    });
-                }
-                enqueue(Job::Stop {
-                    generation,
-                    slot,
-                });
+                slot.released.store(true, Ordering::Release);
+                unsafe { DestroyWindow(host) };
                 return Err(err);
             }
             unsafe { ShowWindow(host, SW_SHOWNA) };
@@ -3089,9 +3125,10 @@ mod tests {
         marker_name, playback_args, pos_is_noop, rect_changed, rects_overlap, sanitize_token,
         select_vlc, swp_names, vlc_candidates, vlc_playback_args, volume_commands, volume_percent,
         apply_engine_callback, client_pixels, engine_files_plan, engine_plan, engine_step,
-        host_child_style, launches_external_vlc, libvlc_instance_args, pe_machine,
-        ENGINE_RELEASE_ORDER, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, LIBVLC_EVENT_END,
-        LIBVLC_EVENT_ERROR,
+        host_child_style, launches_external_vlc, libvlc_argc, libvlc_instance_args, pe_machine,
+        start_would_abort_in_ucrt, surface_style_for_libvlc, ENGINE_RELEASE_ORDER,
+        DISPATCH_DURING_START, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, LIBVLC_EVENT_END,
+        LIBVLC_EVENT_ERROR, LIBVLC_START_ORDER, START_ON_WINDOW_THREAD,
     };
     use std::path::{Path, PathBuf};
     use termy_x::model::MediaKind;
@@ -3415,5 +3452,43 @@ mod tests {
             engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 0, true),
             EnginePlan::Embed
         );
+    }
+
+    #[test]
+    fn play_start_does_not_pump_the_ui_thread_or_skip_clip_children() {
+        // Installed 0278d94 aborted in ucrtbase (0xc0000409) on play.
+        // Start runs inside a GPUI update. DispatchMessage re-enters that
+        // borrow; the panic cannot unwind through the Win32 frame and abort()s.
+        // VLC 3.0.24 also aborts when the drawable lacks WS_CLIPCHILDREN.
+        assert!(START_ON_WINDOW_THREAD);
+        assert!(!DISPATCH_DURING_START);
+        assert!(!start_would_abort_in_ucrt(DISPATCH_DURING_START, true));
+        assert!(start_would_abort_in_ucrt(true, true));
+        assert!(start_would_abort_in_ucrt(false, false));
+        assert_eq!(
+            LIBVLC_START_ORDER,
+            [
+                "place-child",
+                "require-clip-children",
+                "libvlc-new-on-window-thread",
+                "set-hwnd",
+                "play",
+                "show-host",
+            ]
+        );
+        let play_at = LIBVLC_START_ORDER.iter().position(|step| *step == "play").unwrap();
+        let thread_at = LIBVLC_START_ORDER
+            .iter()
+            .position(|step| *step == "libvlc-new-on-window-thread")
+            .unwrap();
+        assert!(thread_at < play_at);
+        assert!(surface_style_for_libvlc(host_child_style()).is_ok());
+        assert!(surface_style_for_libvlc(host_child_style() & !HOST_STYLE_CLIP_CHILDREN).is_err());
+        assert!(surface_style_for_libvlc(host_create_style()).is_err());
+        assert_eq!(libvlc_argc(5, true).unwrap(), 5);
+        assert!(libvlc_argc(5, false).is_err());
+        let args = libvlc_instance_args(r"C:\Program Files\VideoLAN\VLC\plugins");
+        assert_eq!(libvlc_argc(args.len(), true).unwrap() as usize, args.len());
+        assert!(args.iter().all(|arg| !arg.contains("http")));
     }
 }
