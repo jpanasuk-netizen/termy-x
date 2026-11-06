@@ -93,6 +93,12 @@ impl XPanel {
         }
         self.status = format!("{} \u{b7} {}", self.section.label(), sort.label());
         self.persist_list_sort();
+        // Search's provider query is Top vs Latest. Re-ask once, on the
+        // existing single-flight path. Other lists re-rank what is loaded.
+        if self.live && self.section == XSection::Search && !self.searched_query.is_empty() {
+            self.loading = true;
+            self.schedule_fetch(XSection::Search, cx);
+        }
         cx.notify();
     }
 

@@ -60,12 +60,18 @@ pub fn cmp_posts(left: &Post, right: &Post, sort: ResultSort) -> Ordering {
     }
 }
 
+fn created_key(post: &Post) -> Option<i64> {
+    post.created_at
+        .as_deref()
+        .and_then(crate::time::parse_created_at)
+}
+
 fn cmp_created_desc(left: &Post, right: &Post) -> Ordering {
-    match (left.created_at.as_deref(), right.created_at.as_deref()) {
-        (Some(a), Some(b)) => b.cmp(a),
+    match (created_key(left), created_key(right)) {
+        (Some(a), Some(b)) => b.cmp(&a).then_with(|| left.id.cmp(&right.id)),
         (Some(_), None) => Ordering::Less,
         (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
+        (None, None) => left.id.cmp(&right.id),
     }
 }
 
@@ -144,6 +150,41 @@ mod tests {
             .map(|p| p.id)
             .collect();
         assert_eq!(ids, ["new", "old", "undated"]);
+    }
+
+    #[test]
+    fn newest_parses_twitter_dates_and_unix_instead_of_raw_text() {
+        // Raw text order is the opposite of time: "Mon..." < "Wed...",
+        // and "99" > "100".
+        let posts = vec![
+            post(
+                "old-twitter",
+                50,
+                0,
+                Some("Wed Oct 01 00:00:00 +0000 2020"),
+            ),
+            post(
+                "new-twitter",
+                1,
+                0,
+                Some("Mon Jan 15 00:00:00 +0000 2026"),
+            ),
+            post("unix-small", 40, 0, Some("99")),
+            post("unix-big", 2, 0, Some("100")),
+        ];
+        let ids: Vec<String> = sorted_posts(&posts, ResultSort::Newest)
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_eq!(
+            ids,
+            ["new-twitter", "old-twitter", "unix-big", "unix-small"]
+        );
+        let popular: Vec<String> = sorted_posts(&posts, ResultSort::Popular)
+            .into_iter()
+            .map(|item| item.id)
+            .collect();
+        assert_ne!(popular, ids);
     }
 
     #[test]

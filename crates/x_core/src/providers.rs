@@ -249,7 +249,10 @@ impl Service {
             publishers.push(Box::new(OpenCliPublisher::new(config, runner.clone())));
             publishers.push(Box::new(TwitterCliPublisher::new(config, runner)));
         }
-        if config.provider.is_none() || config.provider == Some(ProviderId::Mock) {
+        // Fixtures only when the config asks for them. The normal app
+        // (provider unset) is OpenCLI, then twitter-cli. A miss is an
+        // error, not a silent page of test posts.
+        if config.provider == Some(ProviderId::Mock) {
             readers.push(Box::new(MockProvider));
         }
         if config.provider == Some(ProviderId::OpenCli) {
@@ -2915,16 +2918,6 @@ pub fn research_topic(
         }
     }
     hits.extend(rss_hits(topic, runner));
-    if hits.is_empty() {
-        hits.push(ResearchHit {
-            source: "fixture".into(),
-            title: format!("What people are saying about {topic}"),
-            url: "https://example.com/research".into(),
-            excerpt: "No Reddit, YouTube, or web reader was available. This fixture is safe to draft from."
-                .into(),
-            session: None,
-        });
-    }
     hits
 }
 
@@ -3687,30 +3680,47 @@ mod tests {
     }
 
     #[test]
-    fn default_readers_skip_the_official_api_and_land_on_mock() {
+    fn default_readers_are_live_only_and_do_not_serve_fixtures() {
         let runner = Arc::new(ScriptedRunner::new());
         let http = Arc::new(crate::io::MapHttp::default());
         let service = Service::free(&quiet_config(), runner, http);
         assert_eq!(
             service.reader_ids(),
-            vec![
-                ProviderId::OpenCli,
-                ProviderId::TwitterCli,
-                ProviderId::Mock
-            ]
+            vec![ProviderId::OpenCli, ProviderId::TwitterCli]
         );
+        assert!(!service.reader_ids().contains(&ProviderId::Mock));
         assert!(!service.reader_ids().contains(&ProviderId::OfficialApi));
-        let timeline = service.timeline(2).unwrap();
-        assert_eq!(timeline.status.provider, ProviderId::Mock);
-        assert!(timeline.status.render().contains("no X API credits"));
-        assert_eq!(timeline.value.len(), 2);
+        let error = service.timeline(100).unwrap_err();
         assert!(
-            timeline
-                .status
-                .attempts
+            !error.contains("fy home post") && !error.contains("home post"),
+            "{error}"
+        );
+        let page = service.timeline_page(TimelineFeed::ForYou, None, 100);
+        assert!(page.is_err());
+        if let Err(error) = page {
+            assert!(!error.contains("fy home post"), "{error}");
+        }
+    }
+
+    #[test]
+    fn fixtures_require_an_explicit_mock_provider() {
+        let mut config = quiet_config();
+        config.provider = Some(ProviderId::Mock);
+        let service = Service::free(
+            &config,
+            Arc::new(ScriptedRunner::new()),
+            Arc::new(crate::io::MapHttp::default()),
+        );
+        assert_eq!(service.reader_ids(), vec![ProviderId::Mock]);
+        let page = service
+            .timeline_page(TimelineFeed::ForYou, None, HOME_UI_PAGE)
+            .unwrap();
+        assert_eq!(page.status.provider, ProviderId::Mock);
+        assert!(
+            page.value
+                .posts
                 .iter()
-                .any(|attempt| attempt.provider == ProviderId::OpenCli
-                    && attempt.kind == AttemptKind::Skipped)
+                .any(|post| post.text.contains("fy home post"))
         );
     }
 

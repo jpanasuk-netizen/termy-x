@@ -4884,7 +4884,7 @@ fn fetch_section(
                 // top, Load more continues strictly older from the
                 // stored bottom cursor \u{2014} never a bigger re-fetch.
                 match service.timeline_page(feed, cursor.as_deref(), limit) {
-                    Ok(served) => {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
                         return FetchPayload::Timeline {
                             posts: served.value.posts,
                             status: live_status(&served.status),
@@ -4894,6 +4894,18 @@ fn fetch_section(
                             next_cursor: served.value.next_cursor,
                             cursor_ok: true,
                             failed: false,
+                        };
+                    }
+                    Ok(_) => {
+                        return FetchPayload::Timeline {
+                            posts: Vec::new(),
+                            status: "could not load timeline \u{2014} fixture posts are not used in the normal app. Connect X and try again.".into(),
+                            feed,
+                            append,
+                            requested: limit,
+                            next_cursor: None,
+                            cursor_ok: false,
+                            failed: true,
                         };
                     }
                     Err(error) => {
@@ -4913,7 +4925,9 @@ fn fetch_section(
                         }
                         // Fresh load: legacy one-shot fetch still works
                         // when the cursor session cannot start.
-                        if let Ok(served) = service.timeline_feed(feed, limit.min(TIMELINE_PAGE)) {
+                        if let Ok(served) = service.timeline_feed(feed, limit.min(TIMELINE_PAGE))
+                            && served.status.provider != termy_x::ProviderId::Mock
+                        {
                             return FetchPayload::Timeline {
                                 posts: served.value,
                                 status: format!(
@@ -4945,12 +4959,26 @@ fn fetch_section(
                 }
             }
             XSection::Search => {
-                if let Ok(served) = service.search(&query, newest, LIST_PAGE) {
-                    return FetchPayload::Search {
-                        posts: served.value,
-                        status: live_status(&served.status),
-                    };
-                }
+                return match service.search(&query, newest, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Search {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Search {
+                        posts: Vec::new(),
+                        status: "could not search \u{2014} fixture posts are not used in the normal app."
+                            .into(),
+                    },
+                    Err(error) => FetchPayload::Search {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not search \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
             }
             XSection::Mentions => {
                 let who = if handle.trim().is_empty() {
@@ -4958,12 +4986,25 @@ fn fetch_section(
                 } else {
                     handle.as_str()
                 };
-                if let Ok(served) = service.mentions(who, LIST_PAGE) {
-                    return FetchPayload::Mentions {
-                        posts: served.value,
-                        status: live_status(&served.status),
-                    };
-                }
+                return match service.mentions(who, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Mentions {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Mentions {
+                        posts: Vec::new(),
+                        status: "could not load mentions \u{2014} fixture posts are not used in the normal app.".into(),
+                    },
+                    Err(error) => FetchPayload::Mentions {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not load mentions \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
             }
             XSection::Inbox => {
                 let who = if handle.trim().is_empty() {
@@ -4971,12 +5012,25 @@ fn fetch_section(
                 } else {
                     handle.as_str()
                 };
-                if let Ok(served) = service.inbox_replies(who, LIST_PAGE) {
-                    return FetchPayload::Inbox {
-                        posts: served.value,
-                        status: live_status(&served.status),
-                    };
-                }
+                return match service.inbox_replies(who, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Inbox {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Inbox {
+                        posts: Vec::new(),
+                        status: "could not load inbox \u{2014} fixture posts are not used in the normal app.".into(),
+                    },
+                    Err(error) => FetchPayload::Inbox {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not load inbox \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
             }
             XSection::Trends => {
                 match service.trends(Some("worldwide"), 50) {
@@ -5044,10 +5098,22 @@ fn fetch_section(
             | XSection::Followers
             | XSection::Queue
             | XSection::Analyze
-            | XSection::ReplyGuy => {}
+            | XSection::ReplyGuy => {
+                return FetchPayload::Timeline {
+                    posts: Vec::new(),
+                    status: "could not load \u{2014} this tab does not use fixture posts".into(),
+                    feed,
+                    append,
+                    requested: limit,
+                    next_cursor: None,
+                    cursor_ok: false,
+                    failed: true,
+                };
+            }
         }
     }
 
+    // Preview / tests only. The normal app returned above.
     match section {
         XSection::Timeline => {
             let page = MockProvider
@@ -6273,7 +6339,7 @@ impl XPanel {
             );
         } else {
             rows.push(hint(format!(
-                "{total} unique trends \u{b7} {} \u{b7} Top 20 first, then grouped by the category X reports \u{b7} X no longer publishes trend post counts",
+                "{total} unique trends \u{b7} {} \u{b7} Top 20 first, then grouped by the category X reports \u{b7} trends have no post time, so Newest keeps X's order",
                 self.list_sort.label()
             )));
         }
@@ -6922,7 +6988,7 @@ impl XPanel {
                 rows.push(hint(format!("best hours \u{b7} {}", hours.join(", "))));
             }
             rows.push(self.heatmap_grid(&report.heatmap));
-            for post in &report.top_posts {
+            for post in self.sorted_posts(&report.top_posts) {
                 rows.push(self.tweet_card(post, cx));
             }
         } else if !self.desk.loading {
@@ -7009,10 +7075,18 @@ impl XPanel {
                             "Loading timeline...",
                             "Using your free OpenCLI session. Nothing burns X API credits.",
                         ));
+                    } else if self.status.contains("could not")
+                        || self.status.contains("Not connected")
+                        || self.status.contains("no provider")
+                    {
+                        rows.push(empty_state(
+                            "Timeline did not load",
+                            self.status.clone(),
+                        ));
                     } else {
                         rows.push(empty_state(
                             "Timeline is quiet",
-                            "OpenCLI / twitter-cli / fixtures fill this lane. Press Timeline to retry.",
+                            "Press refresh after Connect my X. Nothing here is sample data.",
                         ));
                     }
                 } else if self.loading {
@@ -7038,13 +7112,15 @@ impl XPanel {
                         self.searched_query
                     )));
                 } else if self.search_posts.is_empty() {
-                    rows.push(empty_state(
-                        "No results",
+                    let detail = if self.status.contains("could not") {
+                        self.status.clone()
+                    } else {
                         format!(
                             "Nothing matched \u{201c}{}\u{201d}. Try a different word, a #tag, or from:someone.",
                             self.searched_query
-                        ),
-                    ));
+                        )
+                    };
+                    rows.push(empty_state("No results", detail));
                 } else {
                     rows.push(hint(format!(
                         "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} {} \u{b7} click a tweet to open the thread",
@@ -10550,6 +10626,36 @@ mod edit_keys_tests {
             ranked
         };
         assert_ne!(popular[0].id, newest[0].id);
+    }
+
+    #[test]
+    fn live_timeline_does_not_render_the_fy_fixture() {
+        let payload = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            true,
+            TimelineFeed::ForYou,
+            false,
+            TIMELINE_PAGE,
+            None,
+        );
+        let FetchPayload::Timeline {
+            posts, status, ..
+        } = payload
+        else {
+            panic!("timeline");
+        };
+        assert!(
+            posts.iter().all(|post| !post.text.contains("fy home post")),
+            "production timeline showed fixture text: {status}"
+        );
+        assert!(
+            !status.contains("fixture page"),
+            "production status labelled a fixture page: {status}"
+        );
     }
 
     #[test]
