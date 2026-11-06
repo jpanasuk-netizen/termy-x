@@ -181,6 +181,77 @@ pub fn host_style_starts_hidden(style: u32) -> bool {
     style & HOST_STYLE_VISIBLE == 0 && style & HOST_STYLE_CLIP_CHILDREN != 0
 }
 
+/// Flags for one playback. `--media-controls=no` stops mpv from opening
+/// the extra top-level `mpv-smtc` window (the 2304×1243 window seen on
+/// the live desktop). Mute and volume are mpv's own, not the OS mixer.
+pub fn playback_args(
+    wid: Option<isize>,
+    pipe: Option<&str>,
+    geometry: Option<&str>,
+    volume: u8,
+) -> Vec<String> {
+    let volume = volume.min(100);
+    let mut args = Vec::new();
+    if let Some(id) = wid {
+        args.push(format!("--wid={id}"));
+    }
+    if let Some(pipe) = pipe {
+        args.push(format!("--input-ipc-server={pipe}"));
+    }
+    if let Some(geometry) = geometry {
+        args.push(format!("--geometry={geometry}"));
+    }
+    args.extend(
+        [
+            "--fs=no",
+            "--fullscreen=no",
+            "--no-border",
+            "--no-auto-window-resize",
+            "--media-controls=no",
+            "--input-default-bindings=no",
+            "--input-vo-keyboard=no",
+            "--osc=no",
+            "--audio-exclusive=no",
+            "--aid=auto",
+            "--no-terminal",
+            "--really-quiet",
+            "--keep-open=yes",
+            "--cursor-autohide=no",
+            "--hwdec=auto-safe",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    args.push(format!("--volume={volume}"));
+    args.push(if volume == 0 {
+        "--mute=yes".to_string()
+    } else {
+        "--mute=no".to_string()
+    });
+    args
+}
+
+/// mpv's own volume, 0–100. Zero is silent. This does not touch the OS mixer.
+pub fn volume_commands(percent: u8) -> [String; 2] {
+    let percent = percent.min(100);
+    [
+        format!(r#"{{"command":["set_property","volume",{percent}]}}"#),
+        format!(
+            r#"{{"command":["set_property","mute",{}]}}"#,
+            if percent == 0 { "true" } else { "false" }
+        ),
+    ]
+}
+
+pub fn volume_percent(click_x: f32, bar_x: f32, bar_w: f32) -> u8 {
+    let frac = if bar_w <= 1.0 {
+        0.0
+    } else {
+        ((click_x - bar_x) / bar_w).clamp(0.0, 1.0)
+    };
+    (frac * 100.0).round().clamp(0.0, 100.0) as u8
+}
+
 /// Playback generation. Open and dismiss each bump it. A callback that
 /// captured an older value must not close or reopen the current player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -248,12 +319,18 @@ pub struct VideoPlayer {
 }
 
 impl VideoPlayer {
-    pub fn start(parent_hwnd: isize, scale: f32, rect: Rect, url: &str) -> Result<Self, String> {
+    pub fn start(
+        parent_hwnd: isize,
+        scale: f32,
+        rect: Rect,
+        url: &str,
+        volume: u8,
+    ) -> Result<Self, String> {
         #[cfg(windows)]
         {
             let bin = find_player()
                 .ok_or_else(|| "mpv not found (expected mpv\\mpv.exe next to Termy)".to_string())?;
-            let inner = win::Player::start(bin, parent_hwnd, scale, rect, url)?;
+            let inner = win::Player::start(bin, parent_hwnd, scale, rect, url, volume)?;
             Ok(Self { inner })
         }
         #[cfg(target_os = "linux")]
@@ -264,19 +341,10 @@ impl VideoPlayer {
             let bin = find_player().ok_or_else(|| {
                 "mpv not found on PATH (install mpv for external video playback)".to_string()
             })?;
+            let mut args = playback_args(None, None, None, volume);
+            args.push(url.to_string());
             let child = Command::new(&bin)
-                .args([
-                    "--fs=no",
-                    "--fullscreen=no",
-                    "--no-border",
-                    "--no-auto-window-resize",
-                    "--input-default-bindings=no",
-                    "--input-vo-keyboard=no",
-                    "--osc=no",
-                    "--really-quiet",
-                    "--keep-open=yes",
-                    url,
-                ])
+                .args(&args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -325,9 +393,11 @@ impl VideoPlayer {
             r#"{{"command":["set_property","mute",{}]}}"#,
             if muted { "true" } else { "false" }
         ));
-        if !muted {
-            // Never unmute into volume 0 (silent "unmuted" playback).
-            self.command(r#"{"command":["set_property","volume",100]}"#);
+    }
+
+    pub fn set_volume(&mut self, percent: u8) {
+        for command in volume_commands(percent) {
+            self.command(&command);
         }
     }
     fn command(&mut self, json: &str) {
@@ -585,6 +655,7 @@ mod win {
             scale: f32,
             rect: Rect,
             url: &str,
+            volume: u8,
         ) -> Result<Self, String> {
             if parent == 0 {
                 return Err("Termy window handle not ready yet".into());
@@ -664,27 +735,16 @@ mod win {
                 std::process::id(),
                 PIPE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             );
+            let mut args = super::playback_args(
+                Some(host as isize),
+                Some(&pipe),
+                Some(&format!("{w}x{h}+{x}+{y}")),
+                volume,
+            );
+            args.push(url.to_string());
+            trace_hwnd(host as isize, "spawn", (x, y, w, h));
             let mut cmd = Command::new(&bin);
-            cmd.args([
-                &format!("--wid={}", host as isize),
-                &format!("--input-ipc-server={pipe}"),
-                &format!("--geometry={w}x{h}+{x}+{y}"),
-                "--fs=no",
-                "--fullscreen=no",
-                "--no-border",
-                "--no-auto-window-resize",
-                "--input-default-bindings=no",
-                "--input-vo-keyboard=no",
-                "--osc=no",
-                "--no-terminal",
-                "--really-quiet",
-                "--keep-open=yes",
-                "--mute=no",
-                "--volume=100",
-                "--cursor-autohide=no",
-                "--hwdec=auto-safe",
-                url,
-            ])
+            cmd.args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -921,8 +981,8 @@ mod tests {
     use super::{
         CLOSE_BAND, HostGate, HostPhase, PlayGen, begin_playback, callback_is_current,
         clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
-        host_create_style, host_style_starts_hidden, rects_overlap, HOST_STYLE_CLIP_CHILDREN,
-        HOST_STYLE_VISIBLE,
+        host_create_style, host_style_starts_hidden, playback_args, rects_overlap,
+        volume_commands, volume_percent, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE,
     };
 
     #[test]
@@ -1001,5 +1061,27 @@ mod tests {
         assert!(host_style_starts_hidden(style));
         assert_eq!(style & HOST_STYLE_VISIBLE, 0);
         assert_ne!(style & HOST_STYLE_CLIP_CHILDREN, 0);
+    }
+
+    #[test]
+    fn volume_slider_maps_to_player_commands() {
+        assert_eq!(volume_percent(10.0, 10.0, 200.0), 0);
+        assert_eq!(volume_percent(210.0, 10.0, 200.0), 100);
+        assert_eq!(volume_percent(110.0, 10.0, 200.0), 50);
+        assert_eq!(volume_percent(-10.0, 10.0, 200.0), 0);
+        let silent = volume_commands(0);
+        assert!(silent[0].contains("\"volume\",0"));
+        assert!(silent[1].contains("\"mute\",true"));
+        let mid = volume_commands(40);
+        assert!(mid[0].contains("\"volume\",40"));
+        assert!(mid[1].contains("\"mute\",false"));
+        let args = playback_args(Some(1), None, None, 40);
+        assert!(args.iter().any(|arg| arg == "--media-controls=no"));
+        assert!(args.iter().any(|arg| arg == "--volume=40"));
+        assert!(args.iter().any(|arg| arg == "--mute=no"));
+        assert!(args.iter().all(|arg| arg != "--ao=null"));
+        let quiet = playback_args(None, None, None, 0);
+        assert!(quiet.iter().any(|arg| arg == "--mute=yes"));
+        assert!(quiet.iter().any(|arg| arg == "--volume=0"));
     }
 }

@@ -480,6 +480,8 @@ pub struct XPanel {
     player_pending: bool,
     player_paused: bool,
     player_muted: bool,
+    /// mpv's own volume, 0–100. Zero is silent. Not the OS mixer.
+    player_volume: u8,
     player_error: Option<String>,
     /// Bumped on open and on dismiss. A late player callback from an
     /// older video must not close or reopen the one on screen.
@@ -878,6 +880,7 @@ impl XPanel {
             player_pending: false,
             player_paused: false,
             player_muted: false,
+            player_volume: 100,
             player_error: None,
             player_gen: 0,
             #[cfg(target_os = "windows")]
@@ -7870,7 +7873,13 @@ impl XPanel {
             self.player_pending = false;
             let play_gen = player::PlayGen(self.player_gen);
             #[cfg(target_os = "windows")]
-            match player::VideoPlayer::start(self.host_hwnd, scale, rect, &viewer.url) {
+            match player::VideoPlayer::start(
+                self.host_hwnd,
+                scale,
+                rect,
+                &viewer.url,
+                self.player_volume,
+            ) {
                 Ok(player) => {
                     self.video_player = Some(player);
                     self.player_error = None;
@@ -7930,7 +7939,7 @@ impl XPanel {
                 }
             }
             #[cfg(target_os = "linux")]
-            match player::VideoPlayer::start(0, scale, rect, &viewer.url) {
+            match player::VideoPlayer::start(0, scale, rect, &viewer.url, self.player_volume) {
                 Ok(player) => {
                     self.video_player = Some(player);
                     // Honest UI note, shown over the viewer area: the
@@ -7993,6 +8002,28 @@ impl XPanel {
 
     /// Seek-bar click/drag at window-x `x`: fraction from the bar's known
     /// geometry (panel is the rightmost 480px, bar inset 12px each side).
+    fn set_player_volume(&mut self, percent: u8) {
+        let percent = percent.min(100);
+        self.player_volume = percent;
+        self.player_muted = percent == 0;
+        if let Some(player) = &mut self.video_player {
+            player.set_volume(percent);
+        }
+    }
+
+    fn volume_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
+        let panel_w = if self.fill_window {
+            self.viewport_w
+        } else {
+            480.0_f32.min(self.viewport_w)
+        };
+        let bar_x = self.viewport_w - panel_w + 12.0;
+        let bar_w = (panel_w - 24.0).max(1.0);
+        self.set_player_volume(player::volume_percent(x, bar_x, bar_w));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn seek_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
         let panel_w = if self.fill_window {
             self.viewport_w
@@ -8184,6 +8215,58 @@ impl XPanel {
                         }),
                     ),
             );
+            let vol = f32::from(self.player_volume) / 100.0;
+            controls = controls.child(
+                div()
+                    .id("x-viewer-volume")
+                    .relative()
+                    .w_full()
+                    .h(px(22.0))
+                    .flex_none()
+                    .rounded(px(999.0))
+                    .bg(tint(0x1a2a4a, 255))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tint(0x243656, 255)))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(px(bar_w * vol))
+                            .rounded(px(999.0))
+                            .bg(rgb(0xffd0ea)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(3.0))
+                            .left(px(10.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xe9fdff))
+                            .child(format!("Volume {}%", self.player_volume)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }),
+                    ),
+            );
             controls = controls.child(
                 div()
                     .flex()
@@ -8231,9 +8314,10 @@ impl XPanel {
                         "x-viewer-mute",
                         if self.player_muted { "Unmute" } else { "Mute" },
                         cx.listener(|this, _, _, cx| {
-                            this.player_muted = !this.player_muted;
-                            if let Some(pl) = &mut this.video_player {
-                                pl.set_muted(this.player_muted);
+                            if this.player_volume == 0 {
+                                this.set_player_volume(100);
+                            } else {
+                                this.set_player_volume(0);
                             }
                             cx.stop_propagation();
                             cx.notify();
