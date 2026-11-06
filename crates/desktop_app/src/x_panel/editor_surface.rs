@@ -35,6 +35,7 @@ struct EditorSnap {
     font_px: f32,
     line_h: f32,
     single_line: bool,
+    masked: bool,
 }
 
 pub(super) fn navigation_motion(key: &str, word: bool) -> Option<Motion> {
@@ -109,12 +110,11 @@ fn hex_hsla(hex: u32, alpha: f32) -> Hsla {
 impl XPanel {
     pub(super) fn active_editor(&self) -> Option<EditorId> {
         if self.bearer_mode {
-            return None;
+            return Some(EditorId::Bearer);
         }
         match self.input_target {
             InputTarget::Compose => Some(EditorId::Compose),
-            // Bullets are not the secret, so this box stays end-caret.
-            InputTarget::RgKey => None,
+            InputTarget::RgKey => Some(EditorId::Field(TextField::RgKey)),
             InputTarget::Reply => Some(EditorId::Field(TextField::Reply)),
             InputTarget::Quote => Some(EditorId::Field(TextField::Quote)),
             other => super::single_line_field_for(other).map(EditorId::Field),
@@ -158,6 +158,7 @@ impl XPanel {
             EditorId::Field(TextField::Analyze) => self.desk.analyze_handle.as_str(),
             EditorId::Field(TextField::RgTopic) => self.desk.rg_topic.as_str(),
             EditorId::Field(TextField::RgKey) => self.desk.rg_key_input.as_str(),
+            EditorId::Bearer => self.bearer_input.as_str(),
         }
     }
 
@@ -167,6 +168,7 @@ impl XPanel {
             EditorId::Field(field) => self
                 .field_text_mut(field)
                 .expect("every draft field has a string"),
+            EditorId::Bearer => &mut self.bearer_input,
         }
     }
 
@@ -178,6 +180,7 @@ impl XPanel {
                 preferred_col: self.compose_preferred,
             }),
             EditorId::Field(field) => self.field_carets.get(&field).copied(),
+            EditorId::Bearer => Some(self.bearer_caret),
         }
     }
 
@@ -191,6 +194,7 @@ impl XPanel {
             EditorId::Field(field) => {
                 self.field_carets.insert(field, draft);
             }
+            EditorId::Bearer => self.bearer_caret = draft,
         }
     }
 
@@ -324,6 +328,9 @@ impl XPanel {
                 self.input_target = InputTarget::Compose;
                 self.focus_compose_editor();
             }
+            EditorId::Bearer => {
+                self.bearer_mode = true;
+            }
             EditorId::Field(field) => {
                 self.input_target = input_target_for(field);
                 self.compose_focused = false;
@@ -455,6 +462,7 @@ impl XPanel {
         placeholder: &str,
         font_px: f32,
         line_h: f32,
+        masked: bool,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let text = self.editor_text(id).to_string();
@@ -480,6 +488,7 @@ impl XPanel {
             font_px,
             line_h,
             single_line,
+            masked,
         };
         let paint_entity = cx.entity();
         div()
@@ -560,20 +569,41 @@ fn paint_editor(
         weight: FontWeight::NORMAL,
         ..gpui_kit::font("")
     };
+    let mask = snap
+        .masked
+        .then(|| termy_x::draft_edit::MaskMap::new(&snap.text));
+    let display_text = mask
+        .as_ref()
+        .map(termy_x::draft_edit::MaskMap::display)
+        .unwrap_or_else(|| snap.text.clone());
+    let real_at = |display_offset: usize| {
+        mask.as_ref()
+            .map(|map| map.display_to_real(display_offset))
+            .unwrap_or(display_offset)
+    };
+    let display_at = |real_offset: usize| {
+        mask.as_ref()
+            .map(|map| map.real_to_display(real_offset))
+            .unwrap_or(real_offset)
+    };
     let text_color = hex_hsla(0xf8fbff, 1.0);
     let entity_color = hex_hsla(0x1d9bf0, 1.0);
     let placeholder_color = hex_hsla(0x93a4c3, 1.0);
     let selection_color = hex_hsla(0x0a84ff, 0.45);
     let caret_color = hex_hsla(0x7af6ff, 1.0);
-    let ranges = soft_wrap_ranges(&snap.text, snap.max_chars);
-    let entities = entity_spans(&snap.text);
-    let caret = snap.caret.min(snap.text.len());
+    let ranges = soft_wrap_ranges(&display_text, snap.max_chars);
+    let entities = if snap.masked {
+        Vec::new()
+    } else {
+        entity_spans(&snap.text)
+    };
+    let caret = display_at(snap.caret.min(snap.text.len()));
     let caret_row = line_index(&ranges, caret);
 
     let mut shaped: Vec<Option<gpui_kit::ShapedLine>> = Vec::with_capacity(ranges.len());
     let mut caret_local_x = 0.0_f32;
     for (idx, &(start, end)) in ranges.iter().enumerate() {
-        let slice = snap.text.get(start..end).unwrap_or("");
+        let slice = display_text.get(start..end).unwrap_or("");
         if slice.is_empty() {
             shaped.push(None);
             continue;
@@ -614,17 +644,20 @@ fn paint_editor(
     for (idx, (&(start, end), line)) in ranges.iter().zip(shaped).enumerate() {
         let line_left = left0 - x_shift;
         let line_top = top0 + idx as f32 * snap.line_h - y_shift;
-        let slice = snap.text.get(start..end).unwrap_or("");
+        let slice = display_text.get(start..end).unwrap_or("");
         let mut stops = Vec::new();
-        stops.push((start, line_left));
+        stops.push((real_at(start), line_left));
         if let Some(line) = line.as_ref() {
             for (_rel, rel_end) in grapheme_ranges(slice) {
                 let x = line_left + f32::from(line.x_for_index(rel_end));
-                stops.push((start + rel_end, x));
+                stops.push((real_at(start + rel_end), x));
             }
         }
+        let selection = snap
+            .selection
+            .map(|(sel_a, sel_b)| (display_at(sel_a), display_at(sel_b)));
         if snap.focused
-            && let Some((sel_a, sel_b)) = snap.selection
+            && let Some((sel_a, sel_b)) = selection
         {
             let from = sel_a.max(start).min(end);
             let to = sel_b.max(start).min(end);

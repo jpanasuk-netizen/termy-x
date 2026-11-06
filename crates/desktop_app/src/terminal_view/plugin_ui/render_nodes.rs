@@ -531,12 +531,24 @@ impl PluginUiView {
                         PluginViewValue::Toggle(_) => None,
                     })
                     .unwrap_or_default();
-                let query = self.list_queries.get(id).cloned().unwrap_or_default();
+                let filter_active = self
+                    .active_input
+                    .as_ref()
+                    .is_some_and(|input| input.id == *id);
+                let query = if filter_active {
+                    self.active_input
+                        .as_ref()
+                        .map(|input| input.state.text().to_string())
+                        .unwrap_or_default()
+                } else {
+                    self.list_queries.get(id).cloned().unwrap_or_default()
+                };
                 let normalized_query = query.to_lowercase();
                 let list_focused = self.focused_control.as_deref() == Some(id.as_str());
                 let mut list = div().w_full().flex().flex_col().gap(px(4.0));
                 if *filtering {
                     let list_id = id.clone();
+                    let move_id = list_id.clone();
                     list = list.child(
                         div()
                             .w_full()
@@ -557,21 +569,44 @@ impl PluginUiView {
                             .cursor_text()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |view, _event, window, cx| {
-                                    cx.stop_propagation();
-                                    view.commit_active_input();
-                                    view.active_input = None;
-                                    view.focused_control = Some(list_id.clone());
-                                    view.focus_handle.focus(window, cx);
-                                    cx.notify();
+                                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+                                    view.handle_input_mouse_down(&list_id, event, window, cx);
                                 }),
                             )
-                            .child(if query.is_empty() {
-                                search_placeholder
-                                    .clone()
-                                    .unwrap_or_else(|| "Type to filter…".to_string())
+                            .on_mouse_move(cx.listener(
+                                move |view, event: &MouseMoveEvent, _window, cx| {
+                                    view.handle_input_mouse_move(&move_id, event, cx);
+                                },
+                            ))
+                            .child(if filter_active {
+                                let entity = cx.entity();
+                                div()
+                                    .w_full()
+                                    .h(px(18.0))
+                                    .overflow_hidden()
+                                    .child(TextInputElement::new(
+                                        entity,
+                                        self.focus_handle.clone(),
+                                        Font {
+                                            family: "sans-serif".into(),
+                                            ..gpui_kit::font("")
+                                        },
+                                        px(12.0),
+                                        style.primary_text.into(),
+                                        style.input_selection.into(),
+                                        TextInputAlignment::Left,
+                                    ))
+                                    .into_any_element()
+                            } else if query.is_empty() {
+                                div()
+                                    .child(
+                                        search_placeholder
+                                            .clone()
+                                            .unwrap_or_else(|| "Type to filter…".to_string()),
+                                    )
+                                    .into_any_element()
                             } else {
-                                query
+                                div().child(query).into_any_element()
                             }),
                     );
                 }

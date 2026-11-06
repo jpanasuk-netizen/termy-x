@@ -387,6 +387,8 @@ enum TextField {
 enum EditorId {
     Compose,
     Field(TextField),
+    /// Developer-key box. Masked; the caret edits the real string.
+    Bearer,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -580,6 +582,7 @@ pub struct XPanel {
     checking_conn: bool,
     bearer_mode: bool,
     bearer_input: String,
+    bearer_caret: termy_x::draft_edit::DraftCaret,
     queued_section: Option<XSection>,
     /// Per-section last successful fetch. Tab switches reuse data younger than 30s.
     fetched_at: SectionTimes,
@@ -616,8 +619,6 @@ pub struct XPanel {
     ui_focus: UiFocus,
     /// Dedup KeyDown + action Paste within the same chord.
     last_edit_chord_at: Option<Instant>,
-    /// Ctrl+A / double-click selected the whole single-line field.
-    field_all_selected: Option<TextField>,
     /// Search tab: what the user typed, and the last query actually run
     /// (empty = never searched yet, so the tab shows a prompt, not posts).
     search_input: String,
@@ -913,6 +914,7 @@ impl XPanel {
             checking_conn: false,
             bearer_mode: false,
             bearer_input: String::new(),
+            bearer_caret: termy_x::draft_edit::DraftCaret::collapsed(0),
             queued_section: None,
             fetched_at: SectionTimes::default(),
             fetch_seq: 0,
@@ -932,7 +934,6 @@ impl XPanel {
             card_copy_focus: false,
             ui_focus: UiFocus::Compose,
             last_edit_chord_at: None,
-            field_all_selected: None,
             search_input: String::new(),
             searched_query: String::new(),
             trends_filter: String::new(),
@@ -2288,7 +2289,7 @@ impl XPanel {
                         )),
                 );
                 if self.bearer_mode {
-                    let masked = "\u{2022}".repeat(self.bearer_input.chars().count().min(24));
+                    let count = self.bearer_input.chars().count();
                     col = col.child(focus_glow(
                         "glow-bearer",
                         true,
@@ -2297,16 +2298,32 @@ impl XPanel {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x7af6ff))
-                            .child(format!("Your key: {masked}"))
-                            .child(caret_element("caret-bearer"))
-                            .child(format!(
-                                " ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
-                                self.bearer_input.chars().count()
-                            ))
-                            .into_any_element()),
-                    );
+                            .gap(px(8.0))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .child(self.editor_canvas(
+                                        EditorId::Bearer,
+                                        true,
+                                        "Paste your developer key",
+                                        editor_surface::FIELD_FONT,
+                                        editor_surface::FIELD_LINE,
+                                        true,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(format!("({count} chars) · Enter saves · Esc cancels")),
+                            )
+                            .into_any_element(),
+                    ));
                     col = col.child(
                         div()
                             .flex()
@@ -3054,32 +3071,55 @@ impl XPanel {
         }
     }
 
+    fn on_bearer_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let word = mods.control || mods.platform;
+        if key == "escape" {
+            self.bearer_mode = false;
+            self.bearer_input.clear();
+            self.bearer_caret = termy_x::draft_edit::DraftCaret::collapsed(0);
+            self.notice = Some("Key entry cancelled. Nothing was saved.".into());
+        } else if key == "enter" {
+            self.save_bearer(cx);
+        } else if let Some(motion) = editor_surface::navigation_motion(key, word) {
+            self.editor_motion(EditorId::Bearer, motion, mods.shift);
+        } else if word && key.eq_ignore_ascii_case("a") {
+            self.editor_select_all(EditorId::Bearer);
+        } else if word && key.eq_ignore_ascii_case("c") {
+            if let Some(selected) = self.editor_selection_text(EditorId::Bearer) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+        } else if word && key.eq_ignore_ascii_case("x") {
+            if let Some(selected) = self.editor_cut(EditorId::Bearer) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+        } else if word && key.eq_ignore_ascii_case("v") {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                self.editor_insert(EditorId::Bearer, clip.trim());
+            }
+        } else if key == "backspace" {
+            self.editor_backspace(EditorId::Bearer, word);
+        } else if key == "delete" {
+            self.editor_delete_forward(EditorId::Bearer);
+        } else if !(mods.control || mods.alt || mods.platform || mods.function)
+            && let Some(ch) = event.keystroke.key_char.as_deref()
+            && !ch.is_empty()
+        {
+            self.editor_insert(EditorId::Bearer, ch);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
         if self.bearer_mode {
-            if key == "escape" {
-                self.bearer_mode = false;
-                self.bearer_input.clear();
-                self.notice = Some("Key entry cancelled. Nothing was saved.".into());
-            } else if key == "enter" {
-                self.save_bearer(cx);
-            } else if key == "backspace" {
-                self.bearer_input.pop();
-            } else if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
-                if let Some(item) = cx.read_from_clipboard()
-                    && let Some(clip) = item.text()
-                {
-                    self.bearer_input.push_str(clip.trim());
-                }
-            } else if !(mods.control || mods.alt || mods.platform || mods.function)
-                && let Some(ch) = event.keystroke.key_char.as_deref()
-            {
-                self.bearer_input.push_str(ch);
-            }
-            cx.stop_propagation();
-            cx.notify();
+            self.on_bearer_key(event, cx);
             return;
         }
 
@@ -3474,24 +3514,17 @@ impl XPanel {
             return;
         }
         let clean = text.trim_end_matches(['\r', '\n']);
-        if let Some(field) = self.field_all_selected.take()
-            && field == TextField::RgKey
-            && self.input_target == InputTarget::RgKey
-        {
-            self.desk.rg_key_input.clear();
-        }
         if self.bearer_mode {
-            self.bearer_input.push_str(clean.trim());
+            self.editor_insert(EditorId::Bearer, clean.trim());
         } else if let Some(id) = self.active_editor() {
             if id == EditorId::Compose {
                 self.focus_compose_editor();
             }
             self.editor_insert(id, clean);
-        } else if self.input_target == InputTarget::RgKey {
-            // A pasted key is complete: save it right away
-            // (Enter/Save also work).
-            self.desk.rg_key_input.push_str(clean.trim());
-            self.rg_save_key_now();
+            if id == EditorId::Field(TextField::RgKey) && !self.desk.rg_key_input.trim().is_empty()
+            {
+                self.rg_save_key_now();
+            }
         }
         self.mark_edit_chord();
     }
@@ -3515,10 +3548,7 @@ impl XPanel {
     /// included) and the multiline writers select the whole draft. The
     /// masked key field keeps its select-all highlight.
     pub fn select_all_active(&mut self) {
-        if self.input_target == InputTarget::RgKey {
-            self.field_all_selected = Some(TextField::RgKey);
-            self.mark_edit_chord();
-        } else if let Some(id) = self.active_editor() {
+        if let Some(id) = self.active_editor() {
             if self.chord_already_applied() {
                 return;
             }
@@ -3703,157 +3733,16 @@ impl XPanel {
         }
     }
 
-    /// Masked Treg/Grok key box: end caret, select-all, and immediate save.
-    /// The displayed bullets are not the secret, so a mid-text caret would lie.
+    /// Every panel field, including the masked key, edits through the caret.
     fn on_text_input_key(
         &mut self,
         event: &KeyDownEvent,
         field: TextField,
         cx: &mut Context<Self>,
     ) {
-        if field != TextField::RgKey {
-            self.on_draft_field_key(event, field, cx);
-            return;
-        }
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        let key = event.keystroke.key.as_str();
-        let mods = &event.keystroke.modifiers;
-        if key == "enter" {
-            match enter_action(field) {
-                EnterAction::RunSearch => match field {
-                    TextField::Trends => self.enter_trends_filter(cx),
-                    TextField::Research => self.run_research(cx),
-                    TextField::Lookup => self.run_lookup(cx),
-                    TextField::FeedQuery | TextField::FeedFilter => self.add_feed_from_fields(cx),
-                    TextField::Analyze => self.run_analyze(cx),
-                    TextField::RgTopic => self.rg_fetch(cx),
-                    TextField::RgKey => self.rg_save_key(cx),
-                    TextField::QueueText | TextField::QueueReplyTo => {
-                        self.queue_add_from_fields(cx);
-                    }
-                    _ => self.run_search(cx),
-                },
-                EnterAction::Newline => match field {
-                    TextField::Reply => self.reply_text.push('\n'),
-                    _ => self.quote_text.push('\n'),
-                },
-            }
-            if field != TextField::Search {
-                self.scroll_small_editor_to_end(field);
-            }
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "escape"
-            && field == TextField::Trends
-            && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
-        {
-            // Esc clears the filter/chip and restores the full list.
-            self.trends_filter.clear();
-            self.trends_bucket = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        // Read chord/clipboard state before borrowing the target string.
-        let is_paste = (mods.control || mods.platform) && key.eq_ignore_ascii_case("v");
-        let already_applied = is_paste && self.chord_already_applied();
-        let clip_text = if is_paste && !already_applied {
-            cx.read_from_clipboard()
-                .and_then(|item| item.text())
-                .map(|clip| clip.trim_end_matches(['\r', '\n']).to_string())
-        } else {
-            None
-        };
-        let ctrl = mods.control || mods.platform;
-        if ctrl && key.eq_ignore_ascii_case("a") {
-            self.field_all_selected = Some(field);
-            self.mark_edit_chord();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        let selected = self.field_all_selected == Some(field);
-        let mut pasted = false;
-        let mut edited = true;
-        let target = match field {
-            TextField::Search => &mut self.search_input,
-            TextField::Reply => &mut self.reply_text,
-            TextField::Quote => &mut self.quote_text,
-            TextField::Trends => &mut self.trends_filter,
-            TextField::Research => &mut self.research_input,
-            TextField::Lookup => &mut self.lookup,
-            TextField::FeedQuery => &mut self.desk.feed_query,
-            TextField::FeedFilter => &mut self.desk.feed_filter,
-            TextField::QueueText => &mut self.desk.queue_text,
-            TextField::QueueReplyTo => &mut self.desk.queue_reply_to,
-            TextField::Analyze => &mut self.desk.analyze_handle,
-            TextField::RgTopic => &mut self.desk.rg_topic,
-            TextField::RgKey => &mut self.desk.rg_key_input,
-        };
-        if key == "backspace" || key == "delete" {
-            if selected {
-                target.clear();
-            } else if key == "backspace" && ctrl {
-                delete_last_word(target);
-            } else if key == "backspace" {
-                target.pop();
-            }
-        } else if is_paste {
-            // If TerminalView's Paste action already inserted this chord
-            // (it routes here via `paste_active_text`), do not insert twice.
-            if let Some(text) = &clip_text {
-                if selected {
-                    target.clear();
-                }
-                target.push_str(text);
-                pasted = true;
-            } else {
-                edited = false;
-            }
-        } else if !(mods.control || mods.alt || mods.platform || mods.function)
-            && let Some(ch) = event.keystroke.key_char.as_deref()
-        {
-            if selected {
-                target.clear();
-            }
-            target.push_str(ch);
-        } else if termy_x::draft_edit::is_navigation_key(key) {
-            // Masked key field has no mid-text caret. Swallow the arrows
-            // so the terminal behind the panel does not take them, and
-            // drop a select-all highlight.
-            self.field_all_selected = None;
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        } else {
-            return;
-        }
-        if edited {
-            self.field_all_selected = None;
-        }
-        if pasted {
-            self.mark_edit_chord();
-        }
-        if field != TextField::Search {
-            self.scroll_small_editor_to_end(field);
-        }
-        if field == TextField::Reply && !self.reply_key_logged {
-            self.reply_key_logged = true;
-            if let Some(opened) = self.reply_opened_at {
-                perf_log(&format!(
-                    "reply first-key after {}ms",
-                    opened.elapsed().as_millis()
-                ));
-            }
-        }
-        cx.stop_propagation();
-        cx.notify();
+        self.on_draft_field_key(event, field, cx);
     }
 
-    /// Run the typed query through the active provider (OpenCLI silent
-    /// background session). Empty query = a plain hint, never a fetch.
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.trim().to_string();
         if query.is_empty() {
@@ -4253,11 +4142,6 @@ impl XPanel {
             480.0
         };
         (((panel_w - 70.0) / 6.8) as usize).clamp(24, 240)
-    }
-
-    /// Keep the reply/quote caret's visual line inside the fixed editor.
-    fn scroll_small_editor_to_end(&mut self, field: TextField) {
-        self.follow_small_caret(field);
     }
 
     /// Keep the Compose caret's visual line inside the scroll view.
@@ -5481,24 +5365,6 @@ fn breath_animation(cycle_ms: u64) -> Animation {
         .repeat()
         .with_max_fps(9.0)
         .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
-}
-
-/// Breathing text caret shared by every panel editor. Always rendered
-/// (fixed cell, zero layout shift); only its opacity breathes.
-fn caret_element(id: &'static str) -> gpui_kit::AnyElement {
-    // A real 2px bar (same look as the Compose caret), not a "|" glyph:
-    // the glyph was thin enough to miss at editor font sizes, which read
-    // as "no cursor" in the small fields.
-    div()
-        .w(px(2.0))
-        .h(px(14.0))
-        .rounded(px(1.0))
-        .bg(rgb(0x7af6ff))
-        .flex_none()
-        .with_animation(id, breath_animation(2_300), |el, v| {
-            el.opacity(0.12 + 0.88 * v)
-        })
-        .into_any_element()
 }
 
 /// Compact post-count formatting for trend volumes ("182K posts").
@@ -8756,6 +8622,7 @@ impl XPanel {
                     "Add your words\u{2026} (Post button sends the quote)",
                     editor_surface::FIELD_FONT,
                     editor_surface::FIELD_LINE,
+                    false,
                     cx,
                 )
             })
@@ -8964,6 +8831,7 @@ impl XPanel {
                             "Write your reply\u{2026} (Post button sends)",
                             editor_surface::FIELD_FONT,
                             editor_surface::FIELD_LINE,
+                            false,
                             cx,
                         )
                     })
@@ -9186,51 +9054,18 @@ impl XPanel {
             text
         };
         let focused = self.input_target == target;
-        let all_selected = field == TextField::RgKey
-            && focused
-            && !text.is_empty()
-            && self.field_all_selected == Some(field);
-        // The key box stays a masked end-caret field. Every other single-line
-        // box (Reply Guy topic included) is the shared caret editor.
-        let content = if field == TextField::RgKey {
-            if text.is_empty() {
-                if focused {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .child(caret_element(caret_id))
-                        .child(
-                            div()
-                                .text_color(rgb(0x93a4c3))
-                                .child(placeholder.to_string()),
-                        )
-                        .into_any_element()
-                } else {
-                    div()
-                        .text_color(rgb(0x93a4c3))
-                        .child(placeholder.to_string())
-                        .into_any_element()
-                }
-            } else {
-                let mut row = div().flex().flex_row().items_center();
-                row = row.child(text.to_string());
-                if focused {
-                    row = row.child(caret_element(caret_id));
-                }
-                row.into_any_element()
-            }
-        } else {
-            self.editor_canvas(
-                EditorId::Field(field),
-                focused,
-                placeholder,
-                editor_surface::FIELD_FONT,
-                editor_surface::FIELD_LINE,
-                cx,
-            )
-        };
+        let _ = (text, caret_id);
+        let masked = field == TextField::RgKey;
+        let key_len = self.desk.rg_key_input.chars().count();
+        let content = self.editor_canvas(
+            EditorId::Field(field),
+            focused,
+            placeholder,
+            editor_surface::FIELD_FONT,
+            editor_surface::FIELD_LINE,
+            masked,
+            cx,
+        );
         focus_glow(
             glow_id,
             focused,
@@ -9258,11 +9093,20 @@ impl XPanel {
                 .cursor_pointer()
                 .text_size(px(13.0))
                 .text_color(rgb(0xf8fbff))
-                .child(if all_selected {
+                .child(if masked {
                     div()
-                        .rounded(px(3.0))
-                        .bg(tint(0x2f6fd6, 200))
-                        .child(content)
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w(px(0.0))
+                        .child(div().flex_1().min_w(px(0.0)).child(content))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x8e8e93))
+                                .child(format!("({key_len} chars)")),
+                        )
                         .into_any_element()
                 } else {
                     content
@@ -9270,19 +9114,7 @@ impl XPanel {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                        if field == TextField::RgKey {
-                            this.input_target = target;
-                            // Focus now (not next frame) so the very next key lands here.
-                            this.focus.focus(window, cx);
-                            this.pending_focus = false;
-                            this.field_all_selected = (event.click_count >= 2).then_some(field);
-                            cx.stop_propagation();
-                            cx.notify();
-                        } else {
-                            // Padding around the shaped text. The canvas overlay
-                            // handles clicks on the glyphs themselves.
-                            this.editor_pointer_down(EditorId::Field(field), event, window, cx);
-                        }
+                        this.editor_pointer_down(EditorId::Field(field), event, window, cx);
                     }),
                 )
                 .into_any_element(),
@@ -9710,6 +9542,7 @@ impl XPanel {
                 placeholder,
                 editor_surface::COMPOSE_FONT,
                 editor_surface::COMPOSE_LINE,
+                false,
                 cx,
             ))
             .into_any_element()

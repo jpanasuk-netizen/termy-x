@@ -5,7 +5,7 @@ impl SettingsWindow {
         if text.is_empty() || text.eq_ignore_ascii_case("not configured") {
             "Not configured".to_string()
         } else {
-            "••••••••".to_string()
+            termy_x::draft_edit::MaskMap::new(text).display()
         }
     }
 
@@ -570,51 +570,9 @@ impl SettingsWindow {
         }
 
         if is_active && uses_text_input {
-            if is_secret_field {
-                let mut hidden_text = text_secondary;
-                hidden_text.a = 0.0;
-                let mut hidden_selection = self.accent_with_alpha(0.3);
-                hidden_selection.a = 0.0;
-                let masked_active_value = self
-                    .active_input
-                    .as_ref()
-                    .filter(|input| input.field == field)
-                    .map_or_else(
-                        || Self::masked_secret_value(&display_value),
-                        |input| Self::masked_secret_value(input.state.text()),
-                    );
-
-                let font = Font {
-                    family: self.config.ui_font_family.clone().into(),
-                    ..gpui_kit::font("")
-                };
-
-                return div()
-                    .relative()
-                    .size_full()
-                    .child(TextInputElement::new(
-                        cx.entity(),
-                        self.focus_handle.clone(),
-                        font,
-                        px(SETTINGS_INPUT_TEXT_SIZE),
-                        hidden_text.into(),
-                        hidden_selection.into(),
-                        TextInputAlignment::Left,
-                    ))
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .text_size(px(SETTINGS_INPUT_TEXT_SIZE))
-                            .text_color(text_secondary)
-                            .child(masked_active_value),
-                    )
-                    .into_any_element();
-            }
+            // Secret fields stay masked inside TextInputElement (one bullet
+            // per grapheme). The caret and hit testing use that bullet row
+            // and map back to the real offset. The value is not drawn.
             let font = Font {
                 family: self.config.ui_font_family.clone().into(),
                 ..gpui_kit::font("")

@@ -257,6 +257,77 @@ impl InlineInputState {
         self.set_cursor_utf8(0);
     }
 
+    fn hard_line_bounds(&self, cursor: usize) -> (usize, usize) {
+        let cursor = cursor.min(self.text.len());
+        let start = self.text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+        let end = self.text[cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| cursor + index);
+        (start, end)
+    }
+
+    fn vertical_offset(&self, direction: isize) -> Option<usize> {
+        let cursor = self.cursor_offset();
+        let (line_start, line_end) = self.hard_line_bounds(cursor);
+        let column = termy_x::draft_edit::grapheme_col(&self.text, line_start, line_end, cursor);
+        if direction < 0 {
+            let previous_end = line_start.checked_sub(1)?;
+            let (previous_start, _) = self.hard_line_bounds(previous_end);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text,
+                previous_start,
+                previous_end,
+                column,
+            ))
+        } else if line_end >= self.text.len() {
+            None
+        } else {
+            let next_start = line_end + 1;
+            let (_, next_end) = self.hard_line_bounds(next_start);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text, next_start, next_end, column,
+            ))
+        }
+    }
+
+    pub(super) fn move_up(&mut self) {
+        if !self.selected_range.is_empty() {
+            self.set_cursor_utf8(self.selected_range.start);
+        } else if let Some(offset) = self.vertical_offset(-1) {
+            self.set_cursor_utf8(offset);
+        }
+    }
+
+    pub(super) fn move_down(&mut self) {
+        if !self.selected_range.is_empty() {
+            self.set_cursor_utf8(self.selected_range.end);
+        } else if let Some(offset) = self.vertical_offset(1) {
+            self.set_cursor_utf8(offset);
+        }
+    }
+
+    pub(super) fn select_up(&mut self) {
+        if let Some(offset) = self.vertical_offset(-1) {
+            self.select_to_utf8(offset);
+        }
+    }
+
+    pub(super) fn select_down(&mut self) {
+        if let Some(offset) = self.vertical_offset(1) {
+            self.select_to_utf8(offset);
+        }
+    }
+
+    pub(super) fn move_to_line_start(&mut self) {
+        let (start, _) = self.hard_line_bounds(self.cursor_offset());
+        self.set_cursor_utf8(start);
+    }
+
+    pub(super) fn move_to_line_end(&mut self) {
+        let (_, end) = self.hard_line_bounds(self.cursor_offset());
+        self.set_cursor_utf8(end);
+    }
+
     pub(super) fn delete_backward(&mut self) {
         let cursor = self.cursor_offset();
         let start = self.previous_char_boundary(cursor);
@@ -1375,7 +1446,7 @@ impl TerminalView {
         if self.forward_edit_to_native_search(SearchEditCommand::MoveToStart) {
             return;
         }
-        self.apply_inline_input_mutation(InlineInputState::move_to_start, cx);
+        self.apply_inline_input_mutation(InlineInputState::move_to_line_start, cx);
     }
 
     pub(super) fn handle_inline_move_to_end_action(
@@ -1387,7 +1458,43 @@ impl TerminalView {
         if self.forward_edit_to_native_search(SearchEditCommand::MoveToEnd) {
             return;
         }
-        self.apply_inline_input_mutation(InlineInputState::move_to_end, cx);
+        self.apply_inline_input_mutation(InlineInputState::move_to_line_end, cx);
+    }
+
+    pub(super) fn handle_inline_move_up_action(
+        &mut self,
+        _: &crate::commands::InlineMoveUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::move_up, cx);
+    }
+
+    pub(super) fn handle_inline_move_down_action(
+        &mut self,
+        _: &crate::commands::InlineMoveDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::move_down, cx);
+    }
+
+    pub(super) fn handle_inline_select_up_action(
+        &mut self,
+        _: &crate::commands::InlineSelectUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::select_up, cx);
+    }
+
+    pub(super) fn handle_inline_select_down_action(
+        &mut self,
+        _: &crate::commands::InlineSelectDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::select_down, cx);
     }
 
     pub(super) fn handle_inline_delete_word_backward_action(

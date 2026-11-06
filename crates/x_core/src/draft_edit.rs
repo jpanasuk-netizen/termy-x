@@ -358,6 +358,87 @@ pub fn grapheme_ranges(text: &str) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// Hard-line byte ranges, one entry per `\n`-separated row, including a
+/// trailing empty row.
+pub fn hard_lines(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            out.push((start, index));
+            start = index + ch.len_utf8();
+        }
+    }
+    out.push((start, text.len()));
+    out
+}
+
+/// If `offset` sits inside a grapheme, the end of that grapheme. A boundary
+/// stays put.
+pub fn ceil_grapheme(text: &str, offset: usize) -> usize {
+    let offset = offset.min(text.len());
+    let floor = floor_grapheme(text, offset);
+    if floor == offset {
+        offset
+    } else {
+        next_grapheme(text, floor)
+    }
+}
+
+/// One bullet per extended grapheme. Display offsets map back to real
+/// byte offsets, so a masked field can place a caret without showing the
+/// secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskMap {
+    bounds: Vec<usize>,
+    bullet_len: usize,
+}
+
+impl MaskMap {
+    pub fn new(text: &str) -> Self {
+        let mut bounds = vec![0usize];
+        for (start, end) in grapheme_ranges(text) {
+            let _ = start;
+            bounds.push(end);
+        }
+        if bounds.last().copied() != Some(text.len()) {
+            bounds.push(text.len());
+        }
+        Self {
+            bounds,
+            bullet_len: '•'.len_utf8(),
+        }
+    }
+
+    pub fn display(&self) -> String {
+        "•".repeat(self.bounds.len().saturating_sub(1))
+    }
+
+    pub fn real_to_display(&self, real: usize) -> usize {
+        let real = real.min(*self.bounds.last().unwrap_or(&0));
+        let index = self.bounds.partition_point(|bound| *bound < real);
+        let index = if self.bounds.get(index) == Some(&real) {
+            index
+        } else {
+            index.saturating_sub(1)
+        };
+        index * self.bullet_len
+    }
+
+    pub fn display_to_real(&self, display: usize) -> usize {
+        if self.bounds.len() <= 1 || self.bullet_len == 0 {
+            return 0;
+        }
+        let mut index = display / self.bullet_len;
+        let into_bullet = display % self.bullet_len;
+        if into_bullet * 2 > self.bullet_len {
+            index += 1;
+        }
+        let index = index.min(self.bounds.len() - 1);
+        self.bounds[index]
+    }
+}
+
 pub fn next_grapheme(text: &str, offset: usize) -> usize {
     let offset = floor_grapheme(text, offset);
     if offset >= text.len() {
@@ -848,5 +929,25 @@ mod tests {
         caret.move_by(text, &lines, Motion::Right, false);
         assert_eq!(caret.caret, 4);
         assert!(caret.selection().is_none());
+    }
+
+    #[test]
+    fn mask_maps_each_grapheme_to_one_bullet_and_back() {
+        let secret = format!("a{FAMILY}b");
+        let map = MaskMap::new(&secret);
+        assert_eq!(map.display().chars().count(), 3);
+        assert!(!map.display().contains('a'));
+        assert_eq!(map.real_to_display(0), 0);
+        assert_eq!(map.display_to_real(0), 0);
+        let family_at = 1usize;
+        assert_eq!(map.real_to_display(family_at), '•'.len_utf8());
+        assert_eq!(map.display_to_real('•'.len_utf8()), family_at);
+        assert_eq!(map.display_to_real(map.display().len()), secret.len());
+        // A display offset inside the family bullet still resolves to the
+        // cluster boundary, never a byte inside the emoji.
+        let mid_bullet = '•'.len_utf8() + 1;
+        let real = map.display_to_real(mid_bullet);
+        assert!(real == family_at || real == secret.len() || real == 1 + FAMILY.len());
+        assert!(secret.is_char_boundary(real));
     }
 }

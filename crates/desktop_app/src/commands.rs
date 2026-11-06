@@ -1242,24 +1242,25 @@ define_commands!(
 
 termy_core::termy_command_catalog!(impl_command_action_id_mapping);
 
-actions!(
-    termy_inline_input,
-    [
-        InlineBackspace,
-        InlineDelete,
-        InlineMoveLeft,
-        InlineMoveRight,
-        InlineSelectLeft,
-        InlineSelectRight,
-        InlineSelectAll,
-        InlineMoveToStart,
-        InlineMoveToEnd,
-        InlineDeleteWordBackward,
-        InlineDeleteWordForward,
-        InlineDeleteToStart,
-        InlineDeleteToEnd,
-    ]
-);
+actions!(termy_inline_input, [
+    InlineBackspace,
+    InlineDelete,
+    InlineMoveLeft,
+    InlineMoveRight,
+    InlineMoveUp,
+    InlineMoveDown,
+    InlineSelectLeft,
+    InlineSelectRight,
+    InlineSelectUp,
+    InlineSelectDown,
+    InlineSelectAll,
+    InlineMoveToStart,
+    InlineMoveToEnd,
+    InlineDeleteWordBackward,
+    InlineDeleteWordForward,
+    InlineDeleteToStart,
+    InlineDeleteToEnd,
+]);
 
 pub fn inline_input_keybindings() -> Vec<KeyBinding> {
     vec![
@@ -1269,8 +1270,12 @@ pub fn inline_input_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("delete", InlineDelete, INLINE_INPUT_CONTEXT),
         KeyBinding::new("left", InlineMoveLeft, INLINE_INPUT_CONTEXT),
         KeyBinding::new("right", InlineMoveRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("up", InlineMoveUp, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("down", InlineMoveDown, INLINE_INPUT_CONTEXT),
         KeyBinding::new("shift-left", InlineSelectLeft, INLINE_INPUT_CONTEXT),
         KeyBinding::new("shift-right", InlineSelectRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-up", InlineSelectUp, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-down", InlineSelectDown, INLINE_INPUT_CONTEXT),
         KeyBinding::new("secondary-a", InlineSelectAll, INLINE_INPUT_CONTEXT),
         KeyBinding::new("home", InlineMoveToStart, INLINE_INPUT_CONTEXT),
         KeyBinding::new("end", InlineMoveToEnd, INLINE_INPUT_CONTEXT),

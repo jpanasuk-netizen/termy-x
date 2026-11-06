@@ -24,6 +24,8 @@ pub struct TextInputState {
     last_line_offset_x: Pixels,
     last_line_metas: Vec<(usize, Bounds<Pixels>, Pixels)>,
     last_line_layouts: Vec<Option<ShapedLine>>,
+    /// The cached shaped line is bullets, not the secret.
+    masked_layout: bool,
 }
 
 impl TextInputState {
@@ -38,6 +40,7 @@ impl TextInputState {
             last_line_offset_x: px(0.0),
             last_line_metas: Vec::new(),
             last_line_layouts: Vec::new(),
+            masked_layout: false,
         };
         state.move_to_end();
         state
@@ -179,38 +182,79 @@ impl TextInputState {
         self.set_cursor_utf8(self.next_char_boundary(cursor));
     }
 
+    fn line_bounds_at(&self, cursor: usize) -> (usize, usize) {
+        let cursor = cursor.min(self.text.len());
+        let start = self.text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+        let end = self.text[cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| cursor + index);
+        (start, end)
+    }
+
     fn vertical_offset(&self, direction: isize) -> Option<usize> {
         let cursor = self.cursor_offset();
-        let line_start = self.text[..cursor].rfind('\n').map_or(0, |index| index + 1);
-        let column = self.text[line_start..cursor].chars().count();
+        let (line_start, line_end) = self.line_bounds_at(cursor);
+        let column = termy_x::draft_edit::grapheme_col(&self.text, line_start, line_end, cursor);
         if direction < 0 {
             let previous_end = line_start.checked_sub(1)?;
-            let previous_start = self.text[..previous_end]
-                .rfind('\n')
-                .map_or(0, |index| index + 1);
-            Some(
-                previous_start
-                    + self.text[previous_start..previous_end]
-                        .chars()
-                        .take(column)
-                        .map(char::len_utf8)
-                        .sum::<usize>(),
-            )
+            let (previous_start, _) = self.line_bounds_at(previous_end);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text,
+                previous_start,
+                previous_end,
+                column,
+            ))
         } else {
-            let current_end = self.text[cursor..].find('\n').map(|index| cursor + index)?;
-            let next_start = current_end + 1;
-            let next_end = self.text[next_start..]
-                .find('\n')
-                .map_or(self.text.len(), |index| next_start + index);
-            Some(
-                next_start
-                    + self.text[next_start..next_end]
-                        .chars()
-                        .take(column)
-                        .map(char::len_utf8)
-                        .sum::<usize>(),
-            )
+            if line_end >= self.text.len() {
+                return None;
+            }
+            let next_start = line_end + 1;
+            let (_, next_end) = self.line_bounds_at(next_start);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text, next_start, next_end, column,
+            ))
         }
+    }
+
+    pub fn move_to_line_start(&mut self) {
+        let (start, _) = self.line_bounds_at(self.cursor_offset());
+        self.set_cursor_utf8(start);
+    }
+
+    pub fn move_to_line_end(&mut self) {
+        let (_, end) = self.line_bounds_at(self.cursor_offset());
+        self.set_cursor_utf8(end);
+    }
+
+    pub fn select_to_line_start(&mut self) {
+        let (start, _) = self.line_bounds_at(self.cursor_offset());
+        self.select_to_utf8(start);
+    }
+
+    pub fn select_to_line_end(&mut self) {
+        let (_, end) = self.line_bounds_at(self.cursor_offset());
+        self.select_to_utf8(end);
+    }
+
+    /// Arrow, Home, and End for every native text field. `shift` extends
+    /// the selection. Returns false when `key` is not a navigation key.
+    pub fn apply_navigation_key(&mut self, key: &str, shift: bool) -> bool {
+        match key {
+            "left" if shift => self.select_left(),
+            "left" => self.move_left(),
+            "right" if shift => self.select_right(),
+            "right" => self.move_right(),
+            "up" if shift => self.select_up(),
+            "up" => self.move_up(),
+            "down" if shift => self.select_down(),
+            "down" => self.move_down(),
+            "home" if shift => self.select_to_line_start(),
+            "home" => self.move_to_line_start(),
+            "end" if shift => self.select_to_line_end(),
+            "end" => self.move_to_line_end(),
+            _ => return false,
+        }
+        true
     }
 
     pub fn move_up(&mut self) {
@@ -300,10 +344,12 @@ impl TextInputState {
         bounds: Bounds<Pixels>,
         layout: Option<ShapedLine>,
         line_offset_x: Pixels,
+        masked: bool,
     ) {
         self.last_bounds = Some(bounds);
         self.last_layout = layout;
         self.last_line_offset_x = line_offset_x;
+        self.masked_layout = masked;
         self.last_line_metas.clear();
         self.last_line_layouts.clear();
     }
@@ -447,10 +493,13 @@ impl TextInputState {
             point.x - text_left
         };
 
-        let utf8_index = self
+        let mut utf8_index = self
             .last_layout
             .as_ref()
             .map_or(0, |layout| layout.closest_index_for_x(local_x));
+        if self.masked_layout {
+            utf8_index = termy_x::draft_edit::MaskMap::new(&self.text).display_to_real(utf8_index);
+        }
         self.utf8_to_utf16(utf8_index)
     }
 
@@ -513,6 +562,12 @@ pub trait TextInputProvider: 'static + Sized {
     /// Returns the cursor style (line width). Defaults to 1.0px (line cursor).
     fn cursor_width(&self, _font_size: f32) -> f32 {
         1.0
+    }
+
+    /// When true, the field paints one bullet per grapheme and hit-tests
+    /// back to the real byte offset. The secret itself is not drawn.
+    fn masks_text(&self) -> bool {
+        false
     }
 }
 
@@ -600,13 +655,26 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                     focused,
                     cursor_visible,
                     cursor_width,
+                    masked,
                 ) = {
                     let view = prepaint_view.read(cx);
                     let focused = prepaint_focus_handle.is_focused(window);
                     let cursor_visible = view.cursor_visible();
                     let cursor_width = view.cursor_width(font_size_value);
+                    let masked = view.masks_text();
                     view.text_input_state().map_or_else(
-                        || (String::new(), 0..0, 0, None, focused, false, cursor_width),
+                        || {
+                            (
+                                String::new(),
+                                0..0,
+                                0,
+                                None,
+                                focused,
+                                false,
+                                cursor_width,
+                                false,
+                            )
+                        },
                         |state| {
                             (
                                 state.text().to_string(),
@@ -616,16 +684,28 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                                 focused,
                                 cursor_visible,
                                 cursor_width,
+                                masked,
                             )
                         },
                     )
                 };
 
-                let line = if text.is_empty() {
+                let mask = masked.then(|| termy_x::draft_edit::MaskMap::new(&text));
+                let display = mask
+                    .as_ref()
+                    .map(termy_x::draft_edit::MaskMap::display)
+                    .unwrap_or_else(|| text.clone());
+                let to_display = |offset: usize| {
+                    mask.as_ref()
+                        .map(|map| map.real_to_display(offset))
+                        .unwrap_or(offset)
+                };
+
+                let line = if display.is_empty() {
                     None
                 } else {
                     let base_run = TextRun {
-                        len: text.len(),
+                        len: display.len(),
                         font: font.clone(),
                         color: text_color,
                         background_color: None,
@@ -633,7 +713,7 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                         strikethrough: None,
                     };
 
-                    let runs = if let Some(marked_range) = marked_range {
+                    let runs = if !masked && let Some(marked_range) = marked_range {
                         let marked_start = marked_range.start.min(text.len());
                         let marked_end = marked_range.end.min(text.len()).max(marked_start);
                         let mut runs = Vec::with_capacity(3);
@@ -666,7 +746,7 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                     };
 
                     Some(window.text_system().shape_line(
-                        text.clone().into(),
+                        display.clone().into(),
                         font_size,
                         &runs,
                         None,
@@ -677,9 +757,9 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                     TextInputAlignment::Left => px(0.0),
                 };
 
-                let cursor_utf8 = cursor_offset.min(text.len());
-                let selection_start = selected_range.start.min(text.len());
-                let selection_end = selected_range.end.min(text.len());
+                let cursor_utf8 = to_display(cursor_offset.min(text.len()));
+                let selection_start = to_display(selected_range.start.min(text.len()));
+                let selection_end = to_display(selected_range.end.min(text.len()));
 
                 let selection = if selection_start < selection_end {
                     let start_x = line
@@ -770,11 +850,13 @@ impl<V: TextInputProvider + gpui_kit::Render + EntityInputHandler> IntoElement
                 }
 
                 view.update(cx, |this, _cx| {
+                    let masked = this.masks_text();
                     if let Some(state) = this.text_input_state_mut() {
                         state.update_layout_cache(
                             prepaint.line_bounds,
                             line,
                             prepaint.line_offset_x,
+                            masked,
                         );
                     }
                 });
@@ -898,6 +980,19 @@ macro_rules! impl_text_input_handler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shift_home_selects_the_current_line_and_left_moves_by_grapheme() {
+        let mut state = TextInputState::new("hello\nworld".to_string());
+        assert!(state.apply_navigation_key("home", true));
+        assert_eq!(state.selected_range(), 6..11);
+        let family = "👨‍👩‍👧";
+        let mut emoji = TextInputState::new(format!("a{family}b"));
+        assert!(emoji.apply_navigation_key("left", false));
+        assert_eq!(emoji.cursor_offset(), 1 + family.len());
+        assert!(emoji.apply_navigation_key("left", false));
+        assert_eq!(emoji.cursor_offset(), 1);
+    }
 
     #[test]
     fn utf16_range_conversion_handles_multibyte_text() {

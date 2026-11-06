@@ -621,27 +621,12 @@ impl SettingsWindow {
                 }
                 cx.notify();
             }
-            "left" => {
+            "left" | "right" | "up" | "down" | "home" | "end" => {
                 if allow_text_editing && let Some(input) = self.active_input.as_mut() {
-                    input.state.move_left();
-                }
-                cx.notify();
-            }
-            "right" => {
-                if allow_text_editing && let Some(input) = self.active_input.as_mut() {
-                    input.state.move_right();
-                }
-                cx.notify();
-            }
-            "home" => {
-                if allow_text_editing && let Some(input) = self.active_input.as_mut() {
-                    input.state.move_to_start();
-                }
-                cx.notify();
-            }
-            "end" => {
-                if allow_text_editing && let Some(input) = self.active_input.as_mut() {
-                    input.state.move_to_end();
+                    input.state.apply_navigation_key(
+                        event.keystroke.key.as_str(),
+                        event.keystroke.modifiers.shift,
+                    );
                 }
                 cx.notify();
             }
@@ -726,6 +711,16 @@ impl TextInputProvider for SettingsWindow {
         } else {
             None
         }
+    }
+
+    fn masks_text(&self) -> bool {
+        self.ssh_input
+            .as_ref()
+            .is_some_and(|input| input.field == ssh::SshFormField::Secret)
+            || self
+                .active_input
+                .as_ref()
+                .is_some_and(|input| Self::is_secret_field(input.field))
     }
 }
 
