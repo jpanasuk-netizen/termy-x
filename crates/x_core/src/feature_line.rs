@@ -35,7 +35,7 @@ const FEATURES: &[Feature] = &[
     Feature {
         id: "home-pages",
         state: FeatureState::InThisBuild,
-        note: "For you and Following load one 20-post page. Load more continues with the cursor. No fixture swap when a live read fails.",
+        note: "For you and Following ask for 100 unique posts. The home provider returns 20 per call, so one screen is at most 5 of those calls. Fewer than 100 is shown as-is. Reply Guy Treg stays at 50 with no cursor.",
     },
     Feature {
         id: "follow",

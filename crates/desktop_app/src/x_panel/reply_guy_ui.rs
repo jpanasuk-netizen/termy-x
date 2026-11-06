@@ -1145,7 +1145,7 @@ impl XPanel {
         });
         if !self.desk.rg_hits.is_empty() {
             rows.push(hint(format!(
-                "{} of {} \u{b7} {} \u{b7} re-ranked locally \u{b7} Fetch asks Treg once (max {}, no next cursor)",
+                "{} of {} \u{b7} {} \u{b7} re-ranked locally \u{b7} Treg hard max {} per Fetch, no cursor",
                 hits.len(),
                 self.desk.rg_hits.len(),
                 self.desk.rg_topic.trim(),

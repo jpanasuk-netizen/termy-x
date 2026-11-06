@@ -694,14 +694,37 @@ pub struct XPanel {
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
-/// One home page. Matches [`termy_x::providers::HOME_PAGE_SIZE`]: the
-/// first screen and every Load more are a single provider call.
-const TIMELINE_PAGE: usize = termy_x::providers::HOME_PAGE_SIZE;
+/// Unique posts For you / Following ask for on open and on each Load more.
+/// The provider may answer in smaller pages; the fetch walks those until
+/// this many unique posts, or until the cursor stops.
+const TIMELINE_PAGE: usize = termy_x::providers::HOME_UI_PAGE;
+/// Search, mentions, inbox, and profile tweets. One request at the
+/// provider max that is still within 100. A short answer is shown as-is.
+const LIST_PAGE: usize = 100;
 /// Posts fetched up front per feed.
 const TIMELINE_INITIAL: usize = TIMELINE_PAGE;
 /// Safety ceiling on how many posts a feed will keep. Load more stops
 /// here even if the provider still has a cursor.
 const TIMELINE_MAX: usize = 1600;
+
+/// Keep a forward cursor. The same cursor twice means the provider did
+/// not advance, so the feed stops instead of calling it again.
+fn store_feed_cursor(
+    slot: &mut Option<String>,
+    exhausted: &mut bool,
+    cursor_ok: &mut bool,
+    next_cursor: Option<String>,
+) {
+    let repeated = next_cursor.is_some() && next_cursor == *slot;
+    *cursor_ok = true;
+    if repeated || next_cursor.is_none() {
+        *exhausted = true;
+        *slot = None;
+    } else {
+        *exhausted = false;
+        *slot = next_cursor;
+    }
+}
 
 /// Another page is allowed while the loaded list is under the ceiling.
 fn next_timeline_limit(current: usize) -> Option<usize> {
@@ -1933,11 +1956,12 @@ impl XPanel {
                         }
                     };
                     if cursor_ok {
-                        self.feed_cursor[idx] = next_cursor.clone();
-                        self.feed_cursor_ok[idx] = true;
-                        if next_cursor.is_none() {
-                            self.feed_exhausted[idx] = true;
-                        }
+                        store_feed_cursor(
+                            &mut self.feed_cursor[idx],
+                            &mut self.feed_exhausted[idx],
+                            &mut self.feed_cursor_ok[idx],
+                            next_cursor,
+                        );
                     } else if added == 0 {
                         self.feed_exhausted[idx] = true;
                     }
@@ -1965,9 +1989,12 @@ impl XPanel {
                     }
                     self.feed_depth[idx] = landed;
                     if cursor_ok {
-                        self.feed_cursor[idx] = next_cursor.clone();
-                        self.feed_cursor_ok[idx] = true;
-                        self.feed_exhausted[idx] = next_cursor.is_none();
+                        store_feed_cursor(
+                            &mut self.feed_cursor[idx],
+                            &mut self.feed_exhausted[idx],
+                            &mut self.feed_cursor_ok[idx],
+                            next_cursor,
+                        );
                     }
                     self.status = status;
                 }
@@ -2592,7 +2619,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().inbox_posts(&me, 20)
+                        XPanel::service_free().inbox_posts(&me, LIST_PAGE)
                     } else {
                         MockProvider
                             .search(&termy_x::inbox::to_me_query(&me), true, 8)
@@ -2649,7 +2676,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().mentions_posts(&me, 20)
+                        XPanel::service_free().mentions_posts(&me, LIST_PAGE)
                     } else {
                         MockProvider.search(&format!("@{me}"), true, 8)
                     }
@@ -2811,7 +2838,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().search(&query, true, 20)
+                        XPanel::service_free().search(&query, true, LIST_PAGE)
                     } else {
                         MockProvider.search(&query, true, 8)
                     }
@@ -3032,7 +3059,7 @@ impl XPanel {
                     if live {
                         let service = XPanel::service_free();
                         let profile = service.lookup(&handle_fetch).ok().map(|s| s.value);
-                        let posts = match service.tweets(&handle_fetch, 80) {
+                        let posts = match service.tweets(&handle_fetch, LIST_PAGE) {
                             Ok(served) if !served.value.is_empty() => served.value,
                             _ => profile
                                 .as_ref()
@@ -4918,7 +4945,7 @@ fn fetch_section(
                 }
             }
             XSection::Search => {
-                if let Ok(served) = service.search(&query, newest, 15) {
+                if let Ok(served) = service.search(&query, newest, LIST_PAGE) {
                     return FetchPayload::Search {
                         posts: served.value,
                         status: live_status(&served.status),
@@ -4931,7 +4958,7 @@ fn fetch_section(
                 } else {
                     handle.as_str()
                 };
-                if let Ok(served) = service.mentions(who, 20) {
+                if let Ok(served) = service.mentions(who, LIST_PAGE) {
                     return FetchPayload::Mentions {
                         posts: served.value,
                         status: live_status(&served.status),
@@ -4944,7 +4971,7 @@ fn fetch_section(
                 } else {
                     handle.as_str()
                 };
-                if let Ok(served) = service.inbox_replies(who, 20) {
+                if let Ok(served) = service.inbox_replies(who, LIST_PAGE) {
                     return FetchPayload::Inbox {
                         posts: served.value,
                         status: live_status(&served.status),
@@ -5049,7 +5076,7 @@ fn fetch_section(
         }
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
-                .search(&query, newest, 15)
+                .search(&query, newest, LIST_PAGE)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
@@ -5062,7 +5089,7 @@ fn fetch_section(
             };
             FetchPayload::Mentions {
                 posts: MockProvider
-                    .mentions(who, 20)
+                    .mentions(who, LIST_PAGE)
                     .map(|served| served.value)
                     .unwrap_or_default(),
                 status: "mock Â· mentions Â· no X API credits".into(),
@@ -5076,7 +5103,7 @@ fn fetch_section(
             };
             FetchPayload::Inbox {
                 posts: MockProvider
-                    .inbox_replies(who, 20)
+                    .inbox_replies(who, LIST_PAGE)
                     .map(|served| served.value)
                     .unwrap_or_default(),
                 status: "mock Â· inbox Â· no X API credits".into(),
@@ -10448,7 +10475,7 @@ mod edit_keys_tests {
         assert_eq!(next_timeline_limit(0), Some(TIMELINE_PAGE));
         assert_eq!(next_timeline_limit(20), Some(TIMELINE_PAGE));
         assert_eq!(next_timeline_limit(TIMELINE_MAX), None);
-        assert!(TIMELINE_PAGE > 5);
+        assert_eq!(TIMELINE_PAGE, 100);
         assert_eq!(TIMELINE_INITIAL, TIMELINE_PAGE);
     }
 
@@ -10478,7 +10505,7 @@ mod edit_keys_tests {
         };
         assert!(!failed);
         assert!(cursor_ok);
-        assert!(posts.len() > 5, "first page {}", posts.len());
+        assert!(posts.len() >= 100, "first page {}", posts.len());
         let cursor = next_cursor.expect("fixture has another page");
         let second = fetch_section(
             XSection::Timeline,
@@ -10500,12 +10527,14 @@ mod edit_keys_tests {
         else {
             panic!("second page");
         };
-        assert!(!more.is_empty());
+        assert!(more.len() >= 100, "second page {}", more.len());
+        let kept = termy_x::providers::append_new_posts(posts.clone(), more.clone());
+        assert_eq!(kept.len(), posts.len() + more.len());
         let mut seen = std::collections::BTreeSet::new();
         for post in posts.iter().chain(more.iter()) {
             assert!(seen.insert(post.id.clone()), "duplicate {}", post.id);
         }
-        assert!(next.is_some() || seen.len() < 45);
+        assert!(next.is_some());
         let popular = {
             let mut ranked = posts.clone();
             ranked.sort_by(|left, right| {

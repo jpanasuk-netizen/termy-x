@@ -137,11 +137,14 @@ pub trait XProvider: Send + Sync {
     }
 }
 
-/// One home-timeline request. X's logged-in home GraphQL accepts about
-/// this many tweets per call; asking for hundreds in one shot either
-/// fails or comes back as a short first screen. Load more continues
-/// with the cursor from the previous page.
-pub const HOME_PAGE_SIZE: usize = 20;
+/// Tweets one home GraphQL call will accept. A UI page is larger than
+/// this, so a page is several of these calls, not one oversized request.
+pub const HOME_PROVIDER_PAGE: usize = 20;
+/// Unique posts the For you / Following screen asks for on open and on
+/// each Load more. Not a promise: a short provider ends the page early.
+pub const HOME_UI_PAGE: usize = 100;
+/// Provider calls inside one UI page. 100 / 20.
+pub const HOME_MAX_HOPS: usize = HOME_UI_PAGE / HOME_PROVIDER_PAGE;
 
 /// A page of timeline posts plus the opaque bottom cursor that fetches
 /// the next (older) page. `next_cursor: None` means the source is dry.
@@ -151,11 +154,11 @@ pub struct TimelinePage {
     pub next_cursor: Option<String>,
 }
 
-/// Slice `posts` at an `off:N` cursor. `count` is clamped to
-/// [`HOME_PAGE_SIZE`]. A full page returns the next offset; a short
-/// page returns no cursor.
+/// Slice `posts` at an `off:N` cursor. `count` is clamped to one
+/// provider page. A full page returns the next offset; a short page
+/// returns no cursor.
 pub fn slice_timeline(posts: &[Post], cursor: Option<&str>, count: usize) -> TimelinePage {
-    let count = count.clamp(1, HOME_PAGE_SIZE);
+    let count = count.clamp(1, HOME_PROVIDER_PAGE);
     let start = cursor
         .and_then(|token| token.strip_prefix("off:"))
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -167,6 +170,59 @@ pub fn slice_timeline(posts: &[Post], cursor: Option<&str>, count: usize) -> Tim
         posts: posts[start..end].to_vec(),
         next_cursor,
     }
+}
+
+/// Walk provider pages until `target` unique posts, the cursor repeats
+/// or disappears, or [`HOME_MAX_HOPS`] is spent. The whole last provider
+/// page is kept, so the result can be a little over the target. It is
+/// never padded when the source runs out.
+pub fn accumulate_timeline_pages(
+    mut fetch: impl FnMut(Option<&str>) -> TimelinePage,
+    start: Option<&str>,
+    target: usize,
+) -> TimelinePage {
+    let target = target.clamp(1, HOME_UI_PAGE);
+    let mut cursor = start.map(str::to_string);
+    let mut posts = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..HOME_MAX_HOPS {
+        if posts.len() >= target {
+            break;
+        }
+        let sent = cursor.clone();
+        let page = fetch(cursor.as_deref());
+        for post in page.posts {
+            if post.id.is_empty() || !seen.insert(post.id.clone()) {
+                continue;
+            }
+            posts.push(post);
+        }
+        match page.next_cursor {
+            Some(next) if sent.as_ref() == Some(&next) => {
+                cursor = None;
+                break;
+            }
+            None => {
+                cursor = None;
+                break;
+            }
+            Some(next) => cursor = Some(next),
+        }
+    }
+    TimelinePage {
+        posts,
+        next_cursor: cursor,
+    }
+}
+
+/// Fixture home page: provider slices of [`HOME_PROVIDER_PAGE`] until
+/// `target` unique posts.
+pub fn accumulate_fixture(posts: &[Post], cursor: Option<&str>, target: usize) -> TimelinePage {
+    accumulate_timeline_pages(
+        |token| slice_timeline(posts, token, HOME_PROVIDER_PAGE),
+        cursor,
+        target,
+    )
 }
 
 pub struct Service {
@@ -579,9 +635,13 @@ impl XProvider for MockProvider {
         Ok(served(posts, "fixture timeline"))
     }
     fn timeline_feed(&self, feed: TimelineFeed, limit: usize) -> Result<Served<Vec<Post>>, String> {
-        let page = slice_timeline(&home_fixture(feed), None, limit);
+        let posts = if limit <= HOME_PROVIDER_PAGE {
+            slice_timeline(&home_fixture(feed), None, limit).posts
+        } else {
+            accumulate_fixture(&home_fixture(feed), None, limit.min(HOME_UI_PAGE)).posts
+        };
         Ok(served(
-            page.posts,
+            posts,
             match feed {
                 TimelineFeed::ForYou => "fixture timeline (for you)",
                 TimelineFeed::Following => "fixture timeline (following)",
@@ -595,7 +655,7 @@ impl XProvider for MockProvider {
         count: usize,
     ) -> Result<Served<TimelinePage>, String> {
         Ok(served(
-            slice_timeline(&home_fixture(feed), cursor, count),
+            accumulate_fixture(&home_fixture(feed), cursor, count),
             match feed {
                 TimelineFeed::ForYou => "fixture timeline page (for you)",
                 TimelineFeed::Following => "fixture timeline page (following)",
@@ -778,15 +838,16 @@ pub fn sample_posts() -> Vec<Post> {
     posts
 }
 
-/// Longer than a single five-post screen, with likes and dates that
-/// disagree, so Popular and Newest are different orders and a second
-/// page exists after [`HOME_PAGE_SIZE`].
+/// Enough posts for two UI pages of [`HOME_UI_PAGE`] plus a short tail.
+/// Likes fall as the index rises; timestamps rise, so Popular and Newest
+/// disagree.
 pub fn home_fixture(feed: TimelineFeed) -> Vec<Post> {
     let tag = match feed {
         TimelineFeed::ForYou => "fy",
         TimelineFeed::Following => "fl",
     };
-    (0..45)
+    const N: usize = 250;
+    (0..N)
         .map(|index| {
             let id = format!("{tag}-{index:03}");
             let mut item = post(
@@ -794,13 +855,14 @@ pub fn home_fixture(feed: TimelineFeed) -> Vec<Post> {
                 "blue_swift",
                 "Blue Swift",
                 &format!("{tag} home post {index}"),
-                (45 - index) as u64 * 4,
+                (N - index) as u64,
                 1,
                 0,
                 0,
             );
-            let day = 1 + (index % 28);
-            item.created_at = Some(format!("2026-09-{day:02}T12:00:00Z"));
+            let day = 1 + (index / 24);
+            let hour = index % 24;
+            item.created_at = Some(format!("2026-10-{day:02}T{hour:02}:00:00Z"));
             item
         })
         .collect()
@@ -1131,7 +1193,7 @@ impl OpenCliProvider {
         cursor: Option<&str>,
         count: usize,
     ) -> Result<TimelinePage, String> {
-        let count = count.clamp(1, HOME_PAGE_SIZE);
+        let count = count.clamp(1, HOME_UI_PAGE);
         let stdout = self.eval_js("https://x.com/home", &timeline_eval_js(feed, cursor, count))?;
         parse_timeline_eval(&stdout)
     }
@@ -2017,10 +2079,14 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
         Some(c) => serde_json::to_string(c).expect("cursor js"),
         None => "null".to_string(),
     };
+    let provider = HOME_PROVIDER_PAGE;
+    let hops = HOME_MAX_HOPS;
     format!(
         r##"(async () => {{
   const FEED = {feed_js};
   const WANT = {count};
+  const PROVIDER = {provider};
+  const MAX_HOPS = {hops};
   let cursor = {cursor_js};
   // The browser tab may still be loading x.com when this eval lands
   // (cold session): poll for the csrf cookie instead of failing fast.
@@ -2107,8 +2173,8 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
   const seen = new Set();
   const out = [];
   let resolved = false;
-  for (let page = 0; page < 1 && out.length < WANT; page++) {{
-    const vars = {{count: Math.min(40, WANT - out.length + 5), includePromotedContent: false, latestControlAvailable: true, requestContext: "launch"}};
+  for (let page = 0; page < MAX_HOPS && out.length < WANT; page++) {{
+    const vars = {{count: PROVIDER, includePromotedContent: false, latestControlAvailable: true, requestContext: "launch"}};
     if (FEED === "for-you") vars.withCommunity = true; else vars.seenTweetIds = [];
     if (cursor) vars.cursor = cursor;
     let url, opts;
@@ -3505,53 +3571,71 @@ mod borrowed_parse_tests {
     }
 
     #[test]
-    fn home_pages_are_longer_than_five_and_keep_a_cursor() {
+    fn ui_page_collects_100_unique_then_continues() {
         let posts = home_fixture(TimelineFeed::ForYou);
-        assert!(posts.len() > HOME_PAGE_SIZE);
-        let mut cursor = None;
-        let mut got = Vec::new();
-        for _ in 0..6 {
-            let page = slice_timeline(&posts, cursor.as_deref(), HOME_PAGE_SIZE);
-            assert!(!page.posts.is_empty());
-            if cursor.is_none() {
-                assert!(page.posts.len() > 5);
-            }
-            for post in &page.posts {
-                assert!(
-                    !got.iter().any(|id: &String| id == &post.id),
-                    "duplicate {}",
-                    post.id
-                );
-                got.push(post.id.clone());
-            }
-            let again = append_new_posts(
-                posts
-                    .iter()
-                    .filter(|post| got.contains(&post.id))
-                    .cloned()
-                    .collect(),
-                page.posts.clone(),
-            );
-            assert_eq!(again.len(), got.len());
-            match page.next_cursor {
-                Some(token) => cursor = Some(token),
-                None => {
-                    cursor = None;
-                    break;
-                }
-            }
-        }
-        assert!(cursor.is_none());
-        assert_eq!(got.len(), posts.len());
-        let mut popular = posts.clone();
+        assert!(posts.len() > HOME_UI_PAGE * 2);
+        let first = accumulate_fixture(&posts, None, HOME_UI_PAGE);
+        assert!(
+            first.posts.len() >= HOME_UI_PAGE,
+            "got {}",
+            first.posts.len()
+        );
+        assert!(first.posts.len() <= HOME_UI_PAGE + HOME_PROVIDER_PAGE);
+        let cursor = first.next_cursor.clone().expect("more than one page");
+        let second = accumulate_fixture(&posts, Some(&cursor), HOME_UI_PAGE);
+        assert!(second.posts.len() >= HOME_UI_PAGE);
+        let kept = append_new_posts(first.posts.clone(), second.posts.clone());
+        assert_eq!(kept.len(), first.posts.len() + second.posts.len());
+        let mut popular = kept.clone();
         popular.sort_by(|left, right| {
             crate::sort::cmp_posts(left, right, crate::sort::ResultSort::Popular)
         });
-        let mut newest = posts.clone();
+        let mut newest = kept.clone();
         newest.sort_by(|left, right| {
             crate::sort::cmp_posts(left, right, crate::sort::ResultSort::Newest)
         });
         assert_ne!(popular[0].id, newest[0].id);
+    }
+
+    #[test]
+    fn short_provider_stops_below_100_without_padding() {
+        let posts = home_fixture(TimelineFeed::ForYou);
+        let short = &posts[..40];
+        let page = accumulate_fixture(short, None, HOME_UI_PAGE);
+        assert_eq!(page.posts.len(), 40);
+        assert!(page.next_cursor.is_none());
+        assert!(page.posts.len() < HOME_UI_PAGE);
+    }
+
+    #[test]
+    fn repeated_cursor_stops_and_duplicate_ids_collapse() {
+        let page = accumulate_timeline_pages(
+            |cursor| {
+                if cursor.is_none() {
+                    TimelinePage {
+                        posts: vec![
+                            post("1", "a", "A", "one", 3, 0, 0, 0),
+                            post("2", "a", "A", "two", 1, 0, 0, 0),
+                        ],
+                        next_cursor: Some("same".into()),
+                    }
+                } else {
+                    TimelinePage {
+                        posts: vec![
+                            post("2", "a", "A", "two-again", 1, 0, 0, 0),
+                            post("3", "a", "A", "three", 9, 0, 0, 0),
+                        ],
+                        next_cursor: Some("same".into()),
+                    }
+                }
+            },
+            None,
+            HOME_UI_PAGE,
+        );
+        let ids: Vec<&str> = page.posts.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+        assert!(page.next_cursor.is_none());
+        assert!(page.posts.len() < HOME_UI_PAGE);
     }
 }
 
