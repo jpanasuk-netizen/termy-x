@@ -165,6 +165,22 @@ impl HostGate {
     }
 }
 
+/// Win32 style bits for the video host. Not visible at creation, and
+/// children are clipped to the host so an mpv child cannot paint at
+/// monitor size outside the panel.
+pub const HOST_STYLE_VISIBLE: u32 = 0x1000_0000;
+pub const HOST_STYLE_CLIP_CHILDREN: u32 = 0x0200_0000;
+pub const HOST_STYLE_POPUP: u32 = 0x8000_0000;
+pub const HOST_STYLE_CLIP_SIBLINGS: u32 = 0x0400_0000;
+
+pub fn host_create_style() -> u32 {
+    HOST_STYLE_POPUP | HOST_STYLE_CLIP_SIBLINGS | HOST_STYLE_CLIP_CHILDREN
+}
+
+pub fn host_style_starts_hidden(style: u32) -> bool {
+    style & HOST_STYLE_VISIBLE == 0 && style & HOST_STYLE_CLIP_CHILDREN != 0
+}
+
 /// Playback generation. Open and dismiss each bump it. A callback that
 /// captured an older value must not close or reopen the current player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,9 +380,6 @@ mod win {
     type Lresult = isize;
     type Wparam = usize;
     type Lparam = isize;
-    const WS_POPUP: u32 = 0x8000_0000;
-    const WS_VISIBLE: u32 = 0x1000_0000;
-    const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
     const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
     const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
     const SWP_NOACTIVATE: u32 = 0x0010;
@@ -601,7 +614,7 @@ mod win {
                     // Hidden until place+show. WS_VISIBLE here is the
                     // full-size flash: mpv resizes the wid before the
                     // first glue tick.
-                    WS_POPUP | WS_CLIPSIBLINGS,
+                    super::host_create_style(),
                     x,
                     y,
                     w,
@@ -907,7 +920,9 @@ mod win {
 mod tests {
     use super::{
         CLOSE_BAND, HostGate, HostPhase, PlayGen, begin_playback, callback_is_current,
-        clamp_window_change, close_button_rect, dismiss_playback, embed_rect, rects_overlap,
+        clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
+        host_create_style, host_style_starts_hidden, rects_overlap, HOST_STYLE_CLIP_CHILDREN,
+        HOST_STYLE_VISIBLE,
     };
 
     #[test]
@@ -978,5 +993,13 @@ mod tests {
         assert!(gate.hide_for_close().is_ok());
         assert!(gate.destroy().is_ok());
         assert_eq!(gate.phase, HostPhase::Destroyed);
+    }
+
+    #[test]
+    fn host_is_created_hidden_and_clips_children() {
+        let style = host_create_style();
+        assert!(host_style_starts_hidden(style));
+        assert_eq!(style & HOST_STYLE_VISIBLE, 0);
+        assert_ne!(style & HOST_STYLE_CLIP_CHILDREN, 0);
     }
 }
