@@ -64,6 +64,107 @@ pub fn rects_overlap(a: Rect, b: Rect) -> bool {
     a.0 < bx2 && ax2 > b.0 && a.1 < by2 && ay2 > b.1
 }
 
+/// Screen rectangle the native host is allowed to occupy.
+pub type ScreenRect = (i32, i32, i32, i32);
+
+/// What a Win32 move/size request becomes. A fullscreen request is
+/// replaced with the panel rect before the window manager applies it,
+/// so there is no frame at monitor size. While closing, the window is
+/// forced hidden so unparenting cannot flash it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClampedPos {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    pub hide: bool,
+}
+
+pub fn clamp_window_change(
+    allowed: ScreenRect,
+    _requested: ScreenRect,
+    closing: bool,
+) -> ClampedPos {
+    ClampedPos {
+        x: allowed.0,
+        y: allowed.1,
+        w: allowed.2.max(1),
+        h: allowed.3.max(1),
+        hide: closing,
+    }
+}
+
+/// Create hidden, place, then show. Destroy is refused while the
+/// window is still shown: hide first so teardown cannot restore a
+/// top-level fullscreen placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPhase {
+    Hidden,
+    Placed,
+    Shown,
+    Closing,
+    Destroyed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostGate {
+    pub phase: HostPhase,
+    pub allowed: ScreenRect,
+}
+
+impl HostGate {
+    pub fn hidden(allowed: ScreenRect) -> Self {
+        Self {
+            phase: HostPhase::Hidden,
+            allowed,
+        }
+    }
+
+    pub fn place(&mut self) -> Result<ScreenRect, &'static str> {
+        match self.phase {
+            HostPhase::Hidden => {
+                self.phase = HostPhase::Placed;
+                Ok(self.allowed)
+            }
+            HostPhase::Placed | HostPhase::Shown => Ok(self.allowed),
+            HostPhase::Closing | HostPhase::Destroyed => Err("place after close"),
+        }
+    }
+
+    pub fn show(&mut self) -> Result<(), &'static str> {
+        match self.phase {
+            HostPhase::Placed | HostPhase::Shown => {
+                self.phase = HostPhase::Shown;
+                Ok(())
+            }
+            HostPhase::Hidden => Err("show before the surface is placed"),
+            HostPhase::Closing | HostPhase::Destroyed => Err("show while closing"),
+        }
+    }
+
+    pub fn retarget(&mut self, allowed: ScreenRect) {
+        if self.phase != HostPhase::Destroyed {
+            self.allowed = allowed;
+        }
+    }
+
+    pub fn hide_for_close(&mut self) -> Result<(), &'static str> {
+        if self.phase == HostPhase::Destroyed {
+            return Err("already destroyed");
+        }
+        self.phase = HostPhase::Closing;
+        Ok(())
+    }
+
+    pub fn destroy(&mut self) -> Result<(), &'static str> {
+        if self.phase != HostPhase::Closing {
+            return Err("destroy while the surface can still paint");
+        }
+        self.phase = HostPhase::Destroyed;
+        Ok(())
+    }
+}
+
 /// Playback generation. Open and dismiss each bump it. A callback that
 /// captured an older value must not close or reopen the current player.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -270,6 +371,53 @@ mod win {
     const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const SWP_HIDEWINDOW: u32 = 0x0080;
+    const WM_WINDOWPOSCHANGING: u32 = 0x0046;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_MAXIMIZE: usize = 0xF030;
+    const SW_HIDE: i32 = 0;
+    const SW_SHOWNA: i32 = 8;
+
+    #[repr(C)]
+    struct WindowPos {
+        hwnd: Hwnd,
+        insert_after: Hwnd,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    }
+
+    struct HostSlot {
+        allowed: super::ScreenRect,
+        closing: bool,
+    }
+
+    fn hosts() -> &'static std::sync::Mutex<std::collections::HashMap<isize, HostSlot>> {
+        static HOSTS: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<isize, HostSlot>>,
+        > = std::sync::OnceLock::new();
+        HOSTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    fn trace_hwnd(hwnd: isize, event: &str, bounds: super::ScreenRect) {
+        let line = format!(
+            "termy-video hwnd={hwnd:#x} event={event} bounds={},{},{},{}",
+            bounds.0, bounds.1, bounds.2, bounds.3
+        );
+        eprintln!("{line}");
+        let path = std::env::temp_dir().join("termy-video-hwnd.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+        }
+    }
 
     #[repr(C)]
     struct WndClassExW {
@@ -337,6 +485,44 @@ mod win {
         (origin.x + x, origin.y + y, w, h)
     }
     unsafe extern "system" fn wndproc(h: Hwnd, m: u32, w: Wparam, l: Lparam) -> Lresult {
+        if m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_MAXIMIZE {
+            return 0;
+        }
+        if m == WM_WINDOWPOSCHANGING && l != 0 {
+            let key = h as isize;
+            if let Some(slot) = hosts().lock().ok().and_then(|guard| {
+                guard.get(&key).map(|slot| HostSlot {
+                    allowed: slot.allowed,
+                    closing: slot.closing,
+                })
+            }) {
+                let pos = unsafe { &mut *(l as *mut WindowPos) };
+                let requested = (pos.x, pos.y, pos.cx, pos.cy);
+                let clamped = super::clamp_window_change(slot.allowed, requested, slot.closing);
+                pos.x = clamped.x;
+                pos.y = clamped.y;
+                pos.cx = clamped.w;
+                pos.cy = clamped.h;
+                if clamped.hide {
+                    pos.flags |= SWP_HIDEWINDOW;
+                    pos.flags &= !SWP_SHOWWINDOW;
+                }
+                if requested != (clamped.x, clamped.y, clamped.w, clamped.h) || clamped.hide {
+                    trace_hwnd(
+                        key,
+                        &format!(
+                            "{} requested={},{},{},{}",
+                            if clamped.hide { "clamp-hide" } else { "clamp" },
+                            requested.0,
+                            requested.1,
+                            requested.2,
+                            requested.3
+                        ),
+                        (clamped.x, clamped.y, clamped.w, clamped.h),
+                    );
+                }
+            }
+        }
         unsafe { DefWindowProcW(h, m, w, l) }
     }
     fn extract_number(line: &str, key: &str) -> Option<f64> {
@@ -412,7 +598,10 @@ mod win {
                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                     class.as_ptr(),
                     wide("").as_ptr(),
-                    WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS,
+                    // Hidden until place+show. WS_VISIBLE here is the
+                    // full-size flash: mpv resizes the wid before the
+                    // first glue tick.
+                    WS_POPUP | WS_CLIPSIBLINGS,
                     x,
                     y,
                     w,
@@ -426,6 +615,34 @@ mod win {
             if host.is_null() {
                 return Err("could not create the in-app video surface".into());
             }
+            let mut gate = super::HostGate::hidden((x, y, w, h));
+            trace_hwnd(host as isize, "create-hidden", (x, y, w, h));
+            let placed = gate.place().map_err(|err| {
+                unsafe { DestroyWindow(host) };
+                err.to_string()
+            })?;
+            hosts().lock().unwrap().insert(host as isize, HostSlot {
+                allowed: placed,
+                closing: false,
+            });
+            unsafe {
+                SetWindowPos(
+                    host,
+                    std::ptr::null_mut(),
+                    placed.0,
+                    placed.1,
+                    placed.2,
+                    placed.3,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            gate.show().map_err(|err| {
+                hosts().lock().unwrap().remove(&(host as isize));
+                unsafe { DestroyWindow(host) };
+                err.to_string()
+            })?;
+            unsafe { ShowWindow(host, SW_SHOWNA) };
+            trace_hwnd(host as isize, "shown", placed);
             // Unique pipe per player instance: a process-wide name let a
             // previous (leaked) poller compete with the next video's mpv.
             static PIPE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -459,7 +676,11 @@ mod win {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
             let child = cmd.spawn().map_err(|e| {
-                unsafe { DestroyWindow(host) };
+                hosts().lock().unwrap().remove(&(host as isize));
+                unsafe {
+                    ShowWindow(host, SW_HIDE);
+                    DestroyWindow(host);
+                }
                 format!("could not start mpv ({}): {e}", bin.display())
             })?;
             let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -538,10 +759,18 @@ mod win {
                             if flag.load(Ordering::Relaxed) {
                                 break;
                             }
+                            let want = (origin.x + ox, origin.y + oy, w2, h2);
+                            if let Ok(mut guard) = hosts().lock()
+                                && let Some(slot) = guard.get_mut(&host_raw)
+                            {
+                                if slot.closing {
+                                    break;
+                                }
+                                slot.allowed = want;
+                            }
                             if IsIconic(parent_h) != 0 {
                                 ShowWindow(host_raw as Hwnd, 0);
                             } else {
-                                let want = (origin.x + ox, origin.y + oy, w2, h2);
                                 let mut r = RectWin {
                                     l: 0,
                                     t: 0,
@@ -587,6 +816,12 @@ mod win {
             let r = screen_rect(self.parent, scale, rect);
             if r != self.last_rect {
                 self.last_rect = r;
+                if let Ok(mut guard) = hosts().lock()
+                    && let Some(slot) = guard.get_mut(&(self.host as isize))
+                    && !slot.closing
+                {
+                    slot.allowed = r;
+                }
                 unsafe {
                     SetWindowPos(
                         self.host,
@@ -632,15 +867,20 @@ mod win {
             }
         }
         pub fn stop_inner(&mut self) {
-            // Hide first, then kill. mpv's own quit path resizes the
-            // surface (fullscreen off) before it exits, which is the
-            // flash on close. Waiting for the process here also held
-            // the UI thread, so Esc could not return to the timeline
-            // until playback or the network timed out.
+            // Mark closing before mpv can unparent the wid. Unparent
+            // posts a move to the restored top-level rect (often the
+            // monitor). The window proc turns that move into a hide.
             self.stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            let hwnd = self.host as isize;
+            if let Ok(mut guard) = hosts().lock()
+                && let Some(slot) = guard.get_mut(&hwnd)
+            {
+                slot.closing = true;
+            }
             if !self.host.is_null() {
-                unsafe { ShowWindow(self.host, 0) };
+                trace_hwnd(hwnd, "hide", self.last_rect);
+                unsafe { ShowWindow(self.host, SW_HIDE) };
             }
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
@@ -649,9 +889,11 @@ mod win {
                 });
             }
             if !self.host.is_null() {
+                trace_hwnd(hwnd, "destroy", self.last_rect);
                 unsafe { DestroyWindow(self.host) };
                 self.host = std::ptr::null_mut();
             }
+            hosts().lock().unwrap().remove(&hwnd);
         }
     }
     impl Drop for Player {
@@ -664,8 +906,8 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_BAND, PlayGen, begin_playback, callback_is_current, close_button_rect,
-        dismiss_playback, embed_rect, rects_overlap,
+        CLOSE_BAND, HostGate, HostPhase, PlayGen, begin_playback, callback_is_current,
+        clamp_window_change, close_button_rect, dismiss_playback, embed_rect, rects_overlap,
     };
 
     #[test]
@@ -711,5 +953,30 @@ mod tests {
         assert!(!callback_is_current(generation, opened));
         assert!(callback_is_current(generation, closed));
         assert!(close_button_rect(1280.0, 800.0, false).is_some());
+    }
+
+    #[test]
+    fn fullscreen_request_is_clamped_before_it_can_paint() {
+        let panel = (1400, 80, 480, 600);
+        let monitor = (0, 0, 1920, 1080);
+        let open = clamp_window_change(panel, monitor, false);
+        assert_eq!((open.x, open.y, open.w, open.h), panel);
+        assert!(!open.hide);
+        let closing = clamp_window_change(panel, monitor, true);
+        assert!(closing.hide);
+        assert_eq!((closing.x, closing.y, closing.w, closing.h), panel);
+    }
+
+    #[test]
+    fn host_cannot_show_before_place_or_destroy_while_shown() {
+        let mut gate = HostGate::hidden((10, 20, 480, 600));
+        assert!(gate.show().is_err());
+        assert_eq!(gate.place().unwrap(), (10, 20, 480, 600));
+        assert!(gate.show().is_ok());
+        assert_eq!(gate.phase, HostPhase::Shown);
+        assert!(gate.destroy().is_err());
+        assert!(gate.hide_for_close().is_ok());
+        assert!(gate.destroy().is_ok());
+        assert_eq!(gate.phase, HostPhase::Destroyed);
     }
 }
