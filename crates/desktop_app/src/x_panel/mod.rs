@@ -481,6 +481,9 @@ pub struct XPanel {
     player_paused: bool,
     player_muted: bool,
     player_error: Option<String>,
+    /// Bumped on open and on dismiss. A late player callback from an
+    /// older video must not close or reopen the one on screen.
+    player_gen: u64,
     #[cfg(target_os = "windows")]
     host_hwnd: isize,
     /// Last window viewport width (logical px), for seek-bar hit math.
@@ -876,6 +879,7 @@ impl XPanel {
             player_paused: false,
             player_muted: false,
             player_error: None,
+            player_gen: 0,
             #[cfg(target_os = "windows")]
             host_hwnd: 0,
             viewport_w: 0.0,
@@ -7517,6 +7521,7 @@ impl XPanel {
             self.notice = Some("Photo opened in Termy — Esc or ✕ to close.".into());
         } else {
             self.player_pending = true;
+            self.player_gen = player::begin_playback(&mut self.player_gen).0;
             self.notice = Some("Playing video inside Termy — Esc or ✕ to stop.".into());
         }
         self.pending_focus = true;
@@ -7535,6 +7540,7 @@ impl XPanel {
     /// and the "Playing video \u{2014} Esc or \u{2715} to stop" notice is
     /// cleared with it so the status can never stick after playback ends.
     fn close_viewer(&mut self) {
+        let _ = player::dismiss_playback(&mut self.player_gen);
         self.stop_video_player();
         self.viewer = None;
         self.player_error = None;
@@ -7845,21 +7851,24 @@ impl XPanel {
         let vw: f32 = viewport.width.into();
         self.viewport_w = vw;
         let vh: f32 = viewport.height.into();
-        let panel_w = if self.fill_window {
-            vw
-        } else {
-            480.0_f32.min(vw)
+        let Some(rect) = player::embed_rect(vw, vh, self.fill_window) else {
+            return;
         };
-        let rect: player::Rect = (vw - panel_w, 56.0, panel_w, (vh - 160.0).max(80.0));
         let scale = window.scale_factor();
         if let Some(player) = &mut self.video_player {
             player.reposition(scale, rect);
         } else if self.player_pending {
-            self.player_pending = false;
             if !self.live {
+                self.player_pending = false;
                 self.player_error = Some("Preview does not play video.".into());
                 return;
             }
+            #[cfg(target_os = "windows")]
+            if self.host_hwnd == 0 {
+                return;
+            }
+            self.player_pending = false;
+            let play_gen = player::PlayGen(self.player_gen);
             #[cfg(target_os = "windows")]
             match player::VideoPlayer::start(self.host_hwnd, scale, rect, &viewer.url) {
                 Ok(player) => {
@@ -7874,6 +7883,9 @@ impl XPanel {
                                 .await;
                             let alive = this
                                 .update(cx, |panel, cx| {
+                                    if !player::callback_is_current(panel.player_gen, play_gen) {
+                                        return false;
+                                    }
                                     let open = panel
                                         .viewer
                                         .as_ref()
@@ -7937,6 +7949,9 @@ impl XPanel {
                                 .await;
                             let alive = this
                                 .update(cx, |panel, cx| {
+                                    if !player::callback_is_current(panel.player_gen, play_gen) {
+                                        return false;
+                                    }
                                     let open = panel
                                         .viewer
                                         .as_ref()

@@ -22,6 +22,45 @@ use std::process::{Child, Command, Stdio};
 /// Logical rect (x, y, w, h) in the parent window's client area.
 pub type Rect = (f32, f32, f32, f32);
 
+/// The embedded surface, in logical pixels, over the X panel's viewer.
+/// Returns None until the window has a real viewport, so the player is
+/// never created at a placeholder full-screen size and then shrunk.
+pub fn embed_rect(viewport_w: f32, viewport_h: f32, fill_window: bool) -> Option<Rect> {
+    if !viewport_w.is_finite() || !viewport_h.is_finite() {
+        return None;
+    }
+    if viewport_w < 320.0 || viewport_h < 240.0 {
+        return None;
+    }
+    let panel_w = if fill_window {
+        viewport_w
+    } else {
+        480.0_f32.min(viewport_w)
+    };
+    let height = (viewport_h - 160.0).clamp(80.0, viewport_h);
+    let x = (viewport_w - panel_w).max(0.0);
+    Some((x, 56.0, panel_w, height))
+}
+
+/// Playback generation. Open and dismiss each bump it. A callback that
+/// captured an older value must not close or reopen the current player.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlayGen(pub u64);
+
+pub fn begin_playback(generation: &mut u64) -> PlayGen {
+    *generation = generation.wrapping_add(1);
+    PlayGen(*generation)
+}
+
+pub fn dismiss_playback(generation: &mut u64) -> PlayGen {
+    *generation = generation.wrapping_add(1);
+    PlayGen(*generation)
+}
+
+pub fn callback_is_current(live: u64, captured: PlayGen) -> bool {
+    live == captured.0
+}
+
 pub fn find_player() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -87,7 +126,18 @@ impl VideoPlayer {
                 "mpv not found on PATH (install mpv for external video playback)".to_string()
             })?;
             let child = Command::new(&bin)
-                .args(["--really-quiet", "--keep-open=yes", url])
+                .args([
+                    "--fs=no",
+                    "--fullscreen=no",
+                    "--no-border",
+                    "--no-auto-window-resize",
+                    "--input-default-bindings=no",
+                    "--input-vo-keyboard=no",
+                    "--osc=no",
+                    "--really-quiet",
+                    "--keep-open=yes",
+                    url,
+                ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -154,7 +204,9 @@ impl VideoPlayer {
         #[cfg(target_os = "linux")]
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
     }
     /// False once the mpv process has exited (EOF quit, crash, or its
@@ -192,8 +244,10 @@ mod win {
     const WS_POPUP: u32 = 0x8000_0000;
     const WS_VISIBLE: u32 = 0x1000_0000;
     const WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
     const SWP_NOACTIVATE: u32 = 0x0010;
-    const SWP_SHOWWINDOW: u32 = 0x0040;
+    const SWP_NOZORDER: u32 = 0x0004;
 
     #[repr(C)]
     struct WndClassExW {
@@ -333,7 +387,7 @@ mod win {
                 };
                 let _ = RegisterClassExW(&wc); // already-registered is fine
                 CreateWindowExW(
-                    0,
+                    WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                     class.as_ptr(),
                     wide("").as_ptr(),
                     WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS,
@@ -362,11 +416,17 @@ mod win {
             cmd.args([
                 &format!("--wid={}", host as isize),
                 &format!("--input-ipc-server={pipe}"),
+                &format!("--geometry={w}x{h}+{x}+{y}"),
+                "--fs=no",
+                "--fullscreen=no",
+                "--no-border",
+                "--no-auto-window-resize",
+                "--input-default-bindings=no",
+                "--input-vo-keyboard=no",
+                "--osc=no",
                 "--no-terminal",
                 "--really-quiet",
                 "--keep-open=yes",
-                "--osc=yes",
-                "--osd-level=1",
                 "--mute=no",
                 "--volume=100",
                 "--cursor-autohide=no",
@@ -453,6 +513,9 @@ mod win {
                             let mut origin = Point { x: 0, y: 0 };
                             ClientToScreen(parent_h, &mut origin);
                             let (ox, oy, w2, h2) = *shared.lock().unwrap();
+                            if flag.load(Ordering::Relaxed) {
+                                break;
+                            }
                             if IsIconic(parent_h) != 0 {
                                 ShowWindow(host_raw as Hwnd, 0);
                             } else {
@@ -472,7 +535,7 @@ mod win {
                                         want.1,
                                         want.2,
                                         want.3,
-                                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                                        SWP_NOACTIVATE | SWP_NOZORDER,
                                     );
                                 }
                             }
@@ -510,7 +573,7 @@ mod win {
                         r.1,
                         r.2,
                         r.3,
-                        SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
                     )
                 };
             }
@@ -547,21 +610,21 @@ mod win {
             }
         }
         pub fn stop_inner(&mut self) {
-            // Stop both background pollers first. This flag existed but
-            // was never set, so every watched video leaked a progress
-            // poller and a window-position poller for the process
-            // lifetime; the orphaned progress poller then competed for
-            // the (previously shared) IPC pipe and starved the next
-            // video's progress updates — position stuck at 0:00/0:00
-            // and EOF was never detected, leaving the viewer open on a
-            // dead end-frame. Killing mpv below breaks any in-flight
-            // pipe read so the poller can observe the flag and exit.
+            // Hide first, then kill. mpv's own quit path resizes the
+            // surface (fullscreen off) before it exits, which is the
+            // flash on close. Waiting for the process here also held
+            // the UI thread, so Esc could not return to the timeline
+            // until playback or the network timed out.
             self.stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            self.ipc(r#"{"command":["quit"]}"#);
+            if !self.host.is_null() {
+                unsafe { ShowWindow(self.host, 0) };
+            }
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
-                let _ = c.wait();
+                std::thread::spawn(move || {
+                    let _ = c.wait();
+                });
             }
             if !self.host.is_null() {
                 unsafe { DestroyWindow(self.host) };
@@ -573,5 +636,39 @@ mod win {
         fn drop(&mut self) {
             self.stop_inner();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlayGen, begin_playback, callback_is_current, dismiss_playback, embed_rect};
+
+    #[test]
+    fn embed_rect_is_the_panel_and_waits_for_a_real_viewport() {
+        assert!(embed_rect(0.0, 0.0, false).is_none());
+        assert!(embed_rect(100.0, 800.0, false).is_none());
+        let rect = embed_rect(1600.0, 900.0, false).unwrap();
+        assert_eq!(rect.2, 480.0);
+        assert_eq!(rect.0, 1120.0);
+        assert!(rect.2 < 1600.0);
+        assert!((rect.3 - 740.0).abs() < 0.1);
+        let again = embed_rect(1600.0, 900.0, false).unwrap();
+        assert_eq!(rect, again);
+        let filled = embed_rect(1600.0, 900.0, true).unwrap();
+        assert_eq!(filled.2, 1600.0);
+        assert!(filled.3 <= 900.0);
+    }
+
+    #[test]
+    fn dismiss_invalidates_the_open_callback_once() {
+        let mut generation = 0u64;
+        let opened = begin_playback(&mut generation);
+        assert!(callback_is_current(generation, opened));
+        let closed = dismiss_playback(&mut generation);
+        assert!(!callback_is_current(generation, opened));
+        assert!(callback_is_current(generation, closed));
+        assert_ne!(opened, closed);
+        let _ = PlayGen(generation);
+        assert!(!callback_is_current(generation, opened));
     }
 }
