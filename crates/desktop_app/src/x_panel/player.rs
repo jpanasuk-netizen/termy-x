@@ -1038,6 +1038,7 @@ mod vlc_embed {
         fn DispatchMessageW(msg: *const Msg) -> isize;
         fn LoadLibraryExW(name: *const u16, file: Hwnd, flags: u32) -> Hmodule;
         fn GetProcAddress(module: Hmodule, name: *const i8) -> *mut core::ffi::c_void;
+        fn SetPropW(hwnd: Hwnd, name: *const u16, data: *mut core::ffi::c_void) -> i32;
     }
 
     type Cb = unsafe extern "system" fn(*const LibvlcEvent, *mut core::ffi::c_void);
@@ -1549,6 +1550,8 @@ mod vlc_embed {
             if host.is_null() {
                 return Err("Could not place the video inside Termy. No window was opened.".into());
             }
+            let rude = wide(std::ffi::OsStr::new("NonRudeHWND"));
+            unsafe { SetPropW(host, rude.as_ptr(), 1 as *mut core::ffi::c_void); }
             static GEN: AtomicU64 = AtomicU64::new(1);
             let generation = GEN.fetch_add(1, Ordering::Relaxed);
             let slot = Arc::new(Slot {

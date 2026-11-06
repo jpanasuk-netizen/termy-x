@@ -60,7 +60,10 @@ impl SavedWindowState {
         let (mode, bounds) = match window.window_bounds() {
             WindowBounds::Windowed(bounds) => (WindowMode::Windowed, bounds),
             WindowBounds::Maximized(bounds) => (WindowMode::Maximized, bounds),
-            WindowBounds::Fullscreen(bounds) => (WindowMode::Fullscreen, bounds),
+            // A stuck fullscreen window makes Windows show "an app is
+            // running in full screen mode and can't close". Keep the
+            // size, but do not restore that mode.
+            WindowBounds::Fullscreen(bounds) => (WindowMode::Windowed, bounds),
         };
         let state = Self {
             mode,
@@ -127,10 +130,10 @@ impl SavedWindowState {
         };
 
         RestoredWindowGeometry {
-            bounds: match self.mode {
+            bounds: match persisted_window_mode(self.mode) {
                 WindowMode::Windowed => WindowBounds::Windowed(bounds),
                 WindowMode::Maximized => WindowBounds::Maximized(bounds),
-                WindowMode::Fullscreen => WindowBounds::Fullscreen(bounds),
+                WindowMode::Fullscreen => WindowBounds::Windowed(bounds),
             },
             display_id: Some(display.id()),
         }
@@ -165,6 +168,13 @@ fn fit_bounds_to_display(window: Bounds<Pixels>, display: Bounds<Pixels>) -> Bou
         ),
         window_size,
     )
+}
+
+fn persisted_window_mode(mode: WindowMode) -> WindowMode {
+    match mode {
+        WindowMode::Fullscreen => WindowMode::Windowed,
+        other => other,
+    }
 }
 
 fn window_state_path() -> Option<PathBuf> {
@@ -262,6 +272,22 @@ mod tests {
 
     fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+    }
+
+    #[test]
+    fn fullscreen_is_not_restored_as_a_rude_fullscreen_window() {
+        assert_eq!(
+            persisted_window_mode(WindowMode::Fullscreen),
+            WindowMode::Windowed
+        );
+        assert_eq!(
+            persisted_window_mode(WindowMode::Maximized),
+            WindowMode::Maximized
+        );
+        assert_eq!(
+            persisted_window_mode(WindowMode::Windowed),
+            WindowMode::Windowed
+        );
     }
 
     #[test]

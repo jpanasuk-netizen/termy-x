@@ -177,36 +177,44 @@ impl TerminalView {
         .flatten()
         .any(Self::title_names_agent);
         let command_is_agent = command_is_agent || title_is_agent;
-        let mut saw_agent = false;
+        let names_agent = command_is_agent || title_is_agent;
+        let mut saw_agent = names_agent;
         let all_ok = tab.panes.iter().all(|pane| {
             let process = pane
                 .terminal()
                 .child_pid()
                 .and_then(termy_core::foreground_process_name_of_pid);
-            match process.as_deref() {
-                Some(name) if super::super::x_host::is_agent_process(name) => {
-                    saw_agent = true;
-                    true
-                }
-                Some(name) if super::super::x_host::is_shell(Some(name)) => {
-                    !pane.terminal().alternate_screen_mode()
-                }
-                None if command_is_agent => {
-                    saw_agent = true;
-                    true
-                }
-                Some(name)
-                    if command_is_agent
-                        && (super::super::x_host::is_shell(Some(name))
-                            || Self::is_agent_runtime(name)) =>
-                {
-                    saw_agent = true;
-                    true
-                }
-                _ => false,
+            let blocks = Self::pane_blocks_close(
+                process.as_deref(),
+                pane.terminal().alternate_screen_mode(),
+                names_agent,
+            );
+            if !blocks && names_agent {
+                saw_agent = true;
             }
+            !blocks
         });
         all_ok && saw_agent
+    }
+
+    /// Agent TUIs use the alternate screen and, on Windows, often keep
+    /// `cmd` or `conhost` as the foreground process. That is not a
+    /// fullscreen app blocking quit. Vim and other non-agent programs
+    /// in the alternate screen still block.
+    fn pane_blocks_close(process: Option<&str>, alternate_screen: bool, names_agent: bool) -> bool {
+        match process {
+            Some(name) if super::super::x_host::is_agent_process(name) => false,
+            Some(name)
+                if names_agent
+                    && (super::super::x_host::is_shell(Some(name))
+                        || Self::is_agent_runtime(name)) =>
+            {
+                false
+            }
+            Some(name) if super::super::x_host::is_shell(Some(name)) => alternate_screen,
+            None => alternate_screen && !names_agent,
+            Some(_) => true,
+        }
     }
 
     fn title_names_agent(title: &str) -> bool {
@@ -816,6 +824,24 @@ mod tests {
             idle.starts_with("Detach keeps this window's 1 process"),
             "{idle}"
         );
+    }
+
+    #[test]
+    fn agent_alt_screen_does_not_block_close_but_vim_does() {
+        assert!(!TerminalView::pane_blocks_close(Some("grok.exe"), true, false));
+        assert!(!TerminalView::pane_blocks_close(
+            Some(r"C:\Windows\System32\cmd.exe"),
+            true,
+            true
+        ));
+        assert!(!TerminalView::pane_blocks_close(Some("conhost.exe"), true, true));
+        assert!(!TerminalView::pane_blocks_close(Some("node.exe"), true, true));
+        assert!(!TerminalView::pane_blocks_close(None, true, true));
+        assert!(!TerminalView::pane_blocks_close(Some("pwsh.exe"), false, false));
+        assert!(TerminalView::pane_blocks_close(Some("cmd.exe"), true, false));
+        assert!(TerminalView::pane_blocks_close(Some("vim.exe"), true, false));
+        assert!(TerminalView::pane_blocks_close(Some("cargo.exe"), false, false));
+        assert!(TerminalView::pane_blocks_close(None, true, false));
     }
 
     #[test]
