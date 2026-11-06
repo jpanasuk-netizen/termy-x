@@ -3199,6 +3199,7 @@ impl XPanel {
                 return;
             }
             if self.viewer.is_some() {
+                player::note_player_phase("esc");
                 self.close_viewer();
                 self.notice = Some("Viewer closed \u{b7} nothing was posted.".into());
                 cx.stop_propagation();
@@ -7917,6 +7918,7 @@ impl XPanel {
                                         .is_some_and(|pl| !pl.is_alive());
                                     let at_eof = dur > 0.0 && pos >= dur - 0.25;
                                     if player_gone || at_eof {
+                                        player::note_player_phase("eof");
                                         panel.close_viewer();
                                         panel.notice =
                                             Some("Video ended \u{b7} back to the timeline.".into());
@@ -7971,6 +7973,7 @@ impl XPanel {
                                     }
                                     if panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive())
                                     {
+                                        player::note_player_phase("eof");
                                         panel.close_viewer();
                                         panel.notice =
                                             Some("Video ended \u{b7} back to the timeline.".into());
@@ -8360,6 +8363,7 @@ impl XPanel {
                         "x-viewer-close",
                         "\u{2715} Close",
                         cx.listener(|this, _, _, cx| {
+                            player::note_player_phase("close");
                             this.close_viewer();
                             cx.stop_propagation();
                             cx.notify();
@@ -8394,6 +8398,7 @@ impl XPanel {
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
+                            player::note_player_phase("close");
                             this.close_viewer();
                             cx.stop_propagation();
                             cx.notify();

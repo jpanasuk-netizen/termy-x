@@ -181,15 +181,158 @@ pub fn host_style_starts_hidden(style: u32) -> bool {
     style & HOST_STYLE_VISIBLE == 0 && style & HOST_STYLE_CLIP_CHILDREN != 0
 }
 
-/// mpv's Windows flip present paints a black full-screen frame when the
-/// swap chain is created and when it is destroyed. The host rectangle
-/// does not change. This switch turns that present off.
-pub const D3D11_FLIP_OFF: &str = "--d3d11-flip=no";
+pub const TRACE_LINE_CAP: u32 = 100;
+pub const TRACE_RECT_CAP: u32 = 50;
+/// Other processes stop being recorded after this many lines so the host
+/// and the player process still have room through Stop.
+pub const TRACE_OTHER_CAP: u32 = 80;
 
-/// Restored placement used before a window is destroyed. Show command 0
-/// is SW_HIDE. The rect stays the panel, not the monitor.
-pub fn hidden_restore(panel: ScreenRect) -> (u32, ScreenRect) {
-    (0, panel)
+pub const SWP_NOSIZE: u32 = 0x0001;
+pub const SWP_NOMOVE: u32 = 0x0002;
+pub const SWP_NOZORDER: u32 = 0x0004;
+pub const SWP_NOREDRAW: u32 = 0x0008;
+pub const SWP_NOACTIVATE_F: u32 = 0x0010;
+pub const SWP_FRAMECHANGED: u32 = 0x0020;
+pub const SWP_SHOWWINDOW_F: u32 = 0x0040;
+pub const SWP_HIDEWINDOW_F: u32 = 0x0080;
+pub const SWP_NOCOPYBITS: u32 = 0x0100;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
+pub const SWP_NOSENDCHANGING: u32 = 0x0400;
+pub const SWP_DEFERERASE: u32 = 0x2000;
+pub const SWP_ASYNCWINDOWPOS: u32 = 0x4000;
+
+pub fn event_name(code: u32) -> &'static str {
+    match code {
+        0x8000 => "CREATE",
+        0x8001 => "DESTROY",
+        0x8002 => "SHOW",
+        0x8003 => "HIDE",
+        0x800B => "LOCATION",
+        0x8017 => "CLOAK",
+        0x8018 => "UNCLOAK",
+        _ => "OTHER",
+    }
+}
+
+pub fn swp_names(flags: u32) -> String {
+    const BITS: [(u32, &str); 13] = [
+        (SWP_NOSIZE, "SWP_NOSIZE"),
+        (SWP_NOMOVE, "SWP_NOMOVE"),
+        (SWP_NOZORDER, "SWP_NOZORDER"),
+        (SWP_NOREDRAW, "SWP_NOREDRAW"),
+        (SWP_NOACTIVATE_F, "SWP_NOACTIVATE"),
+        (SWP_FRAMECHANGED, "SWP_FRAMECHANGED"),
+        (SWP_SHOWWINDOW_F, "SWP_SHOWWINDOW"),
+        (SWP_HIDEWINDOW_F, "SWP_HIDEWINDOW"),
+        (SWP_NOCOPYBITS, "SWP_NOCOPYBITS"),
+        (SWP_NOOWNERZORDER, "SWP_NOOWNERZORDER"),
+        (SWP_NOSENDCHANGING, "SWP_NOSENDCHANGING"),
+        (SWP_DEFERERASE, "SWP_DEFERERASE"),
+        (SWP_ASYNCWINDOWPOS, "SWP_ASYNCWINDOWPOS"),
+    ];
+    let mut names = Vec::new();
+    for (bit, name) in BITS {
+        if flags & bit != 0 {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        "0".to_string()
+    } else {
+        names.join("|")
+    }
+}
+
+/// `requested=0,0,0,0` is not a move when both of these flags are set.
+pub fn pos_is_noop(flags: u32) -> bool {
+    flags & SWP_NOSIZE != 0 && flags & SWP_NOMOVE != 0
+}
+
+pub fn admit_trace_line(pid: u32, host_pid: u32, child_pid: u32, lines: u32) -> bool {
+    if lines >= TRACE_LINE_CAP {
+        return false;
+    }
+    // pid 0 is a window that is already going away. Keep those lines
+    // through the same cap as the host so Destroy is not dropped.
+    if pid == 0 || pid == host_pid || (child_pid != 0 && pid == child_pid) {
+        return true;
+    }
+    lines < TRACE_OTHER_CAP
+}
+
+pub fn keep_main_window(class: &str, rect_changed: bool) -> bool {
+    class != "Zed::Window" || rect_changed
+}
+
+pub fn rect_changed(prev: Option<(i32, i32, i32, i32)>, next: (i32, i32, i32, i32)) -> bool {
+    prev != Some(next)
+}
+
+/// True when width or height moves by more than half the created size.
+/// For the logged host that created size is 600×770.
+pub fn live_size_differs_half(live_w: i32, live_h: i32, base_w: i32, base_h: i32) -> bool {
+    let over = |live: i32, base: i32| base > 0 && (live - base).unsigned_abs() > (base as u32) / 2;
+    over(live_w, base_w) || over(live_h, base_h)
+}
+
+/// Fixed phase names. Anything else is dropped so a title, typed text,
+/// or URL cannot be written into the trace.
+pub fn marker_name(name: &str) -> Option<&'static str> {
+    match name {
+        "play" => Some("play"),
+        "stop" => Some("stop"),
+        "esc" => Some("esc"),
+        "close" => Some("close"),
+        "eof" => Some("eof"),
+        "hook" => Some("hook"),
+        "hookfail" => Some("hookfail"),
+        _ => None,
+    }
+}
+
+pub fn sanitize_token(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars().take(48) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '-') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "_".into() } else { out }
+}
+
+pub fn format_obs_line(
+    source: &str,
+    event: &str,
+    class: &str,
+    flags: u32,
+    bounds: (i32, i32, i32, i32),
+    live: (i32, i32, i32, i32),
+) -> String {
+    format!(
+        "source={} event={} class={} flags={:#x} swp={} bounds={},{},{},{} live={},{},{},{}",
+        sanitize_token(source),
+        sanitize_token(event),
+        sanitize_token(class),
+        flags,
+        swp_names(flags),
+        bounds.0,
+        bounds.1,
+        bounds.2,
+        bounds.3,
+        live.0,
+        live.1,
+        live.2,
+        live.3,
+    )
+}
+
+pub fn note_player_phase(phase: &str) {
+    #[cfg(windows)]
+    win::note_phase(phase);
+    #[cfg(not(windows))]
+    let _ = phase;
 }
 
 /// Flags for one playback. `--media-controls=no` stops mpv from opening
@@ -239,8 +382,6 @@ pub fn playback_args(
     } else {
         "--mute=no".to_string()
     });
-    #[cfg(windows)]
-    args.push(D3D11_FLIP_OFF.to_string());
     args
 }
 
@@ -469,7 +610,12 @@ mod win {
     const SWP_NOZORDER: u32 = 0x0004;
     const SWP_SHOWWINDOW: u32 = 0x0040;
     const SWP_HIDEWINDOW: u32 = 0x0080;
+    const WM_DESTROY: u32 = 0x0002;
+    const WM_MOVE: u32 = 0x0003;
+    const WM_SIZE: u32 = 0x0005;
+    const WM_SHOWWINDOW: u32 = 0x0018;
     const WM_WINDOWPOSCHANGING: u32 = 0x0046;
+    const WM_WINDOWPOSCHANGED: u32 = 0x0047;
     const WM_SYSCOMMAND: u32 = 0x0112;
     const SC_MAXIMIZE: usize = 0xF030;
     const SW_HIDE: i32 = 0;
@@ -499,20 +645,7 @@ mod win {
     }
 
     fn trace_hwnd(hwnd: isize, event: &str, bounds: super::ScreenRect) {
-        let line = format!(
-            "termy-video hwnd={hwnd:#x} event={event} bounds={},{},{},{}",
-            bounds.0, bounds.1, bounds.2, bounds.3
-        );
-        eprintln!("{line}");
-        let path = std::env::temp_dir().join("termy-video-hwnd.log");
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            use std::io::Write;
-            let _ = writeln!(file, "{line}");
-        }
+        observe("checkpoint", event, hwnd as Hwnd, Some(bounds), None);
     }
 
     #[repr(C)]
@@ -556,74 +689,50 @@ mod win {
         fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
         fn GetWindow(h: Hwnd, cmd: u32) -> Hwnd;
         fn GetClassNameW(h: Hwnd, buf: *mut u16, max: i32) -> i32;
-        fn SetWindowPlacement(h: Hwnd, place: *const WindowPlacement) -> i32;
+        fn GetParent(h: Hwnd) -> Hwnd;
+        fn GetAncestor(h: Hwnd, flags: u32) -> Hwnd;
+        fn GetWindowThreadProcessId(h: Hwnd, pid: *mut u32) -> u32;
+        fn GetWindowLongPtrW(h: Hwnd, index: i32) -> isize;
+        fn IsWindowVisible(h: Hwnd) -> i32;
+        fn GetDpiForWindow(h: Hwnd) -> u32;
+        fn MonitorFromWindow(h: Hwnd, flags: u32) -> Hwnd;
+        fn GetMonitorInfoW(monitor: Hwnd, info: *mut MonitorInfo) -> i32;
+        fn SetWinEventHook(
+            min: u32,
+            max: u32,
+            module: *mut core::ffi::c_void,
+            proc: Option<
+                unsafe extern "system" fn(*mut core::ffi::c_void, u32, Hwnd, i32, i32, u32, u32),
+            >,
+            pid: u32,
+            tid: u32,
+            flags: u32,
+        ) -> *mut core::ffi::c_void;
+        fn PeekMessageW(msg: *mut Msg, hwnd: Hwnd, min: u32, max: u32, remove: u32) -> i32;
+        fn TranslateMessage(msg: *const Msg) -> i32;
+        fn DispatchMessageW(msg: *const Msg) -> Lresult;
+        fn GetClientRect(h: Hwnd, r: *mut RectWin) -> i32;
+        fn IsZoomed(h: Hwnd) -> i32;
+        fn IsWindow(h: Hwnd) -> i32;
+        fn UnhookWinEvent(hook: *mut core::ffi::c_void) -> i32;
+        fn EnumWindows(
+            proc: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>,
+            param: isize,
+        ) -> i32;
+        fn EnumChildWindows(
+            parent: Hwnd,
+            proc: Option<unsafe extern "system" fn(Hwnd, isize) -> i32>,
+            param: isize,
+        ) -> i32;
     }
-    #[repr(C)]
-    struct WindowPlacement {
-        length: u32,
-        flags: u32,
-        show_cmd: u32,
-        pt_min: Point,
-        pt_max: Point,
-        rc_normal: RectWin,
-    }
-    fn bury_window(hwnd: Hwnd, panel: super::ScreenRect) {
-        if hwnd.is_null() {
-            return;
-        }
-        let mut class = [0u16; 48];
-        let n = unsafe { GetClassNameW(hwnd, class.as_mut_ptr(), 48) };
-        let class_name = if n > 0 {
-            String::from_utf16_lossy(&class[..n as usize])
-        } else {
-            String::new()
-        };
-        let mut was = RectWin {
-            l: 0,
-            t: 0,
-            r: 0,
-            b: 0,
-        };
-        unsafe { GetWindowRect(hwnd, &mut was) };
-        trace_hwnd(
-            hwnd as isize,
-            &format!(
-                "bury class={class_name} was={},{},{},{}",
-                was.l,
-                was.t,
-                was.r - was.l,
-                was.b - was.t
-            ),
-            panel,
-        );
-        let (show_cmd, rect) = super::hidden_restore(panel);
-        let place = WindowPlacement {
-            length: std::mem::size_of::<WindowPlacement>() as u32,
-            flags: 0,
-            show_cmd,
-            pt_min: Point { x: 0, y: 0 },
-            pt_max: Point { x: 0, y: 0 },
-            rc_normal: RectWin {
-                l: rect.0,
-                t: rect.1,
-                r: rect.0 + rect.2,
-                b: rect.1 + rect.3,
-            },
-        };
-        unsafe {
-            SetWindowPlacement(hwnd, &place);
-            ShowWindow(hwnd, SW_HIDE);
-        }
-    }
-    fn bury_children(parent: Hwnd, panel: super::ScreenRect) {
-        let mut child = unsafe { GetWindow(parent, 5) };
-        let mut guard = 0;
-        while !child.is_null() && guard < 16 {
-            let next = unsafe { GetWindow(child, 2) };
-            bury_window(child, panel);
-            child = next;
-            guard += 1;
-        }
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmGetWindowAttribute(
+            hwnd: Hwnd,
+            attr: u32,
+            value: *mut core::ffi::c_void,
+            size: u32,
+        ) -> i32;
     }
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -638,6 +747,770 @@ mod win {
         r: i32,
         b: i32,
     }
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: RectWin,
+        rc_work: RectWin,
+        flags: u32,
+    }
+    #[repr(C)]
+    struct Msg {
+        hwnd: Hwnd,
+        message: u32,
+        _pad_msg: u32,
+        wparam: usize,
+        lparam: isize,
+        time: u32,
+        pt: Point,
+        lprivate: u32,
+    }
+
+    fn mono_us() -> u64 {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_micros() as u64
+    }
+
+    fn wall_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    #[derive(Clone, Copy)]
+    struct Seen {
+        rect: (i32, i32, i32, i32),
+        vis: u8,
+        cloak: u32,
+        zoomed: u8,
+        rects: u32,
+    }
+
+    struct GenState {
+        generation: u64,
+        armed: bool,
+        host: u64,
+        host_pid: u32,
+        child_pid: u32,
+        base_w: i32,
+        base_h: i32,
+        started: std::time::Instant,
+        lines: u32,
+        seq: u64,
+        seen: std::collections::HashMap<u64, Seen>,
+        main_seen: bool,
+        main_rect: Option<(i32, i32, i32, i32)>,
+        noop_logged: bool,
+        enum_show: bool,
+        enum_big: bool,
+        hooks: Vec<usize>,
+    }
+
+    fn gen_state() -> &'static std::sync::Mutex<GenState> {
+        static STATE: std::sync::OnceLock<std::sync::Mutex<GenState>> = std::sync::OnceLock::new();
+        STATE.get_or_init(|| {
+            std::sync::Mutex::new(GenState {
+                generation: 0,
+                armed: false,
+                host: 0,
+                host_pid: 0,
+                child_pid: 0,
+                base_w: 0,
+                base_h: 0,
+                started: std::time::Instant::now(),
+                lines: 0,
+                seq: 0,
+                seen: std::collections::HashMap::new(),
+                main_seen: false,
+                main_rect: None,
+                noop_logged: false,
+                enum_show: false,
+                enum_big: false,
+                hooks: Vec::new(),
+            })
+        })
+    }
+
+    static HOOK_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    struct PosRequest {
+        flags: u32,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        insert: isize,
+    }
+
+    struct Sample {
+        pid: u32,
+        tid: u32,
+        class: String,
+        parent: u64,
+        owner: u64,
+        root: u64,
+        style: u32,
+        exstyle: u32,
+        live: (i32, i32, i32, i32),
+        client: (i32, i32, i32, i32),
+        parent_rect: (i32, i32, i32, i32),
+        vis: u8,
+        iconic: u8,
+        zoomed: u8,
+        cloak: u32,
+        dpi: u32,
+        mon: (i32, i32, i32, i32),
+    }
+
+    fn rect_of(raw: RectWin) -> (i32, i32, i32, i32) {
+        (
+            raw.l,
+            raw.t,
+            raw.r.saturating_sub(raw.l),
+            raw.b.saturating_sub(raw.t),
+        )
+    }
+
+    fn read_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
+        let mut raw = RectWin {
+            l: 0,
+            t: 0,
+            r: 0,
+            b: 0,
+        };
+        unsafe { GetWindowRect(hwnd, &mut raw) };
+        rect_of(raw)
+    }
+
+    fn sample_hwnd(hwnd: Hwnd) -> Sample {
+        if hwnd.is_null() {
+            return Sample {
+                pid: 0,
+                tid: 0,
+                class: String::new(),
+                parent: 0,
+                owner: 0,
+                root: 0,
+                style: 0,
+                exstyle: 0,
+                live: (0, 0, 0, 0),
+                client: (0, 0, 0, 0),
+                parent_rect: (0, 0, 0, 0),
+                vis: 0,
+                iconic: 0,
+                zoomed: 0,
+                cloak: 0,
+                dpi: 0,
+                mon: (0, 0, 0, 0),
+            };
+        }
+        let mut pid = 0u32;
+        let tid = unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let mut class_buf = [0u16; 48];
+        let n = unsafe { GetClassNameW(hwnd, class_buf.as_mut_ptr(), 48) };
+        let class = if n > 0 {
+            String::from_utf16_lossy(&class_buf[..n as usize])
+        } else {
+            String::new()
+        };
+        let parent = unsafe { GetParent(hwnd) };
+        let owner = unsafe { GetWindow(hwnd, 4) };
+        let root = unsafe { GetAncestor(hwnd, 2) };
+        let mut client = RectWin {
+            l: 0,
+            t: 0,
+            r: 0,
+            b: 0,
+        };
+        unsafe { GetClientRect(hwnd, &mut client) };
+        let mut cloaked = 0xffffu32;
+        let hr = unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                14,
+                &mut cloaked as *mut u32 as *mut core::ffi::c_void,
+                4,
+            )
+        };
+        if hr != 0 {
+            cloaked = 0xffff;
+        }
+        let mut mon = RectWin {
+            l: 0,
+            t: 0,
+            r: 0,
+            b: 0,
+        };
+        let hmon = unsafe { MonitorFromWindow(hwnd, 2) };
+        if !hmon.is_null() {
+            let mut info = MonitorInfo {
+                cb_size: std::mem::size_of::<MonitorInfo>() as u32,
+                rc_monitor: RectWin {
+                    l: 0,
+                    t: 0,
+                    r: 0,
+                    b: 0,
+                },
+                rc_work: RectWin {
+                    l: 0,
+                    t: 0,
+                    r: 0,
+                    b: 0,
+                },
+                flags: 0,
+            };
+            if unsafe { GetMonitorInfoW(hmon, &mut info) } != 0 {
+                mon = info.rc_monitor;
+            }
+        }
+        Sample {
+            pid,
+            tid,
+            class,
+            parent: parent as usize as u64,
+            owner: owner as usize as u64,
+            root: root as usize as u64,
+            style: unsafe { GetWindowLongPtrW(hwnd, -16) as u32 },
+            exstyle: unsafe { GetWindowLongPtrW(hwnd, -20) as u32 },
+            live: read_rect(hwnd),
+            client: (
+                client.l,
+                client.t,
+                client.r.saturating_sub(client.l),
+                client.b.saturating_sub(client.t),
+            ),
+            parent_rect: if parent.is_null() {
+                (0, 0, 0, 0)
+            } else {
+                read_rect(parent)
+            },
+            vis: unsafe { if IsWindowVisible(hwnd) != 0 { 1 } else { 0 } },
+            iconic: unsafe { if IsIconic(hwnd) != 0 { 1 } else { 0 } },
+            zoomed: unsafe { if IsZoomed(hwnd) != 0 { 1 } else { 0 } },
+            cloak: cloaked,
+            dpi: unsafe { GetDpiForWindow(hwnd) },
+            mon: (mon.l, mon.t, mon.r, mon.b),
+        }
+    }
+
+    fn append_line(line: &str) {
+        eprintln!("{line}");
+        let path = std::env::temp_dir().join("termy-video-hwnd.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(file, "{line}");
+        }
+    }
+
+    fn write_line(
+        source: &str,
+        event: &str,
+        hwnd: u64,
+        sample: &Sample,
+        bounds: (i32, i32, i32, i32),
+        pos: Option<&PosRequest>,
+        generation: u64,
+        t_ms: u64,
+        seq: u64,
+        spawn_pid: u32,
+    ) {
+        let pos_fields = match pos {
+            Some(pos) => format!(
+                "flags={:#x} swp={} req={},{},{},{} insert={:#x}",
+                pos.flags,
+                super::swp_names(pos.flags),
+                pos.x,
+                pos.y,
+                pos.cx,
+                pos.cy,
+                pos.insert as usize
+            ),
+            None => "flags=na swp=na req=na insert=na".to_string(),
+        };
+        let head = if source == "checkpoint" {
+            format!(
+                "t_us={} termy-video hwnd={hwnd:#x} event={event} bounds={},{},{},{}",
+                mono_us(),
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3
+            )
+        } else {
+            format!(
+                "t_us={} source={} event={} hwnd={hwnd:#x}",
+                mono_us(),
+                super::sanitize_token(source),
+                super::sanitize_token(event)
+            )
+        };
+        let line = format!(
+            "{head} wall_ms={} gen={generation} t_ms={t_ms} seq={seq} class={} pid={} tid={} parent={:#x} owner={:#x} root={:#x} style={:#x} ex={:#x} {pos_fields} live={},{},{},{} client={},{},{},{} parent_rect={},{},{},{} vis={} iconic={} zoomed={} cloak={} dpi={} mon={},{},{},{} spawn_pid={spawn_pid}",
+            super::sanitize_token(&sample.class),
+            sample.pid,
+            sample.tid,
+            sample.parent,
+            sample.owner,
+            sample.root,
+            sample.style,
+            sample.exstyle,
+            sample.live.0,
+            sample.live.1,
+            sample.live.2,
+            sample.live.3,
+            sample.client.0,
+            sample.client.1,
+            sample.client.2,
+            sample.client.3,
+            sample.parent_rect.0,
+            sample.parent_rect.1,
+            sample.parent_rect.2,
+            sample.parent_rect.3,
+            sample.vis,
+            sample.iconic,
+            sample.zoomed,
+            sample.cloak,
+            sample.dpi,
+            sample.mon.0,
+            sample.mon.1,
+            sample.mon.2,
+            sample.mon.3,
+        );
+        append_line(&line);
+    }
+
+    fn observe(
+        source: &str,
+        event: &str,
+        hwnd: Hwnd,
+        bounds: Option<(i32, i32, i32, i32)>,
+        pos: Option<PosRequest>,
+    ) {
+        let sample = sample_hwnd(hwnd);
+        let key = hwnd as usize as u64;
+        let live = sample.live;
+        let stored = bounds.unwrap_or(live);
+        let location = event == "LOCATION";
+        let mut trigger_enum = false;
+        let mut host_pid = 0u32;
+        let mut child_pid = 0u32;
+        let mut host = 0u64;
+        let snapshot = {
+            let Ok(mut guard) = gen_state().lock() else {
+                return;
+            };
+            if !guard.armed && source != "marker" {
+                return;
+            }
+            if sample.class == "Zed::Window" {
+                let log = guard.main_seen && super::rect_changed(guard.main_rect, live);
+                guard.main_seen = true;
+                guard.main_rect = Some(live);
+                if !log {
+                    return;
+                }
+            }
+            if location {
+                let prev = guard.seen.get(&key).copied();
+                let changed = match prev {
+                    None => true,
+                    Some(prev) => {
+                        super::rect_changed(Some(prev.rect), live)
+                            || prev.vis != sample.vis
+                            || prev.cloak != sample.cloak
+                            || prev.zoomed != sample.zoomed
+                    }
+                };
+                if !changed {
+                    return;
+                }
+                let rects = prev.map(|prev| prev.rects).unwrap_or(0);
+                if super::rect_changed(prev.map(|prev| prev.rect), live)
+                    && rects >= super::TRACE_RECT_CAP
+                {
+                    return;
+                }
+            }
+            if source != "marker"
+                && !super::admit_trace_line(
+                    sample.pid,
+                    guard.host_pid,
+                    guard.child_pid,
+                    guard.lines,
+                )
+            {
+                if guard.lines >= super::TRACE_LINE_CAP {
+                    HOOK_ON.store(false, std::sync::atomic::Ordering::Release);
+                }
+                return;
+            }
+            let prev = guard.seen.get(&key).copied();
+            let rects = prev.map(|prev| prev.rects).unwrap_or(0);
+            let rects = if super::rect_changed(prev.map(|prev| prev.rect), live) {
+                rects.saturating_add(1)
+            } else {
+                rects
+            };
+            guard.seen.insert(
+                key,
+                Seen {
+                    rect: live,
+                    vis: sample.vis,
+                    cloak: sample.cloak,
+                    zoomed: sample.zoomed,
+                    rects,
+                },
+            );
+            if source != "marker" {
+                guard.lines = guard.lines.saturating_add(1);
+                if guard.lines >= super::TRACE_LINE_CAP {
+                    HOOK_ON.store(false, std::sync::atomic::Ordering::Release);
+                }
+            }
+            guard.seq = guard.seq.saturating_add(1);
+            if source != "enum"
+                && source != "winevent"
+                && !guard.enum_big
+                && super::live_size_differs_half(live.2, live.3, guard.base_w, guard.base_h)
+            {
+                guard.enum_big = true;
+                trigger_enum = true;
+                host_pid = guard.host_pid;
+                child_pid = guard.child_pid;
+                host = guard.host;
+            }
+            let generation = guard.generation;
+            let t_ms = guard.started.elapsed().as_millis() as u64;
+            let seq = guard.seq;
+            let spawn_pid = guard.child_pid;
+            (generation, t_ms, seq, spawn_pid)
+        };
+        let (generation, t_ms, seq, spawn_pid) = snapshot;
+        write_line(
+            source,
+            event,
+            key,
+            &sample,
+            stored,
+            pos.as_ref(),
+            generation,
+            t_ms,
+            seq,
+            spawn_pid,
+        );
+        if trigger_enum {
+            enumerate_players(host_pid, child_pid, host);
+        }
+    }
+
+    struct EnumJob {
+        host_pid: u32,
+        child_pid: u32,
+        host: u64,
+        children: bool,
+        left: u32,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: Hwnd, param: isize) -> i32 {
+        let job = unsafe { &mut *(param as *mut EnumJob) };
+        if job.left == 0 {
+            return 0;
+        }
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let key = hwnd as usize as u64;
+        let interesting =
+            job.children || pid == job.child_pid || key == job.host || pid == job.host_pid;
+        if !interesting {
+            return 1;
+        }
+        job.left = job.left.saturating_sub(1);
+        observe("enum", "ENUM", hwnd, None, None);
+        if !job.children && (pid == job.child_pid || key == job.host) {
+            let mut child = EnumJob {
+                host_pid: job.host_pid,
+                child_pid: job.child_pid,
+                host: job.host,
+                children: true,
+                left: job.left,
+            };
+            unsafe { EnumChildWindows(hwnd, Some(enum_cb), &mut child as *mut EnumJob as isize) };
+            job.left = child.left;
+        }
+        if job.left == 0 { 0 } else { 1 }
+    }
+
+    fn enumerate_players(host_pid: u32, child_pid: u32, host: u64) {
+        let mut job = EnumJob {
+            host_pid,
+            child_pid,
+            host,
+            children: false,
+            left: 24,
+        };
+        unsafe { EnumWindows(Some(enum_cb), &mut job as *mut EnumJob as isize) };
+        if job.left == 0 {
+            append_line(&format!(
+                "t_us={} source=enum event=ENUM_TRUNC gen={}",
+                mono_us(),
+                gen_state().lock().map(|g| g.generation).unwrap_or(0)
+            ));
+        }
+    }
+
+    pub fn note_phase(phase: &str) {
+        let Some(name) = super::marker_name(phase) else {
+            return;
+        };
+        let (generation, t_ms, seq) = gen_state()
+            .lock()
+            .map(|mut guard| {
+                guard.seq = guard.seq.saturating_add(1);
+                (
+                    guard.generation,
+                    guard.started.elapsed().as_millis() as u64,
+                    guard.seq,
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        append_line(&format!(
+            "t_us={} source=marker event=MARKER:{name} wall_ms={} gen={generation} t_ms={t_ms} seq={seq} class=_ pid=0 tid=0",
+            mono_us(),
+            wall_ms()
+        ));
+    }
+
+    pub fn set_player_pid(pid: u32) {
+        if let Ok(mut guard) = gen_state().lock() {
+            guard.child_pid = pid;
+        }
+    }
+
+    fn ensure_trace_thread() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = std::thread::Builder::new()
+                .name("termy-video-trace".into())
+                .spawn(trace_thread);
+        });
+    }
+
+    pub fn begin_generation(host: Hwnd, width: i32, height: i32) {
+        let generation = {
+            let Ok(mut guard) = gen_state().lock() else {
+                return;
+            };
+            guard.generation = guard.generation.saturating_add(1);
+            guard.armed = true;
+            guard.host = host as usize as u64;
+            guard.host_pid = std::process::id();
+            guard.child_pid = 0;
+            guard.base_w = width;
+            guard.base_h = height;
+            guard.started = std::time::Instant::now();
+            guard.lines = 0;
+            guard.seen.clear();
+            guard.main_seen = false;
+            guard.main_rect = None;
+            guard.noop_logged = false;
+            guard.enum_show = false;
+            guard.enum_big = false;
+            guard.generation
+        };
+        HOOK_ON.store(true, std::sync::atomic::Ordering::Release);
+        ensure_trace_thread();
+        let host_bits = host as usize as isize;
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            let gone = unsafe { IsWindow(host_bits as Hwnd) } == 0;
+            if !gone {
+                return;
+            }
+            let mut disarm = false;
+            if let Ok(mut guard) = gen_state().lock() {
+                if guard.generation == generation && guard.armed {
+                    guard.armed = false;
+                    disarm = true;
+                }
+            }
+            if disarm {
+                HOOK_ON.store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
+
+    pub fn disarm_generation() {
+        if let Ok(mut guard) = gen_state().lock() {
+            guard.armed = false;
+        }
+        HOOK_ON.store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn note_show_window(hwnd: Hwnd, shown: bool) {
+        observe(
+            "wndproc",
+            if shown {
+                "SHOWWINDOW:1"
+            } else {
+                "SHOWWINDOW:0"
+            },
+            hwnd,
+            None,
+            None,
+        );
+        if !shown {
+            return;
+        }
+        let job = {
+            let Ok(mut guard) = gen_state().lock() else {
+                return;
+            };
+            if !guard.armed || guard.enum_show {
+                return;
+            }
+            guard.enum_show = true;
+            (guard.host_pid, guard.child_pid, guard.host)
+        };
+        enumerate_players(job.0, job.1, job.2);
+    }
+
+    pub fn note_pos(hwnd: Hwnd, event: &str, pos: &WindowPos) {
+        let noop = super::pos_is_noop(pos.flags);
+        if noop {
+            let Ok(mut guard) = gen_state().lock() else {
+                return;
+            };
+            if !guard.armed || guard.noop_logged {
+                return;
+            }
+            guard.noop_logged = true;
+        }
+        observe(
+            "wndproc",
+            event,
+            hwnd,
+            None,
+            Some(PosRequest {
+                flags: pos.flags,
+                x: pos.x,
+                y: pos.y,
+                cx: pos.cx,
+                cy: pos.cy,
+                insert: pos.insert_after as isize,
+            }),
+        );
+    }
+
+    fn install_hooks() {
+        unsafe {
+            let mut msg = std::mem::zeroed::<Msg>();
+            PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 0);
+            let lifecycle = SetWinEventHook(
+                0x8000,
+                0x8003,
+                std::ptr::null_mut(),
+                Some(win_event),
+                0,
+                0,
+                0,
+            );
+            let location = SetWinEventHook(
+                0x800B,
+                0x800B,
+                std::ptr::null_mut(),
+                Some(win_event),
+                0,
+                0,
+                0,
+            );
+            let cloak = SetWinEventHook(
+                0x8017,
+                0x8018,
+                std::ptr::null_mut(),
+                Some(win_event),
+                0,
+                0,
+                0,
+            );
+            let ok = !lifecycle.is_null() && !location.is_null() && !cloak.is_null();
+            if let Ok(mut guard) = gen_state().lock() {
+                guard.hooks = vec![lifecycle as usize, location as usize, cloak as usize];
+            }
+            note_phase(if ok { "hook" } else { "hookfail" });
+        }
+    }
+
+    fn remove_hooks() {
+        let hooks = gen_state()
+            .lock()
+            .map(|mut guard| std::mem::take(&mut guard.hooks))
+            .unwrap_or_default();
+        for hook in hooks {
+            if hook != 0 {
+                unsafe { UnhookWinEvent(hook as *mut core::ffi::c_void) };
+            }
+        }
+    }
+
+    fn trace_thread() {
+        let mut hooked = false;
+        loop {
+            let on = HOOK_ON.load(std::sync::atomic::Ordering::Acquire);
+            if on && !hooked {
+                install_hooks();
+                hooked = true;
+            } else if !on && hooked {
+                remove_hooks();
+                hooked = false;
+            }
+            unsafe {
+                let mut msg = std::mem::zeroed::<Msg>();
+                while PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, 1) != 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(if hooked {
+                15
+            } else {
+                40
+            }));
+        }
+    }
+
+    unsafe extern "system" fn win_event(
+        _hook: *mut core::ffi::c_void,
+        event: u32,
+        hwnd: Hwnd,
+        id_object: i32,
+        _id_child: i32,
+        _event_thread: u32,
+        _event_ms: u32,
+    ) {
+        if hwnd.is_null() || id_object != 0 || !HOOK_ON.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let name = match event {
+            0x8000 => "CREATE",
+            0x8001 => "DESTROY",
+            0x8002 => "SHOW",
+            0x8003 => "HIDE",
+            0x800B => "LOCATION",
+            0x8017 => "CLOAK",
+            0x8018 => "UNCLOAK",
+            _ => return,
+        };
+        observe("winevent", name, hwnd, None, None);
+    }
+
     /// GPUI presents the panel through DirectComposition, which paints
     /// over legacy child HWNDs (airspace) — an embedded child surface
     /// stays black. So the host is an *owned top-level* window docked
@@ -654,7 +1527,21 @@ mod win {
         if m == WM_SYSCOMMAND && (w & 0xFFF0) == SC_MAXIMIZE {
             return 0;
         }
+        if m == WM_DESTROY {
+            observe("wndproc", "DESTROY", h, None, None);
+        } else if m == WM_SHOWWINDOW {
+            note_show_window(h, w != 0);
+        } else if m == WM_SIZE {
+            observe("wndproc", "SIZE", h, None, None);
+        } else if m == WM_MOVE {
+            observe("wndproc", "MOVE", h, None, None);
+        } else if m == WM_WINDOWPOSCHANGED && l != 0 {
+            let pos = unsafe { &*(l as *const WindowPos) };
+            note_pos(h, "WINDOWPOSCHANGED", pos);
+        }
         if m == WM_WINDOWPOSCHANGING && l != 0 {
+            let pos = unsafe { &*(l as *const WindowPos) };
+            note_pos(h, "WINDOWPOSCHANGING", pos);
             let key = h as isize;
             if let Some(slot) = hosts().lock().ok().and_then(|guard| {
                 guard.get(&key).map(|slot| HostSlot {
@@ -677,8 +1564,9 @@ mod win {
                     trace_hwnd(
                         key,
                         &format!(
-                            "{} requested={},{},{},{}",
+                            "{} flags={:#x} requested={},{},{},{}",
                             if clamped.hide { "clamp-hide" } else { "clamp" },
+                            pos.flags,
                             requested.0,
                             requested.1,
                             requested.2,
@@ -743,6 +1631,7 @@ mod win {
             if parent == 0 {
                 return Err("Termy window handle not ready yet".into());
             }
+            note_phase("play");
             let class = wide("TermyXVideoHost");
             let (x, y, w, h) = screen_rect(parent as Hwnd, scale, rect);
             let host = unsafe {
@@ -782,16 +1671,20 @@ mod win {
             if host.is_null() {
                 return Err("could not create the in-app video surface".into());
             }
+            begin_generation(host, w, h);
             let mut gate = super::HostGate::hidden((x, y, w, h));
             trace_hwnd(host as isize, "create-hidden", (x, y, w, h));
             let placed = gate.place().map_err(|err| {
                 unsafe { DestroyWindow(host) };
                 err.to_string()
             })?;
-            hosts().lock().unwrap().insert(host as isize, HostSlot {
-                allowed: placed,
-                closing: false,
-            });
+            hosts().lock().unwrap().insert(
+                host as isize,
+                HostSlot {
+                    allowed: placed,
+                    closing: false,
+                },
+            );
             unsafe {
                 SetWindowPos(
                     host,
@@ -825,12 +1718,11 @@ mod win {
                 volume,
             );
             args.push(url.to_string());
-            trace_hwnd(host as isize, "spawn", (x, y, w, h));
             let mut cmd = Command::new(&bin);
             cmd.args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
             let child = cmd.spawn().map_err(|e| {
                 hosts().lock().unwrap().remove(&(host as isize));
                 unsafe {
@@ -839,6 +1731,8 @@ mod win {
                 }
                 format!("could not start mpv ({}): {e}", bin.display())
             })?;
+            set_player_pid(child.id());
+            trace_hwnd(host as isize, "spawn", (x, y, w, h));
             let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let progress_arc = std::sync::Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64)));
             {
@@ -1026,6 +1920,7 @@ mod win {
             // Mark closing before mpv can unparent the wid. Unparent
             // posts a move to the restored top-level rect (often the
             // monitor). The window proc turns that move into a hide.
+            note_phase("stop");
             self.stop_flag
                 .store(true, std::sync::atomic::Ordering::Relaxed);
             let hwnd = self.host as isize;
@@ -1035,9 +1930,8 @@ mod win {
                 slot.closing = true;
             }
             if !self.host.is_null() {
-                bury_children(self.host, self.last_rect);
-                bury_window(self.host, self.last_rect);
                 trace_hwnd(hwnd, "hide", self.last_rect);
+                unsafe { ShowWindow(self.host, SW_HIDE) };
             }
             if let Some(mut c) = self.child.take() {
                 let _ = c.kill();
@@ -1051,6 +1945,7 @@ mod win {
                 self.host = std::ptr::null_mut();
             }
             hosts().lock().unwrap().remove(&hwnd);
+            disarm_generation();
         }
     }
     impl Drop for Player {
@@ -1063,11 +1958,12 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_BAND, HostGate, HostPhase, PlayGen, begin_playback, callback_is_current,
-        clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
-        host_create_style, host_style_starts_hidden, playback_args, rects_overlap,
-        volume_commands, volume_percent, D3D11_FLIP_OFF, hidden_restore,
-        HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE,
+        CLOSE_BAND, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE, HostGate, HostPhase, PlayGen,
+        SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, TRACE_OTHER_CAP, admit_trace_line, begin_playback,
+        callback_is_current, clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
+        event_name, format_obs_line, host_create_style, host_style_starts_hidden, keep_main_window,
+        live_size_differs_half, marker_name, playback_args, pos_is_noop, rect_changed,
+        rects_overlap, sanitize_token, swp_names, volume_commands, volume_percent,
     };
 
     #[test]
@@ -1165,18 +2061,55 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--volume=40"));
         assert!(args.iter().any(|arg| arg == "--mute=no"));
         assert!(args.iter().all(|arg| arg != "--ao=null"));
+        assert!(args.iter().all(|arg| !arg.contains("d3d11")));
         let quiet = playback_args(None, None, None, 0);
         assert!(quiet.iter().any(|arg| arg == "--mute=yes"));
         assert!(quiet.iter().any(|arg| arg == "--volume=0"));
     }
 
     #[test]
-    fn stop_restores_the_panel_rect_hidden() {
-        let panel = (2276, 655, 600, 770);
-        let (show_cmd, rect) = hidden_restore(panel);
-        assert_eq!(show_cmd, 0);
-        assert_eq!(rect, panel);
-        assert!(rect.2 < 1920 && rect.3 < 1080);
-        assert_eq!(D3D11_FLIP_OFF, "--d3d11-flip=no");
+    fn video_trace_separates_requested_rect_from_live_rect() {
+        assert!(pos_is_noop(SWP_NOSIZE | SWP_NOMOVE));
+        assert!(!pos_is_noop(SWP_NOSIZE));
+        assert!(swp_names(SWP_NOSIZE | SWP_NOMOVE).contains("SWP_NOSIZE"));
+        assert!(swp_names(SWP_NOSIZE | SWP_NOMOVE).contains("SWP_NOMOVE"));
+        assert_eq!(event_name(0x8002), "SHOW");
+        assert_eq!(event_name(0x8017), "CLOAK");
+        assert!(admit_trace_line(9, 1, 2, 79));
+        assert!(!admit_trace_line(9, 1, 2, 80));
+        assert!(admit_trace_line(2, 1, 2, 80));
+        assert!(admit_trace_line(0, 1, 2, 80));
+        assert!(!admit_trace_line(0, 1, 2, TRACE_LINE_CAP));
+        assert!(!admit_trace_line(2, 1, 2, TRACE_LINE_CAP));
+        assert!(admit_trace_line(1, 1, 2, TRACE_OTHER_CAP));
+        assert!(!keep_main_window("Zed::Window", false));
+        assert!(keep_main_window("Zed::Window", true));
+        assert!(keep_main_window("mpv", false));
+        assert!(!rect_changed(Some((1, 2, 3, 4)), (1, 2, 3, 4)));
+        assert!(rect_changed(None, (1, 2, 3, 4)));
+        assert!(!live_size_differs_half(600, 770, 600, 770));
+        assert!(!live_size_differs_half(900, 770, 600, 770));
+        assert!(live_size_differs_half(901, 770, 600, 770));
+        assert!(live_size_differs_half(1920, 1080, 600, 770));
+        assert_eq!(marker_name("esc"), Some("esc"));
+        assert_eq!(marker_name("https://example.test/watch"), None);
+        let line = format_obs_line(
+            "wndproc",
+            "WINDOWPOSCHANGING",
+            "https://x.test/watch title",
+            SWP_NOSIZE | SWP_NOMOVE,
+            (2276, 655, 600, 770),
+            (0, 0, 3072, 1728),
+        );
+        assert!(line.contains("bounds=2276,655,600,770"));
+        assert!(line.contains("live=0,0,3072,1728"));
+        assert!(line.contains("SWP_NOSIZE"));
+        assert!(!line.contains('/'));
+        let class = line
+            .split_whitespace()
+            .find(|part| part.starts_with("class="))
+            .unwrap();
+        assert_eq!(class, "class=https:__x_test_watch_title");
+        assert_eq!(sanitize_token("Zed::Window"), "Zed::Window");
     }
 }
