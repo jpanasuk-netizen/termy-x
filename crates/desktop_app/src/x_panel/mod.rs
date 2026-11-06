@@ -3285,6 +3285,7 @@ impl XPanel {
             .viewer
             .as_ref()
             .is_some_and(|v| v.kind != MediaKind::Photo)
+            && !player::launches_external_vlc()
         {
             match key {
                 "space" => {
@@ -7507,26 +7508,70 @@ impl XPanel {
         media.aspect()
     }
 
+    fn open_still(&mut self, url: String, poster: Option<String>, post_id: &str, notice: &str, cx: &mut Context<Self>) {
+        self.viewer = Some(Viewer {
+            kind: MediaKind::Photo,
+            url: url.clone(),
+            poster,
+            post_id: post_id.to_string(),
+        });
+        self.player_pending = false;
+        self.spawn_media_fetch(url, cx);
+        self.notice = Some(notice.to_string());
+    }
+
     fn open_viewer(&mut self, media: &MediaItem, post_id: &str, cx: &mut Context<Self>) {
         self.autoscroll = None;
         self.stop_video_player();
-        self.viewer = Some(Viewer {
-            kind: media.kind,
-            url: media.url.clone(),
-            poster: media.poster.clone(),
-            post_id: post_id.to_string(),
-        });
         self.player_error = None;
         self.player_paused = false;
         self.player_muted = false;
-        if media.kind == MediaKind::Photo {
-            let url = media.url.clone();
-            self.spawn_media_fetch(url, cx);
-            self.notice = Some("Photo opened in Termy — Esc or ✕ to close.".into());
-        } else {
-            self.player_pending = true;
-            self.player_gen = player::begin_playback(&mut self.player_gen).0;
-            self.notice = Some("Playing video inside Termy — Esc or ✕ to stop.".into());
+        match player::dispatch_media(media.kind, &media.url) {
+            player::MediaDispatch::StillImage => {
+                self.open_still(
+                    media.url.clone(),
+                    media.poster.clone(),
+                    post_id,
+                    "Photo opened in Termy — Esc or \u{2715} to close.",
+                    cx,
+                );
+            }
+            player::MediaDispatch::Vlc => {
+                self.viewer = Some(Viewer {
+                    kind: media.kind,
+                    url: media.url.clone(),
+                    poster: media.poster.clone(),
+                    post_id: post_id.to_string(),
+                });
+                self.player_pending = true;
+                self.player_gen = player::begin_playback(&mut self.player_gen).0;
+                self.notice = Some(player::VLC_OPEN_NOTICE.to_string());
+            }
+            player::MediaDispatch::Unplayable => {
+                if let Some(poster) = media
+                    .poster
+                    .clone()
+                    .filter(|poster| player::is_still_image_url(poster))
+                {
+                    self.open_still(
+                        poster,
+                        media.poster.clone(),
+                        post_id,
+                        "No playable video or audio was attached. Showing the image in Termy.",
+                        cx,
+                    );
+                } else {
+                    self.viewer = Some(Viewer {
+                        kind: media.kind,
+                        url: media.url.clone(),
+                        poster: media.poster.clone(),
+                        post_id: post_id.to_string(),
+                    });
+                    self.player_pending = false;
+                    self.player_error = Some(player::NO_PLAYABLE_MEDIA.to_string());
+                    self.notice = Some(player::NO_PLAYABLE_MEDIA.to_string());
+                }
+            }
         }
         self.pending_focus = true;
     }
@@ -7550,7 +7595,10 @@ impl XPanel {
         self.player_error = None;
         if matches!(
             self.notice.as_deref(),
-            Some(n) if n.starts_with("Playing video") || n.starts_with("Photo opened")
+            Some(n) if n.starts_with("Playing video")
+                || n.starts_with("Playing in VLC")
+                || n.starts_with("Photo opened")
+                || n.starts_with("No playable")
         ) {
             self.notice = None;
         }
@@ -7737,8 +7785,8 @@ impl XPanel {
         let (fit_w, fit_h) = media_fit::contain_size(424.0, box_h, aspect);
         let extra = post.media.len().saturating_sub(1);
         let badge = match kind {
-            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play in Termy",
-            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play in Termy",
+            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play in VLC",
+            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play in VLC",
             MediaKind::Photo => "\u{1f50d} tap to view",
         };
         let mut area = div()
@@ -7855,12 +7903,19 @@ impl XPanel {
         let vw: f32 = viewport.width.into();
         self.viewport_w = vw;
         let vh: f32 = viewport.height.into();
-        let Some(rect) = player::embed_rect(vw, vh, self.fill_window) else {
+        let rect = if player::launches_external_vlc() {
+            Some((0.0_f32, 0.0, 0.0, 0.0))
+        } else {
+            player::embed_rect(vw, vh, self.fill_window)
+        };
+        let Some(rect) = rect else {
             return;
         };
         let scale = window.scale_factor();
         if let Some(player) = &mut self.video_player {
-            player.reposition(scale, rect);
+            if !player::launches_external_vlc() {
+                player.reposition(scale, rect);
+            }
         } else if self.player_pending {
             if !self.live {
                 self.player_pending = false;
@@ -7868,7 +7923,7 @@ impl XPanel {
                 return;
             }
             #[cfg(target_os = "windows")]
-            if self.host_hwnd == 0 {
+            if !player::launches_external_vlc() && self.host_hwnd == 0 {
                 return;
             }
             self.player_pending = false;
@@ -7937,7 +7992,7 @@ impl XPanel {
                     .detach();
                 }
                 Err(e) => {
-                    self.player_error = Some(format!("In-app player unavailable: {e}"));
+                    self.player_error = Some(e);
                 }
             }
             #[cfg(target_os = "linux")]
@@ -8054,8 +8109,8 @@ impl XPanel {
         let is_video = viewer.kind != MediaKind::Photo;
         let title = match viewer.kind {
             MediaKind::Photo => "Photo \u{b7} in Termy",
-            MediaKind::Video => "Video \u{b7} playing in Termy",
-            MediaKind::Gif => "GIF \u{b7} playing in Termy (muted)",
+            MediaKind::Video => "Video \u{b7} playing in VLC",
+            MediaKind::Gif => "GIF \u{b7} playing in VLC",
         };
         // Middle: photo image (contain, whole) or the native video host area.
         let middle: gpui_kit::AnyElement = if is_video {
@@ -8072,9 +8127,13 @@ impl XPanel {
                         .bg(tint(0x2a0f1a, 235))
                         .text_size(px(12.0))
                         .text_color(rgb(0xffd0ea))
-                        .child(format!(
-                            "{error} The poster is shown instead \u{2014} no browser was opened."
-                        )),
+                        .child(if player::launches_external_vlc() {
+                            error.clone()
+                        } else {
+                            format!(
+                                "{error} The poster is shown instead \u{2014} no browser was opened."
+                            )
+                        }),
                 );
             } else if self.video_player.is_none() {
                 area = area.child(
@@ -8082,7 +8141,11 @@ impl XPanel {
                         .p(px(12.0))
                         .text_size(px(12.0))
                         .text_color(rgb(0x93a4c3))
-                        .child("Starting in-app player\u{2026}"),
+                        .child(if player::launches_external_vlc() {
+                            "Opening VLC\u{2026}"
+                        } else {
+                            "Starting in-app player\u{2026}"
+                        }),
                 );
             }
             area.into_any_element()
@@ -8139,7 +8202,14 @@ impl XPanel {
             .justify_center()
             .gap(px(6.0))
             .px(px(12.0));
-        if is_video {
+        if is_video && player::launches_external_vlc() {
+            controls = controls.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(player::VLC_CONTROLS_NOTE),
+            );
+        } else if is_video {
             let (pos, dur) = self
                 .video_player
                 .as_ref()

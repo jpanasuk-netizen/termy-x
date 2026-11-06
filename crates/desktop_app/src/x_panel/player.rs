@@ -15,7 +15,8 @@
 //! and the panel says so in the viewer instead of pretending the
 //! embedded controls work. Other non-Windows builds stay inert.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use termy_x::model::MediaKind;
 #[cfg(any(windows, target_os = "linux"))]
 use std::process::{Child, Command, Stdio};
 
@@ -329,9 +330,6 @@ pub fn format_obs_line(
 }
 
 pub fn note_player_phase(phase: &str) {
-    #[cfg(windows)]
-    win::note_phase(phase);
-    #[cfg(not(windows))]
     let _ = phase;
 }
 
@@ -425,6 +423,202 @@ pub fn callback_is_current(live: u64, captured: PlayGen) -> bool {
     live == captured.0
 }
 
+/// Verified local install. Resolution must open this file when it exists,
+/// not `Command::new("vlc")`, because VLC is not on PATH.
+pub const VLC_CANONICAL_WINDOWS: &str = r"C:\Program Files\VideoLAN\VLC\vlc.exe";
+
+pub const VLC_NOT_FOUND: &str = "VLC was not found at C:\\Program Files\\VideoLAN\\VLC\\vlc.exe (or beside Termy). Nothing was opened. Images stay in Termy.";
+
+pub const NO_PLAYABLE_MEDIA: &str = "No playable video or audio file was attached. The image stays in Termy. VLC was not opened.";
+
+pub const VLC_OPEN_NOTICE: &str = "Playing in VLC. Esc or \u{2715} here stops only the VLC window Termy opened. Esc inside VLC leaves fullscreen and does not always quit.";
+
+pub const VLC_CONTROLS_NOTE: &str = "Volume, seek, play, and close are VLC's own controls in its window. Termy does not resize. Esc or \u{2715} here stops only the VLC Termy started. Esc inside VLC leaves fullscreen and does not always quit.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaDispatch {
+    /// In-app photo viewer. Never VLC.
+    StillImage,
+    /// Separate VLC process. Not the embedded mpv surface.
+    Vlc,
+    /// No still and no playable file.
+    Unplayable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaUrlClass {
+    Still,
+    Playable,
+    Reject,
+}
+
+pub fn launches_external_vlc() -> bool {
+    cfg!(target_os = "windows")
+}
+
+pub fn dispatch_media(kind: MediaKind, url: &str) -> MediaDispatch {
+    if kind == MediaKind::Photo {
+        return MediaDispatch::StillImage;
+    }
+    match media_url_class(url) {
+        MediaUrlClass::Still => MediaDispatch::StillImage,
+        MediaUrlClass::Playable => MediaDispatch::Vlc,
+        MediaUrlClass::Reject => MediaDispatch::Unplayable,
+    }
+}
+
+pub fn is_still_image_url(url: &str) -> bool {
+    media_url_class(url) == MediaUrlClass::Still
+}
+
+fn media_url_class(url: &str) -> MediaUrlClass {
+    let url = url.trim();
+    if url.is_empty() || url.chars().any(|c| c.is_control() || c == '\u{0}') {
+        return MediaUrlClass::Reject;
+    }
+    let lower = url.to_ascii_lowercase();
+    if is_status_page(&lower) {
+        return MediaUrlClass::Reject;
+    }
+    let path = lower.split(['?', '#']).next().unwrap_or(&lower);
+    let ext = path.rsplit('.').next().unwrap_or("");
+    const STILL: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "avif", "bmp"];
+    const PLAYABLE: &[&str] = &[
+        "mp4", "m4v", "webm", "mkv", "mov", "m3u8", "ts", "m4s", "mp3", "m4a", "aac", "wav", "ogg",
+        "opus", "flac",
+    ];
+    if STILL.contains(&ext) {
+        return MediaUrlClass::Still;
+    }
+    if PLAYABLE.contains(&ext) {
+        return MediaUrlClass::Playable;
+    }
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return MediaUrlClass::Playable;
+    }
+    MediaUrlClass::Reject
+}
+
+fn is_status_page(lower: &str) -> bool {
+    let host = lower.contains("://x.com/")
+        || lower.contains("://twitter.com/")
+        || lower.contains("://mobile.twitter.com/")
+        || lower.contains("://mobile.x.com/");
+    host && lower.contains("/status/")
+}
+
+/// Highest-ranked playable variant wins. Video mp4, then HLS, then audio.
+/// A thumbnail JPEG is not a variant and is not chosen here.
+pub fn variant_rank(content_type: &str) -> u8 {
+    let t = content_type.trim().to_ascii_lowercase();
+    if t == "video/mp4" {
+        3
+    } else if t == "application/x-mpegurl" || t == "application/vnd.apple.mpegurl" {
+        2
+    } else if t.starts_with("audio/") {
+        1
+    } else {
+        0
+    }
+}
+
+pub fn choose_variant_url<'a>(variants: &[(&'a str, &'a str, u64)]) -> Option<&'a str> {
+    let mut best: Option<(u8, u64, &str)> = None;
+    for (content_type, url, bitrate) in variants {
+        let rank = variant_rank(content_type);
+        if rank == 0 || url.is_empty() {
+            continue;
+        }
+        let replace = match best {
+            None => true,
+            Some((best_rank, best_bitrate, _)) => {
+                rank > best_rank || (rank == best_rank && *bitrate > best_bitrate)
+            }
+        };
+        if replace {
+            best = Some((rank, *bitrate, *url));
+        }
+    }
+    best.map(|(_, _, url)| url)
+}
+
+pub fn vlc_playback_args(url: &str) -> Result<Vec<String>, &'static str> {
+    if media_url_class(url) != MediaUrlClass::Playable {
+        return Err(NO_PLAYABLE_MEDIA);
+    }
+    Ok(vec![
+        "--no-one-instance".to_string(),
+        "--no-playlist-enqueue".to_string(),
+        "--play-and-exit".to_string(),
+        url.trim().to_string(),
+    ])
+}
+
+pub fn vlc_candidates(
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+    exe_dir: Option<&Path>,
+    path_env: &str,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push_unique = |path: PathBuf| {
+        if !out.iter().any(|existing| existing == &path) {
+            out.push(path);
+        }
+    };
+    push_unique(PathBuf::from(VLC_CANONICAL_WINDOWS));
+    if let Some(dir) = program_files {
+        push_unique(dir.join("VideoLAN").join("VLC").join("vlc.exe"));
+    }
+    if let Some(dir) = program_files_x86 {
+        push_unique(dir.join("VideoLAN").join("VLC").join("vlc.exe"));
+    }
+    if let Some(dir) = exe_dir {
+        push_unique(dir.join("vlc.exe"));
+        push_unique(dir.join("vlc").join("vlc.exe"));
+        push_unique(dir.join("VLC").join("vlc.exe"));
+    }
+    for dir in std::env::split_paths(path_env) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        push_unique(dir.join("vlc.exe"));
+    }
+    out
+}
+
+pub fn select_vlc<'a>(candidates: &'a [PathBuf], exists: impl Fn(&Path) -> bool) -> Option<&'a Path> {
+    candidates.iter().find(|path| exists(path)).map(PathBuf::as_path)
+}
+
+pub fn find_vlc() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let program_files_x86 = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let candidates = vlc_candidates(
+        program_files.as_deref(),
+        program_files_x86.as_deref(),
+        exe_dir.as_deref(),
+        &path_env,
+    );
+    select_vlc(&candidates, Path::exists).map(Path::to_path_buf)
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+fn spawn_vlc(bin: &Path, url: &str) -> Result<Child, String> {
+    let args = vlc_playback_args(url).map_err(str::to_string)?;
+    Command::new(bin)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "VLC was found but did not start. Nothing else was opened.".to_string())
+}
+
 pub fn find_player() -> Option<PathBuf> {
     #[cfg(windows)]
     {
@@ -463,10 +657,9 @@ pub fn find_player() -> Option<PathBuf> {
 }
 
 pub struct VideoPlayer {
-    #[cfg(windows)]
-    inner: win::Player,
-    /// Linux external-mpv child (no embedded surface, no IPC).
-    #[cfg(target_os = "linux")]
+    /// Windows: the VLC process Termy started. Linux: external mpv.
+    /// Neither path embeds a surface or resizes Termy.
+    #[cfg(any(windows, target_os = "linux"))]
     child: Option<Child>,
     #[cfg(not(any(windows, target_os = "linux")))]
     _priv: (),
@@ -482,10 +675,10 @@ impl VideoPlayer {
     ) -> Result<Self, String> {
         #[cfg(windows)]
         {
-            let bin = find_player()
-                .ok_or_else(|| "mpv not found (expected mpv\\mpv.exe next to Termy)".to_string())?;
-            let inner = win::Player::start(bin, parent_hwnd, scale, rect, url, volume)?;
-            Ok(Self { inner })
+            let _ = (parent_hwnd, scale, rect, volume);
+            let bin = find_vlc().ok_or_else(|| VLC_NOT_FOUND.to_string())?;
+            let child = spawn_vlc(&bin, url)?;
+            Ok(Self { child: Some(child) })
         }
         #[cfg(target_os = "linux")]
         {
@@ -513,9 +706,6 @@ impl VideoPlayer {
         }
     }
     pub fn reposition(&mut self, scale: f32, rect: Rect) {
-        #[cfg(windows)]
-        self.inner.reposition(scale, rect);
-        #[cfg(not(windows))]
         let _ = (scale, rect);
     }
     pub fn toggle_pause(&mut self) {
@@ -528,19 +718,10 @@ impl VideoPlayer {
         self.command(&format!(
             r#"{{"command":["seek",{seconds:.3},"absolute"]}}"#
         ));
-        #[cfg(windows)]
-        self.inner.set_progress_pos(seconds);
     }
-    /// Latest (position, duration) in seconds from the background poller.
+    /// VLC keeps its own timeline. Termy does not scrape it.
     pub fn progress(&self) -> (f64, f64) {
-        #[cfg(windows)]
-        {
-            self.inner.progress()
-        }
-        #[cfg(not(windows))]
-        {
-            (0.0, 0.0)
-        }
+        (0.0, 0.0)
     }
     pub fn set_muted(&mut self, muted: bool) {
         self.command(&format!(
@@ -555,16 +736,11 @@ impl VideoPlayer {
         }
     }
     fn command(&mut self, json: &str) {
-        #[cfg(windows)]
-        self.inner.ipc(json);
-        #[cfg(not(windows))]
         let _ = json;
     }
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
     pub fn stop(mut self) {
-        #[cfg(windows)]
-        self.inner.stop_inner();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             std::thread::spawn(move || {
@@ -575,11 +751,7 @@ impl VideoPlayer {
     /// False once the mpv process has exited (EOF quit, crash, or its
     /// window closed) — the panel polls this to clear playing state.
     pub fn is_alive(&mut self) -> bool {
-        #[cfg(windows)]
-        {
-            self.inner.is_alive()
-        }
-        #[cfg(target_os = "linux")]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             match self.child.as_mut() {
                 Some(child) => matches!(child.try_wait(), Ok(None)),
@@ -593,7 +765,9 @@ impl VideoPlayer {
     }
 }
 
-#[cfg(windows)]
+// The embedded mpv host is not the Play path. It stays out of the build
+// so a Windows compile does not depend on that surface.
+#[cfg(any())]
 mod win {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
@@ -1958,13 +2132,17 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_BAND, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE, HostGate, HostPhase, PlayGen,
-        SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, TRACE_OTHER_CAP, admit_trace_line, begin_playback,
-        callback_is_current, clamp_window_change, close_button_rect, dismiss_playback, embed_rect,
-        event_name, format_obs_line, host_create_style, host_style_starts_hidden, keep_main_window,
-        live_size_differs_half, marker_name, playback_args, pos_is_noop, rect_changed,
-        rects_overlap, sanitize_token, swp_names, volume_commands, volume_percent,
+        CLOSE_BAND, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE, HostGate, HostPhase,
+        MediaDispatch, NO_PLAYABLE_MEDIA, PlayGen, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP,
+        TRACE_OTHER_CAP, VLC_CANONICAL_WINDOWS, VLC_NOT_FOUND, admit_trace_line, begin_playback,
+        callback_is_current, choose_variant_url, clamp_window_change, close_button_rect,
+        dismiss_playback, dispatch_media, embed_rect, event_name, format_obs_line,
+        host_create_style, host_style_starts_hidden, keep_main_window, live_size_differs_half,
+        marker_name, playback_args, pos_is_noop, rect_changed, rects_overlap, sanitize_token,
+        select_vlc, swp_names, vlc_candidates, vlc_playback_args, volume_commands, volume_percent,
     };
+    use std::path::{Path, PathBuf};
+    use termy_x::model::MediaKind;
 
     #[test]
     fn embed_rect_is_the_panel_and_waits_for_a_real_viewport() {
@@ -2111,5 +2289,95 @@ mod tests {
             .unwrap();
         assert_eq!(class, "class=https:__x_test_watch_title");
         assert_eq!(sanitize_token("Zed::Window"), "Zed::Window");
+    }
+
+    #[test]
+    fn photos_stay_in_termy_and_only_playable_video_goes_to_vlc() {
+        assert_eq!(
+            dispatch_media(MediaKind::Photo, "https://pbs.twimg.com/media/ABC.jpg"),
+            MediaDispatch::StillImage
+        );
+        assert_eq!(
+            dispatch_media(MediaKind::Photo, "https://video.twimg.com/a.mp4"),
+            MediaDispatch::StillImage
+        );
+        assert_eq!(
+            dispatch_media(
+                MediaKind::Video,
+                "https://video.twimg.com/amplify_video/9/vid/avc1/320x568/a.mp4?tag=29"
+            ),
+            MediaDispatch::Vlc
+        );
+        assert_eq!(
+            dispatch_media(MediaKind::Gif, "https://video.twimg.com/tweet_video/a.mp4"),
+            MediaDispatch::Vlc
+        );
+        assert_eq!(
+            dispatch_media(
+                MediaKind::Video,
+                "https://pbs.twimg.com/amplify_video_thumb/9/img/p.jpg"
+            ),
+            MediaDispatch::StillImage
+        );
+        assert_eq!(
+            dispatch_media(MediaKind::Video, "https://video.twimg.com/audio/a.m4a"),
+            MediaDispatch::Vlc
+        );
+        assert_eq!(
+            dispatch_media(MediaKind::Video, "https://x.com/someone/status/1"),
+            MediaDispatch::Unplayable
+        );
+        assert_eq!(dispatch_media(MediaKind::Video, ""), MediaDispatch::Unplayable);
+        assert_eq!(
+            dispatch_media(MediaKind::Video, "https://video.twimg.com/a.mp4\ncalc"),
+            MediaDispatch::Unplayable
+        );
+    }
+
+    #[test]
+    fn vlc_uses_the_program_files_executable_and_its_own_window() {
+        let candidates = vlc_candidates(
+            Some(Path::new(r"C:\Program Files")),
+            Some(Path::new(r"C:\Program Files (x86)")),
+            Some(Path::new(r"D:\Termy")),
+            r"C:\Windows\System32",
+        );
+        assert_eq!(candidates[0].to_string_lossy(), VLC_CANONICAL_WINDOWS);
+        let chosen = select_vlc(&candidates, |path| {
+            path.to_string_lossy() == VLC_CANONICAL_WINDOWS
+        });
+        assert_eq!(chosen.unwrap().to_string_lossy(), VLC_CANONICAL_WINDOWS);
+        assert!(select_vlc(&[PathBuf::from("vlc"), PathBuf::from("vlc.exe")], |_| false).is_none());
+        assert!(!VLC_NOT_FOUND.contains("http"));
+        assert!(!NO_PLAYABLE_MEDIA.contains("http"));
+        let url = "https://video.twimg.com/a.mp4?tag=1&x=1";
+        let args = vlc_playback_args(url).unwrap();
+        assert!(args.iter().any(|arg| arg == "--no-one-instance"));
+        assert!(args.iter().any(|arg| arg == "--no-playlist-enqueue"));
+        assert!(args.iter().any(|arg| arg == "--play-and-exit"));
+        assert!(args.iter().all(|arg| {
+            arg != "--fullscreen"
+                && arg != "-f"
+                && arg != "--one-instance"
+                && arg != "--playlist-enqueue"
+                && !arg.starts_with("--volume")
+        }));
+        assert_eq!(args.last().map(String::as_str), Some(url));
+        assert_eq!(args.iter().filter(|arg| arg.contains("http")).count(), 1);
+        assert!(vlc_playback_args("https://pbs.twimg.com/media/a.jpg").is_err());
+        assert_eq!(
+            choose_variant_url(&[
+                ("application/x-mpegURL", "https://video.twimg.com/a.m3u8", 0),
+                ("audio/mp4", "https://video.twimg.com/a.m4a", 0),
+                ("video/mp4", "https://video.twimg.com/low.mp4", 256_000),
+                ("video/mp4", "https://video.twimg.com/high.mp4", 2_176_000),
+            ]),
+            Some("https://video.twimg.com/high.mp4")
+        );
+        assert_eq!(
+            choose_variant_url(&[("audio/mp4", "https://video.twimg.com/a.m4a", 64_000)]),
+            Some("https://video.twimg.com/a.m4a")
+        );
+        assert_eq!(choose_variant_url(&[]), None);
     }
 }

@@ -2128,9 +2128,17 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
     for (const m of media) {{
       if (!m) continue;
       if (m.type === "video" || m.type === "animated_gif") {{
-        let best = null;
+        let best = null, bestScore = 0;
         for (const v of (m.video_info && m.video_info.variants) || []) {{
-          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+          if (!v || !v.url) continue;
+          const t = String(v.content_type || "");
+          let rank = 0;
+          if (t === "video/mp4") rank = 3;
+          else if (t === "application/x-mpegURL" || t === "application/vnd.apple.mpegurl") rank = 2;
+          else if (t.indexOf("audio/") === 0) rank = 1;
+          if (!rank) continue;
+          const score = rank * 100000000 + (v.bitrate || 0);
+          if (!best || score > bestScore) {{ best = v; bestScore = score; }}
         }}
         urls.push(best ? best.url : m.media_url_https);
         posters.push(m.media_url_https);
@@ -2311,9 +2319,17 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
     for (const m of media) {
       if (!m) continue;
       if (m.type === "video" || m.type === "animated_gif") {
-        let best = null;
+        let best = null, bestScore = 0;
         for (const v of (m.video_info && m.video_info.variants) || []) {
-          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+          if (!v || !v.url) continue;
+          const t = String(v.content_type || "");
+          let rank = 0;
+          if (t === "video/mp4") rank = 3;
+          else if (t === "application/x-mpegURL" || t === "application/vnd.apple.mpegurl") rank = 2;
+          else if (t.indexOf("audio/") === 0) rank = 1;
+          if (!rank) continue;
+          const score = rank * 100000000 + (v.bitrate || 0);
+          if (!best || score > bestScore) { best = v; bestScore = score; }
         }
         urls.push(best ? best.url : m.media_url_https);
         posters.push(m.media_url_https);
@@ -2451,9 +2467,17 @@ const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
     for (const m of media) {
       if (!m) continue;
       if (m.type === "video" || m.type === "animated_gif") {
-        let best = null;
+        let best = null, bestScore = 0;
         for (const v of (m.video_info && m.video_info.variants) || []) {
-          if (v.content_type === "video/mp4" && v.url && (!best || (v.bitrate || 0) > (best.bitrate || 0))) best = v;
+          if (!v || !v.url) continue;
+          const t = String(v.content_type || "");
+          let rank = 0;
+          if (t === "video/mp4") rank = 3;
+          else if (t === "application/x-mpegURL" || t === "application/vnd.apple.mpegurl") rank = 2;
+          else if (t.indexOf("audio/") === 0) rank = 1;
+          if (!rank) continue;
+          const score = rank * 100000000 + (v.bitrate || 0);
+          if (!best || score > bestScore) { best = v; bestScore = score; }
         }
         urls.push(best ? best.url : m.media_url_https);
         posters.push(m.media_url_https);
