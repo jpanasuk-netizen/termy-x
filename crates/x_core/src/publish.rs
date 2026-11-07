@@ -39,17 +39,51 @@ pub enum EngageAction {
     Quote,
 }
 
-/// Burst label for a verified engagement, or None for no burst.
-/// Posts/replies/quotes and Retweet all read "\u{2713} Posted"
-/// (Jeremy's wording: a retweet posts). Like reads "\u{2713} Liked".
-/// Removals (unlike/unretweet) get no burst — taking a post away is
-/// not a post; the state flip alone confirms them.
+/// Burst label after the provider confirms the action. Unlike has no
+/// toast. Unretweet has its own label so it never says "Retweeted".
+/// Quote uses the reply-style composer toast, not this card label.
 pub fn engage_burst_label(action: EngageAction) -> Option<&'static str> {
     match action {
         EngageAction::Like => Some("\u{2713} Liked"),
-        EngageAction::Retweet => Some("\u{2713} Posted"),
-        EngageAction::Unlike | EngageAction::Unretweet | EngageAction::Quote => None,
+        EngageAction::Retweet => Some("\u{2713} Retweeted"),
+        EngageAction::Unretweet => Some("\u{2713} Unretweeted"),
+        EngageAction::Unlike | EngageAction::Quote => None,
     }
+}
+
+/// Shown on the reply composer only after the provider accepts the reply.
+pub fn reply_sent_label() -> &'static str {
+    "\u{2713} Reply sent"
+}
+
+/// Shown on the author's card only after follow or unfollow is confirmed.
+pub fn follow_burst_label(follow: bool) -> &'static str {
+    if follow {
+        "\u{2713} Followed"
+    } else {
+        "\u{2713} Unfollowed"
+    }
+}
+
+/// Button and heading for the quote composer. The provider verb stays `quote`.
+pub fn quote_action_label() -> &'static str {
+    "Q-tweet"
+}
+
+/// Actions under a tweet. Reply is the one comment control. Video cards
+/// use this same list; they do not drop Reply.
+pub fn card_action_labels(show_follow: bool) -> Vec<&'static str> {
+    let mut labels = vec!["Like", "Retweet", quote_action_label(), "Reply"];
+    if show_follow {
+        labels.push("Follow");
+    }
+    labels
+}
+
+/// Comment/reply on a repost uses the original id. On a quote it uses
+/// the quote tweet itself, not the quoted post.
+pub fn comment_target_id(post: &crate::model::Post) -> &str {
+    post.engage_target().id.as_str()
 }
 
 impl EngageAction {
@@ -635,10 +669,55 @@ mod tests {
         );
         assert_eq!(
             engage_burst_label(EngageAction::Retweet),
-            Some("\u{2713} Posted")
+            Some("\u{2713} Retweeted")
+        );
+        assert_eq!(
+            engage_burst_label(EngageAction::Unretweet),
+            Some("\u{2713} Unretweeted")
         );
         assert_eq!(engage_burst_label(EngageAction::Unlike), None);
-        assert_eq!(engage_burst_label(EngageAction::Unretweet), None);
+        assert_eq!(engage_burst_label(EngageAction::Quote), None);
+        assert_ne!(
+            engage_burst_label(EngageAction::Unretweet),
+            engage_burst_label(EngageAction::Retweet)
+        );
+        assert_eq!(reply_sent_label(), "\u{2713} Reply sent");
+        assert_eq!(follow_burst_label(true), "\u{2713} Followed");
+        assert_eq!(follow_burst_label(false), "\u{2713} Unfollowed");
+        assert_ne!(follow_burst_label(false), follow_burst_label(true));
+        assert_eq!(quote_action_label(), "Q-tweet");
+        assert!(!quote_action_label().to_ascii_lowercase().contains("quote retweet"));
+        let with_follow = card_action_labels(true);
+        let text_only = card_action_labels(false);
+        assert_eq!(
+            with_follow,
+            ["Like", "Retweet", "Q-tweet", "Reply", "Follow"]
+        );
+        assert_eq!(text_only, ["Like", "Retweet", "Q-tweet", "Reply"]);
+        assert_eq!(
+            with_follow.iter().filter(|label| **label == "Reply" || **label == "Comment").count(),
+            1
+        );
+        let mut repost = crate::model::Post::default();
+        repost.id = "wrap".into();
+        let mut original = crate::model::Post::default();
+        original.id = "orig".into();
+        original.media.push(crate::model::MediaItem {
+            kind: crate::model::MediaKind::Video,
+            url: "https://video.twimg.com/a.mp4".into(),
+            poster: None,
+            width: None,
+            height: None,
+        });
+        repost.retweeted = Some(Box::new(original));
+        assert_eq!(comment_target_id(&repost), "orig");
+        let mut quote = crate::model::Post::default();
+        quote.id = "quote-id".into();
+        quote.quoted = Some(Box::new(crate::model::Post {
+            id: "inner".into(),
+            ..crate::model::Post::default()
+        }));
+        assert_eq!(comment_target_id(&quote), "quote-id");
     }
 
     #[test]

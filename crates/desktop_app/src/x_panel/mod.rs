@@ -58,6 +58,44 @@ macro_rules! x_button {
     }};
 }
 
+/// Compact tweet-row control. Padding stays tall enough to tap.
+macro_rules! x_action {
+    ($id:expr, $label:expr, $handler:expr) => {
+        x_action!($id, $label, false, $handler)
+    };
+    ($id:expr, $label:expr, $active:expr, $handler:expr) => {{
+        let active = $active;
+        div()
+            .id($id)
+            .px(px(6.0))
+            .py(px(6.0))
+            .min_h(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if active {
+                rgb(0x0a84ff)
+            } else {
+                rgb(0x3a3a3c)
+            })
+            .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
+            .text_size(px(12.0))
+            .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x3a3a3c))
+                    .border_color(rgb(0x636366))
+                    .text_color(rgb(0xffffff))
+            })
+            .child($label)
+            .on_mouse_down(MouseButton::Left, $handler)
+    }};
+}
+
 /// Primary CTA — one accent (system blue). Use sparingly.
 macro_rules! x_cta {
     ($id:expr, $label:expr, $handler:expr) => {{
@@ -1341,6 +1379,7 @@ impl XPanel {
                     seq: 1,
                     started: Instant::now(),
                     card_id: None,
+                    follow_handle: None,
                     label: "\u{2713} Posted",
                 });
                 self.notice =
@@ -1375,6 +1414,7 @@ impl XPanel {
                         seq: 1,
                         started: Instant::now(),
                         card_id: Some(id),
+                        follow_handle: None,
                         label: "\u{2713} Liked",
                     });
                 }
@@ -4037,7 +4077,12 @@ impl XPanel {
         )
     }
 
-    fn begin_post_burst(&mut self, target: BurstTarget, cx: &mut Context<Self>) {
+    fn begin_post_burst(
+        &mut self,
+        target: BurstTarget,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         self.burst_seq += 1;
         let seq = self.burst_seq;
         self.post_burst = Some(PostBurst {
@@ -4045,7 +4090,8 @@ impl XPanel {
             seq,
             started: Instant::now(),
             card_id: None,
-            label: "\u{2713} Posted",
+            follow_handle: None,
+            label,
         });
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4054,6 +4100,32 @@ impl XPanel {
             let _ = this.update(cx, |panel, cx| {
                 if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
                     panel.finish_post_burst(target);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Same card toast as Like, keyed by the author's handle.
+    fn begin_author_burst(&mut self, handle: &str, label: &'static str, cx: &mut Context<Self>) {
+        self.burst_seq += 1;
+        let seq = self.burst_seq;
+        self.post_burst = Some(PostBurst {
+            target: BurstTarget::Card,
+            seq,
+            started: Instant::now(),
+            card_id: None,
+            follow_handle: Some(handle.trim_start_matches('@').to_string()),
+            label,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BURST_MS + 80))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
+                    panel.finish_post_burst(BurstTarget::Card);
                     cx.notify();
                 }
             });
@@ -4072,6 +4144,7 @@ impl XPanel {
             seq,
             started: Instant::now(),
             card_id: Some(post_id.to_string()),
+            follow_handle: None,
             label,
         });
         cx.spawn(async move |this, cx| {
@@ -4204,7 +4277,15 @@ impl XPanel {
         let burst = self.burst_for(BurstTarget::Card)?;
         // Engage bursts are keyed by the tweet acted on; on a repost
         // card that's the embedded original, not the repost wrapper.
-        if burst.card_id.as_deref() != Some(post.id.as_str())
+        if let Some(handle) = burst.follow_handle.as_deref() {
+            let needle = handle.trim_start_matches('@');
+            let author = post.engage_target().author_handle.as_str();
+            if !author.eq_ignore_ascii_case(needle)
+                && !post.author_handle.eq_ignore_ascii_case(needle)
+            {
+                return None;
+            }
+        } else if burst.card_id.as_deref() != Some(post.id.as_str())
             && burst.card_id.as_deref() != Some(post.engage_target().id.as_str())
         {
             return None;
@@ -4382,6 +4463,11 @@ impl XPanel {
                         }
                         panel.apply_follow_to_thread(&handle, target);
                         panel.status = message;
+                        panel.begin_author_burst(
+                            &handle,
+                            termy_x::publish::follow_burst_label(target),
+                            cx,
+                        );
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
@@ -4696,7 +4782,7 @@ impl XPanel {
                             "Quoted @{author} \u{b7} posted in-app, no browser opened."
                         ));
                         panel.status = format!("quoted @{author}");
-                        panel.begin_post_burst(BurstTarget::Quote, cx);
+                        panel.begin_post_burst(BurstTarget::Quote, "\u{2713} Posted", cx);
                         panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
                     Err(error) => {
@@ -4817,7 +4903,11 @@ impl XPanel {
                             "Replied to @{author} \u{b7} posted in-app, no browser opened."
                         ));
                         panel.status = format!("replied to @{author}");
-                        panel.begin_post_burst(BurstTarget::Reply, cx);
+                        panel.begin_post_burst(
+                            BurstTarget::Reply,
+                            termy_x::publish::reply_sent_label(),
+                            cx,
+                        );
                         panel.close_box_after_burst(
                             BurstTarget::Reply,
                             target_id_for_update.clone(),
@@ -5712,6 +5802,8 @@ struct PostBurst {
     started: Instant,
     /// For BurstTarget::Card: the tweet whose card shows the burst.
     card_id: Option<String>,
+    /// When set, every card by this author shows the toast (follow).
+    follow_handle: Option<String>,
     /// Full burst text ("\u{2713} Posted" / "\u{2713} Liked").
     label: &'static str,
 }
@@ -8845,6 +8937,7 @@ impl XPanel {
         // original tweet, exactly as on X.
         let display = post.engage_target();
         let reply_open = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let quote_open = self.quote_post_id.as_deref() == Some(display.id.as_str());
         let selected = reply_open
             || self
                 .thread
@@ -8867,7 +8960,7 @@ impl XPanel {
         let (down_id, down_text) = (display.id.clone(), post.card_text().to_string());
         let (move_id, move_text) = (display.id.clone(), post.card_text().to_string());
         let (up_id, up_author) = (display.id.clone(), display.author_handle.clone());
-        let mut el = div()
+        let el = div()
             .id(SharedString::from(format!("x-tweet-{scope}-{}", post.id)))
             .relative()
             .p(px(10.0))
@@ -9029,8 +9122,10 @@ impl XPanel {
                     )
                     .children(self.media_box_scoped(quoted, &format!("{scope}-quote"), cx))
             }))
-            .children(self.media_box_scoped(display, scope, cx))
             .child(self.tweet_actions_scoped(display, scope, cx))
+            .children(reply_open.then(|| self.reply_box(display, cx)))
+            .children(quote_open.then(|| self.quote_box(display, cx)))
+            .children(self.media_box_scoped(display, scope, cx))
             .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
@@ -9043,12 +9138,6 @@ impl XPanel {
                     cx.notify();
                 }),
             );
-        if reply_open {
-            el = el.child(self.reply_box(display, cx));
-        }
-        if self.quote_post_id.as_deref() == Some(display.id.as_str()) {
-            el = el.child(self.quote_box(display, cx));
-        }
         el.into_any_element()
     }
 
@@ -9096,11 +9185,13 @@ impl XPanel {
         };
         let show_follow = !post.author_handle.is_empty() && !is_own_profile(&post.author_handle, own);
         let mut row = div()
-            .mt(px(8.0))
+            .mt(px(6.0))
+            .w_full()
             .flex()
-            .gap(px(8.0))
             .flex_wrap()
-            .child(x_button!(
+            .items_center()
+            .gap(px(4.0))
+            .child(x_action!(
                 format!("x-like-{scope}-{}", post.id),
                 if pending {
                     "\u{2026}"
@@ -9122,14 +9213,11 @@ impl XPanel {
             ))
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x93a4c3))
-                    .child(format!(
-                        "{} likes \u{b7} {} retweets",
-                        post.likes, post.reposts
-                    )),
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x8e8e93))
+                    .child(format!("{} \u{00b7} {}", post.likes, post.reposts)),
             )
-            .child(x_button!(
+            .child(x_action!(
                 format!("x-rt-{scope}-{}", post.id),
                 if pending {
                     "\u{2026}"
@@ -9149,16 +9237,16 @@ impl XPanel {
                     cx.stop_propagation();
                 })
             ))
-            .child(x_button!(
+            .child(x_action!(
                 format!("x-quote-{scope}-{}", post.id),
-                "Quote",
+                termy_x::publish::quote_action_label(),
                 cx.listener(move |this, _, _, cx| {
                     this.open_quote(&quote_id, &quote_author);
                     cx.stop_propagation();
                     cx.notify();
                 })
             ))
-            .child(x_button!(
+            .child(x_action!(
                 format!("x-reply-{scope}-{}", post.id),
                 "Reply",
                 cx.listener(move |this, _, _, cx| {
@@ -9171,7 +9259,7 @@ impl XPanel {
                 })
             ));
         if show_follow {
-            row = row.child(x_button!(
+            row = row.child(x_action!(
                 format!("x-follow-{scope}-{}", post.id),
                 if follow_pending {
                     "\u{2026}"
@@ -9214,7 +9302,7 @@ impl XPanel {
                 self.editor_canvas(
                     EditorId::Field(TextField::Quote),
                     focused,
-                    "Add your words\u{2026} (Post button sends the quote)",
+                    "Add your words\u{2026} (Post sends the Q-tweet)",
                     editor_surface::FIELD_FONT,
                     editor_surface::FIELD_LINE,
                     false,
@@ -9262,7 +9350,7 @@ impl XPanel {
                     .text_size(px(11.0))
                     .text_color(rgb(0x7af6ff))
                     .child(format!(
-                        "Quote @{} \u{b7} retweet with your own words",
+                        "Q-tweet @{}",
                         post.author_handle
                     )),
             )
@@ -10486,7 +10574,11 @@ impl XPanel {
                             panel.notice = Some(format!(
                                 "Replied in-app \u{2014} no browser opened. {receipt}"
                             ));
-                            panel.begin_post_burst(BurstTarget::Reply, cx);
+                            panel.begin_post_burst(
+                                BurstTarget::Reply,
+                                termy_x::publish::reply_sent_label(),
+                                cx,
+                            );
                         } else {
                             panel.media.clear();
                             panel.compose.clear();
@@ -10497,7 +10589,7 @@ impl XPanel {
                             ));
                             panel.focus_compose_editor();
                             panel.pending_focus = true;
-                            panel.begin_post_burst(BurstTarget::Compose, cx);
+                            panel.begin_post_burst(BurstTarget::Compose, "\u{2713} Posted", cx);
                         }
                         if let Some(id) = &queue_id {
                             termy_x::queue::remove_item(&mut panel.desk.queue, id);
