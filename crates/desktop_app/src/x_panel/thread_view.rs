@@ -316,36 +316,18 @@ impl XPanel {
     }
 
     fn seed_thread_flags(&mut self) {
-        let (liked, follows) = {
+        let posts = {
             let Some(thread) = &self.thread else {
                 return;
             };
-            let mut liked = Vec::new();
-            let mut follows = Vec::new();
-            let mut consider = |post: &Post| {
-                if post.viewer_liked == Some(true) {
-                    liked.push(post.id.clone());
-                }
-                if post.viewer_follows_author == Some(true) {
-                    follows.push(post.author_handle.clone());
-                }
-            };
-            consider(&thread.root);
+            let mut posts = vec![thread.root.clone()];
             if let ThreadLoad::Ready { replies } = &thread.load {
-                for post in replies {
-                    consider(post);
-                }
+                posts.extend(replies.iter().cloned());
             }
-            (liked, follows)
+            posts
         };
-        for id in liked {
-            if !self.liked_ids.iter().any(|p| p == &id) {
-                self.liked_ids.push(id);
-            }
-        }
-        for handle in follows {
-            self.follow_overrides.entry(handle).or_insert(true);
-        }
+        self.sync_snapshot_ms = termy_x::action_state::now_ms();
+        self.absorb_posts(&posts, None);
     }
 
     pub(super) fn thread_replies_for_bulk(&self) -> Vec<Post> {
@@ -514,16 +496,35 @@ impl XPanel {
     }
 
     fn apply_bulk_success(&mut self, kind: BulkKind, target: &BulkTarget) {
+        let now = termy_x::action_state::now_ms();
+        let account = self.action_account();
         match kind {
             BulkKind::LikeReplies => {
                 self.set_engage_state(&target.post_id, true, true);
+                self.action_db.force_confirm(
+                    &account,
+                    termy_x::action_state::ToggleKind::Like,
+                    &target.post_id,
+                    true,
+                    now,
+                );
             }
             BulkKind::FollowRepliers => {
-                self.follow_overrides
-                    .insert(target.author_handle.clone(), true);
+                self.action_db.force_confirm(
+                    &account,
+                    termy_x::action_state::ToggleKind::Follow,
+                    &target.author_handle,
+                    true,
+                    now,
+                );
+                self.follow_overrides.insert(
+                    termy_x::action_state::account_key(&target.author_handle),
+                    true,
+                );
                 self.apply_follow_to_thread(&target.author_handle, true);
             }
         }
+        self.persist_actions();
     }
 
     fn finish_bulk(
@@ -816,7 +817,17 @@ fn bulk_write(
             BulkKind::LikeReplies => {
                 publisher.engage(termy_x::publish::EngageAction::Like, &target.url, None, &[])
             }
-            BulkKind::FollowRepliers => publisher.set_follow(&target.author_handle, true),
+            BulkKind::FollowRepliers => {
+                let Some(publisher) =
+                    termy_x::publish::first_that_follows(publishers.as_slice())
+                else {
+                    return Err(
+                        "No follow path. OpenCLI can follow and unfollow; this posting path cannot. Nothing was changed."
+                            .into(),
+                    );
+                };
+                publisher.set_follow(&target.author_handle, true)
+            }
         }
     } else {
         match kind {

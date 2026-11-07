@@ -382,6 +382,12 @@ impl XConfig {
     pub fn token_path(&self) -> PathBuf {
         self.config_dir.join("x-tokens.json")
     }
+
+    /// Likes, follows, and post receipts for the signed-in account.
+    /// Not tokens and not the VLC bundle.
+    pub fn action_state_path(&self) -> PathBuf {
+        self.config_dir.join(crate::action_state::FILE_NAME)
+    }
 }
 
 pub fn default_config_dir() -> PathBuf {

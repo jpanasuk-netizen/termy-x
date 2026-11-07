@@ -364,14 +364,45 @@ pub fn follow_step(
 /// Follow button label from the payload's real following flag plus
 /// an in-flight target. `None` flag = payload silent: show Follow and
 /// let only a verified action change the state (never fake Following).
-pub fn follow_button_label(viewer_following: Option<bool>, pending: Option<bool>) -> &'static str {
+pub fn follow_button_label(
+    viewer_following: Option<bool>,
+    pending: Option<bool>,
+    saved: bool,
+) -> &'static str {
     match pending {
         Some(true) => "Following\u{2026}",
         Some(false) => "Unfollowing\u{2026}",
         None => match viewer_following {
-            Some(true) => "Following \u{b7} Unfollow",
+            Some(true) if saved => "Followed \u{b7} saved",
+            Some(true) => "Followed",
             _ => "Follow",
         },
+    }
+}
+
+fn merge_pending_ids(confirmed: &[String], current: &[String], pending: &[String]) -> Vec<String> {
+    let mut ids = confirmed.to_vec();
+    for id in pending {
+        let held = current.iter().any(|item| item == id);
+        if held && !ids.iter().any(|item| item == id) {
+            ids.push(id.clone());
+        }
+        if !held {
+            ids.retain(|item| item != id);
+        }
+    }
+    ids
+}
+
+pub fn like_button_label(liked: bool, pending: bool, saved: bool) -> &'static str {
+    if pending {
+        "\u{2026}"
+    } else if liked && saved {
+        "Liked \u{b7} saved"
+    } else if liked {
+        "Liked"
+    } else {
+        "Like"
     }
 }
 
@@ -570,9 +601,8 @@ pub struct XPanel {
     /// Per-feed: the loaded list's depth is backed by `feed_cursor`, so
     /// Load more can continue strictly older instead of re-fetching.
     feed_cursor_ok: [bool; 2],
-    /// Tweets this session liked / retweeted from the panel (payloads
-    /// carry no favorited/retweeted flag, so state starts unknown and
-    /// only reflects clicks made here; counts move locally with them).
+    /// Confirmed likes / reposts for the signed-in account. Hydrated
+    /// from the action file and from live flags on loaded posts.
     liked_ids: Vec<String>,
     retweeted_ids: Vec<String>,
     /// Bare-repost resolution cache: repost id -> embedded original
@@ -589,8 +619,18 @@ pub struct XPanel {
     /// Waiting for Confirm before any follow write. Nothing is sent until
     /// the person confirms.
     follow_ask: Option<(String, bool)>,
-    /// Session-verified follow states (set only on write success).
+    /// Confirmed follow states for the signed-in account.
     follow_overrides: std::collections::HashMap<String, bool>,
+    /// Generation of the follow write currently in flight.
+    follow_seq: u64,
+    /// Per-tweet generation for an in-flight like or repost.
+    engage_seq: std::collections::HashMap<String, u64>,
+    action_db: termy_x::action_state::ActionDb,
+    action_seq: u64,
+    sync_generation: u64,
+    sync_snapshot_ms: u64,
+    action_persist: bool,
+    sync_line: String,
     /// Inline quote composer state (quote = retweet with your own words).
     quote_post_id: Option<String>,
     quote_author: String,
@@ -914,6 +954,20 @@ impl XPanel {
             termy_x::connect::load_connected_handle(&config)
         };
         let char_limit = config.char_limit_or_fallback();
+        let (action_db, action_persist, action_note) = if fill_window {
+            (termy_x::action_state::ActionDb::default(), false, None)
+        } else {
+            match termy_x::action_state::ActionDb::load(&config.action_state_path()) {
+                Ok(db) => (db, true, None),
+                Err(error) => (
+                    termy_x::action_state::ActionDb::default(),
+                    false,
+                    Some(format!(
+                        "Could not read saved likes and follows ({error}). Nothing was marked successful."
+                    )),
+                ),
+            }
+        };
         let mut panel = Self {
             focus: cx.focus_handle(),
             char_limit,
@@ -959,6 +1013,14 @@ impl XPanel {
             follow_pending: None,
             follow_ask: None,
             follow_overrides: std::collections::HashMap::new(),
+            follow_seq: 0,
+            engage_seq: std::collections::HashMap::new(),
+            action_db,
+            action_seq: 0,
+            sync_generation: 0,
+            sync_snapshot_ms: 0,
+            action_persist,
+            sync_line: String::new(),
             quote_post_id: None,
             quote_author: String::new(),
             quote_text: String::new(),
@@ -1068,9 +1130,13 @@ impl XPanel {
             confirm_queue_id: None,
             desk: desk::DeskState::load(&config),
         };
+        if let Some(note) = action_note {
+            panel.notice = Some(note);
+        }
         if fill_window {
             // Preview path fills via load_scene / open_section.
         } else {
+            panel.hydrate_actions();
             panel.prewarm_art(cx);
             // Who is connected comes first: real tabs must never sit
             // silently empty (or on fixtures) with no profile behind them.
@@ -1902,6 +1968,7 @@ impl XPanel {
         }
         self.fetching[slot] = true;
         self.fetch_seq = self.fetch_seq.wrapping_add(1);
+        self.sync_snapshot_ms = termy_x::action_state::now_ms();
         let seq = self.fetch_seq;
         self.inflight[slot] = seq;
 
@@ -1985,8 +2052,10 @@ impl XPanel {
                     // keep every loaded tweet, keep the cursor, and say
                     // so. Never swap in fixture posts, never mark the
                     // feed exhausted for a transient error.
+                    self.absorb_posts(&[], Some(status.as_str()));
                     self.status = status;
                 } else if append {
+                    self.absorb_posts(&posts, None);
                     // Load more: existing order untouched, only unseen
                     // ids extend the list downward. Scroll is not moved.
                     let (total, added) = match feed {
@@ -2031,6 +2100,7 @@ impl XPanel {
                         TimelineFeed::Following => self.fetched_at.timeline_following = Some(now),
                     }
                 } else {
+                    self.absorb_posts(&posts, None);
                     let landed = posts.len();
                     match feed {
                         TimelineFeed::ForYou => {
@@ -2055,16 +2125,19 @@ impl XPanel {
                 }
             }
             FetchPayload::Search { posts, status } => {
+                self.absorb_posts(&posts, None);
                 self.search_posts = posts;
                 self.status = status;
                 self.fetched_at.search = Some(now);
             }
             FetchPayload::Mentions { posts, status } => {
+                self.absorb_posts(&posts, None);
                 self.mentions_posts = posts;
                 self.status = status;
                 self.fetched_at.mentions = Some(now);
             }
             FetchPayload::Inbox { posts, status } => {
+                self.absorb_posts(&posts, None);
                 self.inbox_posts = posts;
                 self.status = status;
                 self.fetched_at.inbox = Some(now);
@@ -2088,9 +2161,15 @@ impl XPanel {
             } => {
                 self.lookup_error = failed.then_some(status.clone());
                 if !failed {
+                    if let Some(profile) = &profile {
+                        let mut loaded = profile.posts.clone();
+                        loaded.extend(profile.pinned.iter().cloned());
+                        self.absorb_posts(&loaded, None);
+                    }
                     self.profile = profile;
                     self.fetched_at.lookup = Some(now);
                 } else {
+                    self.absorb_posts(&[], Some(status.as_str()));
                     self.profile = None;
                 }
                 self.status = status;
@@ -2248,7 +2327,21 @@ impl XPanel {
                         // Clear any stale "Disconnected\u{2026}" notice from a
                         // previous disconnect_x: it is false once reconnected.
                         panel.notice = None;
-                        panel.connection = ConnState::Connected { handle, via };
+                        let previous = match &panel.connection {
+                            ConnState::Connected { handle: old, .. } => Some(old.clone()),
+                            _ => None,
+                        };
+                        panel.connection = ConnState::Connected {
+                            handle: handle.clone(),
+                            via,
+                        };
+                        if previous.as_deref() != Some(handle.as_str()) {
+                            panel.fetch_seq = panel.fetch_seq.wrapping_add(1);
+                            for slot in &mut panel.inflight {
+                                *slot = panel.fetch_seq;
+                            }
+                        }
+                        panel.bind_account(&handle);
                         let next = panel.queued_section.take().unwrap_or(panel.section);
                         let next = if next == XSection::Compose {
                             XSection::Timeline
@@ -4360,17 +4453,192 @@ impl XPanel {
     /// engage in the background. Failure reverts the flip and says why;
     /// counts move locally with the flip, never via a re-fetch, so the
     /// scroll position cannot jump.
+    fn action_account(&self) -> String {
+        if !self.live {
+            return "preview".to_string();
+        }
+        match &self.connection {
+            ConnState::Connected { handle, .. } => termy_x::action_state::account_key(handle),
+            _ => "signed-out".to_string(),
+        }
+    }
+
+    fn persist_actions(&self) {
+        if !self.action_persist || !self.live {
+            return;
+        }
+        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let _ = self.action_db.save(&config.action_state_path());
+    }
+
+    fn next_action_seq(&mut self) -> u64 {
+        self.action_seq = self.action_seq.wrapping_add(1);
+        self.action_seq
+    }
+
+    fn remember_receipt(&mut self, kind: termy_x::action_state::ReceiptKind, tweet_id: &str, text: &str) {
+        let seq = self.next_action_seq();
+        self.action_db.record_receipt(
+            &self.action_account(),
+            kind,
+            tweet_id,
+            text,
+            seq,
+            termy_x::action_state::now_ms(),
+        );
+        self.persist_actions();
+    }
+
+    fn hydrate_actions(&mut self) {
+        let account = self.action_account();
+        let pending = self.engage_pending.clone();
+        let likes = self
+            .action_db
+            .true_ids(&account, termy_x::action_state::ToggleKind::Like);
+        let reposts = self
+            .action_db
+            .true_ids(&account, termy_x::action_state::ToggleKind::Repost);
+        self.liked_ids = merge_pending_ids(&likes, &self.liked_ids, &pending);
+        self.retweeted_ids = merge_pending_ids(&reposts, &self.retweeted_ids, &pending);
+        if self.follow_pending.is_none() {
+            self.follow_overrides = self.action_db.follow_map(&account);
+        }
+        self.replied_ids = self
+            .action_db
+            .receipt_ids(&account, termy_x::action_state::ReceiptKind::Reply);
+    }
+
+    fn bind_account(&mut self, handle: &str) {
+        self.sync_generation = self.action_db.begin_sync(handle);
+        self.sync_snapshot_ms = termy_x::action_state::now_ms();
+        self.hydrate_actions();
+        self.sync_line = self.action_db.cached_summary(handle);
+    }
+
+    fn absorb_posts(&mut self, posts: &[termy_x::model::Post], failed: Option<&str>) {
+        if !self.live {
+            return;
+        }
+        let account = self.action_account();
+        if account == "signed-out" {
+            return;
+        }
+        let generation = self.sync_generation;
+        if generation == 0 {
+            self.sync_generation = self.action_db.begin_sync(&account);
+        }
+        let generation = self.sync_generation;
+        let now = termy_x::action_state::now_ms();
+        let snapshot = if self.sync_snapshot_ms == 0 {
+            now
+        } else {
+            self.sync_snapshot_ms
+        };
+        let finish = self.action_db.apply_sync_page(
+            &account,
+            generation,
+            posts,
+            failed,
+            snapshot,
+            now,
+        );
+        if let termy_x::action_state::SyncFinish::Report(report) = finish {
+            self.sync_line = report.summary;
+            self.hydrate_actions();
+            self.persist_actions();
+        }
+    }
+
+    fn shown_follow(&self, handle: &str, payload: Option<bool>) -> (Option<bool>, bool) {
+        let account = self.action_account();
+        let remembered = self.action_db.confirmed(
+            &account,
+            termy_x::action_state::ToggleKind::Follow,
+            handle,
+        );
+        let value = termy_x::action_state::remembered_or_payload(remembered, payload);
+        let saved = remembered.is_some()
+            && self.action_db.is_saved(
+                &account,
+                termy_x::action_state::ToggleKind::Follow,
+                handle,
+            );
+        (value, saved)
+    }
+
+    fn shown_liked(&self, id: &str, in_memory: bool) -> (bool, bool) {
+        let account = self.action_account();
+        let saved = in_memory
+            && self
+                .action_db
+                .is_saved(&account, termy_x::action_state::ToggleKind::Like, id);
+        (in_memory, saved)
+    }
+
     fn following_now(&self, handle: &str) -> bool {
-        self.follow_overrides
-            .get(handle)
-            .copied()
-            .or_else(|| {
-                self.profile
-                    .as_ref()
-                    .filter(|profile| profile.handle.eq_ignore_ascii_case(handle))
-                    .and_then(|profile| profile.viewer_following)
-            })
-            .unwrap_or(false)
+        let payload = self.payload_follow(handle).or_else(|| {
+            self.profile
+                .as_ref()
+                .filter(|profile| {
+                    termy_x::model::strip_handle(&profile.handle)
+                        .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+                })
+                .and_then(|profile| profile.viewer_following)
+        });
+        self.shown_follow(handle, payload).0.unwrap_or(false)
+    }
+
+    fn payload_follow(&self, handle: &str) -> Option<bool> {
+        let mut found = None;
+        self.walk_posts(|post| {
+            if termy_x::model::strip_handle(&post.author_handle)
+                .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+                && post.viewer_follows_author == Some(true)
+            {
+                found = Some(true);
+            } else if found.is_none()
+                && termy_x::model::strip_handle(&post.author_handle)
+                    .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+            {
+                found = post.viewer_follows_author;
+            }
+        });
+        found
+    }
+
+    fn walk_posts(&self, mut visit: impl FnMut(&Post)) {
+        let mut one = |post: &Post| {
+            visit(post);
+            if let Some(inner) = &post.retweeted {
+                visit(inner);
+            }
+            if let Some(inner) = &post.quoted {
+                visit(inner);
+            }
+        };
+        for post in self
+            .posts
+            .iter()
+            .chain(self.following_posts.iter())
+            .chain(self.search_posts.iter())
+            .chain(self.mentions_posts.iter())
+            .chain(self.inbox_posts.iter())
+        {
+            one(post);
+        }
+        if let Some(profile) = &self.profile {
+            for post in profile.posts.iter().chain(profile.pinned.iter()) {
+                one(post);
+            }
+        }
+        if let Some(thread) = &self.thread {
+            one(&thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &thread.load {
+                for post in replies {
+                    one(post);
+                }
+            }
+        }
     }
 
     /// Ask before any follow write. Not connected and your own account
@@ -4408,23 +4676,27 @@ impl XPanel {
     /// Follow/unfollow the profile on screen. State shown is the
     /// payload's real flag or a session-verified override — never a
     /// guess; on failure nothing flips and the error is humanized.
-    fn toggle_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
+    fn toggle_follow(&mut self, handle: &str, target: bool, cx: &mut Context<Self>) {
         if self.follow_pending.is_some() {
             return;
         }
-        let current = self
-            .follow_overrides
-            .get(handle)
-            .copied()
-            .or_else(|| {
-                self.profile
-                    .as_ref()
-                    .filter(|p| p.handle.eq_ignore_ascii_case(handle))
-                    .and_then(|p| p.viewer_following)
-            })
-            .unwrap_or(false);
-        let target = !current;
-        let handle = handle.to_string();
+        let handle = termy_x::model::strip_handle(handle).to_string();
+        if handle.is_empty() {
+            self.notice = Some("No account to follow. Nothing was changed.".into());
+            cx.notify();
+            return;
+        }
+        let seq = self.next_action_seq();
+        let now = termy_x::action_state::now_ms();
+        self.action_db.begin_toggle(
+            &self.action_account(),
+            termy_x::action_state::ToggleKind::Follow,
+            &handle,
+            target,
+            seq,
+            now,
+        );
+        self.follow_seq = seq;
         self.follow_pending = Some((handle.clone(), target));
         cx.notify();
         let handle_for_call = handle.clone();
@@ -4452,24 +4724,48 @@ impl XPanel {
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
+                if panel.follow_seq != seq {
+                    return;
+                }
                 panel.follow_pending = None;
+                let account = panel.action_account();
+                let now = termy_x::action_state::now_ms();
                 match result {
                     Ok(message) => {
-                        panel.follow_overrides.insert(handle.clone(), target);
-                        if let Some(profile) = &mut panel.profile
-                            && profile.handle.eq_ignore_ascii_case(&handle)
-                        {
-                            profile.viewer_following = Some(target);
-                        }
-                        panel.apply_follow_to_thread(&handle, target);
-                        panel.status = message;
-                        panel.begin_author_burst(
+                        let applied = panel.action_db.finish_toggle(
+                            &account,
+                            termy_x::action_state::ToggleKind::Follow,
                             &handle,
-                            termy_x::publish::follow_burst_label(target),
-                            cx,
+                            seq,
+                            true,
+                            None,
+                            now,
                         );
+                        if applied == termy_x::action_state::FinishResult::Applied {
+                            panel.follow_overrides.insert(
+                                termy_x::action_state::account_key(&handle),
+                                target,
+                            );
+                            panel.apply_follow_to_thread(&handle, target);
+                            panel.persist_actions();
+                            panel.status = message;
+                            panel.begin_author_burst(
+                                &handle,
+                                termy_x::publish::follow_burst_label(target),
+                                cx,
+                            );
+                        }
                     }
                     Err(error) => {
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            termy_x::action_state::ToggleKind::Follow,
+                            &handle,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
                         panel.notice = Some(format!(
                             "That did not go through: {} Nothing changed on X.",
                             termy_x::publish::humanize_error(&error)
@@ -4500,6 +4796,21 @@ impl XPanel {
         let engage_started = Instant::now();
         let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
         let now_active = matches!(action, EngageAction::Like | EngageAction::Retweet);
+        let seq = self.next_action_seq();
+        let kind = if is_like {
+            termy_x::action_state::ToggleKind::Like
+        } else {
+            termy_x::action_state::ToggleKind::Repost
+        };
+        self.action_db.begin_toggle(
+            &self.action_account(),
+            kind,
+            &id,
+            now_active,
+            seq,
+            termy_x::action_state::now_ms(),
+        );
+        self.engage_seq.insert(id.clone(), seq);
         self.set_engage_state(&id, is_like, now_active);
         self.engage_pending.push(id.clone());
         cx.notify();
@@ -4536,9 +4847,30 @@ impl XPanel {
                 engage_started.elapsed().as_millis()
             ));
             let _ = this.update(cx, |panel, cx| {
+                if panel.engage_seq.get(&id).copied() != Some(seq) {
+                    return;
+                }
+                panel.engage_seq.remove(&id);
                 panel.engage_pending.retain(|p| p != &id);
+                let account = panel.action_account();
+                let now = termy_x::action_state::now_ms();
+                let kind = if is_like {
+                    termy_x::action_state::ToggleKind::Like
+                } else {
+                    termy_x::action_state::ToggleKind::Repost
+                };
                 match result {
                     Ok(_) => {
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            kind,
+                            &id,
+                            seq,
+                            true,
+                            None,
+                            now,
+                        );
+                        panel.persist_actions();
                         panel.status = format!(
                             "{} @{}",
                             match action {
@@ -4557,7 +4889,16 @@ impl XPanel {
                         }
                     }
                     Err(error) => {
-                        // Revert the optimistic flip.
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            kind,
+                            &id,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
+                        // Revert the optimistic flip. The saved value stays.
                         panel.set_engage_state(&id, is_like, !now_active);
                         panel.notice = Some(format!(
                             "That did not go through: {} Nothing changed on X.",
@@ -4624,16 +4965,45 @@ impl XPanel {
     }
 
     fn apply_follow_to_thread(&mut self, handle: &str, following: bool) {
-        let needle = handle.trim_start_matches('@');
+        let needle = termy_x::model::strip_handle(handle).to_ascii_lowercase();
         let apply = |post: &mut Post| {
-            if post
-                .author_handle
-                .trim_start_matches('@')
-                .eq_ignore_ascii_case(needle)
-            {
+            if termy_x::model::strip_handle(&post.author_handle).eq_ignore_ascii_case(&needle) {
                 post.viewer_follows_author = Some(following);
             }
+            if let Some(inner) = post.retweeted.as_mut()
+                && termy_x::model::strip_handle(&inner.author_handle).eq_ignore_ascii_case(&needle)
+            {
+                inner.viewer_follows_author = Some(following);
+            }
+            if let Some(inner) = post.quoted.as_mut()
+                && termy_x::model::strip_handle(&inner.author_handle).eq_ignore_ascii_case(&needle)
+            {
+                inner.viewer_follows_author = Some(following);
+            }
         };
+        for list in [
+            &mut self.posts,
+            &mut self.following_posts,
+            &mut self.search_posts,
+            &mut self.mentions_posts,
+            &mut self.inbox_posts,
+            &mut self.desk.inbox_posts,
+            &mut self.desk.mentions_posts,
+            &mut self.desk.feed_posts,
+            &mut self.desk.stats_top,
+        ] {
+            for post in list.iter_mut() {
+                apply(post);
+            }
+        }
+        if let Some(profile) = &mut self.profile {
+            if termy_x::model::strip_handle(&profile.handle).eq_ignore_ascii_case(&needle) {
+                profile.viewer_following = Some(following);
+            }
+            for post in profile.posts.iter_mut().chain(profile.pinned.iter_mut()) {
+                apply(post);
+            }
+        }
         if let Some(thread) = self.thread.as_mut() {
             apply(&mut thread.root);
             if let thread_view::ThreadLoad::Ready { replies } = &mut thread.load {
@@ -4781,6 +5151,11 @@ impl XPanel {
                             "Q-tweet sent \u{b7} posted in-app, no browser opened.".into(),
                         );
                         panel.status = format!("Q-tweet @{author}");
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::QTweet,
+                            &target_id,
+                            "Q-tweet sent",
+                        );
                         panel.begin_post_burst(
                             BurstTarget::Quote,
                             termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet),
@@ -4910,6 +5285,11 @@ impl XPanel {
                             "Replied to @{author} \u{b7} posted in-app, no browser opened."
                         ));
                         panel.status = format!("replied to @{author}");
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::Reply,
+                            &target_id_for_update,
+                            "Reply sent",
+                        );
                         panel.begin_post_burst(
                             BurstTarget::Reply,
                             termy_x::publish::reply_sent_label(),
@@ -7134,6 +7514,9 @@ impl XPanel {
         if let Some(notice) = &self.notice {
             rows.push(hint(notice.clone()));
         }
+        if !self.sync_line.is_empty() {
+            rows.push(hint(self.sync_line.clone()));
+        }
         if let Some((handle, follow)) = self.follow_ask.clone() {
             let verb = if follow { "Follow" } else { "Unfollow" };
             rows.push(
@@ -7149,8 +7532,8 @@ impl XPanel {
                         "x-follow-confirm",
                         verb,
                         cx.listener(move |this, _, _, cx| {
-                            if let Some((handle, _)) = this.follow_ask.take() {
-                                this.toggle_follow(&handle, cx);
+                            if let Some((handle, follow)) = this.follow_ask.take() {
+                                this.toggle_follow(&handle, follow, cx);
                             }
                             cx.stop_propagation();
                         })
@@ -7941,17 +8324,16 @@ impl XPanel {
             _ => None,
         };
         if !is_own_profile(&profile.handle, own_handle) {
-            let viewer = self
-                .follow_overrides
-                .get(&profile.handle)
-                .copied()
-                .or(profile.viewer_following);
+            let (viewer, saved) = self.shown_follow(&profile.handle, profile.viewer_following);
             let pending = self
                 .follow_pending
                 .as_ref()
-                .filter(|(h, _)| h.eq_ignore_ascii_case(&profile.handle))
+                .filter(|(h, _)| {
+                    termy_x::model::strip_handle(h)
+                        .eq_ignore_ascii_case(termy_x::model::strip_handle(&profile.handle))
+                })
                 .map(|(_, target)| *target);
-            let label = follow_button_label(viewer, pending);
+            let label = follow_button_label(viewer, pending, saved);
             let click_handle = profile.handle.clone();
             card_el = card_el.child(div().flex().child(x_button!(
                 "x-follow-toggle",
@@ -9172,6 +9554,7 @@ impl XPanel {
         };
         let author = post.author_handle.clone();
         let liked = self.liked_ids.iter().any(|p| p == &post.id);
+        let liked_saved = self.shown_liked(&post.id, liked).1;
         let retweeted = self.retweeted_ids.iter().any(|p| p == &post.id);
         let pending = self.engage_pending.iter().any(|p| p == &post.id);
         let (like_id, rt_id) = (id.clone(), id);
@@ -9182,16 +9565,13 @@ impl XPanel {
         let reply_id = post.id.clone();
         let reply_author = post.author_handle.clone();
         let follow_handle = post.author_handle.clone();
-        let following = self
-            .follow_overrides
-            .get(&post.author_handle)
-            .copied()
-            .or(post.viewer_follows_author)
-            == Some(true);
-        let follow_pending = self
-            .follow_pending
-            .as_ref()
-            .is_some_and(|(h, _)| h.eq_ignore_ascii_case(&post.author_handle));
+        let (follow_value, follow_saved) =
+            self.shown_follow(&post.author_handle, post.viewer_follows_author);
+        let follow_pending = self.follow_pending.as_ref().and_then(|(h, target)| {
+            termy_x::model::strip_handle(h)
+                .eq_ignore_ascii_case(termy_x::model::strip_handle(&post.author_handle))
+                .then_some(*target)
+        });
         let own = match &self.connection {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
@@ -9206,13 +9586,7 @@ impl XPanel {
             .gap(px(4.0))
             .child(x_action!(
                 format!("x-like-{scope}-{}", post.id),
-                if pending {
-                    "\u{2026}"
-                } else if liked {
-                    "Liked"
-                } else {
-                    "Like"
-                },
+                like_button_label(liked, pending, liked_saved),
                 liked,
                 cx.listener(move |this, _, _, cx| {
                     let action = if this.liked_ids.iter().any(|p| p == &like_id) {
@@ -9274,14 +9648,8 @@ impl XPanel {
         if show_follow {
             row = row.child(x_action!(
                 format!("x-follow-{scope}-{}", post.id),
-                if follow_pending {
-                    "\u{2026}"
-                } else if following {
-                    "Following"
-                } else {
-                    "Follow"
-                },
-                following,
+                follow_button_label(follow_value, follow_pending, follow_saved),
+                follow_value == Some(true),
                 cx.listener(move |this, _, _, cx| {
                     this.request_follow(&follow_handle, cx);
                     cx.stop_propagation();
@@ -10577,6 +10945,11 @@ impl XPanel {
                     Ok(receipt) => {
                         panel.confirm = false;
                         if let Some(id) = panel.confirm_reply_to.take() {
+                            panel.remember_receipt(
+                                termy_x::action_state::ReceiptKind::Reply,
+                                &id,
+                                &receipt,
+                            );
                             if !panel.replied_ids.contains(&id) {
                                 panel.replied_ids.push(id);
                             }
@@ -10602,6 +10975,11 @@ impl XPanel {
                             ));
                             panel.focus_compose_editor();
                             panel.pending_focus = true;
+                            panel.remember_receipt(
+                                termy_x::action_state::ReceiptKind::Post,
+                                "",
+                                &receipt,
+                            );
                             panel.begin_post_burst(
                                 BurstTarget::Compose,
                                 termy_x::publish::success_note(termy_x::publish::UserWrite::Post),
@@ -10895,23 +11273,27 @@ mod edit_keys_tests {
     use super::{
         BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
         XSection, burst_style_at, caret_visual_line, fetch_section, follow_button_label,
-        follow_step, is_own_profile, soft_wrap_ranges,
+        follow_step, is_own_profile, like_button_label, soft_wrap_ranges,
     };
     use termy_x::providers::TimelineFeed;
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
         // Payload silent: honest Follow (no invented Following state).
-        assert_eq!(follow_button_label(None, None), "Follow");
-        assert_eq!(follow_button_label(Some(false), None), "Follow");
+        assert_eq!(follow_button_label(None, None, false), "Follow");
+        assert_eq!(follow_button_label(Some(false), None, false), "Follow");
+        assert_eq!(follow_button_label(Some(true), None, false), "Followed");
         assert_eq!(
-            follow_button_label(Some(true), None),
-            "Following \u{b7} Unfollow"
+            follow_button_label(Some(true), None, true),
+            "Followed \u{b7} saved"
         );
+        assert_eq!(like_button_label(true, false, true), "Liked \u{b7} saved");
+        assert_eq!(like_button_label(true, true, true), "\u{2026}");
+        assert_eq!(like_button_label(true, false, false), "Liked");
         // In flight: progress label wins; the click guard ignores clicks.
-        assert_eq!(follow_button_label(None, Some(true)), "Following\u{2026}");
+        assert_eq!(follow_button_label(None, Some(true), true), "Following\u{2026}");
         assert_eq!(
-            follow_button_label(Some(true), Some(false)),
+            follow_button_label(Some(true), Some(false), false),
             "Unfollowing\u{2026}"
         );
     }
