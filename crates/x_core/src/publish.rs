@@ -310,20 +310,24 @@ pub fn run_gui_write(
         }
         PreparedKind::Quote { url, target_id } => {
             match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &[]) {
-                Ok(receipt) => {
-                    db.record_receipt(
-                        &request.account,
-                        crate::action_state::ReceiptKind::QTweet,
-                        &target_id,
-                        &receipt,
-                        seq,
-                        now,
-                    );
-                    GuiWriteOutcome::Sent {
-                        provider: publisher.id(),
-                        receipt,
+                Ok(receipt) => match prove_quote(&receipt, &target_id) {
+                    Ok(()) => {
+                        let receipt = quote_saved_receipt(&target_id);
+                        db.record_receipt(
+                            &request.account,
+                            crate::action_state::ReceiptKind::QTweet,
+                            &target_id,
+                            &receipt,
+                            seq,
+                            now,
+                        );
+                        GuiWriteOutcome::Sent {
+                            provider: publisher.id(),
+                            receipt,
+                        }
                     }
-                }
+                    Err(error) => GuiWriteOutcome::Rejected { message: error },
+                },
                 Err(error) => GuiWriteOutcome::Rejected {
                     message: format!("{error} Nothing was retried."),
                 },
@@ -411,10 +415,9 @@ impl PreparedWrite {
                 self.text
             ),
             PreparedKind::Quote { url, target_id } => format!(
-                "provider {} · quote {} · post text: {}",
+                "provider {} · twitter quote {url} · original {target_id} · commentary: {}",
                 provider.as_str(),
-                target_id,
-                quote_post_text(&self.text, url)
+                self.text
             ),
             PreparedKind::Repost { url, target_id } => format!(
                 "provider {} · retweet {} · url {}",
@@ -523,6 +526,7 @@ pub enum OpenCliWrite {
     Unfollow,
     Post,
     Reply,
+    Quote,
 }
 
 impl OpenCliWrite {
@@ -536,6 +540,7 @@ impl OpenCliWrite {
             Self::Unfollow => "Unfollow",
             Self::Post => "Post",
             Self::Reply => "Reply",
+            Self::Quote => "Quote",
         }
     }
 
@@ -545,7 +550,7 @@ impl OpenCliWrite {
             EngageAction::Unlike => Some(Self::Unlike),
             EngageAction::Retweet => Some(Self::Retweet),
             EngageAction::Unretweet => Some(Self::Unretweet),
-            EngageAction::Quote => None,
+            EngageAction::Quote => Some(Self::Quote),
         }
     }
 }
@@ -724,7 +729,98 @@ fn message_matches(kind: OpenCliWrite, message: &str) -> bool {
         }
         OpenCliWrite::Post => message == "Tweet posted successfully.",
         OpenCliWrite::Reply => message == "Reply posted successfully.",
+        OpenCliWrite::Quote => message == "Quote tweet posted successfully.",
     }
+}
+
+/// A quote is confirmed only by OpenCLI's quote command after it has seen
+/// the quoted card. A normal post receipt is not a quote, even when the
+/// text contains the source URL.
+pub fn prove_quote(stdout: &str, target_id: &str) -> Result<(), String> {
+    let target_id = crate::model::post_id_from_input(target_id);
+    if target_id.is_empty() || !target_id.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("Quote target is missing. Not marked sent. Nothing was retried.".into());
+    }
+    let trimmed = stdout.trim();
+    if let Some(message) = first_message(trimmed) {
+        if message == "Tweet posted successfully." {
+            return Err(format!(
+                "Quote of {target_id} was not established. A normal post receipt is not a quote. Not marked sent. Nothing was retried."
+            ));
+        }
+    }
+    prove_opencli_write(OpenCliWrite::Quote, trimmed, None)?;
+    if let Some(found) = quoted_target_id(trimmed) {
+        if found != target_id {
+            return Err(format!(
+                "Quote names {found}, not {target_id}. Not marked sent. Nothing was retried."
+            ));
+        }
+    }
+    if let Some(text) = first_text(trimmed) {
+        for id in status_ids_in_text(&text) {
+            if id != target_id {
+                return Err(format!(
+                    "Quote text names {id}, not {target_id}. Not marked sent. Nothing was retried."
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn quote_saved_receipt(target_id: &str) -> String {
+    format!("Quoted {}", crate::model::post_id_from_input(target_id))
+}
+
+fn first_message(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    success_node(&value)?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn first_text(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    success_node(&value)?
+        .get("text")?
+        .as_str()
+        .map(str::to_string)
+}
+
+fn quoted_target_id(stdout: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
+    let node = success_node(&value)?;
+    for key in [
+        "quoted_status_id_str",
+        "quoted_status_id",
+        "quote_id",
+        "attachment_url",
+    ] {
+        let Some(text) = node.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let id = crate::model::post_id_from_input(text);
+        if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn status_ids_in_text(text: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("/status/") {
+        let after = &rest[pos + "/status/".len()..];
+        let id: String = after.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            ids.push(id);
+        }
+        rest = after;
+    }
+    ids
 }
 
 impl EngageAction {
@@ -893,15 +989,10 @@ pub fn validate_media_paths(media: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-/// The text of a quote post published through the plain post path:
-/// the user's own words plus the source tweet's URL on its own line.
-/// X renders a bare status URL in a post as a native quote embed, so
-/// this IS a quote tweet — it just avoids OpenCLI's `twitter quote`,
-/// whose compose-page card check fails against current x.com (the
-/// `compose/post?url=…` page no longer renders the quoted card, so the
-/// command aborts with "Quote target did not render" and posts nothing;
-/// verified live 2026-10-19 against OpenCLI 1.8.8, whose quote.js is
-/// byte-identical to upstream 2.0.0).
+/// Joins commentary and a status URL. This is not a quote. OpenCLI's
+/// `twitter post` confirms only a sent toast, and X can drop the URL
+/// from the body without attaching a quoted tweet. Quotes go through
+/// `twitter quote` and `prove_quote`.
 pub fn quote_post_text(user_text: &str, target_url: &str) -> String {
     let text = user_text.trim();
     let url = target_url.trim();
@@ -1515,7 +1606,7 @@ mod tests {
                 if action == EngageAction::Retweet {
                     Ok(r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into())
                 } else {
-                    Ok("Posted 9".into())
+                    Ok(r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"my words"}]"#.into())
                 }
             }
         }
@@ -1674,6 +1765,40 @@ mod tests {
         );
         assert!(matches!(not_yes, GuiWriteOutcome::DryRun { .. }));
         assert_eq!(publisher.publish.lock().expect("publish").len(), 2);
+    }
+
+    #[test]
+    fn quote_receipt_requires_the_quote_relation() {
+        let original = "2118971448614334959";
+        let commentary = "A token count alone doesn’t tell you whether a position fits your goals. The more useful questions are time horizon, concentration and how much downside you can tolerate.";
+        let lost_url = format!(
+            "[{{\"status\":\"success\",\"message\":\"Tweet posted successfully.\",\"id\":\"2119067545567121679\",\"text\":\"{commentary}\"}}]"
+        );
+        let err = prove_quote(&lost_url, original).unwrap_err();
+        assert!(err.contains("not a quote"), "{err}");
+        assert!(err.contains(original), "{err}");
+        assert!(err.contains("Nothing was retried"), "{err}");
+
+        let url_in_text = format!(
+            "[{{\"status\":\"success\",\"message\":\"Tweet posted successfully.\",\"id\":\"2119067545567121679\",\"text\":\"{commentary}\\nhttps://x.com/i/status/{original}\"}}]"
+        );
+        assert!(prove_quote(&url_in_text, original).is_err());
+
+        let other = r#"[{"status":"success","message":"Quote tweet posted successfully.","quoted_status_id_str":"20","text":"words"}]"#;
+        let err = prove_quote(other, original).unwrap_err();
+        assert!(err.contains("not 2118971448614334959"), "{err}");
+
+        let exact = format!(
+            "[{{\"status\":\"success\",\"message\":\"Quote tweet posted successfully.\",\"quoted_status_id_str\":\"{original}\",\"text\":\"{commentary}\"}}]"
+        );
+        assert!(prove_quote(&exact, original).is_ok());
+        assert_eq!(quote_saved_receipt(original), format!("Quoted {original}"));
+
+        let command_receipt = format!(
+            "[{{\"status\":\"success\",\"message\":\"Quote tweet posted successfully.\",\"text\":\"{commentary}\"}}]"
+        );
+        assert!(prove_quote(&command_receipt, original).is_ok());
+        assert!(prove_quote(r#"{"ok":true,"id":"2119067545567121679"}"#, original).is_err());
     }
 
     #[test]

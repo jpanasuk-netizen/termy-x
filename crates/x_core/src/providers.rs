@@ -1892,12 +1892,11 @@ fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
 
 impl OpenCliPublisher {
     /// `opencli twitter like|unlike|retweet|unretweet <url>` through
-    /// the same silent-background shim as posts/replies. Quote does
-    /// NOT use `twitter quote`: current x.com no longer renders the
-    /// quoted card on the compose page that command drives, so it
-    /// always aborts (verified live). A quote here is a normal post
-    /// whose text ends with the source tweet URL, which X renders as
-    /// a native quote embed — same post pipeline as Compose.
+    /// the same silent-background shim as posts/replies. A quote uses
+    /// `twitter quote`, which refuses to click Post unless the quoted
+    /// card for that status is on the composer. A normal post is not
+    /// used as a fallback: appending the status URL does not create
+    /// the quote relation.
     fn engage_opencli(
         &self,
         action: crate::publish::EngageAction,
@@ -1923,13 +1922,31 @@ impl OpenCliPublisher {
                         .into(),
                 );
             }
-            // Post path (see the note above): user's words + the
-            // source URL; media rides the post `--images` handling.
-            let combined = crate::publish::quote_post_text(text, target_url);
-            if combined.is_empty() {
-                return Err("write your quote first — nothing was posted".into());
+            let target_id = crate::model::post_id_from_input(target_url);
+            let mut args = vec![
+                "twitter".into(),
+                "quote".into(),
+                target_url.into(),
+                text.to_string(),
+            ];
+            if let Some(image) = media.first() {
+                args.push("--image".into());
+                args.push(image.display().to_string());
             }
-            return self.publish(&[combined], None, media);
+            let args = opencli_json(&args);
+            let output = match self.runner.run_timeout(&self.bin, &args, POST_TIMEOUT) {
+                Ok(output) => output,
+                Err(error) => {
+                    return Err(write_timeout_error(error, "quoting", POST_TIMEOUT));
+                }
+            };
+            let stdout = check_opencli_output(&output, "opencli quote")?;
+            if let Err(error) = crate::publish::prove_quote(&stdout, &target_id) {
+                write_perf_line("engage quote proof=rejected");
+                return Err(error);
+            }
+            write_perf_line("engage quote proof=confirmed");
+            return Ok(stdout);
         }
         let args = opencli_json(&args);
         let call_started = Instant::now();
@@ -4019,10 +4036,12 @@ mod tests {
         use crate::publish::{GuiWrite, GuiWriteOutcome, GuiWriteRequest, run_gui_write};
         let post_ok = r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#;
         let reply_ok = r#"[{"status":"success","message":"Reply posted successfully."}]"#;
+        let quote_ok = r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"harness quote"}]"#;
         let retweet_ok = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
         let runner = Arc::new(ScriptedRunner::new());
         runner.script("opencli", &["twitter", "post"], post_ok);
         runner.script("opencli", &["twitter", "reply"], reply_ok);
+        runner.script("opencli", &["twitter", "quote"], quote_ok);
         runner.script("opencli", &["twitter", "retweet"], retweet_ok);
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let mut db = ActionDb::default();
@@ -4090,10 +4109,10 @@ mod tests {
         assert_eq!(calls[1].1[1], "reply");
         assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
         assert_eq!(calls[1].1[3], "harness reply");
-        assert_eq!(calls[2].1[1], "post");
-        assert!(calls[2].1[2].contains("harness quote"));
-        assert!(calls[2].1[2].contains("https://x.com/i/status/2118971448614334959"));
-        assert!(!calls[2].1.iter().any(|arg| arg == "quote"));
+        assert_eq!(calls[2].1[1], "quote");
+        assert_eq!(calls[2].1[2], "https://x.com/i/status/2118971448614334959");
+        assert_eq!(calls[2].1[3], "harness quote");
+        assert!(!calls[2].1.iter().any(|arg| arg == "post"));
         assert_eq!(calls[3].1[1], "retweet");
         assert!(calls[3].1.iter().any(|arg| arg.contains("2118971448614334959")));
         let dir = tempfile::tempdir().unwrap();
@@ -4104,6 +4123,7 @@ mod tests {
         assert!(exported.contains("2118971448614334959"), "{exported}");
         assert!(exported.contains("Posted 42"), "{exported}");
         assert!(exported.contains("q_tweet"), "{exported}");
+        assert!(exported.contains("Quoted 2118971448614334959"), "{exported}");
         assert!(exported.contains("Reply sent"), "{exported}");
 
         let bad = Arc::new(ScriptedRunner::new());
@@ -4140,7 +4160,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_engages_via_post_path_with_source_url() {
+    fn quote_uses_the_quote_command_and_rejects_a_plain_post() {
         use crate::publish::EngageAction;
         use std::sync::Mutex as StdMutex;
         struct RecRunner {
@@ -4162,7 +4182,7 @@ mod tests {
                 }
                 Ok(CommandOutput {
                     status: 0,
-                    stdout: r#"[{"status":"success","message":"Tweet posted successfully.","id":"9","url":"https://x.com/me/status/9"}]"#
+                    stdout: r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"my words"}]"#
                         .into(),
                     stderr: String::new(),
                 })
@@ -4180,19 +4200,49 @@ mod tests {
         let url = "https://x.com/jack/status/20";
         publisher
             .engage(EngageAction::Quote, url, Some("my words"), &[])
-            .expect("quote via post path should succeed");
+            .expect("quote command should succeed");
         let calls = rec.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         let args = &calls[0];
-        assert_eq!(
-            args[1], "post",
-            "quote must ride the post command: {args:?}"
-        );
-        assert!(
-            !args.iter().any(|a| a == "quote"),
-            "old quote verb must not be used: {args:?}"
-        );
-        assert_eq!(args[2], format!("my words\n{url}"));
+        assert_eq!(args[1], "quote", "quote must use twitter quote: {args:?}");
+        assert_eq!(args[2], url);
+        assert_eq!(args[3], "my words");
+        assert!(!args.iter().any(|arg| arg == "post"), "{args:?}");
+        drop(calls);
+        // A runner that answers the quote verb with a generic post receipt
+        // must not be followed by a second post.
+        struct PlainPost {
+            calls: StdMutex<Vec<Vec<String>>>,
+        }
+        impl CommandRunner for PlainPost {
+            fn exists(&self, _program: &str) -> bool {
+                true
+            }
+            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
+                self.calls.lock().unwrap().push(args.to_vec());
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"status":"success","message":"Tweet posted successfully.","id":"2119067545567121679","text":"A token count alone doesn’t tell you whether a position fits your goals."}]"#.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let plain = Arc::new(PlainPost {
+            calls: StdMutex::new(Vec::new()),
+        });
+        let publisher = OpenCliPublisher {
+            bin: "opencli".into(),
+            runner: plain.clone(),
+            post_ok: StdMutex::new(Some(true)),
+        };
+        let err = publisher
+            .engage(EngageAction::Quote, url, Some("my words"), &[])
+            .unwrap_err();
+        assert!(err.contains("not a quote"), "{err}");
+        assert!(err.contains("Nothing was retried"), "{err}");
+        let calls = plain.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "no standalone fallback: {calls:?}");
+        assert_eq!(calls[0][1], "quote");
         drop(calls);
         // And a failure envelope on a like comes back humanized.
         let rec2 = Arc::new(RecRunner {

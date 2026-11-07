@@ -5261,8 +5261,8 @@ impl XPanel {
         self.status = "quote closed \u{b7} nothing was posted".into();
     }
 
-    /// Post the quote (retweet with your own words) via OpenCLI
-    /// `twitter quote <url> <text>` in the silent background session.
+    /// Post the quote via OpenCLI `twitter quote <url> <text>`.
+    /// A normal post is not a fallback. Failure leaves the draft.
     fn submit_quote(&mut self, cx: &mut Context<Self>) {
         if self.quote_posting {
             self.notice = Some("Already sending that quote \u{2014} wait for it.".into());
@@ -5369,7 +5369,7 @@ impl XPanel {
                         panel.remember_receipt(
                             termy_x::action_state::ReceiptKind::QTweet,
                             &target_id,
-                            "Q-tweet sent",
+                            &termy_x::publish::quote_saved_receipt(&target_id),
                         );
                         panel.begin_post_burst(
                             BurstTarget::Quote,
@@ -5380,7 +5380,7 @@ impl XPanel {
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "{} {}",
+                            "{} {} The draft is still here. Nothing was retried.",
                             termy_x::publish::withheld_note(
                                 termy_x::publish::UserWrite::QTweet,
                                 termy_x::publish::WriteOutcome::Failed

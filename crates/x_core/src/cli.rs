@@ -238,7 +238,7 @@ enum WriteOp {
         to: String,
         text: String,
     },
-    /// Quote one status by posting its URL, the same path as the Q-tweet button.
+    /// Quote one status with twitter quote, the same path as the Q-tweet button.
     Quote {
         #[arg(long)]
         to: String,
@@ -384,7 +384,7 @@ fn print_help_guide() {
     println!("  x stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
     println!("  x write post \"text\"                  Dry-run. Does not start the GUI or post.");
     println!("  x write reply --to ID \"text\"         Dry-run a reply");
-    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet");
+    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet (twitter quote, not a plain post)");
     println!("  x write repost --to ID                Dry-run a repost");
     println!("  x write post \"text\" --confirm yes    One real post. No retry.");
     println!("  x post \"text\"");
