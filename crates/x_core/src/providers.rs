@@ -1790,20 +1790,21 @@ impl Publisher for OpenCliPublisher {
         } else {
             format!(" with {} image(s)", media.len())
         };
-        if reply_to.is_none() {
-            return match crate::publish::prove_new_post(&last) {
-                Ok(receipt) => {
-                    write_perf_line("write post proof=confirmed");
-                    Ok(format!("{receipt}{media_note}"))
-                }
-                Err(error) => {
-                    write_perf_line("write post proof=rejected");
-                    Err(error)
-                }
-            };
+        let proved = if reply_to.is_none() {
+            crate::publish::prove_new_post(&last)
+        } else {
+            crate::publish::prove_reply(&last)
+        };
+        match proved {
+            Ok(receipt) => {
+                write_perf_line("write post proof=confirmed");
+                Ok(format!("{receipt}{media_note}"))
+            }
+            Err(error) => {
+                write_perf_line("write post proof=rejected");
+                Err(error)
+            }
         }
-        let _ = last;
-        Ok(format!("{} part(s) posted{media_note}", parts.len()))
     }
 
     fn engage(
@@ -1845,9 +1846,19 @@ impl Publisher for OpenCliPublisher {
                 return Err(write_timeout_error(error, what, ENGAGE_TIMEOUT));
             }
         };
-        check_opencli_output(&output, "opencli follow/unfollow")?;
+        let stdout = check_opencli_output(&output, "opencli follow/unfollow")?;
+        let kind = if follow {
+            crate::publish::OpenCliWrite::Follow
+        } else {
+            crate::publish::OpenCliWrite::Unfollow
+        };
+        if let Err(error) = crate::publish::prove_opencli_write(kind, &stdout, Some(handle)) {
+            write_perf_line(&format!("write {verb} proof=rejected"));
+            return Err(error);
+        }
+        write_perf_line(&format!("write {verb} proof=confirmed"));
         Ok(if follow {
-            format!("Following @{handle}")
+            format!("Followed @{handle}")
         } else {
             format!("Unfollowed @{handle}")
         })
@@ -1942,22 +1953,17 @@ impl OpenCliPublisher {
             }
         };
         let stdout = check_opencli_output(&output, "opencli engage")?;
-        if matches!(
-            action,
-            crate::publish::EngageAction::Retweet | crate::publish::EngageAction::Unretweet
-        ) {
-            if let Err(error) = crate::publish::prove_engage(action, &stdout, None) {
-                write_perf_line(&format!(
-                    "engage {} proof=rejected",
-                    action.opencli_verb()
-                ));
-                return Err(error);
-            }
+        if let Err(error) = crate::publish::prove_engage(action, &stdout, None) {
             write_perf_line(&format!(
-                "engage {} proof=confirmed",
+                "engage {} proof=rejected",
                 action.opencli_verb()
             ));
+            return Err(error);
         }
+        write_perf_line(&format!(
+            "engage {} proof=confirmed",
+            action.opencli_verb()
+        ));
         Ok(stdout)
     }
 }
@@ -2022,11 +2028,24 @@ impl Publisher for TwitterCliPublisher {
                     output.stderr
                 });
             }
-            if let Some(id) = tweet_id_from_output(&output.stdout) {
-                previous = Some(id);
+            let Some(id) = tweet_id_from_output(&output.stdout) else {
+                return Err(
+                    "Post was not confirmed. twitter-cli returned no status id. Not marked Posted. Nothing was retried."
+                        .into(),
+                );
+            };
+            if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+                return Err(
+                    "Post was not confirmed. twitter-cli returned no status id. Not marked Posted. Nothing was retried."
+                        .into(),
+                );
             }
+            previous = Some(id);
         }
-        Ok(format!("twitter-cli posted {} part(s)", parts.len()))
+        Ok(format!(
+            "twitter-cli posted {}",
+            previous.unwrap_or_else(|| "posted".into())
+        ))
     }
 }
 
@@ -2867,14 +2886,21 @@ impl Publisher for OfficialPublisher {
                 content_type: Some("application/json".into()),
                 headers: Vec::new(),
             })?;
-            if let Some(id) = serde_json::from_str::<Value>(&response)
+            let id = serde_json::from_str::<Value>(&response)
                 .ok()
-                .and_then(|value| value["data"]["id"].as_str().map(str::to_string))
-            {
-                ids.push(id);
-            }
+                .and_then(|value| value["data"]["id"].as_str().map(str::to_string));
+            let Some(id) = id.filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit())) else {
+                return Err(
+                    "Post was not confirmed. The X API response had no status id. Not marked Posted. Nothing was retried."
+                        .into(),
+                );
+            };
+            ids.push(id);
         }
-        Ok(format!("official API posted {} part(s)", parts.len()))
+        Ok(format!(
+            "official API posted {}",
+            ids.last().cloned().unwrap_or_else(|| "posted".into())
+        ))
     }
 }
 
@@ -4010,7 +4036,7 @@ mod tests {
                 }
                 Ok(CommandOutput {
                     status: 0,
-                    stdout: r#"[{"status":"success","id":"9","url":"https://x.com/me/status/9"}]"#
+                    stdout: r#"[{"status":"success","message":"Tweet posted successfully.","id":"9","url":"https://x.com/me/status/9"}]"#
                         .into(),
                     stderr: String::new(),
                 })
@@ -4116,9 +4142,19 @@ mod tests {
                         stderr: String::new(),
                     });
                 }
+                let verb = args.get(1).map(String::as_str).unwrap_or("");
+                let stdout = match verb {
+                    "follow" => {
+                        r#"[{"status":"success","message":"Successfully followed @jack."}]"#
+                    }
+                    "unfollow" => {
+                        r#"[{"status":"success","message":"Successfully unfollowed @jack."}]"#
+                    }
+                    _ => r#"[{"status":"success","message":"Tweet successfully liked."}]"#,
+                };
                 Ok(CommandOutput {
                     status: 0,
-                    stdout: r#"{"ok":true}"#.into(),
+                    stdout: stdout.into(),
                     stderr: String::new(),
                 })
             }
@@ -4944,7 +4980,7 @@ mod tests {
         runner.script(
             "opencli",
             &["twitter", "reply"],
-            r#"[{"status":"ok","url":"https://x.com/ada/status/999"}]"#,
+            r#"[{"status":"success","message":"Reply posted successfully.","url":"https://x.com/ada/status/999"}]"#,
         );
         let config = quiet_config();
         let publisher = OpenCliPublisher::new(&config, runner.clone());

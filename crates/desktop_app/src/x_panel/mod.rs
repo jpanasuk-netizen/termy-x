@@ -4923,6 +4923,13 @@ impl XPanel {
                             now,
                         );
                         if applied == termy_x::action_state::FinishResult::Applied {
+                            if live {
+                                panel.action_db.note_opencli_contract(
+                                    &account,
+                                    termy_x::action_state::ToggleKind::Follow,
+                                    &handle,
+                                );
+                            }
                             panel.follow_overrides.insert(
                                 termy_x::action_state::account_key(&handle),
                                 target,
@@ -5075,6 +5082,9 @@ impl XPanel {
                             None,
                             now,
                         );
+                        if live {
+                            panel.action_db.note_opencli_contract(&account, kind, &id);
+                        }
                         panel.persist_actions();
                         panel.status = format!(
                             "{} @{}",

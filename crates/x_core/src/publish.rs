@@ -204,85 +204,134 @@ pub fn standalone_reply_to() -> Option<&'static str> {
     None
 }
 
-/// Posted text is confirmed only when the provider JSON includes a status id.
+/// A new post is confirmed by OpenCLI's sent-toast message. An id alone is not.
 pub fn prove_new_post(stdout: &str) -> Result<String, String> {
-    let uncertain = "Post was not confirmed. Not marked Posted. Check X. Nothing was retried.";
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("unconfirmed") {
-        return Err(uncertain.into());
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-        return Err(uncertain.into());
+    prove_opencli_write(OpenCliWrite::Post, stdout, None)?;
+    Ok(posted_receipt(stdout))
+}
+
+pub fn prove_reply(stdout: &str) -> Result<String, String> {
+    prove_opencli_write(OpenCliWrite::Reply, stdout, None)?;
+    Ok("Reply sent".into())
+}
+
+fn posted_receipt(stdout: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return "Posted".into();
     };
-    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) || value.get("error").is_some()
-    {
-        return Err("Post was rejected. Not marked Posted. Nothing was retried.".into());
-    }
-    let node = value
-        .get("data")
-        .or_else(|| value.as_array().and_then(|rows| rows.first()))
-        .unwrap_or(&value);
-    let id = ["id", "id_str", "rest_id"]
-        .iter()
-        .find_map(|key| {
-            node.get(*key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-                .or_else(|| node.get(*key).and_then(serde_json::Value::as_u64).map(|n| n.to_string()))
-        });
-    match id {
-        Some(id) if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) => {
-            Ok(format!("Posted {id}"))
+    let node = success_node(&value).unwrap_or(&value);
+    for key in ["id", "id_str", "rest_id"] {
+        if let Some(text) = node.get(key).and_then(serde_json::Value::as_str) {
+            if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()) {
+                return format!("Posted {text}");
+            }
         }
-        _ => Err(uncertain.into()),
+    }
+    "Posted".into()
+}
+
+/// Which OpenCLI write the receipt must match. Messages are the ones
+/// `clis/twitter/*.js` returns after it sees the button or sent-toast change.
+/// Exit 0, `{"ok":true}`, and an id without that message are not receipts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenCliWrite {
+    Like,
+    Unlike,
+    Retweet,
+    Unretweet,
+    Follow,
+    Unfollow,
+    Post,
+    Reply,
+}
+
+impl OpenCliWrite {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Like => "Like",
+            Self::Unlike => "Unlike",
+            Self::Retweet => "Retweet",
+            Self::Unretweet => "Unretweet",
+            Self::Follow => "Follow",
+            Self::Unfollow => "Unfollow",
+            Self::Post => "Post",
+            Self::Reply => "Reply",
+        }
+    }
+
+    fn from_engage(action: EngageAction) -> Option<Self> {
+        match action {
+            EngageAction::Like => Some(Self::Like),
+            EngageAction::Unlike => Some(Self::Unlike),
+            EngageAction::Retweet => Some(Self::Retweet),
+            EngageAction::Unretweet => Some(Self::Unretweet),
+            EngageAction::Quote => None,
+        }
     }
 }
 
-/// A retweet is confirmed only by a structured receipt. Exit 0, empty
-/// output, and `{"ok":true}` with no retweet id are not enough. Nothing
-/// here retries the write.
 pub fn prove_engage(
     action: EngageAction,
     stdout: &str,
     expected_account: Option<&str>,
 ) -> Result<(), String> {
-    if !matches!(action, EngageAction::Retweet | EngageAction::Unretweet) {
+    let Some(kind) = OpenCliWrite::from_engage(action) else {
         return Ok(());
-    }
-    let verb = if action == EngageAction::Retweet {
-        "Retweet"
-    } else {
-        "Unretweet"
     };
+    prove_opencli_write(kind, stdout, expected_account)
+}
+
+/// Confirmed only when OpenCLI's own success row is present.
+/// `subject` is the follow handle when the message names one.
+pub fn prove_opencli_write(
+    kind: OpenCliWrite,
+    stdout: &str,
+    subject: Option<&str>,
+) -> Result<(), String> {
+    let label = kind.label();
     let uncertain = format!(
-        "{verb} was not confirmed. Not marked {verb}ed. Check the post on X. Nothing was retried."
+        "{label} was not confirmed. Not marked done. Check X. Nothing was retried."
     );
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Err(uncertain);
     }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower.contains("unconfirmed") || lower.contains("check before") {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Err(uncertain);
+    };
+    if value_flag(&value, "unconfirmed") == Some(true) {
         return Err(uncertain);
     }
-    let value: serde_json::Value = match serde_json::from_str(trimmed) {
-        Ok(value) => value,
-        Err(_) => return Err(uncertain),
-    };
     if json_says_failure(&value) {
         return Err(format!(
-            "{verb} was rejected by X. Not marked {verb}ed. Nothing was retried."
+            "{label} was rejected. Not marked done. Nothing was retried."
         ));
     }
-    if let (Some(actor), Some(expected)) = (actor_handle(&value), expected_account) {
-        let expected = crate::model::strip_handle(expected);
-        if !expected.is_empty() && !actor.eq_ignore_ascii_case(expected) {
+    let Some(node) = success_node(&value) else {
+        return Err(uncertain);
+    };
+    if node.get("unconfirmed").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err(uncertain);
+    }
+    let status = node
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if !status.eq_ignore_ascii_case("success") {
+        return Err(uncertain);
+    }
+    let Some(message) = node.get("message").and_then(serde_json::Value::as_str) else {
+        return Err(uncertain);
+    };
+    match subject_mismatch(kind, message, subject) {
+        SubjectCheck::Mismatch { found, expected } => {
             return Err(format!(
-                "{verb} ran as @{actor}, not @{expected}. Not marked {verb}ed. Nothing was retried."
+                "{label} names @{found}, not @{expected}. Not marked done. Nothing was retried."
             ));
         }
+        SubjectCheck::Matches | SubjectCheck::NotApplicable => {}
     }
-    if engage_receipt_present(action, &value) {
+    if message_matches(kind, message) {
         Ok(())
     } else {
         Err(uncertain)
@@ -304,75 +353,98 @@ fn json_says_failure(value: &serde_json::Value) -> bool {
         )
 }
 
-fn engage_receipt_present(action: EngageAction, value: &serde_json::Value) -> bool {
-    let node = value
-        .get("data")
-        .or_else(|| value.as_array().and_then(|rows| rows.first()))
-        .unwrap_or(value);
-    let flag = node
-        .get("retweeted")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| {
-            node.get("data")
-                .and_then(|inner| inner.get("retweeted"))
-                .and_then(serde_json::Value::as_bool)
-        });
-    let want = action == EngageAction::Retweet;
-    if flag == Some(!want) {
-        return false;
-    }
-    if flag == Some(want) && json_has_id(node) {
-        return true;
-    }
-    if flag.is_some() {
-        return false;
-    }
-    let status = node
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("");
-    let ok = node.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
-        || status.eq_ignore_ascii_case("success");
-    ok && json_has_id(node)
+fn value_flag(value: &serde_json::Value, key: &str) -> Option<bool> {
+    value.get(key).and_then(serde_json::Value::as_bool)
 }
 
-fn json_has_id(node: &serde_json::Value) -> bool {
-    for key in ["id", "rest_id", "tweet_id", "id_str"] {
-        if let Some(value) = node.get(key).and_then(serde_json::Value::as_str) {
-            if value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty() {
-                return true;
-            }
+fn success_node(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(rows) = value.as_array() {
+        return rows.first();
+    }
+    if let Some(data) = value.get("data") {
+        if let Some(rows) = data.as_array() {
+            return rows.first();
         }
-        if node.get(key).and_then(serde_json::Value::as_u64).is_some() {
-            return true;
+        if data.get("message").is_some() {
+            return Some(data);
         }
     }
-    false
-}
-
-fn actor_handle(value: &serde_json::Value) -> Option<String> {
-    let node = value
-        .get("data")
-        .or_else(|| value.as_array().and_then(|rows| rows.first()))
-        .unwrap_or(value);
-    for key in ["screen_name", "username", "handle"] {
-        if let Some(text) = node.get(key).and_then(serde_json::Value::as_str) {
-            let handle = crate::model::strip_handle(text);
-            if !handle.is_empty() {
-                return Some(handle.to_string());
-            }
-        }
-    }
-    let user = node.get("user").or_else(|| node.get("author"))?;
-    for key in ["screen_name", "username", "handle"] {
-        if let Some(text) = user.get(key).and_then(serde_json::Value::as_str) {
-            let handle = crate::model::strip_handle(text);
-            if !handle.is_empty() {
-                return Some(handle.to_string());
-            }
-        }
+    if value.get("message").is_some() {
+        return Some(value);
     }
     None
+}
+
+enum SubjectCheck {
+    Matches,
+    Mismatch { found: String, expected: String },
+    NotApplicable,
+}
+
+fn subject_mismatch(kind: OpenCliWrite, message: &str, subject: Option<&str>) -> SubjectCheck {
+    if !matches!(kind, OpenCliWrite::Follow | OpenCliWrite::Unfollow) {
+        return SubjectCheck::NotApplicable;
+    }
+    let Some(found) = message_handle(message) else {
+        return SubjectCheck::NotApplicable;
+    };
+    let Some(expected) = subject else {
+        return SubjectCheck::Matches;
+    };
+    let expected = crate::model::strip_handle(expected);
+    if expected.is_empty() || found.eq_ignore_ascii_case(expected) {
+        SubjectCheck::Matches
+    } else {
+        SubjectCheck::Mismatch {
+            found,
+            expected: expected.to_string(),
+        }
+    }
+}
+
+fn message_handle(message: &str) -> Option<String> {
+    let at = message.find('@')?;
+    let handle: String = message[at + 1..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect();
+    if handle.is_empty() { None } else { Some(handle) }
+}
+
+fn message_matches(kind: OpenCliWrite, message: &str) -> bool {
+    let message = message.trim();
+    match kind {
+        OpenCliWrite::Like => {
+            message == "Tweet successfully liked." || message == "Tweet is already liked."
+        }
+        OpenCliWrite::Unlike => {
+            message == "Tweet successfully unliked."
+                || message == "Tweet is not liked (already unliked)."
+        }
+        OpenCliWrite::Retweet => {
+            message == "Tweet successfully retweeted." || message == "Tweet is already retweeted."
+        }
+        OpenCliWrite::Unretweet => {
+            message == "Tweet successfully unretweeted."
+                || message == "Tweet is not retweeted (already removed)."
+        }
+        OpenCliWrite::Follow => {
+            let Some(handle) = message_handle(message) else {
+                return false;
+            };
+            message == format!("Successfully followed @{handle}.")
+                || message == format!("Already following @{handle}.")
+        }
+        OpenCliWrite::Unfollow => {
+            let Some(handle) = message_handle(message) else {
+                return false;
+            };
+            message == format!("Successfully unfollowed @{handle}.")
+                || message.starts_with(&format!("Not following @{handle} "))
+        }
+        OpenCliWrite::Post => message == "Tweet posted successfully.",
+        OpenCliWrite::Reply => message == "Reply posted successfully.",
+    }
 }
 
 impl EngageAction {
@@ -458,19 +530,24 @@ impl Publisher for IntentPublisher {
         {
             self.opener.open(url)?;
         }
-        if media.is_empty() {
-            Ok(format!("opened web intent for {} part(s)", parts.len()))
+        let opened = if self.open_browser {
+            "Opened the browser composer. "
+        } else {
+            ""
+        };
+        let attach = if media.is_empty() {
+            String::new()
         } else {
             let list = media
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Ok(format!(
-                "opened web intent for {} part(s). Attach these images in the browser compose UI (web intent cannot upload files): {list}",
-                parts.len()
-            ))
-        }
+            format!(" Attach these images in the browser: {list}.")
+        };
+        Err(format!(
+            "{opened}Termy cannot confirm a web-intent post.{attach} Not marked Posted."
+        ))
     }
 }
 
@@ -1049,20 +1126,35 @@ mod tests {
         assert_eq!(standalone_tweet("  hello  ").unwrap(), "hello");
         assert!(standalone_tweet("  ").is_err());
         assert!(standalone_reply_to().is_none());
-        assert_eq!(
-            prove_new_post(r#"{"ok":true,"id":"42"}"#).unwrap(),
-            "Posted 42"
-        );
-        assert!(prove_new_post("").is_err());
-        assert!(prove_new_post(r#"{"ok":true}"#).is_err());
-        assert!(prove_new_post(r#"{"ok":false,"error":{"message":"no"}}"#).is_err());
 
-        let confirmed = r#"{"ok":true,"retweeted":true,"id":"555","user":{"screen_name":"Jasper_Black"}}"#;
-        assert!(prove_engage(EngageAction::Retweet, confirmed, Some("jasper_black")).is_ok());
+        let confirmed = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
+        assert!(prove_engage(EngageAction::Retweet, confirmed, None).is_ok());
+        assert!(prove_engage(
+            EngageAction::Like,
+            r#"[{"status":"success","message":"Tweet successfully liked."}]"#,
+            None
+        )
+        .is_ok());
+        assert!(prove_opencli_write(
+            OpenCliWrite::Reply,
+            r#"[{"status":"success","message":"Reply posted successfully."}]"#,
+            None
+        )
+        .is_ok());
+        assert!(prove_opencli_write(
+            OpenCliWrite::Follow,
+            r#"[{"status":"success","message":"Successfully followed @jack."}]"#,
+            Some("jack")
+        )
+        .is_ok());
         assert!(
-            prove_engage(EngageAction::Retweet, confirmed, Some("@other"))
-                .unwrap_err()
-                .contains("not @other")
+            prove_opencli_write(
+                OpenCliWrite::Follow,
+                r#"[{"status":"success","message":"Successfully followed @other."}]"#,
+                Some("jack")
+            )
+            .unwrap_err()
+            .contains("not @jack")
         );
 
         for bad in [
@@ -1071,18 +1163,25 @@ mod tests {
             "unconfirmed — check before retrying",
             "not json",
             r#"{"ok":true}"#,
+            r#"{"ok":true,"id":"555"}"#,
             r#"{"ok":false,"error":{"message":"nope"}}"#,
+            r#"[{"status":"success","id":"555"}]"#,
+            r#"[{"status":"success","message":"Tweet successfully retweeted.","unconfirmed":true}]"#,
             "[]",
         ] {
-            let err = prove_engage(EngageAction::Retweet, bad, Some("Jasper_Black")).unwrap_err();
+            let err = prove_engage(EngageAction::Retweet, bad, None).unwrap_err();
             assert!(err.contains("Not marked"), "{bad} -> {err}");
             assert!(err.contains("Nothing was retried"), "{err}");
-            assert!(!err.to_ascii_lowercase().contains("token"));
         }
 
-        let removed = r#"{"ok":true,"retweeted":false,"id":"555"}"#;
-        assert!(prove_engage(EngageAction::Unretweet, removed, None).is_ok());
-        assert!(prove_engage(EngageAction::Retweet, removed, None).is_err());
+        assert!(prove_new_post(
+            r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#
+        )
+        .unwrap()
+        .contains("42"));
+        assert!(prove_new_post(r#"{"ok":true,"id":"42"}"#).is_err());
+        assert!(prove_new_post("").is_err());
+        assert!(prove_reply(r#"[{"status":"success","message":"Reply posted successfully."}]"#).is_ok());
     }
 
     #[test]

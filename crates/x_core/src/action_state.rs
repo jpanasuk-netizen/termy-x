@@ -115,6 +115,9 @@ struct ToggleState {
     verified_at_ms: u64,
     #[serde(default)]
     seq: u64,
+    /// Set only after an OpenCLI success message was checked. Older rows stay empty.
+    #[serde(default)]
+    proof: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -212,15 +215,20 @@ pub fn export_sanitized(path: &Path) -> Result<String, String> {
     }
     let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|error| format!("action database: {error}"))?;
+    let has_proof = toggles_have_column(&conn, "proof")?;
     let mut lines = vec![
         "action export (read-only). No passwords or keys. Nothing was sent to X.".to_string(),
-        "columns: account, kind, target, confirmed, source, time_utc, error".to_string(),
+        "columns: account, kind, target, confirmed, source, time_utc, error, proof".to_string(),
         "provider is not stored on these rows. A retweet click uses OpenCLI when that posting path is available.".to_string(),
+        "proof=legacy-unverified means confirmed was saved before the OpenCLI message check. It is not fresh X proof.".to_string(),
     ];
+    let sql = if has_proof {
+        "SELECT account, kind, item_key, confirmed, source, verified_at_ms, last_error, proof FROM toggles ORDER BY verified_at_ms, account, kind, item_key"
+    } else {
+        "SELECT account, kind, item_key, confirmed, source, verified_at_ms, last_error, NULL FROM toggles ORDER BY verified_at_ms, account, kind, item_key"
+    };
     let mut stmt = conn
-        .prepare(
-            "SELECT account, kind, item_key, confirmed, source, verified_at_ms, last_error FROM toggles ORDER BY verified_at_ms, account, kind, item_key",
-        )
+        .prepare(sql)
         .map_err(|error| format!("action database: {error}"))?;
     let rows = stmt
         .query_map([], |row| {
@@ -232,25 +240,32 @@ pub fn export_sanitized(path: &Path) -> Result<String, String> {
                 row.get::<_, Option<String>>(4)?,
                 row.get::<_, i64>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| format!("action database: {error}"))?;
     for row in rows {
-        let (account, kind, target, confirmed, source, at_ms, error) =
+        let (account, kind, target, confirmed, source, at_ms, error, proof) =
             row.map_err(|error| format!("action database: {error}"))?;
-        let confirmed = match confirmed {
+        let confirmed_label = match confirmed {
             Some(1) => "yes",
             Some(0) => "no",
             _ => "unknown",
         };
+        let proof_label = match proof.as_deref() {
+            Some(text) if !text.is_empty() => text.to_string(),
+            _ if source.as_deref() == Some("live_read") => "live-flag".into(),
+            _ if confirmed == Some(1) => "legacy-unverified".into(),
+            _ => "-".into(),
+        };
         lines.push(format!(
-            "{account}\t{kind}\t{target}\t{confirmed}\t{}\t{}\t{}",
+            "{account}\t{kind}\t{target}\t{confirmed_label}\t{}\t{}\t{}\t{proof_label}",
             source.unwrap_or_else(|| "-".into()),
             utc_stamp(at_ms as u64),
             error.unwrap_or_else(|| "-".into())
         ));
     }
-    if lines.len() == 3 {
+    if lines.len() == 4 {
         lines.push("no rows".into());
     }
     Ok(lines.join("\n"))
@@ -571,6 +586,21 @@ impl ActionDb {
         toggle.verified_at_ms = now;
     }
 
+    /// Mark a row only after this process checked an OpenCLI success message.
+    /// Older rows stay empty. This does not change `confirmed`.
+    pub fn note_opencli_contract(&mut self, account: &str, kind: ToggleKind, id: &str) {
+        let key = match kind {
+            ToggleKind::Follow => account_key(id),
+            _ => tweet_key(id),
+        };
+        let Some(toggle) = self.toggle_ref_mut(account, kind, &key) else {
+            return;
+        };
+        if toggle.confirmed.is_some() {
+            toggle.proof = Some("opencli-contract".into());
+        }
+    }
+
     pub fn record_receipt(
         &mut self,
         account: &str,
@@ -725,6 +755,7 @@ impl ActionDb {
         toggle.source = Some(RecordSource::LiveRead);
         toggle.verified_at_ms = now;
         toggle.last_error = None;
+        toggle.proof = None;
     }
 
     fn settle_abandoned(&mut self) {
@@ -805,6 +836,7 @@ CREATE TABLE IF NOT EXISTS toggles (
     source TEXT,
     verified_at_ms INTEGER NOT NULL DEFAULT 0,
     seq INTEGER NOT NULL DEFAULT 0,
+    proof TEXT,
     PRIMARY KEY (account, kind, item_key)
 );
 CREATE TABLE IF NOT EXISTS receipts (
@@ -856,7 +888,27 @@ fn ensure_schema(conn: &Connection) -> Result<(), String> {
     }
     conn.execute_batch(SCHEMA)
         .map_err(|error| format!("action database: {error}"))?;
+    if !toggles_have_column(conn, "proof")? {
+        conn.execute("ALTER TABLE toggles ADD COLUMN proof TEXT", [])
+            .map_err(|error| format!("action database: {error}"))?;
+    }
     Ok(())
+}
+
+fn toggles_have_column(conn: &Connection, name: &str) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(toggles)")
+        .map_err(|error| format!("action database: {error}"))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("action database: {error}"))?;
+    for name_row in names {
+        let found = name_row.map_err(|error| format!("action database: {error}"))?;
+        if found == name {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_sqlite(path: &Path) -> Result<ActionDb, String> {
@@ -884,7 +936,7 @@ fn read_sqlite(path: &Path) -> Result<ActionDb, String> {
     }
     let mut toggles = conn
         .prepare(
-            "SELECT account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq FROM toggles",
+            "SELECT account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq, proof FROM toggles",
         )
         .map_err(|error| format!("action database: {error}"))?;
     let toggle_rows = toggles
@@ -901,6 +953,7 @@ fn read_sqlite(path: &Path) -> Result<ActionDb, String> {
                 source: row.get(8)?,
                 verified_at_ms: row.get(9)?,
                 seq: row.get(10)?,
+                proof: row.get(11)?,
             })
         })
         .map_err(|error| format!("action database: {error}"))?;
@@ -955,6 +1008,7 @@ struct ToggleRow {
     source: Option<String>,
     verified_at_ms: i64,
     seq: i64,
+    proof: Option<String>,
 }
 
 impl ToggleRow {
@@ -980,6 +1034,7 @@ impl ToggleRow {
             source: self.source.as_deref().and_then(record_source),
             verified_at_ms: self.verified_at_ms as u64,
             seq: self.seq as u64,
+            proof: self.proof.filter(|text| !text.is_empty()),
         })
     }
 }
@@ -1000,7 +1055,7 @@ fn write_toggles(
             None => (None, None, None),
         };
         conn.execute(
-            "INSERT INTO toggles(account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO toggles(account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq, proof) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 account,
                 toggle_kind_str(kind),
@@ -1012,7 +1067,8 @@ fn write_toggles(
                 toggle.last_error,
                 toggle.source.map(source_str),
                 toggle.verified_at_ms as i64,
-                toggle.seq as i64
+                toggle.seq as i64,
+                toggle.proof
             ],
         )
         .map_err(|error| format!("action database: {error}"))?;
@@ -1346,9 +1402,55 @@ mod tests {
         assert!(text.contains("repost"));
         assert!(text.contains("555"));
         assert!(text.contains("read-only"));
-        let rows: String = text.lines().skip(3).collect();
+        let rows: String = text.lines().skip(4).collect();
+        assert!(rows.contains("legacy-unverified") || rows.contains("opencli-contract"));
         assert!(!rows.to_ascii_lowercase().contains("token"));
         assert!(!rows.to_ascii_lowercase().contains("password"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn old_confirmed_rows_stay_unverified_and_are_not_rewritten_by_export() {
+        let dir = std::env::temp_dir().join(format!("termy-actions-legacy-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(FILE_NAME);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE toggles (
+                account TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                item_key TEXT NOT NULL,
+                confirmed INTEGER,
+                pending_seq INTEGER,
+                pending_desired INTEGER,
+                pending_at_ms INTEGER,
+                last_error TEXT,
+                source TEXT,
+                verified_at_ms INTEGER NOT NULL DEFAULT 0,
+                seq INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (account, kind, item_key)
+            );
+            INSERT INTO toggles(account, kind, item_key, confirmed, source, verified_at_ms, seq)
+            VALUES('jasper_black', 'repost', '2119037065459568858', 1, 'local_write', 1762513834000, 1);
+            PRAGMA user_version = 1;",
+        )
+        .unwrap();
+        drop(conn);
+        let before = fs::read(&db_path).unwrap();
+        let text = export_sanitized(&db_path).unwrap();
+        assert_eq!(fs::read(&db_path).unwrap(), before);
+        assert!(text.contains("2119037065459568858"));
+        assert!(text.contains("legacy-unverified"));
+        assert!(!text.contains("opencli-contract"));
+        let loaded = ActionDb::load(&db_path).unwrap();
+        assert_eq!(
+            loaded.confirmed("jasper_black", ToggleKind::Repost, "2119037065459568858"),
+            Some(true)
+        );
+        let after = export_sanitized(&db_path).unwrap();
+        assert!(after.contains("legacy-unverified"));
+        assert!(!after.lines().any(|line| line.contains("2119037065459568858") && line.contains("opencli-contract")));
         let _ = fs::remove_dir_all(&dir);
     }
 }

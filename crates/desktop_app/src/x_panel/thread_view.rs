@@ -508,6 +508,13 @@ impl XPanel {
                     true,
                     now,
                 );
+                if self.live {
+                    self.action_db.note_opencli_contract(
+                        &account,
+                        termy_x::action_state::ToggleKind::Like,
+                        &target.post_id,
+                    );
+                }
             }
             BulkKind::FollowRepliers => {
                 self.action_db.force_confirm(
@@ -517,6 +524,13 @@ impl XPanel {
                     true,
                     now,
                 );
+                if self.live {
+                    self.action_db.note_opencli_contract(
+                        &account,
+                        termy_x::action_state::ToggleKind::Follow,
+                        &target.author_handle,
+                    );
+                }
                 self.follow_overrides.insert(
                     termy_x::action_state::account_key(&target.author_handle),
                     true,
