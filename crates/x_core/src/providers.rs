@@ -1695,57 +1695,87 @@ fn sanitize_browser_note(raw: &str) -> String {
     out
 }
 
-fn close_quote_session(bin: &str, runner: &dyn crate::io::CommandRunner, session: &str) {
+fn close_quote_session(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    session: &str,
+) {
     let _ = runner.run_timeout(
         bin,
-        &["browser".into(), session.into(), "close".into()],
+        &crate::publish::browser_command(cli, session, "close", None),
         Duration::from_secs(15),
     );
+}
+
+fn browser_cli_for(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+) -> Result<crate::publish::BrowserCli, String> {
+    let output = runner
+        .run_timeout(
+            bin,
+            &["browser".into(), "--help".into()],
+            Duration::from_secs(20),
+        )
+        .map_err(|error| {
+            crate::publish::explain_opencli_failure(
+                "bridge",
+                "browser --help",
+                -1,
+                "",
+                &sanitize_browser_note(&error),
+            )
+        })?;
+    let help = format!("{}\n{}", output.stdout, output.stderr);
+    if help.trim().is_empty() {
+        return Err(crate::publish::explain_opencli_failure(
+            "bridge",
+            "browser --help",
+            output.status,
+            "",
+            "",
+        ));
+    }
+    Ok(crate::publish::browser_cli_from_help(&help))
 }
 
 fn browser_page_json(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
     session: &str,
     url: &str,
     js: &str,
 ) -> Result<serde_json::Value, String> {
-    let opened = match runner.run_timeout(
-        bin,
-        &[
-            "browser".into(),
-            session.into(),
-            "open".into(),
-            url.into(),
-            "--window".into(),
-            "background".into(),
-        ],
-        Duration::from_secs(60),
-    ) {
+    let open_args = crate::publish::browser_command(cli, session, "open", Some(url));
+    let open_public = crate::publish::browser_argv_public(&open_args);
+    let opened = match runner.run_timeout(bin, &open_args, Duration::from_secs(60)) {
         Ok(output) => output,
         Err(error) => {
-            return Err(format!(
-                "Could not open the quote page. Post was not clicked. {}",
-                sanitize_browser_note(&error)
+            return Err(crate::publish::explain_opencli_failure(
+                "navigation",
+                &open_public,
+                -1,
+                "",
+                &error,
             ));
         }
     };
     if opened.status != 0 {
-        close_quote_session(bin, runner, session);
-        return Err(format!(
-            "Could not open the quote page. Post was not clicked. {}",
-            sanitize_browser_note(&opened.stderr)
+        close_quote_session(bin, runner, cli, session);
+        return Err(crate::publish::explain_opencli_failure(
+            "navigation",
+            &open_public,
+            opened.status,
+            &opened.stdout,
+            &opened.stderr,
         ));
     }
     for _ in 0..8 {
         match runner.run_timeout(
             bin,
-            &[
-                "browser".into(),
-                session.into(),
-                "eval".into(),
-                "location.href".into(),
-            ],
+            &crate::publish::browser_command(cli, session, "eval", Some("location.href")),
             Duration::from_secs(20),
         ) {
             Ok(probe) if probe.stdout.contains("https://x.com") => break,
@@ -1762,45 +1792,48 @@ fn browser_page_json(
         };
         let loaded = runner.run_timeout(
             bin,
-            &["browser".into(), session.into(), "eval".into(), arg],
+            &crate::publish::browser_command(cli, session, "eval", Some(&arg)),
             Duration::from_secs(30),
         );
         if loaded.map(|output| output.status != 0).unwrap_or(true) {
-            close_quote_session(bin, runner, session);
-            return Err("Could not load the quote check. Post was not clicked.".into());
+            close_quote_session(bin, runner, cli, session);
+            return Err(
+                "stage editor · the quote page opened but the check script did not load · Post was not clicked"
+                    .into(),
+            );
         }
     }
-    let evaluated = runner.run_timeout(
-        bin,
-        &[
-            "browser".into(),
-            session.into(),
-            "eval".into(),
-            "eval(atob(window.__qx))".into(),
-        ],
-        Duration::from_secs(90),
-    );
-    close_quote_session(bin, runner, session);
+    let eval_args =
+        crate::publish::browser_command(cli, session, "eval", Some("eval(atob(window.__qx))"));
+    let eval_public = crate::publish::browser_argv_public(&eval_args);
+    let evaluated = runner.run_timeout(bin, &eval_args, Duration::from_secs(90));
+            close_quote_session(bin, runner, cli, session);
     let evaluated = evaluated.map_err(|error| {
-        format!(
-            "Quote check failed. Post was not clicked. {}",
-            sanitize_browser_note(&error)
+        crate::publish::explain_opencli_failure(
+            "editor",
+            &eval_public,
+            -1,
+            "",
+            &sanitize_browser_note(&error),
         )
     })?;
     if evaluated.status != 0 {
-        return Err(format!(
-            "Quote check failed. Post was not clicked. {}",
-            sanitize_browser_note(&evaluated.stderr)
+        return Err(crate::publish::explain_opencli_failure(
+            "editor",
+            &eval_public,
+            evaluated.status,
+            &evaluated.stdout,
+            &evaluated.stderr,
         ));
     }
-    let start = evaluated
-        .stdout
-        .find('{')
-        .ok_or_else(|| "Quote page returned no report. Post was not clicked.".to_string())?;
-    let end = evaluated
-        .stdout
-        .rfind('}')
-        .ok_or_else(|| "Quote page returned no report. Post was not clicked.".to_string())?;
+    let start = evaluated.stdout.find('{').ok_or_else(|| {
+        "stage editor · the quote page opened but returned no report · Post was not clicked"
+            .to_string()
+    })?;
+    let end = evaluated.stdout.rfind('}').ok_or_else(|| {
+        "stage editor · the quote page opened but returned no report · Post was not clicked"
+            .to_string()
+    })?;
     serde_json::from_str(&evaluated.stdout[start..=end])
         .map_err(|_| "Quote page report was not readable. Post was not clicked.".to_string())
 }
@@ -1812,9 +1845,10 @@ fn run_quote_attachment(
     text: &str,
     inspect: bool,
 ) -> Result<crate::publish::QuotePageReport, String> {
+    let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
     let script = crate::publish::quote_page_script(target_id, Some(text), inspect);
-    let value = browser_page_json(bin, runner, QUOTE_SESSION, &page, &script)?;
+    let value = browser_page_json(bin, runner, cli, QUOTE_SESSION, &page, &script)?;
     let report = crate::publish::parse_quote_page_report(&value.to_string())?;
     if inspect {
         return Ok(report);
@@ -1841,7 +1875,7 @@ fn run_quote_attachment(
     };
     let read_page = format!("https://x.com/i/status/{new_id}");
     let read_script = crate::publish::quote_read_script(target_id);
-    let read_value = browser_page_json(bin, runner, QUOTE_READ_SESSION, &read_page, &read_script)?;
+    let read_value = browser_page_json(bin, runner, cli, QUOTE_READ_SESSION, &read_page, &read_script)?;
     let read = crate::publish::parse_quote_page_report(&read_value.to_string())?;
     crate::publish::quote_read_confirms(&read, target_id)
         .map_err(|error| format!("Post was clicked once. {error}"))?;
@@ -4224,6 +4258,11 @@ mod tests {
         runner.script("opencli", &["twitter", "post"], post_ok);
         runner.script("opencli", &["twitter", "reply"], reply_ok);
         runner.script("opencli", &["twitter", "retweet"], retweet_ok);
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
+        );
         runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
@@ -4355,10 +4394,46 @@ mod tests {
     }
 
     #[test]
+    fn quote_open_failure_keeps_the_opencli_cause() {
+        use crate::io::{CommandOutput, CommandRunner};
+        struct Runner;
+        impl CommandRunner for Runner {
+            fn exists(&self, _: &str) -> bool {
+                true
+            }
+            fn run(&self, _: &str, args: &[String]) -> Result<CommandOutput, String> {
+                if args.get(1).map(String::as_str) == Some("--help") {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: "opencli browser open <url> --session <name>\n--window background\n"
+                            .into(),
+                        stderr: String::new(),
+                    });
+                }
+                Ok(CommandOutput {
+                    status: 1,
+                    stdout: r#"{"ok":false,"error":{"code":"UNKNOWN_COMMAND","message":"unknown command termyx-quote"}}"#.into(),
+                    stderr: String::new(),
+                })
+            }
+        }
+        let err = inspect_quote_attachment("opencli", &Runner, "20").unwrap_err();
+        assert!(err.contains("stage navigation"), "{err}");
+        assert!(err.contains("unknown command termyx-quote"), "{err}");
+        assert!(err.contains("--session"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
+    }
+
+    #[test]
     fn quote_opens_the_status_menu_and_stops_when_the_card_is_missing() {
         use crate::publish::EngageAction;
         let missing = r#"{"stage":"composer","path":"/i/status/20","testid_count":12,"composer":true,"card":false,"status_ids":[],"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"text_landed":false,"quoted_status_id":null,"new_status_id":null,"message":"Quote card for 20 was not in the composer. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
+        );
         runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");

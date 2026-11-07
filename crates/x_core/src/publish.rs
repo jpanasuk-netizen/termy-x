@@ -777,6 +777,134 @@ pub fn quote_saved_receipt(target_id: &str) -> String {
     format!("Quoted {}", crate::model::post_id_from_input(target_id))
 }
 
+/// How this OpenCLI build names a browser session. 2.0 uses
+/// `browser open <url> --session <name>`. 1.8 uses
+/// `browser <session> open <url>`. The 241742ac inspect used only the
+/// 1.8 shape, so a 2.0 CLI exited before any page opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BrowserCli {
+    pub session_flag: bool,
+    pub window_flag: bool,
+}
+
+pub fn browser_cli_from_help(help: &str) -> BrowserCli {
+    let lower = help.to_ascii_lowercase();
+    let positional = lower.contains("browser <session>")
+        || lower.contains("browser [session]")
+        || lower.contains("<session> open")
+        || lower.contains("<session> <command>");
+    let session_flag = lower.contains("--session") && !positional;
+    BrowserCli {
+        session_flag: if positional { false } else { session_flag || lower.contains("--session") || help.trim().is_empty() },
+        window_flag: lower.contains("--window") || help.trim().is_empty(),
+    }
+}
+
+pub fn browser_command(
+    cli: BrowserCli,
+    session: &str,
+    command: &str,
+    arg: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec!["browser".to_string()];
+    if !cli.session_flag {
+        args.push(session.to_string());
+    }
+    args.push(command.to_string());
+    if let Some(arg) = arg {
+        args.push(arg.to_string());
+    }
+    if cli.session_flag {
+        args.push("--session".into());
+        args.push(session.to_string());
+    }
+    if cli.window_flag && command == "open" {
+        args.push("--window".into());
+        args.push("background".into());
+    }
+    args
+}
+
+pub fn browser_argv_public(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.starts_with("http://") || arg.starts_with("https://") {
+                "<status>"
+            } else {
+                arg.as_str()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Keep OpenCLI's own code and message. Drop credential-shaped lines.
+pub fn explain_opencli_failure(stage: &str, argv: &str, status: i32, stdout: &str, stderr: &str) -> String {
+    let cause = opencli_error_cause(stdout)
+        .or_else(|| opencli_error_cause(stderr))
+        .or_else(|| first_safe_line(stdout))
+        .or_else(|| first_safe_line(stderr))
+        .unwrap_or_else(|| "opencli printed nothing".into());
+    format!("stage {stage} · argv {argv} · exit {status} · {cause} · Post was not clicked")
+}
+
+fn opencli_error_cause(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(&text[start..=end]).ok()?;
+    let error = value.get("error")?;
+    let code = error.get("code").and_then(serde_json::Value::as_str).unwrap_or("");
+    let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
+    let hint = error.get("hint").and_then(serde_json::Value::as_str).unwrap_or("");
+    if code.is_empty() && message.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !code.is_empty() {
+        parts.push(code.to_string());
+    }
+    if !message.is_empty() {
+        parts.push(message.to_string());
+    }
+    if !hint.is_empty() && !line_has_secret(hint) {
+        parts.push(hint.to_string());
+    }
+    Some(parts.join(" · "))
+}
+
+fn first_safe_line(text: &str) -> Option<String> {
+    for line in text.lines() {
+        if line_has_secret(line) {
+            continue;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut out = String::new();
+        for ch in trimmed.chars().take(160) {
+            if ch != '{' && ch != '}' {
+                out.push(ch);
+            }
+        }
+        if !out.is_empty() {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn line_has_secret(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("token")
+        || lower.contains("cookie")
+        || lower.contains("authorization")
+        || lower.contains("ct0=")
+}
+
 fn first_message(stdout: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
     success_node(&value)?
@@ -2085,6 +2213,50 @@ mod tests {
         let err = prove_quote(&command_receipt, original).unwrap_err();
         assert!(err.contains("not in the receipt"), "{err}");
         assert!(prove_quote(r#"{"ok":true,"id":"2119067545567121679"}"#, original).is_err());
+    }
+
+    #[test]
+    fn browser_help_picks_the_installed_session_syntax() {
+        let current = "Usage: opencli browser open <url> --session <name>\n--session <name>\n--window <mode>\n";
+        let cli = browser_cli_from_help(current);
+        assert!(cli.session_flag);
+        assert!(cli.window_flag);
+        let args = browser_command(cli, "termyx-quote", "open", Some("https://x.com/i/status/20"));
+        assert_eq!(
+            args,
+            vec![
+                "browser",
+                "open",
+                "https://x.com/i/status/20",
+                "--session",
+                "termyx-quote",
+                "--window",
+                "background"
+            ]
+        );
+        let older = "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n";
+        let cli = browser_cli_from_help(older);
+        assert!(!cli.session_flag);
+        let args = browser_command(cli, "termyx-quote", "open", Some("https://x.com/i/status/20"));
+        assert_eq!(args[0], "browser");
+        assert_eq!(args[1], "termyx-quote");
+        assert_eq!(args[2], "open");
+        let explained = explain_opencli_failure(
+            "navigation",
+            "browser open <status> --session termyx-quote",
+            1,
+            r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#,
+            "",
+        );
+        assert!(explained.contains("stage navigation"), "{explained}");
+        assert!(explained.contains("NAVIGATION"), "{explained}");
+        assert!(explained.contains("Navigation rejected"), "{explained}");
+        assert!(explained.contains("exit 1"), "{explained}");
+        assert!(!explained.contains("ct0"));
+        assert!(!explained.contains("secret"));
+        let empty = explain_opencli_failure("bridge", "browser --help", 1, "", "");
+        assert!(empty.contains("printed nothing"), "{empty}");
+        assert!(empty.contains("stage bridge"), "{empty}");
     }
 
     #[test]

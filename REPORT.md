@@ -45,10 +45,10 @@ Layout: Jeremy changed the spec mid-build. The app is **not** ultrawide-first. I
 ## How to run (Windows, from the repo root)
 ```
 cargo build --release
-target\release\x.exe doctor
-target\release\x.exe splash
-target\release\x.exe search "gpui terminal"
-target\release\x.exe post --dry-run "hello"      # shows the exact text + intent URL; nothing is posted
+target\release\termy-xcli.exe doctor
+target\release\termy-xcli.exe splash
+target\release\termy-xcli.exe search "gpui terminal"
+target\release\termy-xcli.exe post --dry-run "hello"      # shows the exact text + intent URL; nothing is posted
 target\release\termy.exe                          # main app; Ctrl+Shift+X toggles the X panel
 target\release\x_panel_preview.exe --splash       # splash, full-strength bird (default 1600x1000)
 target\release\x_panel_preview.exe --mock         # panel with fixture results over the dimmed bird, no network

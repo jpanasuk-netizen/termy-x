@@ -18,10 +18,10 @@ use crate::splash::{render_splash, splash_ansi};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "x",
+    name = "termy-xcli",
     version,
     about = "Termy X - read and post without X API credits",
-    after_help = "Examples:\n  x doctor                 Check what is connected (free, read-only)\n  x connect --check        Show which of YOUR X accounts is connected\n  x search \"rust\" --recent  Search posts\n  x post --dry-run \"hi\"    Preview a post, never posts\n  x timeline               Your home timeline (or fixtures if not connected)",
+    after_help = "The program file is termy-xcli.exe. Do not run a file named x.exe.\nExamples:\n  termy-xcli doctor\n  termy-xcli connect --check\n  termy-xcli write quote --to ID --inspect",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -371,45 +371,46 @@ fn print_help_guide() {
     println!("                        OpenCLI (with images) when available; else browser intent.");
     println!("  Tab / Esc / Enter     Cycle controls, cancel confirm, activate focused button");
     println!();
+    println!("CLI binary: termy-xcli.exe. Do not run x.exe.");
     #[cfg(windows)]
-    println!("CLI  (from the termy-x folder: .\\target\\release\\x.exe …)");
+    println!("CLI  (from the termy-x folder: .\\target-vlc\\release\\termy-xcli.exe …)");
     #[cfg(not(windows))]
-    println!("CLI  (from the termy-x folder: ./target/release/termy-xcli \u{2026})");
-    println!("  x doctor              Session / OpenCLI / Premium limit check. Never posts.");
-    println!("  x splash              Print the Termy X bird");
-    println!("  x search \"query\" [--recent|--newest|--top|--popular] [--limit N]");
-    println!("  x feed [--topic \"subject\"] [--hot|--popular|--upcoming|--newest] [--limit N]");
+    println!("CLI  (from the termy-x folder: ./target/release/termy-xcli …)");
+    println!("  termy-xcli doctor              Session / OpenCLI / Premium limit check. Never posts.");
+    println!("  termy-xcli splash              Print the Termy X bird");
+    println!("  termy-xcli search \"query\" [--recent|--newest|--top|--popular] [--limit N]");
+    println!("  termy-xcli feed [--topic \"subject\"] [--hot|--popular|--upcoming|--newest] [--limit N]");
     println!("    j/k move  s popular/newest  h popular  u newest  /subject search");
     println!("    r reply box  type a line  p preview  y post  esc cancel  q quit");
-    println!("  x feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
-    println!("  x timeline [--limit N]");
-    println!("  x trends [--place NAME] [--limit N]");
-    println!("  x lookup handle");
-    println!("  x stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
-    println!("  x write post \"text\"                  Dry-run. Does not start the GUI or post.");
-    println!("  x write reply --to ID \"text\"         Dry-run a reply");
-    println!("  x write quote --to ID --inspect        Look at the quote card. Does not click Post");
-    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet");
-    println!("  x write repost --to ID                Dry-run a repost");
-    println!("  x write post \"text\" --confirm yes    One real post. No retry.");
-    println!("  x post \"text\"");
-    println!("  x post --dry-run \"text\"          Plan only - never posts");
-    println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
-    println!("  x post --reply-to ID \"text\"      Reply to a status");
-    println!("  x inbox [--handle me]            Replies/mentions still waiting");
-    println!("  x inbox done ID | waiting ID | draft ID");
-    println!("  x mentions                       Posts that mention you, newest first");
-    println!("  x feeds | feeds add QUERY [--lang en] [--max-age 24]");
-    println!("  x feeds run ID                   Search + apply local filters");
-    println!("  x analytics [--days 7]           Per-day stats vs the prior window");
-    println!("  x followers snapshot | diff      Snapshot on command only; then diff");
-    println!("  x queue | queue add --reply-to ID --text \"...\"");
-    println!("  x queue send ID --dry-run        Confirm path; dry-run never posts");
-    println!("  x analyze HANDLE [--days 14]     14-day read of any account");
+    println!("  termy-xcli feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
+    println!("  termy-xcli timeline [--limit N]");
+    println!("  termy-xcli trends [--place NAME] [--limit N]");
+    println!("  termy-xcli lookup handle");
+    println!("  termy-xcli stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
+    println!("  termy-xcli write post \"text\"                  Dry-run. Does not start the GUI or post.");
+    println!("  termy-xcli write reply --to ID \"text\"         Dry-run a reply");
+    println!("  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post");
+    println!("  termy-xcli write quote --to ID \"text\"         Dry-run a Q-tweet");
+    println!("  termy-xcli write repost --to ID                Dry-run a repost");
+    println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
+    println!("  termy-xcli post \"text\"");
+    println!("  termy-xcli post --dry-run \"text\"          Plan only - never posts");
+    println!("  termy-xcli post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
+    println!("  termy-xcli post --reply-to ID \"text\"      Reply to a status");
+    println!("  termy-xcli inbox [--handle me]            Replies/mentions still waiting");
+    println!("  termy-xcli inbox done ID | waiting ID | draft ID");
+    println!("  termy-xcli mentions                       Posts that mention you, newest first");
+    println!("  termy-xcli feeds | feeds add QUERY [--lang en] [--max-age 24]");
+    println!("  termy-xcli feeds run ID                   Search + apply local filters");
+    println!("  termy-xcli analytics [--days 7]           Per-day stats vs the prior window");
+    println!("  termy-xcli followers snapshot | diff      Snapshot on command only; then diff");
+    println!("  termy-xcli queue | queue add --reply-to ID --text \"...\"");
+    println!("  termy-xcli queue send ID --dry-run        Confirm path; dry-run never posts");
+    println!("  termy-xcli analyze HANDLE [--days 14]     14-day read of any account");
     #[cfg(windows)]
-    println!("  PowerShell long text:  x post --dry-run (Get-Content -Raw .\\post.txt)");
+    println!("  PowerShell long text:  termy-xcli post --dry-run (Get-Content -Raw .\\post.txt)");
     #[cfg(not(windows))]
-    println!("  Shell long text:       x post --dry-run \"$(cat ./post.txt)\"");
+    println!("  Shell long text:       termy-xcli post --dry-run \"$(cat ./post.txt)\"");
     println!();
     println!("Nothing posts until you type yes (CLI) or hit Post now after Confirm (GUI).");
     println!("Premium auto-detects (25,000 chars); otherwise 280.");
@@ -417,7 +418,9 @@ fn print_help_guide() {
 
 pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
     let cli =
-        match Cli::try_parse_from(std::iter::once("x".to_string()).chain(args.iter().cloned())) {
+        match Cli::try_parse_from(
+            std::iter::once("termy-xcli".to_string()).chain(args.iter().cloned()),
+        ) {
             Ok(cli) => cli,
             Err(error) => {
                 if error.kind() == clap::error::ErrorKind::DisplayHelp

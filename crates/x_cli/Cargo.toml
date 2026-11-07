@@ -5,13 +5,13 @@ edition = "2024"
 license = "MIT"
 description = "Termy X command line"
 readme = "README.md"
-default-run = "x"
+default-run = "termy-xcli"
 
 [lints]
 workspace = true
 
 [[bin]]
-name = "x"
+name = "termy-xcli"
 path = "src/main.rs"
 
 [dependencies]
