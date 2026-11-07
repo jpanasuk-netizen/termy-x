@@ -79,8 +79,8 @@ instead. The DLLs must be 64-bit; a 32-bit tree is rejected.
 The stage step places next to `termy.exe`:
 
 - `vlc\source\vlc-3.0.24.tar.xz` (sha256 `e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`), plus `COPYING` (GPL-2.0) and `COPYING.LIB` (LGPL-2.1)
-- `vlc\source\ffmpeg-8.1.2.tar.xz`, the file named by VLC's `contrib/src/ffmpeg/SHA512SUMS`, checked against VideoLAN's 3.0.24 win64 build artifacts
-- `vlc\source\x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz`, the snapshot named by `contrib/src/x264/rules.mak`
+- `vlc\source\ffmpeg-8.1.2.tar.xz`, the file named by VLC's `contrib/src/ffmpeg/SHA512SUMS` (sha512 `b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b`), checked against VideoLAN's 3.0.24 win64 build artifacts
+- `vlc\source\x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz` (sha256 `fa11489fecc4655152a7dc3eab1a8b33bf84b67ff6c62f919f07958e1bd44cae`), the snapshot named by `contrib/src/x264/rules.mak`
 - `prereqs\VC_redist.x64.exe`, Microsoft's x64 Visual C++ redistributable, file version 14.51.36247 (sha256 `843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
 
 `termy.exe` needs `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
@@ -88,8 +88,11 @@ The package contains the official installer for them. Setup does not run it,
 and the DLLs are not copied from System32. Run `VC_redist.x64.exe` on a PC
 that does not already have those files. `libavcodec` stays in the video
 folder. x264 and x265 encoder plugins are omitted. The dummy interface plugin
-stays and is GPL-2.0-or-later. Termy's license is not changed. This is not a
-public release.
+stays, and so do the other GPL-2.0-or-later plugins named in
+`docs/architecture/release-packaging.md`. FFmpeg and x264 source archives are
+included. Other VLC contrib archives are not, and this repo does not rebuild
+the DLLs. Termy's license is not changed. Staging and tests are not a public
+release.
 
 Termy will also be available through winget as `lassejlv.Termy` once the
 package is accepted into the winget repository:

@@ -103,8 +103,13 @@ copied too. `modules/codec/x264.c` and
 `libx26410b`, and `libx265` are omitted. `libdummy_plugin.dll` remains because
 playback passes `--intf=dummy`.
 
-This is not a public-release clearance. Termy is not relicensed. Corresponding
-source for FFmpeg and x264 inside the shipped plugins is not in the package.
+The installed `812e0a88` tree was inventoried at 376 files and 233502222 bytes,
+with 355 plugins. That inventory includes `vlc\source\vlc-3.0.24.tar.xz`,
+`vlc\source\ffmpeg-8.1.2.tar.xz`, and
+`vlc\source\x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz`, plus
+`prereqs\VC_redist.x64.exe`. The redistributable was hash-checked and not
+executed. FFmpeg and x264 source are in the package.
+
 `termy.exe` imports `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`
 (file version 14.51.36247 on the machine that built `d6238614`). The stage step
 copies Microsoft's official `VC_redist.x64.exe` for that version
@@ -115,6 +120,86 @@ installer, not an app-local copy of the Visual Studio `VC\Redist` directory.
 License terms are inside the executable:
 `https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files`.
 libVLC's `msvcrt.dll` import is a separate Windows system runtime.
+
+### Technical validation and legal review
+
+These are separate. A green test run and a staged folder do not clear the
+package for publication.
+
+Technical checks already recorded for `812e0a88`:
+
+- Windows tests: 64 passed.
+- App-local libVLC reports 3.0.24 when `vlc\` sits beside `termy.exe`.
+- The staged tree matches the script: 355 plugins, no `vlc.exe`, no
+  `plugins\gui`, no x264/x265 encoder DLLs, and the three source archives
+  above plus the VC++ installer, each hash-checked by `stage-libvlc.py`.
+- The VC++ installer was not run. Playback of a tweet through this bundle
+  was not part of that inventory.
+
+Still technical, and still open:
+
+1. Play one tweet video from the installed `vlc\` folder and confirm the
+   picture stays inside Termy.
+2. On a machine that does not already have VC++ 14.51.36247, run
+   `prereqs\VC_redist.x64.exe /install /passive /norestart` once, then start
+   Termy. Do not copy those DLLs from System32.
+3. Build `Termy-*-Setup.exe` from this same staged tree and install it on a
+   machine that also has system VLC. The shortcut must launch the copy whose
+   neighbor is `vlc\libvlc.dll`, and Setup must not run the redistributable.
+
+Legal review is not finished. Termy stays under its own license. The staged
+binaries are the official VideoLAN win64 zip, not a rebuild. There is no
+script that recompiles `libvlc.dll` or the plugins from `vlc\source`.
+
+Source that is staged and hash-checked:
+
+- VLC 3.0.24 source, sha256 `e7cab503…`.
+- FFmpeg 8.1.2, the file named by `contrib/src/ffmpeg/SHA512SUMS`, and the
+  bytes match that sha512.
+- x264 git `e067ab0b530395f90b578f6d05ab0a225e2efdf9`, the snapshot named by
+  `contrib/src/x264/rules.mak`. The official zip was built with
+  `BUILD_ENCODERS` and `GPL`, because it contains the x264 and x265 encoder
+  plugins. Those encoder DLLs are not copied. The x264 archive is still
+  staged. `libavcodec_plugin.dll` is copied. Its configure line was not
+  recovered, so this note does not call that plugin GPL and does not call it
+  LGPL-only. The VLC wrapper `modules/codec/avcodec` is LGPL-2.1-or-later.
+
+Source that is not staged:
+
+- The rest of `contrib/src` in the VLC 3.0.24 tree (dav1d, gnutls, opus,
+  freetype, and the other third-party builds used by the win64 plugins).
+  Their licenses are not one license. No claim is made here that each is GPL
+  or that each is LGPL.
+- A from-source rebuild script for the plugin DLLs.
+
+GPL-2.0-or-later VLC modules whose plugins are still copied, because the
+stager only drops `plugins\gui` and the x264/x265/x262 encoder DLLs:
+
+`libdshow_plugin.dll`, `libdolby_surround_decoder_plugin.dll`,
+`libheadphone_channel_mixer_plugin.dll`, `libmono_plugin.dll`,
+`libt140_plugin.dll`, `libdummy_plugin.dll`, `libgestures_plugin.dll`,
+`libhotkeys_plugin.dll`, `libnetsync_plugin.dll`, `libntservice_plugin.dll`,
+`liboldrc_plugin.dll`, `libwin_hotkeys_plugin.dll`, `libwin_msg_plugin.dll`,
+`libmpc_plugin.dll`, `libreal_plugin.dll`, `liblua_plugin.dll`,
+`libaudioscrobbler_plugin.dll`, `libexport_plugin.dll`, `libstats_plugin.dll`,
+`libvod_rtsp_plugin.dll`, `libmediadirs_plugin.dll`, `libpodcast_plugin.dll`,
+`libsap_plugin.dll`, `libstream_out_cycle_plugin.dll`,
+`libstream_out_rtp_plugin.dll`, `librotate_plugin.dll`.
+
+`libdummy_plugin.dll` is the one playback loads (`--intf=dummy`). Removing
+the others would shrink the GPL set and would not make the bundle publishable
+while that plugin stays. `liblive555_plugin.dll` is LGPL-2.1-or-later and is
+not in this list. Qt and skins are already omitted with `plugins\gui`.
+
+What would close the publication question, any one of these:
+
+1. Do not publish the combined installer.
+2. Relicense the combined distribution to GPL-2.0-or-later. That is a decision
+   for the copyright holders. This repo does not do it by itself.
+3. Change playback so it does not load `libdummy_plugin.dll`, drop every GPL
+   plugin in the list above, and play a tweet again. That is a runtime change.
+   It is not done. The other contrib source archives would still be a separate
+   source-offer question for whatever libraries the remaining plugins link.
 
 ### What else the Windows build already carries
 

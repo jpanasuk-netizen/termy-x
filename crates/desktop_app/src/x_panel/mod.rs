@@ -4550,9 +4550,8 @@ impl XPanel {
                             },
                             author
                         );
-                        // Verified success only: Like and Retweet get
-                        // the card burst. Removals (unlike/unretweet)
-                        // just flip state — taking away is not a post.
+                        // Verified success only. Like, unlike, retweet, and
+                        // unretweet each have their own card note.
                         if let Some(label) = termy_x::publish::engage_burst_label(action) {
                             panel.begin_card_burst(&id, label, cx);
                         }
@@ -4778,16 +4777,24 @@ impl XPanel {
                         }
                         panel.quote_text.clear();
                         panel.quote_media.clear();
-                        panel.notice = Some(format!(
-                            "Quoted @{author} \u{b7} posted in-app, no browser opened."
-                        ));
-                        panel.status = format!("quoted @{author}");
-                        panel.begin_post_burst(BurstTarget::Quote, "\u{2713} Posted", cx);
+                        panel.notice = Some(
+                            "Q-tweet sent \u{b7} posted in-app, no browser opened.".into(),
+                        );
+                        panel.status = format!("Q-tweet @{author}");
+                        panel.begin_post_burst(
+                            BurstTarget::Quote,
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet),
+                            cx,
+                        );
                         panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not quote: {} Nothing was posted; no browser opened.",
+                            "{} {}",
+                            termy_x::publish::withheld_note(
+                                termy_x::publish::UserWrite::QTweet,
+                                termy_x::publish::WriteOutcome::Failed
+                            ),
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
@@ -7153,7 +7160,13 @@ impl XPanel {
                         "Cancel",
                         cx.listener(|this, _, _, cx| {
                             this.follow_ask = None;
-                            this.notice = Some("Follow cancelled. Nothing was changed.".into());
+                            this.notice = Some(
+                                termy_x::publish::withheld_note(
+                                    termy_x::publish::UserWrite::Follow,
+                                    termy_x::publish::WriteOutcome::Cancelled,
+                                )
+                                .into(),
+                            );
                             cx.stop_propagation();
                             cx.notify();
                         })
@@ -10589,7 +10602,11 @@ impl XPanel {
                             ));
                             panel.focus_compose_editor();
                             panel.pending_focus = true;
-                            panel.begin_post_burst(BurstTarget::Compose, "\u{2713} Posted", cx);
+                            panel.begin_post_burst(
+                                BurstTarget::Compose,
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Post),
+                                cx,
+                            );
                         }
                         if let Some(id) = &queue_id {
                             termy_x::queue::remove_item(&mut panel.desk.queue, id);

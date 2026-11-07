@@ -39,30 +39,129 @@ pub enum EngageAction {
     Quote,
 }
 
-/// Burst label after the provider confirms the action. Unlike has no
-/// toast. Unretweet has its own label so it never says "Retweeted".
-/// Quote uses the reply-style composer toast, not this card label.
+/// A user-facing write. Quote in the provider API is the Q-tweet action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserWrite {
+    Like,
+    Unlike,
+    Retweet,
+    Unretweet,
+    QTweet,
+    Reply,
+    Follow,
+    Unfollow,
+    Post,
+}
+
+/// What happened to that write. Only `Confirmed` may use a success note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    Confirmed,
+    Failed,
+    Cancelled,
+    Draft,
+    Unsupported,
+}
+
+const USER_WRITES: [UserWrite; 9] = [
+    UserWrite::Like,
+    UserWrite::Unlike,
+    UserWrite::Retweet,
+    UserWrite::Unretweet,
+    UserWrite::QTweet,
+    UserWrite::Reply,
+    UserWrite::Follow,
+    UserWrite::Unfollow,
+    UserWrite::Post,
+];
+
+const WITHHELD_OUTCOMES: [WriteOutcome; 4] = [
+    WriteOutcome::Failed,
+    WriteOutcome::Cancelled,
+    WriteOutcome::Draft,
+    WriteOutcome::Unsupported,
+];
+
+/// Success note after the provider confirms the write. Each action has
+/// its own text. A Q-tweet says Q-tweet, not the generic post note.
+pub fn success_note(action: UserWrite) -> &'static str {
+    match action {
+        UserWrite::Like => "\u{2713} Liked",
+        UserWrite::Unlike => "\u{2713} Unliked",
+        UserWrite::Retweet => "\u{2713} Retweeted",
+        UserWrite::Unretweet => "\u{2713} Unretweeted",
+        UserWrite::QTweet => "\u{2713} Q-tweet",
+        UserWrite::Reply => "\u{2713} Reply sent",
+        UserWrite::Follow => "\u{2713} Followed",
+        UserWrite::Unfollow => "\u{2713} Unfollowed",
+        UserWrite::Post => "\u{2713} Posted",
+    }
+}
+
+/// Note for every outcome that is not a confirmed write. None of these
+/// claim the action succeeded.
+pub fn withheld_note(action: UserWrite, outcome: WriteOutcome) -> &'static str {
+    match outcome {
+        WriteOutcome::Confirmed => success_note(action),
+        WriteOutcome::Cancelled => match action {
+            UserWrite::Follow | UserWrite::Unfollow => "Follow cancelled. Nothing was changed.",
+            _ => "Cancelled. Nothing was posted.",
+        },
+        WriteOutcome::Draft => "Draft only. Nothing was posted.",
+        WriteOutcome::Unsupported => match action {
+            UserWrite::Follow | UserWrite::Unfollow => {
+                "This posting path cannot follow or unfollow. Nothing was changed."
+            }
+            UserWrite::Like | UserWrite::Unlike | UserWrite::Retweet | UserWrite::Unretweet => {
+                "This posting path cannot like, unlike, retweet, or quote. Nothing changed on X."
+            }
+            _ => "Preview/mock never posts. Nothing was posted.",
+        },
+        WriteOutcome::Failed => match action {
+            UserWrite::QTweet => "Could not send the Q-tweet. Nothing was posted.",
+            UserWrite::Reply => "Could not reply. Nothing was posted.",
+            UserWrite::Post => "Could not post. Nothing was posted.",
+            UserWrite::Follow | UserWrite::Unfollow => {
+                "That did not go through. Nothing changed on X."
+            }
+            _ => "That did not go through. Nothing changed on X.",
+        },
+    }
+}
+
+pub fn user_writes() -> &'static [UserWrite] {
+    &USER_WRITES
+}
+
+pub fn withheld_outcomes() -> &'static [WriteOutcome] {
+    &WITHHELD_OUTCOMES
+}
+
+/// Card burst after like, unlike, retweet, or unretweet. A Q-tweet uses
+/// [`success_note`] on the composer instead, so this stays empty for Quote
+/// and does not also show the generic post note.
 pub fn engage_burst_label(action: EngageAction) -> Option<&'static str> {
     match action {
-        EngageAction::Like => Some("\u{2713} Liked"),
-        EngageAction::Retweet => Some("\u{2713} Retweeted"),
-        EngageAction::Unretweet => Some("\u{2713} Unretweeted"),
-        EngageAction::Unlike | EngageAction::Quote => None,
+        EngageAction::Like => Some(success_note(UserWrite::Like)),
+        EngageAction::Unlike => Some(success_note(UserWrite::Unlike)),
+        EngageAction::Retweet => Some(success_note(UserWrite::Retweet)),
+        EngageAction::Unretweet => Some(success_note(UserWrite::Unretweet)),
+        EngageAction::Quote => None,
     }
 }
 
 /// Shown on the reply composer only after the provider accepts the reply.
 pub fn reply_sent_label() -> &'static str {
-    "\u{2713} Reply sent"
+    success_note(UserWrite::Reply)
 }
 
 /// Shown on the author's card only after follow or unfollow is confirmed.
 pub fn follow_burst_label(follow: bool) -> &'static str {
-    if follow {
-        "\u{2713} Followed"
+    success_note(if follow {
+        UserWrite::Follow
     } else {
-        "\u{2713} Unfollowed"
-    }
+        UserWrite::Unfollow
+    })
 }
 
 /// Button and heading for the quote composer. The provider verb stays `quote`.
@@ -675,7 +774,10 @@ mod tests {
             engage_burst_label(EngageAction::Unretweet),
             Some("\u{2713} Unretweeted")
         );
-        assert_eq!(engage_burst_label(EngageAction::Unlike), None);
+        assert_eq!(
+            engage_burst_label(EngageAction::Unlike),
+            Some("\u{2713} Unliked")
+        );
         assert_eq!(engage_burst_label(EngageAction::Quote), None);
         assert_ne!(
             engage_burst_label(EngageAction::Unretweet),
@@ -718,6 +820,30 @@ mod tests {
             ..crate::model::Post::default()
         }));
         assert_eq!(comment_target_id(&quote), "quote-id");
+        let mut seen = std::collections::BTreeSet::new();
+        for action in user_writes() {
+            let success = success_note(*action);
+            assert!(success.starts_with('\u{2713}'), "{action:?} {success}");
+            assert!(seen.insert(success), "duplicate success note {success}");
+            if *action == UserWrite::QTweet {
+                assert!(success.contains(quote_action_label()));
+                assert_ne!(success, success_note(UserWrite::Post));
+            }
+            for outcome in withheld_outcomes() {
+                let withheld = withheld_note(*action, *outcome);
+                assert!(!withheld.contains('\u{2713}'), "{action:?} {outcome:?} {withheld}");
+                assert_ne!(withheld, success);
+                assert!(!withheld.contains(success), "{action:?} {outcome:?}");
+            }
+        }
+        assert_eq!(
+            withheld_note(UserWrite::Follow, WriteOutcome::Cancelled),
+            "Follow cancelled. Nothing was changed."
+        );
+        assert_eq!(
+            withheld_note(UserWrite::QTweet, WriteOutcome::Failed),
+            "Could not send the Q-tweet. Nothing was posted."
+        );
     }
 
     #[test]

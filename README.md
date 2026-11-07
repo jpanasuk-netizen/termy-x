@@ -67,8 +67,14 @@ VideoLAN's 3.0.24 win64 build artifacts after its sha512 matches
 `modules/codec/x264.c` and
 `modules/control/dummy.c` are GPL-2.0-or-later. The x264/x265 encoder plugins
 are left out. `libdummy_plugin.dll` stays because playback asks for
-`--intf=dummy`. That GPL plugin, and FFmpeg's license inside `libavcodec_plugin.dll`,
-are why this package is not cleared for a public release. Termy's license is
+`--intf=dummy`. The stager also still copies other GPL-2.0-or-later plugins
+(DirectShow, hotkeys, lua, and the rest listed in
+`docs/architecture/release-packaging.md`). FFmpeg's own configure flags inside
+`libavcodec_plugin.dll` were not recovered, so that plugin is not labeled GPL
+here and is not labeled LGPL-only. The VLC source, the matching FFmpeg 8.1.2
+archive, and the matching x264 snapshot are in `vlc\source`. Other contrib
+archives are not, and nothing in this repo rebuilds the DLLs from those
+archives. That is a legal review, not a failed build. Termy's license is
 unchanged. `termy.exe` imports `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
 The stage step places Microsoft's official x64 installer
 `VC_redist.x64.exe` (file version 14.51.36247, sha256
