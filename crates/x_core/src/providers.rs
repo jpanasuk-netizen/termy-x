@@ -4014,6 +4014,132 @@ mod tests {
     }
 
     #[test]
+    fn gui_write_uses_the_opencli_receipt_once() {
+        use crate::action_state::{ActionDb, ReceiptKind, ToggleKind};
+        use crate::publish::{GuiWrite, GuiWriteOutcome, GuiWriteRequest, run_gui_write};
+        let post_ok = r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#;
+        let reply_ok = r#"[{"status":"success","message":"Reply posted successfully."}]"#;
+        let retweet_ok = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script("opencli", &["twitter", "post"], post_ok);
+        runner.script("opencli", &["twitter", "reply"], reply_ok);
+        runner.script("opencli", &["twitter", "retweet"], retweet_ok);
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let mut db = ActionDb::default();
+        let request = |write| GuiWriteRequest {
+            write,
+            confirm: Some("yes".into()),
+            account: "Jasper_Black".into(),
+            char_limit: 280,
+        };
+        let sent = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Post {
+                text: "harness post".into(),
+            }),
+            20,
+            1,
+        );
+        assert!(matches!(sent, GuiWriteOutcome::Sent { .. }), "{sent:?}");
+        let reply = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Reply {
+                target_id: "2118971448614334959".into(),
+                text: "harness reply".into(),
+            }),
+            21,
+            2,
+        );
+        assert!(matches!(reply, GuiWriteOutcome::Sent { .. }), "{reply:?}");
+        let quote = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Quote {
+                target_id: "2118971448614334959".into(),
+                text: "harness quote".into(),
+            }),
+            22,
+            3,
+        );
+        assert!(matches!(quote, GuiWriteOutcome::Sent { .. }), "{quote:?}");
+        assert_eq!(
+            db.receipt_ids("jasper_black", ReceiptKind::QTweet),
+            vec!["2118971448614334959".to_string()]
+        );
+        let repost = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Repost {
+                target_id: "2118971448614334959".into(),
+            }),
+            23,
+            4,
+        );
+        assert!(matches!(repost, GuiWriteOutcome::Sent { .. }), "{repost:?}");
+        assert_eq!(
+            db.confirmed("Jasper_Black", ToggleKind::Repost, "2118971448614334959"),
+            Some(true)
+        );
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(calls[0].1[1], "post");
+        assert_eq!(calls[0].1[2], "harness post");
+        assert!(!calls[0].1.iter().any(|arg| arg == "reply"));
+        assert_eq!(calls[1].1[1], "reply");
+        assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
+        assert_eq!(calls[1].1[3], "harness reply");
+        assert_eq!(calls[2].1[1], "post");
+        assert!(calls[2].1[2].contains("harness quote"));
+        assert!(calls[2].1[2].contains("https://x.com/i/status/2118971448614334959"));
+        assert!(!calls[2].1.iter().any(|arg| arg == "quote"));
+        assert_eq!(calls[3].1[1], "retweet");
+        assert!(calls[3].1.iter().any(|arg| arg.contains("2118971448614334959")));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x-action-state.db");
+        db.save(&path).unwrap();
+        let exported = crate::action_state::export_sanitized(&path).unwrap();
+        assert!(exported.contains("opencli-contract"), "{exported}");
+        assert!(exported.contains("2118971448614334959"), "{exported}");
+        assert!(exported.contains("Posted 42"), "{exported}");
+        assert!(exported.contains("q_tweet"), "{exported}");
+        assert!(exported.contains("Reply sent"), "{exported}");
+
+        let bad = Arc::new(ScriptedRunner::new());
+        bad.script("opencli", &["twitter", "retweet"], r#"{"ok":true,"id":"2118971448614334959"}"#);
+        bad.script("opencli", &["twitter", "post"], r#"{"ok":true}"#);
+        let publisher = OpenCliPublisher::new(&quiet_config(), bad.clone());
+        let mut db = ActionDb::default();
+        let rejected = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Post {
+                text: "not a receipt".into(),
+            }),
+            24,
+            5,
+        );
+        assert!(matches!(rejected, GuiWriteOutcome::Rejected { .. }), "{rejected:?}");
+        assert!(db.receipt_ids("jasper_black", ReceiptKind::Post).is_empty());
+        let rejected = run_gui_write(
+            &publisher,
+            &mut db,
+            &request(GuiWrite::Repost {
+                target_id: "2118971448614334959".into(),
+            }),
+            25,
+            6,
+        );
+        assert!(matches!(rejected, GuiWriteOutcome::Rejected { .. }), "{rejected:?}");
+        assert_ne!(
+            db.confirmed("Jasper_Black", ToggleKind::Repost, "2118971448614334959"),
+            Some(true)
+        );
+        assert_eq!(bad.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
     fn quote_engages_via_post_path_with_source_url() {
         use crate::publish::EngageAction;
         use std::sync::Mutex as StdMutex;

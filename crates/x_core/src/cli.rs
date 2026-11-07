@@ -54,6 +54,14 @@ enum Cmd {
     },
     /// Read a post and its thread
     Thread { id_or_url: String },
+    /// One panel write. Dry-run unless `--confirm yes`. Never bulk, never a retry.
+    Write {
+        #[command(subcommand)]
+        op: WriteOp,
+        /// The only approval that performs the write. Must be the word yes.
+        #[arg(long, global = true)]
+        confirm: Option<String>,
+    },
     /// Publish text after you type yes. `--dry-run` prints the plan and never posts.
     Post {
         text: String,
@@ -221,6 +229,29 @@ enum Cmd {
 }
 
 #[derive(Subcommand, Debug)]
+enum WriteOp {
+    /// Standalone tweet. No reply id.
+    Post { text: String },
+    /// Reply to one status.
+    Reply {
+        #[arg(long)]
+        to: String,
+        text: String,
+    },
+    /// Quote one status by posting its URL, the same path as the Q-tweet button.
+    Quote {
+        #[arg(long)]
+        to: String,
+        text: String,
+    },
+    /// Repost one status.
+    Repost {
+        #[arg(long)]
+        to: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum InboxAction {
     /// Mark a tweet as done
     Done { id: String },
@@ -351,6 +382,11 @@ fn print_help_guide() {
     println!("  x trends [--place NAME] [--limit N]");
     println!("  x lookup handle");
     println!("  x stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
+    println!("  x write post \"text\"                  Dry-run. Does not start the GUI or post.");
+    println!("  x write reply --to ID \"text\"         Dry-run a reply");
+    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet");
+    println!("  x write repost --to ID                Dry-run a repost");
+    println!("  x write post \"text\" --confirm yes    One real post. No retry.");
     println!("  x post \"text\"");
     println!("  x post --dry-run \"text\"          Plan only - never posts");
     println!("  x post --media pic.jpg \"text\"    Up to 4 images (repeat --media)");
@@ -513,6 +549,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             print!("{}", render_splash(true));
             0
         }
+        Cmd::Write { op, confirm } => gui_write(op, confirm, json, io),
         Cmd::Post {
             text,
             dry_run,
@@ -1406,6 +1443,158 @@ fn publish_draft(
     )
 }
 
+fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -> i32 {
+    use crate::publish::{GuiWrite, GuiWriteRequest, run_gui_write};
+    let write = match op {
+        WriteOp::Post { text } => GuiWrite::Post { text },
+        WriteOp::Reply { to, text } => GuiWrite::Reply {
+            target_id: to,
+            text,
+        },
+        WriteOp::Quote { to, text } => GuiWrite::Quote {
+            target_id: to,
+            text,
+        },
+        WriteOp::Repost { to } => GuiWrite::Repost { target_id: to },
+    };
+    let approved = confirm.as_deref() == Some("yes");
+    let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
+    let publisher = if approved {
+        first_available(service.publishers.as_slice())
+    } else {
+        service
+            .publishers
+            .iter()
+            .find(|publisher| match publisher.id() {
+                crate::model::ProviderId::OpenCli => io.runner.exists(&io.config.opencli_bin),
+                crate::model::ProviderId::TwitterCli => io.runner.exists(&io.config.twitter_bin),
+                crate::model::ProviderId::OfficialApi => io.config.official_enabled,
+                crate::model::ProviderId::Mock | crate::model::ProviderId::WebIntent => false,
+            })
+            .map(|publisher| publisher.as_ref())
+    };
+    let Some(publisher) = publisher else {
+        eprintln!(
+            "No in-app posting path found. Nothing was sent. This command does not open the Termy window or a browser."
+        );
+        return 1;
+    };
+    let account = crate::connect::load_connected_handle(&io.config).unwrap_or_default();
+    if !approved {
+        let mut db = crate::action_state::ActionDb::default();
+        let outcome = run_gui_write(
+            publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write,
+                confirm,
+                account,
+                char_limit: io.config.char_limit_or_fallback(),
+            },
+            0,
+            0,
+        );
+        return print_gui_write(&outcome, json, false);
+    }
+    let path = io.config.action_state_path();
+    let mut db = match crate::action_state::ActionDb::load(&path) {
+        Ok(db) => db,
+        Err(error) => {
+            eprintln!("{error} Nothing was sent.");
+            return 1;
+        }
+    };
+    let account = crate::connect::load_connected_handle(&io.config).unwrap_or_default();
+    let outcome = run_gui_write(
+        publisher,
+        &mut db,
+        &GuiWriteRequest {
+            write,
+            confirm,
+            account,
+            char_limit: io.config.char_limit_or_fallback(),
+        },
+        crate::action_state::now_ms(),
+        crate::action_state::now_ms(),
+    );
+    let saved = if outcome.saved_a_row() {
+        match db.save(&path) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("The write finished, but the action database was not saved: {error}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    print_gui_write(&outcome, json, saved)
+}
+
+fn print_gui_write(outcome: &crate::publish::GuiWriteOutcome, json: bool, saved: bool) -> i32 {
+    match outcome {
+        crate::publish::GuiWriteOutcome::DryRun { provider, detail } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "dry_run": true,
+                        "sent": false,
+                        "provider": provider.as_str(),
+                        "detail": detail,
+                    })
+                );
+            } else {
+                println!("dry-run — nothing was sent");
+                println!("{detail}");
+                println!("Add --confirm yes to perform this one write. It will not retry.");
+            }
+            0
+        }
+        crate::publish::GuiWriteOutcome::Sent { provider, receipt } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": true,
+                        "dry_run": false,
+                        "sent": true,
+                        "provider": provider.as_str(),
+                        "receipt": receipt,
+                        "saved": saved,
+                    })
+                );
+            } else {
+                println!("sent — one write, no retry");
+                println!("{receipt}");
+                println!("provider {}", provider.label());
+                if saved {
+                    println!("saved the action row");
+                }
+            }
+            0
+        }
+        crate::publish::GuiWriteOutcome::Rejected { message } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "ok": false,
+                        "dry_run": false,
+                        "sent": false,
+                        "error": message,
+                    })
+                );
+            } else {
+                eprintln!("not sent");
+                eprintln!("{message}");
+            }
+            1
+        }
+    }
+}
+
 fn publish_text(
     text: &str,
     dry_run: bool,
@@ -1783,6 +1972,53 @@ mod tests {
         assert_eq!(execute(&["stats".into()], &mut io, false), 2);
         // Connect instructions are printable with no account set up.
         assert_eq!(execute(&["connect".into()], &mut io, false), 0);
+    }
+
+    #[test]
+    fn write_dry_run_does_not_spawn_or_post() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.install("opencli");
+        let mut io = test_io(dir.path());
+        io.config.provider = Some(ProviderId::OpenCli);
+        io.runner = runner.clone();
+        assert_eq!(
+            execute(
+                &["write".into(), "post".into(), "hello from the harness".into()],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert!(
+            runner.calls.lock().expect("calls").is_empty(),
+            "dry-run must not start OpenCLI"
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "write".into(),
+                    "repost".into(),
+                    "--to".into(),
+                    "2118971448614334959".into(),
+                    "--confirm".into(),
+                    "Yes".into()
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert!(runner.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            execute(&["write".into(), "--help".into()], &mut io, false),
+            0
+        );
+        assert_eq!(
+            execute(&["--help".into()], &mut io, false),
+            0
+        );
+        assert!(runner.calls.lock().expect("calls").is_empty());
     }
 
     #[test]

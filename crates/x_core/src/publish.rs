@@ -204,6 +204,286 @@ pub fn standalone_reply_to() -> Option<&'static str> {
     None
 }
 
+/// One panel write, driven without the window. Dry-run unless `confirm` is
+/// exactly `yes`. A confirmed run calls the publisher once and does not retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiWrite {
+    Post { text: String },
+    Reply { target_id: String, text: String },
+    Quote { target_id: String, text: String },
+    Repost { target_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuiWriteRequest {
+    pub write: GuiWrite,
+    /// Only `yes` performs the provider call.
+    pub confirm: Option<String>,
+    pub account: String,
+    pub char_limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuiWriteOutcome {
+    DryRun {
+        provider: ProviderId,
+        detail: String,
+    },
+    Sent {
+        provider: ProviderId,
+        receipt: String,
+    },
+    Rejected {
+        message: String,
+    },
+}
+
+impl GuiWriteOutcome {
+    pub fn saved_a_row(&self) -> bool {
+        matches!(self, Self::Sent { .. })
+    }
+}
+
+pub fn run_gui_write(
+    publisher: &dyn Publisher,
+    db: &mut crate::action_state::ActionDb,
+    request: &GuiWriteRequest,
+    now: u64,
+    seq: u64,
+) -> GuiWriteOutcome {
+    let approved = request.confirm.as_deref() == Some("yes");
+    let prepared = match prepare_gui_write(&request.write) {
+        Ok(prepared) => prepared,
+        Err(message) => return GuiWriteOutcome::Rejected { message },
+    };
+    if !approved {
+        return GuiWriteOutcome::DryRun {
+            provider: publisher.id(),
+            detail: prepared.detail(publisher.id()),
+        };
+    }
+    if request.account.trim().is_empty() {
+        return GuiWriteOutcome::Rejected {
+            message: "No connected account is saved. Nothing was sent.".into(),
+        };
+    }
+    match prepared.kind {
+        PreparedKind::Text { reply_to } => {
+            let text = &prepared.text;
+            match confirm_and_publish_with_media(
+                text,
+                reply_to.as_deref(),
+                ConfirmDecision::Yes,
+                false,
+                publisher,
+                request.char_limit,
+                &[],
+            ) {
+                GateOutcome::Sent { receipt, .. } => {
+                    let kind = if reply_to.is_some() {
+                        crate::action_state::ReceiptKind::Reply
+                    } else {
+                        crate::action_state::ReceiptKind::Post
+                    };
+                    db.record_receipt(
+                        &request.account,
+                        kind,
+                        reply_to.as_deref().unwrap_or(""),
+                        &receipt,
+                        seq,
+                        now,
+                    );
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
+                    }
+                }
+                GateOutcome::Rejected { plan } => GuiWriteOutcome::Rejected {
+                    message: plan.session.unwrap_or_else(|| {
+                        "The write was rejected. Nothing was retried.".into()
+                    }),
+                },
+                GateOutcome::DryRun { .. } => GuiWriteOutcome::Rejected {
+                    message: "The write stayed a dry run. Nothing was sent.".into(),
+                },
+            }
+        }
+        PreparedKind::Quote { url, target_id } => {
+            match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &[]) {
+                Ok(receipt) => {
+                    db.record_receipt(
+                        &request.account,
+                        crate::action_state::ReceiptKind::QTweet,
+                        &target_id,
+                        &receipt,
+                        seq,
+                        now,
+                    );
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
+                    }
+                }
+                Err(error) => GuiWriteOutcome::Rejected {
+                    message: format!("{error} Nothing was retried."),
+                },
+            }
+        }
+        PreparedKind::Repost { url, target_id } => {
+            db.begin_toggle(
+                &request.account,
+                crate::action_state::ToggleKind::Repost,
+                &target_id,
+                true,
+                seq,
+                now,
+            );
+            match publisher.engage(EngageAction::Retweet, &url, None, &[]) {
+                Ok(receipt) => {
+                    if let Err(error) = prove_engage(EngageAction::Retweet, &receipt, None) {
+                        let _ = db.finish_toggle(
+                            &request.account,
+                            crate::action_state::ToggleKind::Repost,
+                            &target_id,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
+                        return GuiWriteOutcome::Rejected { message: error };
+                    }
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        crate::action_state::ToggleKind::Repost,
+                        &target_id,
+                        seq,
+                        true,
+                        None,
+                        now,
+                    );
+                    db.note_opencli_contract(
+                        &request.account,
+                        crate::action_state::ToggleKind::Repost,
+                        &target_id,
+                    );
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
+                    }
+                }
+                Err(error) => {
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        crate::action_state::ToggleKind::Repost,
+                        &target_id,
+                        seq,
+                        false,
+                        Some(&error),
+                        now,
+                    );
+                    GuiWriteOutcome::Rejected {
+                        message: format!("{error} Nothing was retried."),
+                    }
+                }
+            }
+        }
+    }
+}
+
+enum PreparedKind {
+    Text { reply_to: Option<String> },
+    Quote { url: String, target_id: String },
+    Repost { url: String, target_id: String },
+}
+
+struct PreparedWrite {
+    kind: PreparedKind,
+    text: String,
+}
+
+impl PreparedWrite {
+    fn detail(&self, provider: ProviderId) -> String {
+        match &self.kind {
+            PreparedKind::Text { reply_to } => format!(
+                "provider {} · reply_to {} · text: {}",
+                provider.as_str(),
+                reply_to.as_deref().unwrap_or("none"),
+                self.text
+            ),
+            PreparedKind::Quote { url, target_id } => format!(
+                "provider {} · quote {} · post text: {}",
+                provider.as_str(),
+                target_id,
+                quote_post_text(&self.text, url)
+            ),
+            PreparedKind::Repost { url, target_id } => format!(
+                "provider {} · retweet {} · url {}",
+                provider.as_str(),
+                target_id,
+                url
+            ),
+        }
+    }
+}
+
+fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
+    match write {
+        GuiWrite::Post { text } => {
+            let text = standalone_tweet(text).map_err(|error| error.to_string())?;
+            if standalone_reply_to().is_some() {
+                return Err("New tweet was blocked because it had a reply id.".into());
+            }
+            Ok(PreparedWrite {
+                kind: PreparedKind::Text { reply_to: None },
+                text,
+            })
+        }
+        GuiWrite::Reply { target_id, text } => {
+            let target_id = require_status_id(target_id)?;
+            let text = text.trim();
+            if text.is_empty() {
+                return Err("Type a reply before sending. Nothing was sent.".into());
+            }
+            Ok(PreparedWrite {
+                kind: PreparedKind::Text {
+                    reply_to: Some(target_id),
+                },
+                text: text.to_string(),
+            })
+        }
+        GuiWrite::Quote { target_id, text } => {
+            let target_id = require_status_id(target_id)?;
+            let text = text.trim();
+            if text.is_empty() {
+                return Err("Write the quote first. Nothing was sent.".into());
+            }
+            let url = crate::model::post_url("", &target_id);
+            Ok(PreparedWrite {
+                kind: PreparedKind::Quote { url, target_id },
+                text: text.to_string(),
+            })
+        }
+        GuiWrite::Repost { target_id } => {
+            let target_id = require_status_id(target_id)?;
+            let url = crate::model::post_url("", &target_id);
+            Ok(PreparedWrite {
+                kind: PreparedKind::Repost { url, target_id },
+                text: String::new(),
+            })
+        }
+    }
+}
+
+fn require_status_id(input: &str) -> Result<String, String> {
+    let id = crate::model::post_id_from_input(input);
+    if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err(
+            "The target must be a status id or a status URL. Nothing was sent.".into(),
+        );
+    }
+    Ok(id)
+}
+
 /// A new post is confirmed by OpenCLI's sent-toast message. An id alone is not.
 pub fn prove_new_post(stdout: &str) -> Result<String, String> {
     prove_opencli_write(OpenCliWrite::Post, stdout, None)?;
@@ -1182,6 +1462,218 @@ mod tests {
         assert!(prove_new_post(r#"{"ok":true,"id":"42"}"#).is_err());
         assert!(prove_new_post("").is_err());
         assert!(prove_reply(r#"[{"status":"success","message":"Reply posted successfully."}]"#).is_ok());
+    }
+
+    #[test]
+    fn gui_write_defaults_to_dry_run_and_persists_one_confirmed_call() {
+        use crate::action_state::{ActionDb, ReceiptKind, ToggleKind};
+        struct LogPublisher {
+            publish: Mutex<Vec<(Vec<String>, Option<String>)>>,
+            engage: Mutex<Vec<(EngageAction, String, Option<String>)>>,
+            fail: Mutex<bool>,
+        }
+        impl Publisher for LogPublisher {
+            fn id(&self) -> ProviderId {
+                ProviderId::OpenCli
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn session_note(&self) -> Option<String> {
+                None
+            }
+            fn publish(
+                &self,
+                parts: &[String],
+                reply_to: Option<&str>,
+                _media: &[PathBuf],
+            ) -> Result<String, String> {
+                self.publish
+                    .lock()
+                    .expect("publish")
+                    .push((parts.to_vec(), reply_to.map(str::to_string)));
+                if *self.fail.lock().expect("fail") {
+                    return Err("provider rejected".into());
+                }
+                Ok("Posted 42".into())
+            }
+            fn engage(
+                &self,
+                action: EngageAction,
+                target_url: &str,
+                text: Option<&str>,
+                _media: &[PathBuf],
+            ) -> Result<String, String> {
+                self.engage.lock().expect("engage").push((
+                    action,
+                    target_url.to_string(),
+                    text.map(str::to_string),
+                ));
+                if *self.fail.lock().expect("fail") {
+                    return Err("provider rejected".into());
+                }
+                if action == EngageAction::Retweet {
+                    Ok(r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into())
+                } else {
+                    Ok("Posted 9".into())
+                }
+            }
+        }
+        let publisher = LogPublisher {
+            publish: Mutex::new(Vec::new()),
+            engage: Mutex::new(Vec::new()),
+            fail: Mutex::new(false),
+        };
+        let mut db = ActionDb::default();
+        let dry = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Post {
+                    text: "  hello  ".into(),
+                },
+                confirm: None,
+                account: "Jasper_Black".into(),
+                char_limit: 280,
+            },
+            10,
+            1,
+        );
+        assert!(matches!(dry, GuiWriteOutcome::DryRun { .. }));
+        assert!(publisher.publish.lock().expect("publish").is_empty());
+        assert!(db.receipt_ids("Jasper_Black", ReceiptKind::Post).is_empty());
+
+        let sent = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Post {
+                    text: "hello".into(),
+                },
+                confirm: Some("yes".into()),
+                account: "Jasper_Black".into(),
+                char_limit: 280,
+            },
+            11,
+            2,
+        );
+        assert!(matches!(sent, GuiWriteOutcome::Sent { .. }));
+        assert_eq!(
+            publisher.publish.lock().expect("publish").clone(),
+            vec![(vec!["hello".to_string()], None)]
+        );
+
+        let reply = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Reply {
+                    target_id: "https://x.com/cryptoXRPwhale/status/2118971448614334959".into(),
+                    text: "reply text".into(),
+                },
+                confirm: Some("yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            12,
+            3,
+        );
+        assert!(matches!(reply, GuiWriteOutcome::Sent { .. }));
+        assert_eq!(
+            publisher.publish.lock().expect("publish")[1].1.as_deref(),
+            Some("2118971448614334959")
+        );
+        assert_eq!(
+            db.receipt_ids("jasper_black", ReceiptKind::Reply),
+            vec!["2118971448614334959".to_string()]
+        );
+
+        let quote = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Quote {
+                    target_id: "2118971448614334959".into(),
+                    text: "my words".into(),
+                },
+                confirm: Some("yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            13,
+            4,
+        );
+        assert!(matches!(quote, GuiWriteOutcome::Sent { .. }));
+        let engage = publisher.engage.lock().expect("engage").clone();
+        assert_eq!(engage.len(), 1);
+        assert_eq!(engage[0].0, EngageAction::Quote);
+        assert_eq!(
+            engage[0].1,
+            "https://x.com/i/status/2118971448614334959"
+        );
+        assert_eq!(db.receipt_ids("jasper_black", ReceiptKind::QTweet), vec![
+            "2118971448614334959".to_string()
+        ]);
+
+        let repost = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Repost {
+                    target_id: "2118971448614334959".into(),
+                },
+                confirm: Some("yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            14,
+            5,
+        );
+        assert!(matches!(repost, GuiWriteOutcome::Sent { .. }));
+        assert_eq!(
+            db.confirmed("jasper_black", ToggleKind::Repost, "2118971448614334959"),
+            Some(true)
+        );
+        assert_eq!(publisher.engage.lock().expect("engage").len(), 2);
+
+        *publisher.fail.lock().expect("fail") = true;
+        let before = publisher.engage.lock().expect("engage").len();
+        let failed = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Repost {
+                    target_id: "20".into(),
+                },
+                confirm: Some("yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            15,
+            6,
+        );
+        assert!(matches!(failed, GuiWriteOutcome::Rejected { .. }));
+        assert_eq!(publisher.engage.lock().expect("engage").len(), before + 1);
+        assert_eq!(
+            db.confirmed("jasper_black", ToggleKind::Repost, "20"),
+            None
+        );
+        let not_yes = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Post {
+                    text: "nope".into(),
+                },
+                confirm: Some("Yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            16,
+            7,
+        );
+        assert!(matches!(not_yes, GuiWriteOutcome::DryRun { .. }));
+        assert_eq!(publisher.publish.lock().expect("publish").len(), 2);
     }
 
     #[test]

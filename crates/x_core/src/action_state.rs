@@ -268,7 +268,51 @@ pub fn export_sanitized(path: &Path) -> Result<String, String> {
     if lines.len() == 4 {
         lines.push("no rows".into());
     }
+    if sqlite_table_exists(&conn, "receipts")? {
+        let mut receipts = conn
+            .prepare(
+                "SELECT account, kind, tweet_id, at_ms, text FROM receipts ORDER BY id",
+            )
+            .map_err(|error| format!("action database: {error}"))?;
+        let receipt_rows = receipts
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|error| format!("action database: {error}"))?;
+        let mut receipt_lines = Vec::new();
+        for row in receipt_rows {
+            let (account, kind, target, at_ms, text) =
+                row.map_err(|error| format!("action database: {error}"))?;
+            receipt_lines.push(format!(
+                "{account}\t{kind}\t{target}\t{}\t{text}",
+                utc_stamp(at_ms as u64)
+            ));
+        }
+        if !receipt_lines.is_empty() {
+            lines.push(
+                "receipts (read-only): account, kind, target, time_utc, text".into(),
+            );
+            lines.extend(receipt_lines);
+        }
+    }
     Ok(lines.join("\n"))
+}
+
+fn sqlite_table_exists(conn: &Connection, name: &str) -> Result<bool, String> {
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(found.is_some())
 }
 
 fn utc_stamp(ms: u64) -> String {
