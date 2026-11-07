@@ -342,6 +342,58 @@ pub enum FollowStep {
     Confirm { handle: String, follow: bool },
 }
 
+/// What a Follow click does. Every variant is visible. None of them send
+/// a write except after [`FollowClick::Confirm`] is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowClick {
+    /// A follow write is already in flight. The button stays on Following….
+    InFlight,
+    ConnectFirst,
+    OwnAccount,
+    Confirm { handle: String, follow: bool },
+}
+
+pub fn follow_click(
+    in_flight: bool,
+    connected: bool,
+    own_account: bool,
+    currently_following: bool,
+    handle: &str,
+) -> FollowClick {
+    if !termy_x::action_state::follow_write_allowed(in_flight) {
+        return FollowClick::InFlight;
+    }
+    match follow_step(connected, own_account, currently_following, handle) {
+        FollowStep::ConnectFirst => FollowClick::ConnectFirst,
+        FollowStep::OwnAccount => FollowClick::OwnAccount,
+        FollowStep::Confirm { handle, follow } => FollowClick::Confirm { handle, follow },
+    }
+}
+
+/// Text for the always-visible status line. Never empty.
+pub fn follow_click_status(click: &FollowClick) -> String {
+    match click {
+        FollowClick::InFlight => "Follow is already in progress.".into(),
+        FollowClick::ConnectFirst => {
+            "Connect X before following anyone. Nothing was changed.".into()
+        }
+        FollowClick::OwnAccount => "That's your account. Nothing was changed.".into(),
+        FollowClick::Confirm { handle, follow } => {
+            let verb = if *follow { "Follow" } else { "Unfollow" };
+            format!("{verb} @{handle}? Confirm on that card. Nothing is sent until you do.")
+        }
+    }
+}
+
+/// The confirm buttons belong on the card that was clicked, not at the
+/// top of the scrolled list where a long feed hides them.
+pub fn follow_confirm_on_card(ask_handle: Option<&str>, card_handle: &str) -> bool {
+    ask_handle.is_some_and(|ask| {
+        termy_x::model::strip_handle(ask)
+            .eq_ignore_ascii_case(termy_x::model::strip_handle(card_handle))
+    })
+}
+
 pub fn follow_step(
     connected: bool,
     own_account: bool,
@@ -4644,29 +4696,43 @@ impl XPanel {
     /// Ask before any follow write. Not connected and your own account
     /// never reach the publisher.
     fn request_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
-        if !termy_x::action_state::follow_write_allowed(self.follow_pending.is_some()) {
-            return;
-        }
         let own = match &self.connection {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
         };
         let connected = !self.live || matches!(self.connection, ConnState::Connected { .. });
-        match follow_step(
+        let click = follow_click(
+            self.follow_pending.is_some(),
             connected,
             is_own_profile(handle, own),
             self.following_now(handle),
             handle,
-        ) {
-            FollowStep::ConnectFirst => {
-                self.notice = Some(
-                    "Connect X before following anyone. Nothing was changed.".into(),
-                );
+        );
+        let status = follow_click_status(&click);
+        perf_log(&format!(
+            "follow click {}",
+            match &click {
+                FollowClick::InFlight => "in-flight",
+                FollowClick::ConnectFirst => "connect-first",
+                FollowClick::OwnAccount => "own-account",
+                FollowClick::Confirm { follow, .. } => {
+                    if *follow {
+                        "confirm-follow"
+                    } else {
+                        "confirm-unfollow"
+                    }
+                }
             }
-            FollowStep::OwnAccount => {
-                self.notice = Some("That's your account. Nothing was changed.".into());
+        ));
+        self.status = status.clone();
+        match click {
+            FollowClick::InFlight => {}
+            FollowClick::ConnectFirst | FollowClick::OwnAccount => {
+                self.notice = Some(status);
+                self.follow_ask = None;
             }
-            FollowStep::Confirm { handle, follow } => {
+            FollowClick::Confirm { handle, follow } => {
+                self.notice = None;
                 self.follow_ask = Some((handle, follow));
             }
         }
@@ -7517,46 +7583,6 @@ impl XPanel {
         if !self.sync_line.is_empty() {
             rows.push(hint(self.sync_line.clone()));
         }
-        if let Some((handle, follow)) = self.follow_ask.clone() {
-            let verb = if follow { "Follow" } else { "Unfollow" };
-            rows.push(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(hint(format!(
-                        "{verb} @{handle} on X? Nothing happens until you confirm."
-                    )))
-                    .child(x_button!(
-                        "x-follow-confirm",
-                        verb,
-                        cx.listener(move |this, _, _, cx| {
-                            if let Some((handle, follow)) = this.follow_ask.take() {
-                                this.toggle_follow(&handle, follow, cx);
-                            }
-                            cx.stop_propagation();
-                        })
-                    ))
-                    .child(x_button!(
-                        "x-follow-cancel",
-                        "Cancel",
-                        cx.listener(|this, _, _, cx| {
-                            this.follow_ask = None;
-                            this.notice = Some(
-                                termy_x::publish::withheld_note(
-                                    termy_x::publish::UserWrite::Follow,
-                                    termy_x::publish::WriteOutcome::Cancelled,
-                                )
-                                .into(),
-                            );
-                            cx.stop_propagation();
-                            cx.notify();
-                        })
-                    ))
-                    .into_any_element(),
-            );
-        }
         if self.thread.is_some() {
             rows.extend(self.thread_rows(cx));
             return rows;
@@ -8333,17 +8359,36 @@ impl XPanel {
                         .eq_ignore_ascii_case(termy_x::model::strip_handle(&profile.handle))
                 })
                 .map(|(_, target)| *target);
-            let label = follow_button_label(viewer, pending, saved);
+            let asking = follow_confirm_on_card(
+                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+                &profile.handle,
+            );
+            let label = if asking {
+                if viewer == Some(true) {
+                    "Unfollow?"
+                } else {
+                    "Follow?"
+                }
+            } else {
+                follow_button_label(viewer, pending, saved)
+            };
             let click_handle = profile.handle.clone();
-            card_el = card_el.child(div().flex().child(x_button!(
-                "x-follow-toggle",
-                label,
-                viewer == Some(true),
-                cx.listener(move |this, _, _, cx| {
-                    this.request_follow(&click_handle, cx);
-                    cx.stop_propagation();
-                })
-            )));
+            card_el = card_el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(x_button!(
+                        "x-follow-toggle",
+                        label,
+                        viewer == Some(true),
+                        cx.listener(move |this, _, _, cx| {
+                            this.request_follow(&click_handle, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .children(self.follow_confirm_strip(&profile.handle, "profile", cx)),
+            );
         }
         card_el.into_any_element()
     }
@@ -9572,6 +9617,10 @@ impl XPanel {
                 .eq_ignore_ascii_case(termy_x::model::strip_handle(&post.author_handle))
                 .then_some(*target)
         });
+        let follow_asking = follow_confirm_on_card(
+            self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+            &post.author_handle,
+        );
         let own = match &self.connection {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
@@ -9648,7 +9697,15 @@ impl XPanel {
         if show_follow {
             row = row.child(x_action!(
                 format!("x-follow-{scope}-{}", post.id),
-                follow_button_label(follow_value, follow_pending, follow_saved),
+                if follow_asking {
+                    if follow_value == Some(true) {
+                        "Unfollow?"
+                    } else {
+                        "Follow?"
+                    }
+                } else {
+                    follow_button_label(follow_value, follow_pending, follow_saved)
+                },
                 follow_value == Some(true),
                 cx.listener(move |this, _, _, cx| {
                     this.request_follow(&follow_handle, cx);
@@ -9657,7 +9714,71 @@ impl XPanel {
                 })
             ));
         }
+        if let Some(strip) =
+            self.follow_confirm_strip(&post.author_handle, &format!("{scope}-{}", post.id), cx)
+        {
+            row = row.child(strip);
+        }
         row.into_any_element()
+    }
+
+    /// Confirm / Cancel for a follow, drawn on the card that was clicked.
+    fn follow_confirm_strip(
+        &self,
+        handle: &str,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let (ask_handle, follow) = self.follow_ask.clone()?;
+        if !follow_confirm_on_card(Some(ask_handle.as_str()), handle) {
+            return None;
+        }
+        let verb = if follow { "Follow" } else { "Unfollow" };
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xf5f5f7))
+                        .child(format!(
+                            "{verb} @{ask_handle}? Nothing is sent until you confirm."
+                        )),
+                )
+                .child(x_action!(
+                    format!("x-follow-yes-{scope}"),
+                    verb,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some((handle, follow)) = this.follow_ask.take() {
+                            this.toggle_follow(&handle, follow, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .child(x_action!(
+                    format!("x-follow-no-{scope}"),
+                    "Cancel",
+                    cx.listener(|this, _, _, cx| {
+                        this.follow_ask = None;
+                        this.status = "Follow cancelled. Nothing was changed.".into();
+                        this.notice = Some(
+                            termy_x::publish::withheld_note(
+                                termy_x::publish::UserWrite::Follow,
+                                termy_x::publish::WriteOutcome::Cancelled,
+                            )
+                            .into(),
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+        )
     }
 
     /// Inline quote composer under a card: retweet with your own words.
@@ -11272,8 +11393,9 @@ mod edit_keys_tests {
     use super::next_timeline_limit;
     use super::{
         BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
-        XSection, burst_style_at, caret_visual_line, fetch_section, follow_button_label,
-        follow_step, is_own_profile, like_button_label, soft_wrap_ranges,
+        FollowClick, XSection, burst_style_at, caret_visual_line, fetch_section, follow_button_label,
+        follow_click, follow_click_status, follow_confirm_on_card, follow_step, is_own_profile,
+        like_button_label, soft_wrap_ranges,
     };
     use termy_x::providers::TimelineFeed;
 
@@ -11296,6 +11418,50 @@ mod edit_keys_tests {
             follow_button_label(Some(true), Some(false), false),
             "Unfollowing\u{2026}"
         );
+    }
+
+    #[test]
+    fn follow_click_dispatches_a_visible_result_on_the_clicked_card() {
+        let ask = follow_click(false, true, false, false, "@Jack");
+        assert_eq!(
+            ask,
+            FollowClick::Confirm {
+                handle: "Jack".into(),
+                follow: true
+            }
+        );
+        let status = follow_click_status(&ask);
+        assert!(status.contains("Confirm on that card"));
+        assert!(status.contains("Nothing is sent"));
+        assert!(follow_confirm_on_card(Some("Jack"), "jack"));
+        assert!(!follow_confirm_on_card(Some("Jack"), "reposter"));
+        assert_eq!(
+            follow_click(false, true, false, true, "jack"),
+            FollowClick::Confirm {
+                handle: "jack".into(),
+                follow: false
+            }
+        );
+        assert_eq!(
+            follow_click(true, true, false, false, "jack"),
+            FollowClick::InFlight
+        );
+        assert!(follow_click_status(&FollowClick::InFlight).contains("already in progress"));
+        assert!(
+            follow_click_status(&FollowClick::ConnectFirst).contains("Nothing was changed")
+        );
+        assert!(follow_click_status(&FollowClick::OwnAccount).contains("Nothing was changed"));
+        for click in [
+            FollowClick::InFlight,
+            FollowClick::ConnectFirst,
+            FollowClick::OwnAccount,
+            FollowClick::Confirm {
+                handle: "a".into(),
+                follow: true,
+            },
+        ] {
+            assert!(!follow_click_status(&click).is_empty());
+        }
     }
 
     #[test]
