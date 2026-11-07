@@ -175,6 +175,32 @@ foreach ($winuiFile in @("Microsoft.UI.Xaml.dll", "resources.pri", "termy.manife
 }
 & (Join-Path $PSScriptRoot "windows\embed-manifest.ps1") -ExePath $exePath
 
+# Video playback loads libVLC from <exe>\vlc. The installer must not ship
+# without that folder. Staging copies an official 3.0.24 tree; it does not
+# modify a VLC install and does not download unless the caller passes a zip.
+$vlcDest = Join-Path $releaseDir "vlc"
+$stage = Join-Path $PSScriptRoot "windows\stage-libvlc.ps1"
+if ($env:TERMY_VLC_ZIP) {
+    & $stage -Zip $env:TERMY_VLC_ZIP -Dest $vlcDest
+} elseif ($env:TERMY_VLC_SOURCE) {
+    & $stage -SourceDir $env:TERMY_VLC_SOURCE -Dest $vlcDest
+} else {
+    $python = $null
+    foreach ($name in @("python", "python3", "py")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) { $python = $command.Source; break }
+    }
+    $checker = Join-Path $PSScriptRoot "windows\stage-libvlc.py"
+    if ($python -and (Test-Path $vlcDest)) {
+        & $python $checker --check --dest $vlcDest
+        if ($LASTEXITCODE -ne 0) {
+            throw "The vlc folder beside termy.exe is incomplete. Stage official VLC 3.0.24 with scripts/windows/stage-libvlc.ps1 -Zip <vlc-3.0.24-win64.zip> -Dest $vlcDest"
+        }
+    } else {
+        throw "Windows video playback needs the official VLC 3.0.24 win64 runtime beside termy.exe. It is not bundled in git. Download https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip (sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323) and rerun with TERMY_VLC_ZIP set to that file, or set TERMY_VLC_SOURCE to an extracted 3.0.24 tree. A copy of C:\Program Files\VideoLAN\VLC is only accepted when libvlc.dll contains 3.0.24. The script copies files; it does not change that install."
+    }
+}
+
 $isccPath = Resolve-IsccPath
 Write-Host "Using ISCC at $isccPath"
 Write-Host "Packaging Termy $appVersion ($Arch)..."

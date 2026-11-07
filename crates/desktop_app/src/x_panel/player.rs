@@ -443,7 +443,10 @@ pub fn callback_is_current(live: u64, captured: PlayGen) -> bool {
 /// not `Command::new("vlc")`, because VLC is not on PATH.
 pub const VLC_CANONICAL_WINDOWS: &str = r"C:\Program Files\VideoLAN\VLC\vlc.exe";
 
-pub const VLC_NOT_FOUND: &str = "VLC was not found at C:\\Program Files\\VideoLAN\\VLC\\vlc.exe. No window was opened. Images stay in Termy.";
+pub const VLC_NOT_FOUND: &str = "VLC's engine was not found beside Termy (vlc\\libvlc.dll) or at C:\\Program Files\\VideoLAN\\VLC\\vlc.exe. No window was opened. Images stay in Termy.";
+
+/// The folder next to termy.exe exists but cannot play. Do not use another install.
+pub const VLC_BUNDLE_INCOMPLETE: &str = "The video engine shipped beside Termy is incomplete. It needs libvlc.dll, libvlccore.dll, and a non-empty plugins folder. No other player was opened.";
 
 pub const VLC_ENGINE_MISSING: &str = "VLC's 64-bit engine (libvlc.dll) was not found beside C:\\Program Files\\VideoLAN\\VLC\\vlc.exe. No window was opened.";
 
@@ -808,6 +811,108 @@ pub fn select_vlc<'a>(candidates: &'a [PathBuf], exists: impl Fn(&Path) -> bool)
     candidates.iter().find(|path| exists(path)).map(PathBuf::as_path)
 }
 
+/// Portable runtime copied next to `termy.exe`. Not Program Files.
+pub fn app_local_vlc_dir(exe_dir: &Path) -> PathBuf {
+    exe_dir.join("vlc")
+}
+
+/// `Ok(true)` uses the folder beside Termy. `Ok(false)` means that folder
+/// is absent, so an installed VLC may be used. A present but unusable
+/// folder is an error and must not fall through to another install.
+pub fn app_bundle_decision(dir_exists: bool, plan: EnginePlan) -> Result<bool, &'static str> {
+    if !dir_exists {
+        return Ok(false);
+    }
+    match plan {
+        EnginePlan::Embed => Ok(true),
+        EnginePlan::Refuse(VLC_WRONG_ARCH) => Err(VLC_WRONG_ARCH),
+        EnginePlan::Refuse(_) => Err(VLC_BUNDLE_INCOMPLETE),
+    }
+}
+
+fn read_pe_machine(path: &Path) -> Option<u16> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut prefix = [0u8; 4096];
+    use std::io::Read;
+    let n = file.read(&mut prefix).ok()?;
+    pe_machine(&prefix[..n])
+}
+
+fn bundle_engine_plan(dir: &Path) -> EnginePlan {
+    let libvlc = read_pe_machine(&dir.join("libvlc.dll"));
+    let core = read_pe_machine(&dir.join("libvlccore.dll"));
+    let mut count = 0usize;
+    let mut all_64 = true;
+    let mut stack = vec![dir.join("plugins")];
+    while let Some(current) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.ends_with("_plugin.dll") {
+                continue;
+            }
+            match read_pe_machine(&path) {
+                Some(IMAGE_FILE_MACHINE_AMD64) => count += 1,
+                Some(_) => {
+                    count += 1;
+                    all_64 = false;
+                }
+                None => all_64 = false,
+            }
+        }
+    }
+    engine_files_plan(libvlc, core, count, all_64 && count > 0)
+}
+
+/// Directory that contains `libvlc.dll`. The `vlc` folder beside the
+/// executable wins over Program Files. That folder is not replaced by
+/// another install when it is incomplete or the wrong architecture.
+pub fn locate_vlc_root(
+    exe_dir: Option<&Path>,
+    program_files: Option<&Path>,
+    program_files_x86: Option<&Path>,
+    path_env: &str,
+) -> Result<PathBuf, &'static str> {
+    if let Some(dir) = exe_dir {
+        let bundle = app_local_vlc_dir(dir);
+        if bundle.is_dir() {
+            return match app_bundle_decision(true, bundle_engine_plan(&bundle))? {
+                true => Ok(bundle),
+                false => Err(VLC_BUNDLE_INCOMPLETE),
+            };
+        }
+    }
+    let candidates = vlc_candidates(program_files, program_files_x86, exe_dir, path_env);
+    select_vlc(&candidates, Path::is_file)
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or(VLC_NOT_FOUND)
+}
+
+pub fn find_vlc_root() -> Result<PathBuf, &'static str> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf));
+    let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+    let program_files_x86 = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    locate_vlc_root(
+        exe_dir.as_deref(),
+        program_files.as_deref(),
+        program_files_x86.as_deref(),
+        &path_env,
+    )
+}
+
 pub fn find_vlc() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -1014,7 +1119,7 @@ impl VideoPlayer {
 #[cfg(windows)]
 mod vlc_embed {
     use super::{
-        client_pixels, engine_files_plan, find_vlc, host_child_style, libvlc_instance_args,
+        client_pixels, engine_files_plan, find_vlc_root, host_child_style, libvlc_instance_args,
         media_url_class, pe_machine, EnginePlan, MediaUrlClass, Rect, DLL_LOAD_FLAGS,
         IMAGE_FILE_MACHINE_AMD64, LIBVLC_EVENT_END, LIBVLC_EVENT_ERROR,
     };
@@ -1351,11 +1456,8 @@ mod vlc_embed {
             return Err("video start would abort before playback. No window was opened.".into());
         }
         ensure_clip_children(hwnd as Hwnd)?;
-        let exe = find_vlc().ok_or_else(|| super::VLC_NOT_FOUND.to_string())?;
-        let Some(dir) = exe.parent() else {
-            return Err(super::VLC_ENGINE_MISSING.into());
-        };
-        let api = load_api(dir)?;
+        let dir = super::find_vlc_root().map_err(str::to_string)?;
+        let api = load_api(&dir)?;
         let old = current().lock().ok().and_then(|mut g| g.take());
         if let Some(old) = old {
             release_handles(api, old);
@@ -1522,8 +1624,7 @@ mod vlc_embed {
     }
 
     fn worker_stop(generation: u64, slot: Arc<Slot>) {
-        let exe = find_vlc();
-        let api = exe.as_ref().and_then(|exe| exe.parent()).and_then(|dir| load_api(dir).ok());
+        let api = super::find_vlc_root().ok().and_then(|dir| load_api(&dir).ok());
         let handles = current().lock().ok().and_then(|mut guard| {
             if guard.as_ref().is_some_and(|cur| cur.generation == generation) {
                 guard.take()
@@ -3118,7 +3219,8 @@ mod tests {
         DLL_LOAD_FLAGS, EngineFlags, EnginePhase, EnginePlan, EngineStep, HOST_STYLE_POPUP,
         MediaDispatch, NO_PLAYABLE_MEDIA, VLC_PLUGINS_MISSING, WS_CHILD,
         PlayGen, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, VLC_ENGINE_MISSING, VLC_WRONG_ARCH,
-        TRACE_OTHER_CAP, VLC_CANONICAL_WINDOWS, VLC_NOT_FOUND, admit_trace_line, begin_playback,
+        TRACE_OTHER_CAP, VLC_BUNDLE_INCOMPLETE, VLC_CANONICAL_WINDOWS, VLC_NOT_FOUND, admit_trace_line,
+        app_bundle_decision, app_local_vlc_dir, begin_playback, locate_vlc_root,
         callback_is_current, choose_variant_url, clamp_window_change, close_button_rect,
         dismiss_playback, dispatch_media, embed_rect, event_name, format_obs_line,
         host_create_style, host_style_starts_hidden, keep_main_window, live_size_differs_half,
@@ -3490,5 +3592,54 @@ mod tests {
         let args = libvlc_instance_args(r"C:\Program Files\VideoLAN\VLC\plugins");
         assert_eq!(libvlc_argc(args.len(), true).unwrap() as usize, args.len());
         assert!(args.iter().all(|arg| !arg.contains("http")));
+    }
+
+    fn amd64_pe() -> Vec<u8> {
+        let mut pe = vec![0u8; 0x80];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c] = 0x40;
+        pe[0x40] = b'P';
+        pe[0x41] = b'E';
+        pe[0x44] = (IMAGE_FILE_MACHINE_AMD64 & 0xff) as u8;
+        pe[0x45] = (IMAGE_FILE_MACHINE_AMD64 >> 8) as u8;
+        pe
+    }
+
+    #[test]
+    fn app_local_vlc_wins_and_a_broken_bundle_does_not_use_program_files() {
+        let root = std::env::temp_dir().join(format!(
+            "termy-vlc-locate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let exe = root.join("Termy");
+        let bundle = app_local_vlc_dir(&exe);
+        let system = root.join("pf").join("VideoLAN").join("VLC");
+        std::fs::create_dir_all(bundle.join("plugins").join("codec")).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let pe = amd64_pe();
+        std::fs::write(bundle.join("libvlc.dll"), &pe).unwrap();
+        std::fs::write(bundle.join("libvlccore.dll"), &pe).unwrap();
+        std::fs::write(bundle.join("plugins").join("codec").join("libavcodec_plugin.dll"), &pe).unwrap();
+        std::fs::write(system.join("vlc.exe"), b"system").unwrap();
+        let found = locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, "").unwrap();
+        assert_eq!(found, bundle);
+        std::fs::remove_file(bundle.join("libvlccore.dll")).unwrap();
+        assert_eq!(
+            locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, ""),
+            Err(VLC_BUNDLE_INCOMPLETE)
+        );
+        std::fs::remove_dir_all(bundle).unwrap();
+        let found = locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, "").unwrap();
+        assert_eq!(found, system);
+        assert_eq!(app_bundle_decision(false, EnginePlan::Embed), Ok(false));
+        assert_eq!(
+            app_bundle_decision(true, EnginePlan::Refuse(VLC_WRONG_ARCH)),
+            Err(VLC_WRONG_ARCH)
+        );
+        assert!(!VLC_BUNDLE_INCOMPLETE.contains("http"));
+        assert!(!launches_external_vlc());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

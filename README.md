@@ -37,6 +37,29 @@ pass `/ALLUSERS` or pick **Install for all users** to install under Program
 Files. See the [installation guide](https://termy.sh/docs/getting-started/installation#windows)
 for SmartScreen and winget notes.
 
+### Video on Windows
+
+Video inside Termy uses libVLC 3 from a `vlc` folder next to `termy.exe`. That
+folder is not in git and Termy does not install VLC. The tested runtime is
+official VideoLAN **3.0.24** for 64-bit Windows, not whatever the download page
+lists as current:
+
+[vlc-3.0.24-win64.zip](https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip)
+`sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
+
+`scripts/windows/stage-libvlc.ps1` copies `libvlc.dll`, `libvlccore.dll`, and
+the playback plugins into that folder. It does not copy `vlc.exe`, and it does
+not change a VLC install already on the PC. Photos do not need it. If the
+folder is missing or incomplete, video shows an error and does not open VLC or
+mpv. A 32-bit tree is refused. When `vlc\libvlc.dll` sits beside Termy, that
+copy is used even if VLC is also installed under `C:\Program Files\VideoLAN\VLC`.
+
+`COPYING.txt` in the VLC archive is GPL-2.0. libVLC is LGPL-2.1-or-later;
+plugin licenses are not all LGPL. Matching source:
+[vlc-3.0.24.tar.xz](https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz).
+Publishing a Termy installer that contains this runtime still needs that source
+offered with the package. This branch does not do that publish.
+
 ### Build from source
 
 Termy is a Rust workspace. Build and launch the desktop app with:

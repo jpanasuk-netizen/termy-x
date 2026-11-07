@@ -86,6 +86,9 @@ Source: "..\..\target\{#MyTarget}\release\resources.pri"; DestDir: "{app}"; Flag
 ; without them fall back to the system ConPTY.
 Source: "..\..\target\{#MyTarget}\release\conpty.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "..\..\target\{#MyTarget}\release\OpenConsole.exe"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+; libVLC 3.0.24 runtime staged by scripts/windows/stage-libvlc.py.
+; Missing this directory fails the installer build.
+Source: "..\..\target\{#MyTarget}\release\vlc\*"; DestDir: "{app}\vlc"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Termy"; Filename: "{app}\{#MyExeName}"; AppUserModelID: "{#MyAppUserModelID}"

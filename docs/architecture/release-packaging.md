@@ -55,6 +55,57 @@ Use `scripts/build-dmg-signed.sh` when a Developer ID signing identity is requir
 
 The release workflow requires the Developer ID certificate and App Store Connect team API key described in [macOS release signing](macos-release-signing.md). Both macOS architectures must be signed and notarized before the release workflow attaches artifacts. Stable release finalization waits for those signed DMGs.
 
+## Windows video runtime
+
+In-panel video loads libVLC from `<install>\vlc` beside `termy.exe`. The git
+repo does not contain those binaries. `scripts/build-setup.ps1` refuses to
+build the installer unless that folder is complete.
+
+Stage it from the official 3.0.24 win64 zip (tested version, not "latest"):
+
+```powershell
+$env:TERMY_VLC_ZIP = "C:\path\vlc-3.0.24-win64.zip"
+.\scripts\build-setup.ps1 -Version <version> -Arch x64 -Target x86_64-pc-windows-msvc
+```
+
+Zip: `https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip`
+
+sha256: `fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
+
+`TERMY_VLC_SOURCE` may point at an extracted 3.0.24 tree, including
+`C:\Program Files\VideoLAN\VLC`. The script copies. It does not install, uninstall,
+or edit that tree. A source directory is accepted only when `libvlc.dll` contains
+the text `3.0.24`; unlike the zip, its hash is then not checked.
+
+The staged folder contains `libvlc.dll`, `libvlccore.dll`, `plugins\` (without
+`plugins\gui`), and `COPYING.txt`, `AUTHORS.txt`, `THANKS.txt`, `NEWS.txt`,
+`README.txt`, plus `TERMY-VLC-PROVENANCE.txt`. It does not contain `vlc.exe`.
+Playback does not spawn `vlc.exe` or mpv. If `vlc\libvlc.dll` exists beside
+Termy, that directory is the engine even when a system VLC is installed. If
+that directory exists but is missing a DLL, plugins, or is not 64-bit, playback
+stops with an error instead of using the system install.
+
+`COPYING.txt` from the archive is GPL-2.0. libVLC is LGPL-2.1-or-later. Plugin
+licenses are not all LGPL, so this is not an "LGPL-only" bundle. Matching
+source: `https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz`.
+Do not publish the installer until that source is offered with the package.
+
+### What else the Windows build already carries
+
+Measured from the official 3.0.24 zip (78.9 MiB compressed, plugins about 140 MiB
+uncompressed) and from the desktop build:
+
+| Piece | Needed for video? | How it is provided |
+| --- | --- | --- |
+| `libvlc.dll`, `libvlccore.dll`, playback plugins | Yes | Staged by `stage-libvlc`. About 140 MiB of plugins before dropping `plugins\gui` (Qt about 17 MiB, skins2 about 2 MiB). |
+| `vlc.exe`, Qt/skins UI, locale (about 43 MiB), lua (about 1 MiB), hrtfs, skins | No for in-panel playback | Not staged. |
+| `msvcrt.dll`, `kernel32.dll`, and the other imports of those two DLLs | Yes, as Windows system libraries | Not copied. `libvlc.dll` imports `libvlccore.dll`, `ADVAPI32.dll`, `KERNEL32.dll`, and `msvcrt.dll`. |
+| Termy MSVC / Universal CRT | Yes for `termy.exe` | The Rust `pc-windows-msvc` toolchain links the CRT dynamically. UCRT is part of Windows 10 and later. Do not copy `vcruntime` out of System32; install the Visual C++ redistributable only if a machine actually lacks it. Not measured on a clean VM here. |
+| `Microsoft.UI.Xaml.dll`, `resources.pri`, `termy.manifest` | Yes for the WinUI tab strip, not for video | Already staged by the desktop build and copied by the installer. |
+| `conpty.dll`, `OpenConsole.exe` | No | Optional. The installer omits them when absent and uses the system ConPTY. |
+| mpv | No on Windows | Windows playback does not call mpv. |
+| Fonts, extra certificates, user config, API keys | No | Not bundled. |
+
 ## Boundary Rules
 
 - Keep packaging scripts in `scripts/`.

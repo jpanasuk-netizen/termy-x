@@ -57,6 +57,31 @@ choose **Run anyway**. To confirm the download, compare its SHA-256 hash
 (`Get-FileHash .\Termy-<version>-windows-x64-Setup.exe` in PowerShell) with
 `checksums.txt` on the same release.
 
+## Video on Windows
+
+Playing a video uses libVLC 3 from a `vlc` folder next to `termy.exe`. Termy
+does not install VLC, and that folder is not downloaded by the installer on its
+own. The tested files are the official VideoLAN **3.0.24** 64-bit archive
+(not a statement that 3.0.24 is the newest release):
+
+https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip
+
+`sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
+
+Before building the Setup exe, stage that archive with
+`scripts/windows/stage-libvlc.ps1`. The script copies `libvlc.dll`,
+`libvlccore.dll`, and the playback plugins. It leaves `vlc.exe` out and does
+not modify `C:\Program Files\VideoLAN\VLC` if VLC is already installed. Photos
+stay inside Termy without this folder. A missing or incomplete `vlc` folder
+makes video fail with an error. Termy does not open VLC's own window or mpv
+instead. The DLLs must be 64-bit; a 32-bit tree is rejected.
+
+The archive's `COPYING.txt` is GPL-2.0. libVLC is LGPL-2.1-or-later, and the
+plugins are not uniformly LGPL. The matching source archive is
+https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz.
+A public Termy release that includes these binaries still has to ship or offer
+that source. That release step is not done here.
+
 Termy will also be available through winget as `lassejlv.Termy` once the
 package is accepted into the winget repository:
 
