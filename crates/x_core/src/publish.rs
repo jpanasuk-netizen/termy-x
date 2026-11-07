@@ -1004,6 +1004,34 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     return "unknown";
   }};
   let picked = {{ tag: "", testid: "", label: "", href_kind: "none", scope: "none" }};
+  let beforeTopo = "none";
+  let menuShape = "none";
+  const hrefShape = (el) => {{
+    const raw = el.getAttribute("href") || "";
+    if (!raw) return "none";
+    try {{
+      const parsed = new URL(raw, location.origin);
+      const keys = Array.from(parsed.searchParams.keys()).slice(0, 4);
+      const path = parsed.pathname.slice(0, 80);
+      return "path=" + path + " keys=" + (keys.length ? keys.join(",") : "none");
+    }} catch (e) {{
+      return "unparsed";
+    }}
+  }};
+  const topology = () => {{
+    const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
+    let place = "none";
+    if (boxes.length) {{
+      const box = boxes[boxes.length - 1];
+      if (box.closest('[role="dialog"], [aria-modal="true"]')) place = "dialog";
+      else if (box.closest("article")) place = "article";
+      else place = "page";
+    }}
+    return place
+      + " textareas=" + boxes.length
+      + " quotes=" + document.querySelectorAll('[data-testid="quoteTweet"]').length
+      + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length;
+  }};
   const report = (stage, message) => {{
     const button = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
     const attached = quoteAttachment();
@@ -1029,6 +1057,9 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
       selected_label: picked.label,
       selected_href_kind: picked.href_kind,
       selected_scope: picked.scope,
+      topo_before: beforeTopo,
+      topo_after: topology(),
+      menu_shape: menuShape,
       message: message
     }};
   }};
@@ -1040,6 +1071,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   const articles = Array.from(document.querySelectorAll("article"));
   const article = articles.find((node) => statusIds(node).indexOf(TARGET) >= 0) || articles[0] || document;
   const opener = article.querySelector('[data-testid="retweet"], [data-testid="unretweet"]');
+  beforeTopo = topology();
   if (!opener) {{
     const missing = report("page", "Repost menu button was not on the tweet. Post was not clicked.");
     return finish(missing);
@@ -1060,22 +1092,26 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     if (quoteItem) break;
     await sleep(250);
   }}
+  if (menu) {{
+    menuShape = Array.from(menu.querySelectorAll('[role="menuitem"]')).slice(0, 4).map((el) => {{
+      const label = (el.innerText || "").trim().split("\\n")[0].replace(/[^A-Za-z0-9 ]/g, "").trim().slice(0, 16) || "-";
+      const tid = el.getAttribute("data-testid") || "-";
+      return el.tagName + ":" + (el.getAttribute("role") || "-") + ":" + tid + ":" + label + ":" + hrefShape(el);
+    }}).join(" | ");
+  }}
   if (!quoteItem) {{
     return finish(report("menu", "Quote menu item did not appear. Post was not clicked."));
   }}
   const href = quoteItem.getAttribute("href") || "";
-  let hrefKind = "none";
-  if (href.indexOf("in_reply_to") >= 0) hrefKind = "reply";
-  else if (href.indexOf("url=") >= 0) hrefKind = "quote-url";
-  else if (href) hrefKind = "other";
+  const shape = hrefShape(quoteItem);
   picked = {{
     tag: quoteItem.tagName || "",
     testid: quoteItem.getAttribute("data-testid") || "",
     label: (quoteItem.innerText || "").trim().split("\\n")[0].trim().slice(0, 24),
-    href_kind: hrefKind,
+    href_kind: shape,
     scope: menu ? "menu" : "page"
   }};
-  if (picked.testid === "retweetConfirm" || picked.testid === "unretweetConfirm" || hrefKind === "reply") {{
+  if (picked.testid === "retweetConfirm" || picked.testid === "unretweetConfirm" || href.indexOf("in_reply_to") >= 0) {{
     return finish(report("menu", "Refused the repost confirm. Post was not clicked."));
   }}
   if (quoteItem.tagName === "A") {{
@@ -1227,6 +1263,9 @@ pub struct QuotePageReport {
     pub selected_testid: String,
     pub selected_href_kind: String,
     pub selected_scope: String,
+    pub topo_before: String,
+    pub topo_after: String,
+    pub menu_shape: String,
     pub message: String,
 }
 
@@ -1381,6 +1420,9 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
         selected_testid: text("selected_testid"),
         selected_href_kind: text("selected_href_kind"),
         selected_scope: text("selected_scope"),
+        topo_before: text("topo_before"),
+        topo_after: text("topo_after"),
+        menu_shape: text("menu_shape"),
         message: text("message"),
     }
 }
@@ -1392,7 +1434,7 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         report.status_ids.join(",")
     };
     format!(
-        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · {}",
+        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · before {} · after {} · menu {} · {}",
         report.stage,
         if report.path.is_empty() { "-" } else { &report.path },
         if report.composer_kind.is_empty() { "-" } else { &report.composer_kind },
@@ -1406,6 +1448,9 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         if report.selected_label.is_empty() { "-" } else { &report.selected_label },
         if report.selected_testid.is_empty() { "-" } else { &report.selected_testid },
         if report.selected_href_kind.is_empty() { "-" } else { &report.selected_href_kind },
+        if report.topo_before.is_empty() { "-" } else { &report.topo_before },
+        if report.topo_after.is_empty() { "-" } else { &report.topo_after },
+        if report.menu_shape.is_empty() { "-" } else { &report.menu_shape },
         report.message
     )
 }
@@ -2565,6 +2610,8 @@ mod tests {
         assert!(script.contains("quoteTweet"));
         assert!(script.contains("preventDefault"));
         assert!(script.contains("[role=\"menu\"]"));
+        assert!(script.contains("textareas="));
+        assert!(script.contains("keys="));
     }
 
     #[test]
