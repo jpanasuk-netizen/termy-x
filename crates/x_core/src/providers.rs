@@ -1905,9 +1905,25 @@ fn run_quote_attachment(
     if inspect {
         return Ok(report);
     }
+    if report.clicked_post
+        && (report.quote_testids == 0 || report.composer_kind == "reply" || !report.card)
+    {
+        return match crate::publish::quote_outcome(
+            report.new_status_id.as_deref(),
+            &report,
+            target_id,
+        ) {
+            Err(error) => Err(error),
+            Ok(()) => Err(
+                "Quote evidence was ambiguous. Not marked sent. Nothing was retried.".into(),
+            ),
+        };
+    }
     if report.clicked_repost_confirm
         || !report.clicked_post
         || !report.card
+        || report.quote_testids == 0
+        || report.composer_kind != "quote"
         || report.quoted_status_id.as_deref() != Some(target_id)
         || report.message != "Quote tweet posted successfully."
     {
@@ -1928,8 +1944,7 @@ fn run_quote_attachment(
     let read_page = format!("https://x.com/i/status/{new_id}");
     let read_script = crate::publish::quote_read_script(target_id);
     let read = browser_page_json(bin, runner, cli, QUOTE_READ_SESSION, &read_page, &read_script)?;
-    crate::publish::quote_read_confirms(&read, target_id)
-        .map_err(|error| format!("Post was clicked once. {error}"))?;
+    crate::publish::quote_outcome(Some(new_id), &read, target_id)?;
     Ok(report)
 }
 
@@ -4303,8 +4318,8 @@ mod tests {
         let post_ok = r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#;
         let reply_ok = r#"[{"status":"success","message":"Reply posted successfully."}]"#;
         let retweet_ok = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
-        let quote_page = r#"{"stage":"posted","path":"/i/status/2118971448614334959","testid_count":40,"composer":true,"card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":true,"clicked_repost_confirm":false,"text_landed":true,"quoted_status_id":"2118971448614334959","new_status_id":"2119069999999999999","message":"Quote tweet posted successfully."}"#;
-        let quote_read = r#"{"stage":"read","path":"/cryptoXRPwhale/status/2119069999999999999","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
+        let quote_page = r#"{"stage":"posted","path":"/compose/post","testid_count":40,"composer":true,"composer_kind":"quote","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":true,"clicked_repost_confirm":false,"text_landed":true,"quoted_status_id":"2118971448614334959","new_status_id":"2119069999999999999","message":"Quote tweet posted successfully."}"#;
+        let quote_read = r#"{"stage":"read","path":"/cryptoXRPwhale/status/2119069999999999999","composer_kind":"quote","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
         runner.script("opencli", &["twitter", "post"], post_ok);
         runner.script("opencli", &["twitter", "reply"], reply_ok);

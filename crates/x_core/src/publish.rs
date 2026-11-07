@@ -961,12 +961,12 @@ fn status_ids_in_text(text: &str) -> Vec<String> {
 /// never clicks `retweetConfirm` or `unretweetConfirm`. Inspect mode never
 /// clicks Post.
 pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: bool) -> String {
-    let id_js = serde_json::to_string(target_id).unwrap_or_else(|_| "\"\"".into());
+    let id_js = js_ascii_string(target_id);
     let text_js = if inspect {
         "null".to_string()
     } else {
         commentary
-            .map(|text| serde_json::to_string(text).unwrap_or_else(|_| "null".into()))
+            .map(js_ascii_string)
             .unwrap_or_else(|| "null".to_string())
     };
     let inspect_js = if inspect { "true" } else { "false" };
@@ -993,15 +993,26 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     }}
     return ids;
   }};
-  const hasCard = () => statusIds(document).indexOf(TARGET) >= 0;
+  const quoteAttachment = () => {{
+    const node = document.querySelector('[data-testid="quoteTweet"]');
+    return !!node && statusIds(node).indexOf(TARGET) >= 0;
+  }};
+  const composerKind = () => {{
+    if (quoteAttachment()) return "quote";
+    const text = (document.body && document.body.innerText || "").slice(0, 2500);
+    if (/replying to/i.test(text)) return "reply";
+    return "unknown";
+  }};
   const report = (stage, message) => {{
     const button = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
+    const attached = quoteAttachment();
     return {{
       stage: stage,
       path: location.pathname,
       testid_count: document.querySelectorAll("[data-testid]").length,
       composer: !!document.querySelector('[data-testid="tweetTextarea_0"]'),
-      card: hasCard(),
+      composer_kind: composerKind(),
+      card: attached,
       status_ids: statusIds(document),
       quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
       retweet_button: !!document.querySelector('[data-testid="retweet"]'),
@@ -1011,7 +1022,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
       clicked_post: false,
       clicked_repost_confirm: false,
       new_status_id: null,
-      quoted_status_id: hasCard() ? TARGET : null,
+      quoted_status_id: attached ? TARGET : null,
       message: message
     }};
   }};
@@ -1030,13 +1041,11 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   opener.click();
   let quoteItem = null;
   for (let i = 0; i < 20; i++) {{
-    const items = Array.from(document.querySelectorAll("[role='menuitem'], a[href*='compose/post'], [data-testid='quoteTweet']"));
+    const items = Array.from(document.querySelectorAll("[role='menuitem'], [data-testid='quoteTweet']"));
     quoteItem = items.find((el) => {{
       const tid = el.getAttribute("data-testid") || "";
-      if (tid === "retweetConfirm" || tid === "unretweetConfirm") return false;
-      if (tid === "quoteTweet") return true;
-      const href = el.getAttribute("href") || "";
-      if (href.indexOf("compose/post") >= 0) return true;
+      if (tid === "retweetConfirm" || tid === "unretweetConfirm" || tid === "reply") return false;
+      if (tid === "quoteTweet" && (el.getAttribute("role") === "menuitem" || (el.innerText || "").trim().length < 40)) return true;
       return /^quote$/i.test((el.innerText || "").trim());
     }});
     if (quoteItem) break;
@@ -1050,24 +1059,25 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     return finish(report("menu", "Refused the repost confirm. Post was not clicked."));
   }}
   quoteItem.click();
-  let card = false;
+  let attached = false;
   for (let i = 0; i < 40; i++) {{
-    card = hasCard();
-    if (card && document.querySelector('[data-testid="tweetTextarea_0"]')) break;
+    attached = quoteAttachment();
+    if (attached && document.querySelector('[data-testid="tweetTextarea_0"]')) break;
     await sleep(250);
   }}
-  if (!card) {{
-    return finish(report("composer", "Quote card for " + TARGET + " was not in the composer. Post was not clicked."));
+  if (!attached) {{
+    const kind = composerKind();
+    const why = kind === "reply"
+      ? "Reply composer is open, not a quote of " + TARGET + ". Post was not clicked."
+      : "No quote attachment for " + TARGET + ". Post was not clicked.";
+    return finish(report(kind === "reply" ? "reply" : "composer", why));
   }}
   if (INSPECT || TEXT == null) {{
-    const seen = report("inspect", "Inspect only. Post was not clicked.");
-    seen.card = true;
-    seen.quoted_status_id = TARGET;
-    return finish(seen);
+    return finish(report("inspect", "Inspect only. Post was not clicked."));
   }}
   const box = document.querySelector('[data-testid="tweetTextarea_0"]');
   if (!box) {{
-    return finish(report("composer", "Quote card is visible but the composer box is not. Post was not clicked."));
+    return finish(report("composer", "Quote attachment is visible but the composer box is not. Post was not clicked."));
   }}
   box.focus();
   if (!document.execCommand("insertText", false, TEXT)) {{
@@ -1080,11 +1090,11 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   const landed = norm(box.innerText || box.textContent || "").indexOf(norm(TEXT)) >= 0;
   const button = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
     .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
-  if (!landed || !button || !hasCard()) {{
-    const stuck = report("editor", "Composer did not take the full commentary or Post stayed disabled. Post was not clicked.");
+  if (!landed || !button || !quoteAttachment() || composerKind() !== "quote") {{
+    const stuck = report("editor", "Quote attachment, commentary, or Post button was not proven. Post was not clicked.");
     stuck.text_landed = landed;
     stuck.post_enabled = !!button;
-    stuck.card = hasCard();
+    stuck.card = quoteAttachment();
     return finish(stuck);
   }}
   button.click();
@@ -1096,9 +1106,9 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
       const link = sent.querySelector('a[href*="/status/"]');
       const done = report("posted", "Quote tweet posted successfully.");
       done.clicked_post = true;
-      done.card = true;
+      done.card = quoteAttachment();
       done.text_landed = true;
-      done.quoted_status_id = TARGET;
+      done.quoted_status_id = quoteAttachment() ? TARGET : null;
       done.new_status_id = link ? statusId(link.href) : null;
       return finish(done);
     }}
@@ -1111,23 +1121,42 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
 }
 
 pub fn quote_read_script(target_id: &str) -> String {
-    let id_js = serde_json::to_string(target_id).unwrap_or_else(|_| "\"\"".into());
+    let id_js = js_ascii_string(target_id);
     format!(
         r#"(async () => {{
   const TARGET = {id_js};
+  const statusId = (href) => {{
+    try {{
+      const path = new URL(href, location.origin).pathname;
+      const match = path.match(/\/status\/(\d+)/);
+      return match ? match[1] : null;
+    }} catch (e) {{ return null; }}
+  }};
   const ids = [];
   for (const link of document.querySelectorAll('a[href*="/status/"]')) {{
-    const match = (link.pathname || new URL(link.href, location.origin).pathname).match(/\/status\/(\d+)/);
-    if (match && ids.indexOf(match[1]) < 0 && ids.length < 8) ids.push(match[1]);
+    const id = statusId(link.href);
+    if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id);
   }}
+  const quoteNode = document.querySelector('[data-testid="quoteTweet"]');
+  const quoteIds = [];
+  if (quoteNode) {{
+    for (const link of quoteNode.querySelectorAll('a[href*="/status/"]')) {{
+      const id = statusId(link.href);
+      if (id && quoteIds.indexOf(id) < 0) quoteIds.push(id);
+    }}
+  }}
+  const attached = quoteIds.indexOf(TARGET) >= 0;
+  const replying = /replying to/i.test((document.body && document.body.innerText || "").slice(0, 2500));
   const report = {{
     stage: "read",
     path: location.pathname,
-    card: ids.indexOf(TARGET) >= 0,
+    composer_kind: attached ? "quote" : (replying || ids.indexOf(TARGET) >= 0 ? "reply" : "unknown"),
+    card: attached,
     status_ids: ids,
     quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
     clicked_post: false,
     clicked_repost_confirm: false,
+    quoted_status_id: attached ? TARGET : null,
     message: "Read only. Post was not clicked."
   }};
   window.__qxReport = report;
@@ -1136,12 +1165,32 @@ pub fn quote_read_script(target_id: &str) -> String {
     )
 }
 
+/// ASCII-only JavaScript string. `atob` + `eval` reads bytes as Latin-1,
+/// which turned U+2019 into `â€™` on the published reply.
+fn js_ascii_string(text: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            ch if (ch as u32) < 128 && ch >= ' ' => out.push(ch),
+            ch => out.push_str(&format!("\\u{:04x}", ch as u32)),
+        }
+    }
+    out.push('"');
+    out
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuotePageReport {
     pub stage: String,
     pub path: String,
     pub testid_count: u64,
     pub composer: bool,
+    /// `quote`, `reply`, or `unknown`. A status link alone is not `quote`.
+    pub composer_kind: String,
     pub card: bool,
     pub status_ids: Vec<String>,
     pub quote_testids: u64,
@@ -1282,6 +1331,7 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
         path: text("path"),
         testid_count: value.get("testid_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
         composer: flag("composer"),
+        composer_kind: text("composer_kind"),
         card: flag("card"),
         status_ids: ids,
         quote_testids: value
@@ -1310,9 +1360,10 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         report.status_ids.join(",")
     };
     format!(
-        "stage {} · path {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · {}",
+        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · {}",
         report.stage,
         if report.path.is_empty() { "-" } else { &report.path },
+        if report.composer_kind.is_empty() { "-" } else { &report.composer_kind },
         if report.card { "yes" } else { "no" },
         if report.composer { "yes" } else { "no" },
         ids,
@@ -1323,18 +1374,53 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
     )
 }
 
-/// The posted status page must itself link the original. A composer toast
-/// is not that relation.
-pub fn quote_read_confirms(report: &QuotePageReport, target_id: &str) -> Result<(), String> {
+/// Post is allowed only for a quote attachment of this exact status.
+/// A reply composer that merely links the original is not enough.
+pub fn quote_post_allowed(report: &QuotePageReport, target_id: &str) -> bool {
     let target_id = crate::model::post_id_from_input(target_id);
-    if report.clicked_post || report.clicked_repost_confirm {
-        return Err("The quote check tried to post. Not marked sent. Nothing was retried.".into());
+    report.quote_testids > 0
+        && report.card
+        && report.composer
+        && report.composer_kind == "quote"
+        && report.quoted_status_id.as_deref() == Some(target_id.as_str())
+        && report.text_landed
+        && !report.clicked_repost_confirm
+}
+
+pub fn quote_read_confirms(report: &QuotePageReport, target_id: &str) -> Result<(), String> {
+    quote_outcome(None, report, target_id)
+}
+
+/// When Post already happened, name the published status and what it was.
+pub fn quote_outcome(
+    new_id: Option<&str>,
+    report: &QuotePageReport,
+    target_id: &str,
+) -> Result<(), String> {
+    let target_id = crate::model::post_id_from_input(target_id);
+    if report.clicked_repost_confirm {
+        return Err("The quote check tried to repost. Not marked sent. Nothing was retried.".into());
     }
-    if report.card && report.status_ids.iter().any(|id| id == &target_id) {
+    let proven = report.quote_testids > 0
+        && report.composer_kind != "reply"
+        && report.quoted_status_id.as_deref() == Some(target_id.as_str());
+    if proven {
         return Ok(());
     }
+    let link = new_id
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("https://x.com/i/status/{id}"))
+        .unwrap_or_else(|| "the new status".into());
+    let kind = if report.composer_kind == "reply"
+        || (report.quote_testids == 0 && report.status_ids.iter().any(|id| id == &target_id))
+    {
+        "a reply"
+    } else {
+        "not a confirmed quote"
+    };
+    let relation = if kind == "a reply" { "to" } else { "of" };
     Err(format!(
-        "The new status did not show a quote of {target_id}. Not marked sent. Nothing was retried."
+        "Clicked once. {link} is {kind} {relation} {target_id}, not a quote. Draft kept. No retry."
     ))
 }
 
@@ -2405,8 +2491,23 @@ mod tests {
         assert!(quote_report_line(&report).contains("Post was not clicked"));
         let read = r#"{"stage":"read","path":"/user/status/99","card":false,"status_ids":["99"],"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
         assert!(quote_read_confirms(&parse_quote_page_report(read).unwrap(), original).is_err());
-        let linked = r#"{"stage":"read","path":"/user/status/99","card":true,"status_ids":["2118971448614334959"],"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
-        assert!(quote_read_confirms(&parse_quote_page_report(linked).unwrap(), original).is_ok());
+        let reply_page = r#"{"stage":"read","path":"/Jasper_Black/status/2119115255108526411","card":true,"composer_kind":"reply","quote_testids":0,"status_ids":["2118971448614334959"],"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
+        let reply = parse_quote_page_report(reply_page).unwrap();
+        assert!(!quote_post_allowed(&reply, original));
+        let note = quote_outcome(Some("2119115255108526411"), &reply, original).unwrap_err();
+        assert!(note.contains("https://x.com/i/status/2119115255108526411"), "{note}");
+        assert!(note.contains("a reply"), "{note}");
+        assert!(note.contains("not a quote"), "{note}");
+        let false_card = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"unknown","quote_testids":0,"status_ids":["2118971448614334959"],"testid_count":69,"clicked_post":false,"text_landed":true,"quoted_status_id":"2118971448614334959","message":"Inspect only. Post was not clicked."}"#;
+        assert!(!quote_post_allowed(&parse_quote_page_report(false_card).unwrap(), original));
+        let real = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"quote","quote_testids":1,"quoted_status_id":"2118971448614334959","text_landed":true,"clicked_repost_confirm":false,"message":"Inspect only. Post was not clicked."}"#;
+        assert!(quote_post_allowed(&parse_quote_page_report(real).unwrap(), original));
+        let script = quote_page_script(original, Some("doesn’t"), false);
+        assert!(script.is_ascii(), "quote script must stay ASCII so atob cannot mojibake");
+        assert!(script.contains("\\u2019"), "{script}");
+        assert!(!script.contains("compose/post"));
+        assert!(!script.contains("seen.card = true"));
+        assert!(script.contains("quoteTweet"));
     }
 
     #[test]
