@@ -54,11 +54,20 @@ folder is missing or incomplete, video shows an error and does not open VLC or
 mpv. A 32-bit tree is refused. When `vlc\libvlc.dll` sits beside Termy, that
 copy is used even if VLC is also installed under `C:\Program Files\VideoLAN\VLC`.
 
-`COPYING.txt` in the VLC archive is GPL-2.0. libVLC is LGPL-2.1-or-later;
-plugin licenses are not all LGPL. Matching source:
-[vlc-3.0.24.tar.xz](https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz).
-Publishing a Termy installer that contains this runtime still needs that source
-offered with the package. This branch does not do that publish.
+The stage step also copies
+[vlc-3.0.24.tar.xz](https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz)
+(`sha256 e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`)
+into `vlc\source`, plus `COPYING` and `COPYING.LIB` from that tree.
+`COPYING.txt` in the binary archive is GPL-2.0. `COPYING.LIB` is LGPL-2.1.
+libVLC's header is LGPL-2.1-or-later. `modules/codec/avcodec` is LGPL-2.1-or-later
+and links FFmpeg; the VLC 3.0.24 contrib checksum names `ffmpeg-8.1.2.tar.xz`,
+which is not in the VLC tarball and is not staged. `modules/codec/x264.c` and
+`modules/control/dummy.c` are GPL-2.0-or-later. The x264/x265 encoder plugins
+are left out. `libdummy_plugin.dll` stays because playback asks for
+`--intf=dummy`. That GPL plugin, and FFmpeg's license inside `libavcodec_plugin.dll`,
+are why this package is not cleared for a public release. Termy's license is
+unchanged. A later import audit of `termy.exe` still has to decide the Visual
+C++ redistributable; libVLC importing `msvcrt.dll` does not answer that.
 
 ### Build from source
 

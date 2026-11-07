@@ -775,6 +775,7 @@ pub fn vlc_playback_args(url: &str) -> Result<Vec<String>, &'static str> {
 }
 
 pub fn vlc_candidates(
+    canonical: &Path,
     program_files: Option<&Path>,
     program_files_x86: Option<&Path>,
     exe_dir: Option<&Path>,
@@ -786,7 +787,7 @@ pub fn vlc_candidates(
             out.push(path);
         }
     };
-    push_unique(PathBuf::from(VLC_CANONICAL_WINDOWS));
+    push_unique(canonical.to_path_buf());
     if let Some(dir) = program_files {
         push_unique(dir.join("VideoLAN").join("VLC").join("vlc.exe"));
     }
@@ -881,6 +882,7 @@ pub fn locate_vlc_root(
     program_files: Option<&Path>,
     program_files_x86: Option<&Path>,
     path_env: &str,
+    canonical: &Path,
 ) -> Result<PathBuf, &'static str> {
     if let Some(dir) = exe_dir {
         let bundle = app_local_vlc_dir(dir);
@@ -891,7 +893,7 @@ pub fn locate_vlc_root(
             };
         }
     }
-    let candidates = vlc_candidates(program_files, program_files_x86, exe_dir, path_env);
+    let candidates = vlc_candidates(canonical, program_files, program_files_x86, exe_dir, path_env);
     select_vlc(&candidates, Path::is_file)
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -910,6 +912,7 @@ pub fn find_vlc_root() -> Result<PathBuf, &'static str> {
         program_files.as_deref(),
         program_files_x86.as_deref(),
         &path_env,
+        Path::new(VLC_CANONICAL_WINDOWS),
     )
 }
 
@@ -921,6 +924,7 @@ pub fn find_vlc() -> Option<PathBuf> {
     let program_files_x86 = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
     let path_env = std::env::var("PATH").unwrap_or_default();
     let candidates = vlc_candidates(
+        Path::new(VLC_CANONICAL_WINDOWS),
         program_files.as_deref(),
         program_files_x86.as_deref(),
         exe_dir.as_deref(),
@@ -3428,6 +3432,7 @@ mod tests {
     #[test]
     fn vlc_uses_the_program_files_executable_and_its_own_window() {
         let candidates = vlc_candidates(
+            Path::new(VLC_CANONICAL_WINDOWS),
             Some(Path::new(r"C:\Program Files")),
             Some(Path::new(r"C:\Program Files (x86)")),
             Some(Path::new(r"D:\Termy")),
@@ -3623,16 +3628,41 @@ mod tests {
         std::fs::write(bundle.join("libvlccore.dll"), &pe).unwrap();
         std::fs::write(bundle.join("plugins").join("codec").join("libavcodec_plugin.dll"), &pe).unwrap();
         std::fs::write(system.join("vlc.exe"), b"system").unwrap();
-        let found = locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, "").unwrap();
+        let other = root.join("otherpf").join("VideoLAN").join("VLC");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("vlc.exe"), b"other").unwrap();
+        let canonical = system.join("vlc.exe");
+        let found = locate_vlc_root(
+            Some(&exe),
+            Some(&root.join("otherpf")),
+            None,
+            "",
+            &canonical,
+        )
+        .unwrap();
         assert_eq!(found, bundle);
         std::fs::remove_file(bundle.join("libvlccore.dll")).unwrap();
         assert_eq!(
-            locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, ""),
+            locate_vlc_root(
+                Some(&exe),
+                Some(&root.join("otherpf")),
+                None,
+                "",
+                &canonical,
+            ),
             Err(VLC_BUNDLE_INCOMPLETE)
         );
         std::fs::remove_dir_all(bundle).unwrap();
-        let found = locate_vlc_root(Some(&exe), Some(&root.join("pf")), None, "").unwrap();
+        let found = locate_vlc_root(
+            Some(&exe),
+            Some(&root.join("otherpf")),
+            None,
+            "",
+            &canonical,
+        )
+        .unwrap();
         assert_eq!(found, system);
+        assert_ne!(found, other);
         assert_eq!(app_bundle_decision(false, EnginePlan::Embed), Ok(false));
         assert_eq!(
             app_bundle_decision(true, EnginePlan::Refuse(VLC_WRONG_ARCH)),

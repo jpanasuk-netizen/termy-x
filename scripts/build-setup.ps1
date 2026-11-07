@@ -181,9 +181,9 @@ foreach ($winuiFile in @("Microsoft.UI.Xaml.dll", "resources.pri", "termy.manife
 $vlcDest = Join-Path $releaseDir "vlc"
 $stage = Join-Path $PSScriptRoot "windows\stage-libvlc.ps1"
 if ($env:TERMY_VLC_ZIP) {
-    & $stage -Zip $env:TERMY_VLC_ZIP -Dest $vlcDest
+    & $stage -Zip $env:TERMY_VLC_ZIP -Dest $vlcDest -SourceTar $env:TERMY_VLC_SOURCE_TAR
 } elseif ($env:TERMY_VLC_SOURCE) {
-    & $stage -SourceDir $env:TERMY_VLC_SOURCE -Dest $vlcDest
+    & $stage -SourceDir $env:TERMY_VLC_SOURCE -Dest $vlcDest -SourceTar $env:TERMY_VLC_SOURCE_TAR
 } else {
     $python = $null
     foreach ($name in @("python", "python3", "py")) {

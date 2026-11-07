@@ -85,10 +85,25 @@ Termy, that directory is the engine even when a system VLC is installed. If
 that directory exists but is missing a DLL, plugins, or is not 64-bit, playback
 stops with an error instead of using the system install.
 
-`COPYING.txt` from the archive is GPL-2.0. libVLC is LGPL-2.1-or-later. Plugin
-licenses are not all LGPL, so this is not an "LGPL-only" bundle. Matching
-source: `https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz`.
-Do not publish the installer until that source is offered with the package.
+The same step copies `vlc-3.0.24.tar.xz` to `vlc\source` after checking
+`sha256 e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`,
+and writes `COPYING` and `COPYING.LIB` from that archive next to the DLLs.
+`COPYING.txt` (from the win64 zip) and `COPYING` are GPL-2.0. `COPYING.LIB` is
+LGPL-2.1. libVLC's header is LGPL-2.1-or-later. `modules/codec/avcodec` is
+LGPL-2.1-or-later and links FFmpeg. `contrib/src/ffmpeg/SHA512SUMS` in the VLC
+source names `ffmpeg-8.1.2.tar.xz` with sha512
+`b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b`.
+That tarball is not staged. VideoLAN's `release-win64` artifact index also lists
+`x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz` beside the 3.0.24 build;
+those contrib files are not hash-pinned here. `modules/codec/x264.c` and
+`modules/control/dummy.c` are GPL-2.0-or-later. Encoder plugins `libx264`,
+`libx26410b`, and `libx265` are omitted. `libdummy_plugin.dll` remains because
+playback passes `--intf=dummy`.
+
+This is not a public-release clearance. Termy is not relicensed. Corresponding
+source for FFmpeg and x264 inside the shipped plugins is not in the package.
+`libvlc.dll` importing `msvcrt.dll` does not show whether `termy.exe` needs the
+Visual C++ redistributable; that waits on the Windows builder's import audit.
 
 ### What else the Windows build already carries
 

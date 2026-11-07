@@ -19,6 +19,7 @@ Destination folder, normally the vlc directory beside termy.exe.
 param(
     [string]$Zip,
     [string]$SourceDir,
+    [string]$SourceTar,
     [Parameter(Mandatory = $true)]
     [string]$Dest
 )
@@ -48,6 +49,9 @@ if ($Zip) {
     $arguments += @("--zip", $Zip)
 } else {
     $arguments += @("--source-dir", $SourceDir)
+}
+if ($SourceTar) {
+    $arguments += @("--source-tar", $SourceTar)
 }
 & $python @arguments
 if ($LASTEXITCODE -ne 0) {

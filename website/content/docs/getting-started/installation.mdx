@@ -76,11 +76,14 @@ stay inside Termy without this folder. A missing or incomplete `vlc` folder
 makes video fail with an error. Termy does not open VLC's own window or mpv
 instead. The DLLs must be 64-bit; a 32-bit tree is rejected.
 
-The archive's `COPYING.txt` is GPL-2.0. libVLC is LGPL-2.1-or-later, and the
-plugins are not uniformly LGPL. The matching source archive is
-https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz.
-A public Termy release that includes these binaries still has to ship or offer
-that source. That release step is not done here.
+The stage step also places `vlc-3.0.24.tar.xz`
+(sha256 `e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`)
+in `vlc\source`, with `COPYING` (GPL-2.0) and `COPYING.LIB` (LGPL-2.1) from
+that archive. The VLC tarball does not contain FFmpeg or x264. `libavcodec`
+is an LGPL-2.1-or-later wrapper around FFmpeg, and `dummy` / `x264` modules
+are GPL-2.0-or-later. x264 and x265 encoder plugins are omitted; the dummy
+interface plugin stays because playback requests it. This package is not
+cleared for a public release, and Termy's license is not changed to GPL.
 
 Termy will also be available through winget as `lassejlv.Termy` once the
 package is accepted into the winget repository:
