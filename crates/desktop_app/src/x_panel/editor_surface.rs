@@ -62,6 +62,7 @@ fn input_target_for(field: TextField) -> InputTarget {
         TextField::Search => InputTarget::Search,
         TextField::Reply => InputTarget::Reply,
         TextField::Quote => InputTarget::Quote,
+        TextField::NewTweet => InputTarget::NewTweet,
         TextField::Trends => InputTarget::Trends,
         TextField::Research => InputTarget::Research,
         TextField::Lookup => InputTarget::Lookup,
@@ -117,6 +118,7 @@ impl XPanel {
             InputTarget::RgKey => Some(EditorId::Field(TextField::RgKey)),
             InputTarget::Reply => Some(EditorId::Field(TextField::Reply)),
             InputTarget::Quote => Some(EditorId::Field(TextField::Quote)),
+            InputTarget::NewTweet => Some(EditorId::Field(TextField::NewTweet)),
             other => super::single_line_field_for(other).map(EditorId::Field),
         }
     }
@@ -124,7 +126,8 @@ impl XPanel {
     fn editor_is_single(&self, id: EditorId) -> bool {
         !matches!(
             id,
-            EditorId::Compose | EditorId::Field(TextField::Reply | TextField::Quote)
+            EditorId::Compose
+                | EditorId::Field(TextField::Reply | TextField::Quote | TextField::NewTweet)
         )
     }
 
@@ -148,6 +151,7 @@ impl XPanel {
             EditorId::Field(TextField::Search) => self.search_input.as_str(),
             EditorId::Field(TextField::Reply) => self.reply_text.as_str(),
             EditorId::Field(TextField::Quote) => self.quote_text.as_str(),
+            EditorId::Field(TextField::NewTweet) => self.new_tweet_text.as_str(),
             EditorId::Field(TextField::Trends) => self.trends_filter.as_str(),
             EditorId::Field(TextField::Research) => self.research_input.as_str(),
             EditorId::Field(TextField::Lookup) => self.lookup.as_str(),
@@ -281,6 +285,7 @@ impl XPanel {
             EditorId::Compose => self.follow_compose_caret(),
             EditorId::Field(TextField::Reply) => self.follow_small_caret(TextField::Reply),
             EditorId::Field(TextField::Quote) => self.follow_small_caret(TextField::Quote),
+            EditorId::Field(TextField::NewTweet) => self.follow_small_caret(TextField::NewTweet),
             _ => {}
         }
     }
@@ -296,6 +301,7 @@ impl XPanel {
         let handle = match field {
             TextField::Reply => &self.reply_scroll,
             TextField::Quote => &self.quote_scroll,
+            TextField::NewTweet => &self.new_tweet_scroll,
             _ => return,
         };
         let line_h = FIELD_LINE;
@@ -377,6 +383,7 @@ impl XPanel {
             EditorId::Compose => self.compose_scroll.bounds(),
             EditorId::Field(TextField::Reply) => self.reply_scroll.bounds(),
             EditorId::Field(TextField::Quote) => self.quote_scroll.bounds(),
+            EditorId::Field(TextField::NewTweet) => self.new_tweet_scroll.bounds(),
             _ => return (0.0, 0.0),
         };
         let pad = match id {

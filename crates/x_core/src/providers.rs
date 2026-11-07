@@ -1790,6 +1790,18 @@ impl Publisher for OpenCliPublisher {
         } else {
             format!(" with {} image(s)", media.len())
         };
+        if reply_to.is_none() {
+            return match crate::publish::prove_new_post(&last) {
+                Ok(receipt) => {
+                    write_perf_line("write post proof=confirmed");
+                    Ok(format!("{receipt}{media_note}"))
+                }
+                Err(error) => {
+                    write_perf_line("write post proof=rejected");
+                    Err(error)
+                }
+            };
+        }
         let _ = last;
         Ok(format!("{} part(s) posted{media_note}", parts.len()))
     }

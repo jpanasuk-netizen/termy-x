@@ -191,6 +191,53 @@ pub fn retweet_target_id(post: &crate::model::Post) -> &str {
     post.engage_target().id.as_str()
 }
 
+/// A timeline "New tweet" is a standalone post. It never carries a reply id.
+pub fn standalone_tweet(text: &str) -> Result<String, &'static str> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Type a tweet before Post.");
+    }
+    Ok(text.to_string())
+}
+
+pub fn standalone_reply_to() -> Option<&'static str> {
+    None
+}
+
+/// Posted text is confirmed only when the provider JSON includes a status id.
+pub fn prove_new_post(stdout: &str) -> Result<String, String> {
+    let uncertain = "Post was not confirmed. Not marked Posted. Check X. Nothing was retried.";
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed.to_ascii_lowercase().contains("unconfirmed") {
+        return Err(uncertain.into());
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Err(uncertain.into());
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) || value.get("error").is_some()
+    {
+        return Err("Post was rejected. Not marked Posted. Nothing was retried.".into());
+    }
+    let node = value
+        .get("data")
+        .or_else(|| value.as_array().and_then(|rows| rows.first()))
+        .unwrap_or(&value);
+    let id = ["id", "id_str", "rest_id"]
+        .iter()
+        .find_map(|key| {
+            node.get(*key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or_else(|| node.get(*key).and_then(serde_json::Value::as_u64).map(|n| n.to_string()))
+        });
+    match id {
+        Some(id) if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) => {
+            Ok(format!("Posted {id}"))
+        }
+        _ => Err(uncertain.into()),
+    }
+}
+
 /// A retweet is confirmed only by a structured receipt. Exit 0, empty
 /// output, and `{"ok":true}` with no retweet id are not enough. Nothing
 /// here retries the write.
@@ -999,6 +1046,16 @@ mod tests {
         wrapper.retweeted = Some(Box::new(original));
         assert_eq!(retweet_target_id(&wrapper), "555");
         assert_ne!(retweet_target_id(&wrapper), "wrap");
+        assert_eq!(standalone_tweet("  hello  ").unwrap(), "hello");
+        assert!(standalone_tweet("  ").is_err());
+        assert!(standalone_reply_to().is_none());
+        assert_eq!(
+            prove_new_post(r#"{"ok":true,"id":"42"}"#).unwrap(),
+            "Posted 42"
+        );
+        assert!(prove_new_post("").is_err());
+        assert!(prove_new_post(r#"{"ok":true}"#).is_err());
+        assert!(prove_new_post(r#"{"ok":false,"error":{"message":"no"}}"#).is_err());
 
         let confirmed = r#"{"ok":true,"retweeted":true,"id":"555","user":{"screen_name":"Jasper_Black"}}"#;
         assert!(prove_engage(EngageAction::Retweet, confirmed, Some("jasper_black")).is_ok());

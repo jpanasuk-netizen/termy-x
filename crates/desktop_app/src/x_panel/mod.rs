@@ -247,6 +247,7 @@ enum InputTarget {
     Search,
     Reply,
     Quote,
+    NewTweet,
     Trends,
     Research,
     Lookup,
@@ -293,6 +294,7 @@ fn edit_keys_owned(
         InputTarget::Reply => reply_open,
         // Quote shares the reply's gate: caller passes reply||quote open.
         InputTarget::Quote => reply_open,
+        InputTarget::NewTweet => reply_open,
         InputTarget::Trends => section == XSection::Trends,
         InputTarget::Research => section == XSection::Research,
         InputTarget::Lookup => section == XSection::Lookup,
@@ -565,7 +567,7 @@ fn enter_action(field: TextField) -> EnterAction {
         | TextField::Analyze
         | TextField::RgTopic
         | TextField::RgKey => EnterAction::RunSearch,
-        TextField::Reply | TextField::Quote => EnterAction::Newline,
+        TextField::Reply | TextField::Quote | TextField::NewTweet => EnterAction::Newline,
     }
 }
 
@@ -575,6 +577,7 @@ enum TextField {
     Search,
     Reply,
     Quote,
+    NewTweet,
     Trends,
     Research,
     Lookup,
@@ -752,6 +755,7 @@ pub struct XPanel {
     /// Internal scroll for the three text editors (fixed-height boxes;
     /// long drafts scroll inside instead of overflowing the card).
     reply_scroll: ScrollHandle,
+    new_tweet_scroll: ScrollHandle,
     quote_scroll: ScrollHandle,
     compose_scroll: ScrollHandle,
     /// "Posted" burst playing in the editor a post just succeeded
@@ -868,6 +872,9 @@ pub struct XPanel {
     reply_post_id: Option<String>,
     reply_author: String,
     reply_text: String,
+    new_tweet_open: bool,
+    new_tweet_text: String,
+    new_tweet_posting: bool,
     reply_media: Vec<PathBuf>,
     reply_posting: bool,
     replied_ids: Vec<String>,
@@ -1141,6 +1148,7 @@ impl XPanel {
             quote_media: Vec::new(),
             quote_posting: false,
             reply_scroll: ScrollHandle::new(),
+            new_tweet_scroll: ScrollHandle::new(),
             quote_scroll: ScrollHandle::new(),
             compose_scroll: ScrollHandle::new(),
             post_burst: None,
@@ -1226,6 +1234,9 @@ impl XPanel {
             reply_post_id: None,
             reply_author: String::new(),
             reply_text: String::new(),
+            new_tweet_open: false,
+            new_tweet_text: String::new(),
+            new_tweet_posting: false,
             reply_media: Vec::new(),
             reply_posting: false,
             replied_ids: Vec::new(),
@@ -3639,6 +3650,10 @@ impl XPanel {
             }
             return;
         }
+        if self.input_target == InputTarget::NewTweet && self.new_tweet_open && self.section == XSection::Timeline {
+            self.on_text_input_key(event, TextField::NewTweet, cx);
+            return;
+        }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
             self.on_text_input_key(event, TextField::Reply, cx);
             return;
@@ -3840,7 +3855,7 @@ impl XPanel {
             self.bearer_mode,
             self.input_target,
             self.section,
-            self.reply_post_id.is_some() || self.quote_post_id.is_some(),
+            self.reply_post_id.is_some() || self.quote_post_id.is_some() || self.new_tweet_open,
             self.compose_focused,
             self.ui_focus == UiFocus::Compose,
         )
@@ -7724,6 +7739,7 @@ impl XPanel {
         }
         match self.section {
             XSection::Timeline => {
+                rows.push(self.new_tweet_bar(cx));
                 if !self.feed_posts().is_empty() {
                     rows.push(hint(format!(
                         "{} \u{b7} {} shown",
@@ -10100,6 +10116,240 @@ impl XPanel {
     }
 
     /// The inline reply editor shown under the selected tweet.
+    fn new_tweet_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let identity = match &self.connection {
+            ConnState::Connected { handle, .. } => {
+                format!("As @{handle} \u{b7} new post, not a reply")
+            }
+            _ => "Connect X before posting. Nothing will be sent.".into(),
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(x_action!(
+                "x-new-tweet",
+                "New tweet",
+                cx.listener(|this, _, _, cx| {
+                    this.new_tweet_open = true;
+                    this.input_target = InputTarget::NewTweet;
+                    this.pending_focus = true;
+                    this.status = "New tweet. Post sends it. Nothing is sent until then.".into();
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        if self.new_tweet_open {
+            let char_limit = self.char_limit;
+            let count = weighted_len_limited(&self.new_tweet_text, char_limit);
+            let focused = self.input_target == InputTarget::NewTweet;
+            column = column.child(
+                div()
+                    .p(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(tint(0x0f1c33, 245))
+                    .border_1()
+                    .border_color(if focused {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 70)
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.input_target = InputTarget::NewTweet;
+                            this.pending_focus = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xf5f5f7))
+                            .child("New tweet"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(identity),
+                    )
+                    .child(
+                        div()
+                            .id("x-new-tweet-editor")
+                            .h(px(60.0))
+                            .flex_none()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.new_tweet_scroll)
+                            .p(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(tint(0x0c1422, 235))
+                            .child(self.editor_canvas(
+                                EditorId::Field(TextField::NewTweet),
+                                focused,
+                                "Write a new tweet\u{2026} Post sends it",
+                                editor_surface::FIELD_FONT,
+                                editor_surface::FIELD_LINE,
+                                false,
+                                cx,
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    this.input_target = InputTarget::NewTweet;
+                                    this.pending_focus = true;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(4.0))
+                            .child(x_action!(
+                                "x-new-tweet-post",
+                                if self.new_tweet_posting {
+                                    "Posting..."
+                                } else {
+                                    "Post"
+                                },
+                                cx.listener(|this, _, _, cx| {
+                                    this.submit_new_tweet(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_action!(
+                                "x-new-tweet-cancel",
+                                "Cancel",
+                                cx.listener(|this, _, _, cx| {
+                                    if this.new_tweet_posting {
+                                        this.notice = Some(
+                                            "Still posting that tweet. Cancel does not send another."
+                                                .into(),
+                                        );
+                                    } else {
+                                        this.new_tweet_open = false;
+                                        this.status = "New tweet closed. Nothing was posted.".into();
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(format!("{} / {}", count.weighted, count.limit)),
+                    ),
+            );
+        }
+        column.into_any_element()
+    }
+
+    fn submit_new_tweet(&mut self, cx: &mut Context<Self>) {
+        if self.new_tweet_posting {
+            self.notice = Some("Already posting that tweet. Nothing else was sent.".into());
+            cx.notify();
+            return;
+        }
+        let text = match termy_x::publish::standalone_tweet(&self.new_tweet_text) {
+            Ok(text) => text,
+            Err(error) => {
+                self.notice = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        if termy_x::publish::standalone_reply_to().is_some() {
+            self.notice = Some("New tweet was blocked because it had a reply id.".into());
+            cx.notify();
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never posts. Nothing was posted.".into());
+            cx.notify();
+            return;
+        }
+        if !matches!(self.connection, ConnState::Connected { .. }) {
+            self.notice = Some("Connect X before posting. Nothing was posted.".into());
+            cx.notify();
+            return;
+        }
+        self.new_tweet_posting = true;
+        self.status = "Posting the new tweet. Nothing else will be sent.".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first. Nothing was posted."
+                                .to_string(),
+                        );
+                    };
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        termy_x::publish::standalone_reply_to(),
+                        termy_x::publish::ConfirmDecision::Yes,
+                        false,
+                        publisher,
+                        char_limit,
+                        &[],
+                    ) {
+                        termy_x::publish::GateOutcome::Sent { receipt, .. } => Ok(receipt),
+                        termy_x::publish::GateOutcome::Rejected { plan } => Err(plan
+                            .session
+                            .unwrap_or_else(|| "posting was rejected".to_string())),
+                        termy_x::publish::GateOutcome::DryRun { .. } => {
+                            Err("unexpected dry-run".to_string())
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.new_tweet_posting = false;
+                match result {
+                    Ok(receipt) => {
+                        panel.new_tweet_text.clear();
+                        panel.new_tweet_open = false;
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::Post,
+                            "",
+                            &receipt,
+                        );
+                        panel.status = termy_x::publish::success_note(
+                            termy_x::publish::UserWrite::Post,
+                        )
+                        .to_string();
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Could not post: {} The draft is still here. Nothing was retried.",
+                            termy_x::publish::humanize_error(&error)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn reply_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.reply_text, char_limit);
@@ -10376,8 +10626,8 @@ impl XPanel {
                 "caret-rg-key",
                 InputTarget::RgKey,
             ),
-            TextField::Reply | TextField::Quote => {
-                unreachable!("reply/quote use the multi-line small editor")
+            TextField::Reply | TextField::Quote | TextField::NewTweet => {
+                unreachable!("reply/quote/new tweet use the multi-line small editor")
             }
         };
         // Never render a secret: the key field shows bullets only.
@@ -11924,6 +12174,13 @@ mod edit_keys_tests {
         assert_eq!(enter_action(TextField::QueueText), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Analyze), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Reply), EnterAction::Newline);
+        assert_eq!(enter_action(TextField::NewTweet), EnterAction::Newline);
+        assert_eq!(
+            termy_x::publish::standalone_tweet("  hi there  ").unwrap(),
+            "hi there"
+        );
+        assert!(termy_x::publish::standalone_reply_to().is_none());
+        assert!(termy_x::publish::standalone_tweet(" ").is_err());
         assert_eq!(enter_action(TextField::Quote), EnterAction::Newline);
         // Focus routing matrix: panel must actually hold focus before
         // any edit chord is intercepted (the Ctrl+C-in-PowerShell bug).
@@ -12044,6 +12301,7 @@ impl XPanel {
             TextField::Search => &mut self.search_input,
             TextField::Reply => &mut self.reply_text,
             TextField::Quote => &mut self.quote_text,
+            TextField::NewTweet => &mut self.new_tweet_text,
             TextField::Trends => &mut self.trends_filter,
             TextField::Research => &mut self.research_input,
             TextField::Lookup => &mut self.lookup,
