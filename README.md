@@ -60,14 +60,23 @@ The stage step also copies
 into `vlc\source`, plus `COPYING` and `COPYING.LIB` from that tree.
 `COPYING.txt` in the binary archive is GPL-2.0. `COPYING.LIB` is LGPL-2.1.
 libVLC's header is LGPL-2.1-or-later. `modules/codec/avcodec` is LGPL-2.1-or-later
-and links FFmpeg; the VLC 3.0.24 contrib checksum names `ffmpeg-8.1.2.tar.xz`,
-which is not in the VLC tarball and is not staged. `modules/codec/x264.c` and
+and links FFmpeg. The stage step also copies `ffmpeg-8.1.2.tar.xz` from
+VideoLAN's 3.0.24 win64 build artifacts after its sha512 matches
+`contrib/src/ffmpeg/SHA512SUMS` in the VLC source, and the x264 snapshot
+`e067ab0b530395f90b578f6d05ab0a225e2efdf9` named by `contrib/src/x264/rules.mak`.
+`modules/codec/x264.c` and
 `modules/control/dummy.c` are GPL-2.0-or-later. The x264/x265 encoder plugins
 are left out. `libdummy_plugin.dll` stays because playback asks for
 `--intf=dummy`. That GPL plugin, and FFmpeg's license inside `libavcodec_plugin.dll`,
 are why this package is not cleared for a public release. Termy's license is
-unchanged. A later import audit of `termy.exe` still has to decide the Visual
-C++ redistributable; libVLC importing `msvcrt.dll` does not answer that.
+unchanged. `termy.exe` imports `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
+The stage step places Microsoft's official x64 installer
+`VC_redist.x64.exe` (file version 14.51.36247, sha256
+`843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
+in `prereqs` beside `termy.exe`. It does not run that installer and it does
+not copy those DLLs out of System32. A machine that does not already have
+them needs that executable run once. libVLC itself imports `msvcrt.dll`,
+which is a Windows system DLL and is a different runtime.
 
 ### Build from source
 

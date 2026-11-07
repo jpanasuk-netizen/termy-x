@@ -33,12 +33,21 @@ PINNED_ZIP_URL = (
 )
 PINNED_SOURCE_URL = "https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz"
 PINNED_SOURCE_SHA256 = "e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf"
-# SHA512 of ffmpeg-8.1.2.tar.xz recorded in contrib/src/ffmpeg/SHA512SUMS
-# inside that VLC source. The bytes of the FFmpeg tarball are not fetched here.
-FFMPEG_SHA512 = (
-    "b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287"
-    "746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b"
-)
+# SHA512 of ffmpeg-8.1.2.tar.xz in contrib/src/ffmpeg/SHA512SUMS of the VLC
+# 3.0.24 source. The bytes were checked against the win64 release artifact.
+FFMPEG_URL = "https://artifacts.videolan.org/vlc/release-win64/ffmpeg-8.1.2.tar.xz"
+FFMPEG_SHA512 = "b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b"
+# contrib/src/x264/rules.mak pins this git hash. The tarball is the file
+# named by the .githash beside the 3.0.24 win64 build. Encoder plugins that
+# link it are not copied; the source is still staged because that build used it.
+X264_GIT = "e067ab0b530395f90b578f6d05ab0a225e2efdf9"
+X264_URL = "https://artifacts.videolan.org/vlc/release-win64/x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz"
+X264_SHA256 = "fa11489fecc4655152a7dc3eab1a8b33bf84b67ff6c62f919f07958e1bd44cae"
+# Microsoft Visual C++ v14 redistributable 14.51.36247, x64. The file version
+# string is inside the executable. Hash matches the official download URL.
+VC_REDIST_URL = "https://download.visualstudio.microsoft.com/download/pr/ebdab8e5-1d7b-4d9f-a11b-cbb1720c3b12/843068991DAAA1F73AD9F6239BCE4D0F6A07A51F18C37EA2A867E9BECA71295C/VC_redist.x64.exe"
+VC_REDIST_SHA256 = "843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c"
+VC_REDIST_VERSION = "14.51.36247"
 
 LICENSE_FILES = ("COPYING.txt", "AUTHORS.txt", "THANKS.txt", "NEWS.txt", "README.txt")
 # VLC module sources under GPL-2.0-or-later that are not needed to play video.
@@ -76,12 +85,16 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+def hash_file(path: Path, algo: str) -> str:
+    digest = hashlib.new(algo)
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return hash_file(path, "sha256")
 
 
 def find_runtime_root(extracted: Path) -> Path:
@@ -145,13 +158,19 @@ def copy_tree(source: Path, dest: Path) -> int:
                 "COPYING.txt is the GPL-2.0 text shipped in the official win64 zip.",
                 "COPYING is the GPL-2.0 text from the VLC source tree. COPYING.LIB is the LGPL-2.1 text from that tree.",
                 "libvlc's public header is LGPL-2.1-or-later. modules/codec/avcodec is LGPL-2.1-or-later and links FFmpeg.",
-                f"contrib/src/ffmpeg/SHA512SUMS in the VLC source names ffmpeg-8.1.2.tar.xz sha512 {FFMPEG_SHA512}.",
-                "That FFmpeg archive is not copied. x264 (modules/codec/x264.c, GPL-2.0-or-later) encoder plugins are omitted.",
+                f"FFmpeg source: {FFMPEG_URL}",
+                f"FFmpeg sha512: {FFMPEG_SHA512}",
+                f"x264 git {X264_GIT} source: {X264_URL}",
+                f"x264 sha256: {X264_SHA256}",
+                "x264 and x265 encoder plugins are omitted. libavcodec_plugin.dll is included.",
+                f"VC++ redistributable {VC_REDIST_VERSION} x64: {VC_REDIST_URL}",
+                f"VC++ sha256: {VC_REDIST_SHA256}",
+                "That executable is staged in prereqs next to termy.exe. It is not run, and its DLLs are not copied from System32.",
                 "modules/control/dummy.c is GPL-2.0-or-later and libdummy_plugin.dll is still included because playback requests --intf=dummy.",
                 "Not included: vlc.exe, vlc-cache-gen.exe, axvlc.dll, plugins/gui, the x264/x265 encoder plugins, locale, lua, skins, hrtfs, msi.",
                 "libvlc.dll imports libvlccore.dll, ADVAPI32.dll, KERNEL32.dll, and msvcrt.dll. Those Windows DLLs are not copied.",
-                "This does not show whether termy.exe needs the Visual C++ redistributable.",
-                "Not a public-release clearance: Termy stays under its own license, and GPL plugins are still in this folder.",
+                "termy.exe additionally imports msvcp140.dll, vcruntime140.dll, and vcruntime140_1.dll. Those come from the VC++ redistributable above, not from a System32 copy.",
+                "Not a public-release clearance. Termy stays under its own license. libdummy_plugin.dll is GPL-2.0-or-later.",
                 "",
             ]
         ),
@@ -177,6 +196,17 @@ def verify_dest(dest: Path) -> None:
     source_tar = dest / "source" / "vlc-3.0.24.tar.xz"
     if sha256_file(source_tar) != PINNED_SOURCE_SHA256:
         fail("staged source/vlc-3.0.24.tar.xz is missing or does not match the pinned sha256")
+    ffmpeg = dest / "source" / "ffmpeg-8.1.2.tar.xz"
+    if hash_file(ffmpeg, "sha512") != FFMPEG_SHA512:
+        fail("staged source/ffmpeg-8.1.2.tar.xz is missing or does not match VLC's SHA512SUMS")
+    x264 = dest / "source" / f"x264-{X264_GIT}.tar.xz"
+    if sha256_file(x264) != X264_SHA256:
+        fail("staged x264 source archive is missing or does not match the pinned sha256")
+    redist = dest.parent / "prereqs" / "VC_redist.x64.exe"
+    if sha256_file(redist) != VC_REDIST_SHA256:
+        fail("staged prereqs/VC_redist.x64.exe is missing or does not match the pinned sha256")
+    if VC_REDIST_VERSION.encode("utf-16le") not in redist.read_bytes():
+        fail(f"staged VC_redist.x64.exe does not contain file version {VC_REDIST_VERSION}")
     if not (dest / "COPYING.LIB").is_file() or not (dest / "COPYING").is_file():
         fail("staged runtime is missing COPYING or COPYING.LIB from the VLC source tree")
     count = len(list((dest / "plugins").rglob("*_plugin.dll")))
@@ -203,7 +233,56 @@ def place_source(tar_path: Path, dest: Path) -> None:
             (dest / out_name).write_bytes(extracted.read())
 
 
-def stage(source: Path, dest: Path, source_tar: Path) -> None:
+def fetch_hashed(url: str, target: Path, algo: str, expect: str) -> Path:
+    if target.is_file() and hash_file(target, algo) == expect:
+        return target
+    import urllib.request
+
+    print(f"stage-libvlc: fetching {url}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    urllib.request.urlretrieve(url, target)
+    if hash_file(target, algo) != expect:
+        target.unlink(missing_ok=True)
+        fail(f"downloaded {target.name} did not match the pinned {algo}")
+    return target
+
+
+def place_matching_sources(dest: Path, ffmpeg: Path, x264: Path, redist: Path) -> None:
+    if hash_file(ffmpeg, "sha512") != FFMPEG_SHA512:
+        fail(f"{ffmpeg} sha512 does not match VLC contrib/src/ffmpeg/SHA512SUMS")
+    if sha256_file(x264) != X264_SHA256:
+        fail(f"{x264} sha256 does not match the pinned x264 archive")
+    if sha256_file(redist) != VC_REDIST_SHA256:
+        fail(f"{redist} sha256 does not match the pinned VC++ redistributable")
+    source_dir = dest / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ffmpeg, source_dir / "ffmpeg-8.1.2.tar.xz")
+    shutil.copy2(x264, source_dir / f"x264-{X264_GIT}.tar.xz")
+    prereq = dest.parent / "prereqs"
+    prereq.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(redist, prereq / "VC_redist.x64.exe")
+    (prereq / "VC_REDIST.txt").write_text(
+        "\n".join(
+            [
+                f"Microsoft Visual C++ v14 Redistributable (x64), file version {VC_REDIST_VERSION}.",
+                f"File: VC_redist.x64.exe",
+                f"sha256: {VC_REDIST_SHA256}",
+                f"URL: {VC_REDIST_URL}",
+                "License terms are inside this executable and at",
+                "https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files",
+                "This is the official installer. It is not a copy of System32 DLLs and it is not",
+                "the Visual Studio VC\\Redist merge-module directory. This script does not run it.",
+                "termy.exe imports msvcp140.dll, vcruntime140.dll, and vcruntime140_1.dll.",
+                "Run VC_redist.x64.exe on a machine that does not already have them.",
+                "Supported parameters include /install /passive /norestart. A reboot is not requested here.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def stage(source: Path, dest: Path, source_tar: Path, ffmpeg: Path, x264: Path, redist: Path) -> None:
     root = find_runtime_root(source)
     if not dll_says_version(root / "libvlc.dll", PINNED_VERSION):
         fail(
@@ -212,6 +291,7 @@ def stage(source: Path, dest: Path, source_tar: Path) -> None:
         )
     copied = copy_tree(root, dest)
     place_source(source_tar, dest)
+    place_matching_sources(dest, ffmpeg, x264, redist)
     verify_dest(dest)
     print(f"stage-libvlc: {copied} plugins -> {dest}")
 
@@ -236,12 +316,25 @@ def main() -> None:
         type=Path,
         help="vlc-3.0.24.tar.xz; downloaded from the pinned URL when omitted",
     )
+    parser.add_argument("--ffmpeg-tar", type=Path)
+    parser.add_argument("--x264-tar", type=Path)
+    parser.add_argument("--vc-redist", type=Path)
     args = parser.parse_args()
     if args.check:
         verify_dest(args.dest)
         print(f"stage-libvlc: {args.dest} is complete")
         return
+    cache = args.dest.parent
     source_tar = args.source_tar or fetch_source_tar(args.dest)
+    ffmpeg = args.ffmpeg_tar or fetch_hashed(
+        FFMPEG_URL, cache / "ffmpeg-8.1.2.tar.xz", "sha512", FFMPEG_SHA512
+    )
+    x264 = args.x264_tar or fetch_hashed(
+        X264_URL, cache / f"x264-{X264_GIT}.tar.xz", "sha256", X264_SHA256
+    )
+    redist = args.vc_redist or fetch_hashed(
+        VC_REDIST_URL, cache / "VC_redist.x64.exe", "sha256", VC_REDIST_SHA256
+    )
     if args.zip:
         if not args.zip.is_file():
             fail(f"zip not found: {args.zip}")
@@ -255,7 +348,7 @@ def main() -> None:
         with zipfile.ZipFile(args.zip) as archive:
             archive.extractall(extract)
         try:
-            stage(extract, args.dest, source_tar)
+            stage(extract, args.dest, source_tar, ffmpeg, x264, redist)
         finally:
             shutil.rmtree(extract, ignore_errors=True)
         return
@@ -265,7 +358,7 @@ def main() -> None:
         "stage-libvlc: source directory matches the 3.0.24 version string only; "
         "the official zip hash was not checked."
     )
-    stage(args.source_dir, args.dest, source_tar)
+    stage(args.source_dir, args.dest, source_tar, ffmpeg, x264, redist)
 
 
 def fetch_source_tar(dest: Path) -> Path:

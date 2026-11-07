@@ -89,6 +89,8 @@ Source: "..\..\target\{#MyTarget}\release\OpenConsole.exe"; DestDir: "{app}"; Fl
 ; libVLC 3.0.24 runtime staged by scripts/windows/stage-libvlc.py.
 ; Missing this directory fails the installer build.
 Source: "..\..\target\{#MyTarget}\release\vlc\*"; DestDir: "{app}\vlc"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Official VC++ redistributable. Not run by Setup. Not a System32 copy.
+Source: "..\..\target\{#MyTarget}\release\prereqs\*"; DestDir: "{app}\prereqs"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Termy"; Filename: "{app}\{#MyExeName}"; AppUserModelID: "{#MyAppUserModelID}"

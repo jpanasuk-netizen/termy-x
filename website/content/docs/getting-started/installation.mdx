@@ -76,14 +76,20 @@ stay inside Termy without this folder. A missing or incomplete `vlc` folder
 makes video fail with an error. Termy does not open VLC's own window or mpv
 instead. The DLLs must be 64-bit; a 32-bit tree is rejected.
 
-The stage step also places `vlc-3.0.24.tar.xz`
-(sha256 `e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`)
-in `vlc\source`, with `COPYING` (GPL-2.0) and `COPYING.LIB` (LGPL-2.1) from
-that archive. The VLC tarball does not contain FFmpeg or x264. `libavcodec`
-is an LGPL-2.1-or-later wrapper around FFmpeg, and `dummy` / `x264` modules
-are GPL-2.0-or-later. x264 and x265 encoder plugins are omitted; the dummy
-interface plugin stays because playback requests it. This package is not
-cleared for a public release, and Termy's license is not changed to GPL.
+The stage step places next to `termy.exe`:
+
+- `vlc\source\vlc-3.0.24.tar.xz` (sha256 `e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`), plus `COPYING` (GPL-2.0) and `COPYING.LIB` (LGPL-2.1)
+- `vlc\source\ffmpeg-8.1.2.tar.xz`, the file named by VLC's `contrib/src/ffmpeg/SHA512SUMS`, checked against VideoLAN's 3.0.24 win64 build artifacts
+- `vlc\source\x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz`, the snapshot named by `contrib/src/x264/rules.mak`
+- `prereqs\VC_redist.x64.exe`, Microsoft's x64 Visual C++ redistributable, file version 14.51.36247 (sha256 `843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
+
+`termy.exe` needs `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
+The package contains the official installer for them. Setup does not run it,
+and the DLLs are not copied from System32. Run `VC_redist.x64.exe` on a PC
+that does not already have those files. `libavcodec` stays in the video
+folder. x264 and x265 encoder plugins are omitted. The dummy interface plugin
+stays and is GPL-2.0-or-later. Termy's license is not changed. This is not a
+public release.
 
 Termy will also be available through winget as `lassejlv.Termy` once the
 package is accepted into the winget repository:

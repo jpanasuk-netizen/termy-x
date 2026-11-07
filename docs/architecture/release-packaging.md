@@ -93,17 +93,28 @@ LGPL-2.1. libVLC's header is LGPL-2.1-or-later. `modules/codec/avcodec` is
 LGPL-2.1-or-later and links FFmpeg. `contrib/src/ffmpeg/SHA512SUMS` in the VLC
 source names `ffmpeg-8.1.2.tar.xz` with sha512
 `b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b`.
-That tarball is not staged. VideoLAN's `release-win64` artifact index also lists
-`x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz` beside the 3.0.24 build;
-those contrib files are not hash-pinned here. `modules/codec/x264.c` and
+The bytes at `https://artifacts.videolan.org/vlc/release-win64/ffmpeg-8.1.2.tar.xz`
+match that checksum and are copied to `vlc\source`. `contrib/src/x264/rules.mak`
+pins git `e067ab0b530395f90b578f6d05ab0a225e2efdf9`. The matching tarball from
+the same win64 artifact directory has sha256
+`fa11489fecc4655152a7dc3eab1a8b33bf84b67ff6c62f919f07958e1bd44cae` and is
+copied too. `modules/codec/x264.c` and
 `modules/control/dummy.c` are GPL-2.0-or-later. Encoder plugins `libx264`,
 `libx26410b`, and `libx265` are omitted. `libdummy_plugin.dll` remains because
 playback passes `--intf=dummy`.
 
 This is not a public-release clearance. Termy is not relicensed. Corresponding
 source for FFmpeg and x264 inside the shipped plugins is not in the package.
-`libvlc.dll` importing `msvcrt.dll` does not show whether `termy.exe` needs the
-Visual C++ redistributable; that waits on the Windows builder's import audit.
+`termy.exe` imports `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`
+(file version 14.51.36247 on the machine that built `d6238614`). The stage step
+copies Microsoft's official `VC_redist.x64.exe` for that version
+(sha256 `843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
+into `prereqs` beside `termy.exe` and into the installer. It is not executed,
+and those DLLs are not taken from System32. This is the redistributable
+installer, not an app-local copy of the Visual Studio `VC\Redist` directory.
+License terms are inside the executable:
+`https://learn.microsoft.com/en-us/cpp/windows/redistributing-visual-cpp-files`.
+libVLC's `msvcrt.dll` import is a separate Windows system runtime.
 
 ### What else the Windows build already carries
 
