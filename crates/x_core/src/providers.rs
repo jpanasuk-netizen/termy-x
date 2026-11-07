@@ -1929,7 +1929,24 @@ impl OpenCliPublisher {
                 return Err(write_timeout_error(error, "that action", ENGAGE_TIMEOUT));
             }
         };
-        check_opencli_output(&output, "opencli engage")
+        let stdout = check_opencli_output(&output, "opencli engage")?;
+        if matches!(
+            action,
+            crate::publish::EngageAction::Retweet | crate::publish::EngageAction::Unretweet
+        ) {
+            if let Err(error) = crate::publish::prove_engage(action, &stdout, None) {
+                write_perf_line(&format!(
+                    "engage {} proof=rejected",
+                    action.opencli_verb()
+                ));
+                return Err(error);
+            }
+            write_perf_line(&format!(
+                "engage {} proof=confirmed",
+                action.opencli_verb()
+            ));
+        }
+        Ok(stdout)
     }
 }
 

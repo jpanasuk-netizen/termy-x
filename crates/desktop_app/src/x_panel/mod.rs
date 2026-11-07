@@ -378,11 +378,18 @@ pub fn follow_click_status(click: &FollowClick) -> String {
             "Connect X before following anyone. Nothing was changed.".into()
         }
         FollowClick::OwnAccount => "That's your account. Nothing was changed.".into(),
-        FollowClick::Confirm { handle, follow } => {
-            let verb = if *follow { "Follow" } else { "Unfollow" };
-            format!("{verb} @{handle}? Confirm on that card. Nothing is sent until you do.")
-        }
+        FollowClick::Confirm { handle, follow } => format!(
+            "{} Press Confirm or Cancel on that card. Nothing is sent until you do.",
+            follow_confirm_prompt(handle, *follow)
+        ),
     }
+}
+
+/// The sentence on the card. The Follow button itself does not become this.
+pub fn follow_confirm_prompt(handle: &str, follow: bool) -> String {
+    let verb = if follow { "Follow" } else { "Unfollow" };
+    let handle = handle.trim().trim_start_matches('@');
+    format!("{verb} @{handle}?")
 }
 
 /// The confirm buttons belong on the card that was clicked, not at the
@@ -4918,6 +4925,8 @@ impl XPanel {
         use termy_x::publish::EngageAction;
         let id = id.to_string();
         if self.engage_pending.iter().any(|p| p == &id) {
+            self.status = "That action is already in progress. Nothing was retried.".into();
+            cx.notify();
             return;
         }
         let url = url.to_string();
@@ -4987,6 +4996,27 @@ impl XPanel {
                     termy_x::action_state::ToggleKind::Like
                 } else {
                     termy_x::action_state::ToggleKind::Repost
+                };
+                let proven = match &result {
+                    Ok(receipt)
+                        if matches!(
+                            action,
+                            termy_x::publish::EngageAction::Retweet
+                                | termy_x::publish::EngageAction::Unretweet
+                        ) =>
+                    {
+                        let expected = match &panel.connection {
+                            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+                            _ => None,
+                        };
+                        termy_x::publish::prove_engage(action, receipt, expected).err()
+                    }
+                    _ => None,
+                };
+                let result = if let Some(error) = proven {
+                    Err(error)
+                } else {
+                    result
                 };
                 match result {
                     Ok(_) => {
@@ -8422,19 +8452,7 @@ impl XPanel {
                         .eq_ignore_ascii_case(termy_x::model::strip_handle(&profile.handle))
                 })
                 .map(|(_, target)| *target);
-            let asking = follow_confirm_on_card(
-                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
-                &profile.handle,
-            );
-            let label = if asking {
-                if viewer == Some(true) {
-                    "Unfollow?"
-                } else {
-                    "Follow?"
-                }
-            } else {
-                follow_button_label(viewer, pending, self.follow_dots)
-            };
+            let label = follow_button_label(viewer, pending, self.follow_dots);
             let click_handle = profile.handle.clone();
             card_el = card_el.child(
                 div()
@@ -9696,10 +9714,6 @@ impl XPanel {
                 .eq_ignore_ascii_case(termy_x::model::strip_handle(&post.author_handle))
                 .then_some(*target)
         });
-        let follow_asking = follow_confirm_on_card(
-            self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
-            &post.author_handle,
-        );
         let own = match &self.connection {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
@@ -9776,15 +9790,7 @@ impl XPanel {
         if show_follow {
             row = row.child(x_action!(
                 format!("x-follow-{scope}-{}", post.id),
-                if follow_asking {
-                    if follow_value == Some(true) {
-                        "Unfollow?"
-                    } else {
-                        "Follow?"
-                    }
-                } else {
-                    follow_button_label(follow_value, follow_pending, self.follow_dots)
-                },
+                follow_button_label(follow_value, follow_pending, self.follow_dots),
                 follow_value == Some(true),
                 cx.listener(move |this, _, _, cx| {
                     this.request_follow(&follow_handle, cx);
@@ -9824,7 +9830,7 @@ impl XPanel {
         if !follow_confirm_on_card(Some(ask_handle.as_str()), handle) {
             return None;
         }
-        let verb = if follow { "Follow" } else { "Unfollow" };
+        let prompt = follow_confirm_prompt(&ask_handle, follow);
         Some(
             div()
                 .w_full()
@@ -9836,13 +9842,11 @@ impl XPanel {
                     div()
                         .text_size(px(12.0))
                         .text_color(rgb(0xf5f5f7))
-                        .child(format!(
-                            "{verb} @{ask_handle}? Nothing is sent until you confirm."
-                        )),
+                        .child(prompt),
                 )
                 .child(x_action!(
                     format!("x-follow-yes-{scope}"),
-                    verb,
+                    "Confirm",
                     cx.listener(move |this, _, _, cx| {
                         if let Some((handle, follow)) = this.follow_ask.take() {
                             this.toggle_follow(&handle, follow, cx);
@@ -11486,6 +11490,7 @@ mod edit_keys_tests {
         BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
         FollowClick, FOLLOW_DOT_MS, XSection, burst_style_at, caret_visual_line, fetch_section,
         follow_button_label, follow_click, follow_click_status, follow_confirm_on_card,
+        follow_confirm_prompt,
         follow_dots_keep_going, follow_pending_label, follow_saved_mark, follow_step, is_own_profile,
         like_button_label,
         soft_wrap_ranges,
@@ -11540,7 +11545,12 @@ mod edit_keys_tests {
             }
         );
         let status = follow_click_status(&ask);
-        assert!(status.contains("Confirm on that card"));
+        assert_eq!(follow_confirm_prompt("Jack", true), "Follow @Jack?");
+        assert_eq!(follow_confirm_prompt("@Jack", false), "Unfollow @Jack?");
+        assert!(!follow_button_label(Some(false), None, 0).contains('?'));
+        assert!(!follow_button_label(Some(true), None, 0).contains('?'));
+        assert!(status.contains("Follow @Jack?"));
+        assert!(status.contains("Press Confirm"));
         assert!(status.contains("Nothing is sent"));
         assert!(follow_confirm_on_card(Some("Jack"), "jack"));
         assert!(!follow_confirm_on_card(Some("Jack"), "reposter"));

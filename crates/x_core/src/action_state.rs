@@ -202,6 +202,75 @@ pub fn sync_coverage() -> &'static str {
     "Login checks the posts that load for this account, up to one page. A like or follow flag is applied only when that payload includes it. This provider has no call for the full like history or the full following list, so anything older stays saved until a loaded post carries the flag. The sync does not follow, like, or post."
 }
 
+/// Read saved action rows. Does not write the database and does not call X.
+pub fn export_sanitized(path: &Path) -> Result<String, String> {
+    if !path.exists() {
+        return Ok(format!(
+            "No action database at {}. Nothing was changed.",
+            path.display()
+        ));
+    }
+    let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| format!("action database: {error}"))?;
+    let mut lines = vec![
+        "action export (read-only). No passwords or keys. Nothing was sent to X.".to_string(),
+        "columns: account, kind, target, confirmed, source, time_utc, error".to_string(),
+        "provider is not stored on these rows. A retweet click uses OpenCLI when that posting path is available.".to_string(),
+    ];
+    let mut stmt = conn
+        .prepare(
+            "SELECT account, kind, item_key, confirmed, source, verified_at_ms, last_error FROM toggles ORDER BY verified_at_ms, account, kind, item_key",
+        )
+        .map_err(|error| format!("action database: {error}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(|error| format!("action database: {error}"))?;
+    for row in rows {
+        let (account, kind, target, confirmed, source, at_ms, error) =
+            row.map_err(|error| format!("action database: {error}"))?;
+        let confirmed = match confirmed {
+            Some(1) => "yes",
+            Some(0) => "no",
+            _ => "unknown",
+        };
+        lines.push(format!(
+            "{account}\t{kind}\t{target}\t{confirmed}\t{}\t{}\t{}",
+            source.unwrap_or_else(|| "-".into()),
+            utc_stamp(at_ms as u64),
+            error.unwrap_or_else(|| "-".into())
+        ));
+    }
+    if lines.len() == 3 {
+        lines.push("no rows".into());
+    }
+    Ok(lines.join("\n"))
+}
+
+fn utc_stamp(ms: u64) -> String {
+    if ms == 0 {
+        return "-".into();
+    }
+    let secs = (ms / 1000) as i64;
+    let rem = secs.rem_euclid(86_400) as u64;
+    format!(
+        "{} {:02}:{:02}:{:02}Z",
+        crate::time::ymd(secs),
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 pub fn database_location_note() -> &'static str {
     "SQLite file x-action-state.db in the Termy config directory (%APPDATA%\\termy on Windows, ~/.config/termy on Linux). Handles, tweet ids, and short receipts only. No separate database server."
 }
@@ -1258,6 +1327,28 @@ mod tests {
         }
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
         assert_eq!(version, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_is_read_only_and_has_no_secrets() {
+        let dir = std::env::temp_dir().join(format!("termy-actions-export-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(FILE_NAME);
+        let mut db = ActionDb::default();
+        db.force_confirm("Jasper_Black", ToggleKind::Repost, "555", true, 1_762_000_000_000);
+        db.save(&db_path).unwrap();
+        let before = fs::read(&db_path).unwrap();
+        let text = export_sanitized(&db_path).unwrap();
+        assert_eq!(fs::read(&db_path).unwrap(), before);
+        assert!(text.contains("jasper_black"));
+        assert!(text.contains("repost"));
+        assert!(text.contains("555"));
+        assert!(text.contains("read-only"));
+        let rows: String = text.lines().skip(3).collect();
+        assert!(!rows.to_ascii_lowercase().contains("token"));
+        assert!(!rows.to_ascii_lowercase().contains("password"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

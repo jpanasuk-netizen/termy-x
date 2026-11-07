@@ -185,6 +185,149 @@ pub fn comment_target_id(post: &crate::model::Post) -> &str {
     post.engage_target().id.as_str()
 }
 
+/// Retweet uses the same id as other engagement: the original post, not
+/// the repost wrapper.
+pub fn retweet_target_id(post: &crate::model::Post) -> &str {
+    post.engage_target().id.as_str()
+}
+
+/// A retweet is confirmed only by a structured receipt. Exit 0, empty
+/// output, and `{"ok":true}` with no retweet id are not enough. Nothing
+/// here retries the write.
+pub fn prove_engage(
+    action: EngageAction,
+    stdout: &str,
+    expected_account: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(action, EngageAction::Retweet | EngageAction::Unretweet) {
+        return Ok(());
+    }
+    let verb = if action == EngageAction::Retweet {
+        "Retweet"
+    } else {
+        "Unretweet"
+    };
+    let uncertain = format!(
+        "{verb} was not confirmed. Not marked {verb}ed. Check the post on X. Nothing was retried."
+    );
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(uncertain);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("unconfirmed") || lower.contains("check before") {
+        return Err(uncertain);
+    }
+    let value: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Err(uncertain),
+    };
+    if json_says_failure(&value) {
+        return Err(format!(
+            "{verb} was rejected by X. Not marked {verb}ed. Nothing was retried."
+        ));
+    }
+    if let (Some(actor), Some(expected)) = (actor_handle(&value), expected_account) {
+        let expected = crate::model::strip_handle(expected);
+        if !expected.is_empty() && !actor.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "{verb} ran as @{actor}, not @{expected}. Not marked {verb}ed. Nothing was retried."
+            ));
+        }
+    }
+    if engage_receipt_present(action, &value) {
+        Ok(())
+    } else {
+        Err(uncertain)
+    }
+}
+
+fn json_says_failure(value: &serde_json::Value) -> bool {
+    let node = value
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(value);
+    if node.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return true;
+    }
+    node.get("error").is_some()
+        || matches!(
+            node.get("status").and_then(serde_json::Value::as_str),
+            Some("error" | "failed" | "failure")
+        )
+}
+
+fn engage_receipt_present(action: EngageAction, value: &serde_json::Value) -> bool {
+    let node = value
+        .get("data")
+        .or_else(|| value.as_array().and_then(|rows| rows.first()))
+        .unwrap_or(value);
+    let flag = node
+        .get("retweeted")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            node.get("data")
+                .and_then(|inner| inner.get("retweeted"))
+                .and_then(serde_json::Value::as_bool)
+        });
+    let want = action == EngageAction::Retweet;
+    if flag == Some(!want) {
+        return false;
+    }
+    if flag == Some(want) && json_has_id(node) {
+        return true;
+    }
+    if flag.is_some() {
+        return false;
+    }
+    let status = node
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let ok = node.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+        || status.eq_ignore_ascii_case("success");
+    ok && json_has_id(node)
+}
+
+fn json_has_id(node: &serde_json::Value) -> bool {
+    for key in ["id", "rest_id", "tweet_id", "id_str"] {
+        if let Some(value) = node.get(key).and_then(serde_json::Value::as_str) {
+            if value.chars().all(|ch| ch.is_ascii_digit()) && !value.is_empty() {
+                return true;
+            }
+        }
+        if node.get(key).and_then(serde_json::Value::as_u64).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn actor_handle(value: &serde_json::Value) -> Option<String> {
+    let node = value
+        .get("data")
+        .or_else(|| value.as_array().and_then(|rows| rows.first()))
+        .unwrap_or(value);
+    for key in ["screen_name", "username", "handle"] {
+        if let Some(text) = node.get(key).and_then(serde_json::Value::as_str) {
+            let handle = crate::model::strip_handle(text);
+            if !handle.is_empty() {
+                return Some(handle.to_string());
+            }
+        }
+    }
+    let user = node.get("user").or_else(|| node.get("author"))?;
+    for key in ["screen_name", "username", "handle"] {
+        if let Some(text) = user.get(key).and_then(serde_json::Value::as_str) {
+            let handle = crate::model::strip_handle(text);
+            if !handle.is_empty() {
+                return Some(handle.to_string());
+            }
+        }
+    }
+    None
+}
+
 impl EngageAction {
     /// The `opencli twitter <verb>` subcommand (verified against
     /// OpenCLI 1.8.8 `--help`: like/unlike/retweet/unretweet/quote all
@@ -844,6 +987,45 @@ mod tests {
             withheld_note(UserWrite::QTweet, WriteOutcome::Failed),
             "Could not send the Q-tweet. Nothing was posted."
         );
+    }
+
+    #[test]
+    fn retweet_needs_a_receipt_and_uses_the_original_id() {
+        use crate::model::Post;
+        let mut wrapper = Post::default();
+        wrapper.id = "wrap".into();
+        let mut original = Post::default();
+        original.id = "555".into();
+        wrapper.retweeted = Some(Box::new(original));
+        assert_eq!(retweet_target_id(&wrapper), "555");
+        assert_ne!(retweet_target_id(&wrapper), "wrap");
+
+        let confirmed = r#"{"ok":true,"retweeted":true,"id":"555","user":{"screen_name":"Jasper_Black"}}"#;
+        assert!(prove_engage(EngageAction::Retweet, confirmed, Some("jasper_black")).is_ok());
+        assert!(
+            prove_engage(EngageAction::Retweet, confirmed, Some("@other"))
+                .unwrap_err()
+                .contains("not @other")
+        );
+
+        for bad in [
+            "",
+            "   ",
+            "unconfirmed — check before retrying",
+            "not json",
+            r#"{"ok":true}"#,
+            r#"{"ok":false,"error":{"message":"nope"}}"#,
+            "[]",
+        ] {
+            let err = prove_engage(EngageAction::Retweet, bad, Some("Jasper_Black")).unwrap_err();
+            assert!(err.contains("Not marked"), "{bad} -> {err}");
+            assert!(err.contains("Nothing was retried"), "{err}");
+            assert!(!err.to_ascii_lowercase().contains("token"));
+        }
+
+        let removed = r#"{"ok":true,"retweeted":false,"id":"555"}"#;
+        assert!(prove_engage(EngageAction::Unretweet, removed, None).is_ok());
+        assert!(prove_engage(EngageAction::Retweet, removed, None).is_err());
     }
 
     #[test]

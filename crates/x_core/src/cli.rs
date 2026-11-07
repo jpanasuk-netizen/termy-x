@@ -43,6 +43,8 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Print saved like, follow, and retweet rows. Read-only. No tokens.
+    Actions,
     /// Look up a user
     Lookup { handle: String },
     /// Profile totals from OpenCLI plus sums over the loaded tweet window
@@ -476,6 +478,20 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
+        Cmd::Actions => {
+            let _ = json;
+            let path = io.config.action_state_path();
+            match crate::action_state::export_sanitized(&path) {
+                Ok(text) => {
+                    println!("{text}");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
         Cmd::Lookup { handle } if handle.trim().is_empty() => {
             eprintln!("give a username. Example: x lookup yourname");
             2
