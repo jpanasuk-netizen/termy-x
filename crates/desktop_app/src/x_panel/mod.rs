@@ -413,22 +413,49 @@ pub fn follow_step(
     }
 }
 
-/// Follow button label from the payload's real following flag plus
-/// an in-flight target. `None` flag = payload silent: show Follow and
-/// let only a verified action change the state (never fake Following).
+/// Gap between rolling follow dots. Long enough that the redraw is not a spin.
+pub const FOLLOW_DOT_MS: u64 = 400;
+
+/// The dots keep moving only while this follow write is still the one in flight.
+pub fn follow_dots_keep_going(seq_matches: bool, pending: bool) -> bool {
+    seq_matches && pending
+}
+
+/// One frame of the rolling dots. Frame 3 matches frame 0.
+pub fn follow_pending_label(following: bool, frame: u32) -> &'static str {
+    match (following, frame % 3) {
+        (true, 0) => "Following.",
+        (true, 1) => "Following..",
+        (true, _) => "Following...",
+        (false, 0) => "Unfollowing.",
+        (false, 1) => "Unfollowing..",
+        (false, _) => "Unfollowing...",
+    }
+}
+
+/// Action on the button. Someone you follow gets Unfollow. Followed is
+/// the success note, not this label. `frame` rolls the dots only while
+/// a confirmed request is in flight.
 pub fn follow_button_label(
     viewer_following: Option<bool>,
     pending: Option<bool>,
-    saved: bool,
+    frame: u32,
 ) -> &'static str {
     match pending {
-        Some(true) => "Following\u{2026}",
-        Some(false) => "Unfollowing\u{2026}",
+        Some(target) => follow_pending_label(target, frame),
         None => match viewer_following {
-            Some(true) if saved => "Followed \u{b7} saved",
-            Some(true) => "Followed",
+            Some(true) => "Unfollow",
             _ => "Follow",
         },
+    }
+}
+
+/// Small note beside a remembered follow. It does not replace Unfollow.
+pub fn follow_saved_mark(following: bool, saved: bool, pending: bool) -> Option<&'static str> {
+    if following && saved && !pending {
+        Some("saved")
+    } else {
+        None
     }
 }
 
@@ -675,6 +702,8 @@ pub struct XPanel {
     follow_overrides: std::collections::HashMap<String, bool>,
     /// Generation of the follow write currently in flight.
     follow_seq: u64,
+    /// Which rolling-dot frame the in-flight Follow button is on.
+    follow_dots: u32,
     /// Per-tweet generation for an in-flight like or repost.
     engage_seq: std::collections::HashMap<String, u64>,
     action_db: termy_x::action_state::ActionDb,
@@ -1066,6 +1095,7 @@ impl XPanel {
             follow_ask: None,
             follow_overrides: std::collections::HashMap::new(),
             follow_seq: 0,
+            follow_dots: 0,
             engage_seq: std::collections::HashMap::new(),
             action_db,
             action_seq: 0,
@@ -4343,6 +4373,36 @@ impl XPanel {
         .detach();
     }
 
+    /// Roll the follow dots until this write ends, a newer one replaces it,
+    /// or the panel is gone. The timer is the only wake-up; it does not spin.
+    fn spawn_follow_dots(&self, cx: &mut Context<Self>, seq: u64) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(FOLLOW_DOT_MS))
+                    .await;
+                let keep_going = cx.update(|cx| {
+                    this.update(cx, |panel, cx| {
+                        let keep = follow_dots_keep_going(
+                            panel.follow_seq == seq,
+                            panel.follow_pending.is_some(),
+                        );
+                        if keep {
+                            panel.follow_dots = panel.follow_dots.wrapping_add(1);
+                            cx.notify();
+                        }
+                        keep
+                    })
+                    .unwrap_or(false)
+                });
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// While a submit is in flight, keep an honest elapsed-time status
     /// alive (OpenCLI writes take 5-20s on a good day; silence read as
     /// a hang). Stops when the submit resolves or a newer one starts.
@@ -4763,7 +4823,9 @@ impl XPanel {
             now,
         );
         self.follow_seq = seq;
+        self.follow_dots = 0;
         self.follow_pending = Some((handle.clone(), target));
+        self.spawn_follow_dots(cx, seq);
         cx.notify();
         let handle_for_call = handle.clone();
         let live = self.live;
@@ -4814,7 +4876,8 @@ impl XPanel {
                             );
                             panel.apply_follow_to_thread(&handle, target);
                             panel.persist_actions();
-                            panel.status = message;
+                            let _ = message;
+                            panel.status = termy_x::publish::follow_burst_label(target).to_string();
                             panel.begin_author_burst(
                                 &handle,
                                 termy_x::publish::follow_burst_label(target),
@@ -8370,7 +8433,7 @@ impl XPanel {
                     "Follow?"
                 }
             } else {
-                follow_button_label(viewer, pending, saved)
+                follow_button_label(viewer, pending, self.follow_dots)
             };
             let click_handle = profile.handle.clone();
             card_el = card_el.child(
@@ -8378,15 +8441,31 @@ impl XPanel {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .child(x_button!(
-                        "x-follow-toggle",
-                        label,
-                        viewer == Some(true),
-                        cx.listener(move |this, _, _, cx| {
-                            this.request_follow(&click_handle, cx);
-                            cx.stop_propagation();
-                        })
-                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                "x-follow-toggle",
+                                label,
+                                viewer == Some(true),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.request_follow(&click_handle, cx);
+                                    cx.stop_propagation();
+                                })
+                            ))
+                            .children(follow_saved_mark(
+                                viewer == Some(true),
+                                saved,
+                                pending.is_some(),
+                            ).map(|mark| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(mark)
+                            })),
+                    )
                     .children(self.follow_confirm_strip(&profile.handle, "profile", cx)),
             );
         }
@@ -9704,7 +9783,7 @@ impl XPanel {
                         "Follow?"
                     }
                 } else {
-                    follow_button_label(follow_value, follow_pending, follow_saved)
+                    follow_button_label(follow_value, follow_pending, self.follow_dots)
                 },
                 follow_value == Some(true),
                 cx.listener(move |this, _, _, cx| {
@@ -9713,6 +9792,18 @@ impl XPanel {
                     cx.notify();
                 })
             ));
+            if let Some(mark) = follow_saved_mark(
+                follow_value == Some(true),
+                follow_saved,
+                follow_pending.is_some(),
+            ) {
+                row = row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8e8e93))
+                        .child(mark),
+                );
+            }
         }
         if let Some(strip) =
             self.follow_confirm_strip(&post.author_handle, &format!("{scope}-{}", post.id), cx)
@@ -11393,31 +11484,49 @@ mod edit_keys_tests {
     use super::next_timeline_limit;
     use super::{
         BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
-        FollowClick, XSection, burst_style_at, caret_visual_line, fetch_section, follow_button_label,
-        follow_click, follow_click_status, follow_confirm_on_card, follow_step, is_own_profile,
-        like_button_label, soft_wrap_ranges,
+        FollowClick, FOLLOW_DOT_MS, XSection, burst_style_at, caret_visual_line, fetch_section,
+        follow_button_label, follow_click, follow_click_status, follow_confirm_on_card,
+        follow_dots_keep_going, follow_pending_label, follow_saved_mark, follow_step, is_own_profile,
+        like_button_label,
+        soft_wrap_ranges,
     };
     use termy_x::providers::TimelineFeed;
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
         // Payload silent: honest Follow (no invented Following state).
-        assert_eq!(follow_button_label(None, None, false), "Follow");
-        assert_eq!(follow_button_label(Some(false), None, false), "Follow");
-        assert_eq!(follow_button_label(Some(true), None, false), "Followed");
-        assert_eq!(
-            follow_button_label(Some(true), None, true),
-            "Followed \u{b7} saved"
-        );
+        assert_eq!(follow_button_label(None, None, 1), "Follow");
+        assert_eq!(follow_button_label(Some(false), None, 2), "Follow");
+        assert_eq!(follow_button_label(Some(true), None, 2), "Unfollow");
+        assert_eq!(follow_button_label(Some(true), None, 0), "Unfollow");
+        assert_eq!(follow_saved_mark(true, true, false), Some("saved"));
+        assert_eq!(follow_saved_mark(true, false, false), None);
+        assert_eq!(follow_saved_mark(true, true, true), None);
         assert_eq!(like_button_label(true, false, true), "Liked \u{b7} saved");
         assert_eq!(like_button_label(true, true, true), "\u{2026}");
         assert_eq!(like_button_label(true, false, false), "Liked");
         // In flight: progress label wins; the click guard ignores clicks.
-        assert_eq!(follow_button_label(None, Some(true), true), "Following\u{2026}");
+        assert_eq!(follow_button_label(None, Some(true), 1), "Following..");
+        assert_eq!(follow_button_label(Some(true), Some(false), 0), "Unfollowing.");
+    }
+
+    #[test]
+    fn follow_dots_roll_only_while_the_request_is_in_flight() {
+        assert_eq!(follow_pending_label(true, 0), "Following.");
+        assert_eq!(follow_pending_label(true, 1), "Following..");
+        assert_eq!(follow_pending_label(true, 2), "Following...");
+        assert_eq!(follow_pending_label(true, 3), "Following.");
+        assert_ne!(follow_pending_label(true, 0), follow_pending_label(true, 1));
+        assert_eq!(follow_pending_label(false, 2), "Unfollowing...");
+        assert_eq!(follow_button_label(Some(true), None, 2), "Unfollow");
         assert_eq!(
-            follow_button_label(Some(true), Some(false), false),
-            "Unfollowing\u{2026}"
+            termy_x::publish::follow_burst_label(true),
+            "\u{2713} Followed"
         );
+        assert!(follow_dots_keep_going(true, true));
+        assert!(!follow_dots_keep_going(true, false));
+        assert!(!follow_dots_keep_going(false, true));
+        assert!(FOLLOW_DOT_MS >= 200 && FOLLOW_DOT_MS <= 1000);
     }
 
     #[test]
