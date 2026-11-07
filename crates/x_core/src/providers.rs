@@ -2157,7 +2157,7 @@ fn timeline_eval_js(feed: TimelineFeed, cursor: Option<&str>, count: usize) -> S
           if (!best || score > bestScore) {{ best = v; bestScore = score; }}
         }}
         urls.push(best ? best.url : m.media_url_https);
-        posters.push(m.media_url_https);
+        posters.push([m.media_url_https, m.media_url, m.preview_image_url].find(function(c){{ return typeof c==="string" && c && !/\.(mp4|m4v|webm|mkv|mov|m3u8|ts|m4s)(\?|#|$)/i.test(c.split("?")[0]); }}) || "");
         durations.push((m.video_info && m.video_info.duration_millis) || 0);
       }} else {{
         urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
@@ -2363,7 +2363,7 @@ const PROFILE_EVAL_JS: &str = r##"(async () => {
           if (!best || score > bestScore) { best = v; bestScore = score; }
         }
         urls.push(best ? best.url : m.media_url_https);
-        posters.push(m.media_url_https);
+        posters.push([m.media_url_https, m.media_url, m.preview_image_url].find(function(c){ return typeof c==="string" && c && !/\.(mp4|m4v|webm|mkv|mov|m3u8|ts|m4s)(\?|#|$)/i.test(c.split("?")[0]); }) || "");
         durations.push((m.video_info && m.video_info.duration_millis) || 0);
       } else {
         urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
@@ -2526,7 +2526,7 @@ const TWEET_BY_ID_EVAL_JS: &str = r##"(async () => {
           if (!best || score > bestScore) { best = v; bestScore = score; }
         }
         urls.push(best ? best.url : m.media_url_https);
-        posters.push(m.media_url_https);
+        posters.push([m.media_url_https, m.media_url, m.preview_image_url].find(function(c){ return typeof c==="string" && c && !/\.(mp4|m4v|webm|mkv|mov|m3u8|ts|m4s)(\?|#|$)/i.test(c.split("?")[0]); }) || "");
         durations.push((m.video_info && m.video_info.duration_millis) || 0);
       } else {
         urls.push(m.media_url_https); posters.push(m.media_url_https); durations.push(0);
@@ -4782,6 +4782,17 @@ mod tests {
             profile.contains("tw.retweeted_status_result"),
             "profile unwraps reposts from the tweet result"
         );
+        let tweet = tweet_by_id_eval_js("1");
+        for script in [&timeline, &profile, &tweet] {
+            assert!(
+                script.contains("preview_image_url"),
+                "video poster uses the provider still, not only the mp4"
+            );
+            assert!(
+                script.contains("media_url_https, m.media_url, m.preview_image_url"),
+                "poster candidates stay the fields the provider actually sends"
+            );
+        }
     }
 
     #[test]

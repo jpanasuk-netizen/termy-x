@@ -7,6 +7,7 @@ mod editor_surface;
 mod list_sort;
 mod media_fit;
 mod player;
+mod preview;
 mod scroll_math;
 mod thread_view;
 
@@ -580,6 +581,10 @@ pub struct XPanel {
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
+    frame_queue: std::collections::VecDeque<String>,
+    frames_inflight: u8,
+    /// Poster URL → video URL, used once if the still image fails.
+    preview_fallback: HashMap<String, String>,
     search_posts: Vec<Post>,
     mentions_posts: Vec<Post>,
     inbox_posts: Vec<Post>,
@@ -933,6 +938,9 @@ impl XPanel {
             mention_timer: false,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
+            frame_queue: std::collections::VecDeque::new(),
+            frames_inflight: 0,
+            preview_fallback: HashMap::new(),
             search_posts: Vec::new(),
             mentions_posts: Vec::new(),
             inbox_posts: Vec::new(),
@@ -2153,6 +2161,7 @@ impl XPanel {
                     }
                 }
                 panel.resolve_bare_reposts(cx);
+                panel.prefetch_media(cx);
                 cx.notify();
             });
         })
@@ -5479,26 +5488,8 @@ impl Render for XPanel {
 /// Local copy of the release-notes loader: x_panel lives in the lib crate,
 /// which cannot reach the binary crate's `ui` module.
 fn fetch_image_rgba(url: &str) -> Result<image::RgbaImage, String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("only http(s) images".into());
-    }
-    use std::io::Read;
-    let response = ureq::get(url)
-        .set("User-Agent", "TermyX/1.0")
-        .call()
-        .map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(5_000_001)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 5_000_000 {
-        return Err("image too large".into());
-    }
-    image::load_from_memory(&bytes)
-        .map(|d| d.to_rgba8())
-        .map_err(|e| e.to_string())
+    let bytes = preview::fetch_bounded(url, 5_000_000)?;
+    preview::decode_still(&bytes)
 }
 
 /// Global cursor Y in list-relative logical coordinates, read straight
@@ -7414,43 +7405,116 @@ impl XPanel {
     /// the render loop. The drain loop starts a few at a time on the
     /// background executor; scrolling and typing never wait on it.
     fn prefetch_media(&mut self, cx: &mut Context<Self>) {
-        let mut urls: Vec<String> = Vec::new();
-        let collect = |posts: &[Post], urls: &mut Vec<String>| {
-            for post in posts {
-                for media in &post.media {
-                    if let Some(poster) = &media.poster
-                        && !poster.is_empty()
-                    {
-                        urls.push(poster.clone());
-                    }
-                }
-            }
-        };
-        collect(&self.posts, &mut urls);
-        collect(&self.following_posts, &mut urls);
-        collect(&self.search_posts, &mut urls);
-        collect(&self.mentions_posts, &mut urls);
-        collect(&self.inbox_posts, &mut urls);
-        if let Some(profile) = &self.profile {
-            collect(&profile.posts, &mut urls);
-            collect(&profile.pinned, &mut urls);
-            for image in [&profile.avatar_url, &profile.banner_url]
-                .into_iter()
-                .flatten()
-            {
-                if !image.is_empty() {
-                    urls.push(image.clone());
-                }
-            }
+        let mut plans = Vec::new();
+        let mut avatars = Vec::new();
+        for posts in [
+            &self.posts,
+            &self.following_posts,
+            &self.search_posts,
+            &self.mentions_posts,
+            &self.inbox_posts,
+        ] {
+            plans.extend(posts.iter().flat_map(preview::preview_jobs));
         }
-        urls.sort();
-        urls.dedup();
-        for url in urls {
-            if !self.media_cache.contains_key(&url) && !self.media_queue.contains(&url) {
-                self.media_queue.push_back(url);
-            }
+        if let Some(profile) = &self.profile {
+            plans.extend(profile.posts.iter().flat_map(preview::preview_jobs));
+            plans.extend(profile.pinned.iter().flat_map(preview::preview_jobs));
+            avatars.extend(
+                [&profile.avatar_url, &profile.banner_url]
+                    .into_iter()
+                    .flatten()
+                    .filter(|image| !image.is_empty())
+                    .cloned(),
+            );
+        }
+        for plan in plans {
+            self.enqueue_post_plan(plan);
+        }
+        for image in avatars {
+            self.enqueue_still(image);
         }
         self.drain_media_queue(cx);
+        self.drain_frame_queue(cx);
+    }
+
+    fn enqueue_post_plan(&mut self, plan: preview::PreviewPlan) {
+        match plan {
+            preview::PreviewPlan::Still { url, video } => {
+                if let Some(video) = video {
+                    self.preview_fallback.entry(url.clone()).or_insert(video);
+                }
+                self.enqueue_still(url);
+            }
+            preview::PreviewPlan::Frame { video } => self.enqueue_frame(video),
+            preview::PreviewPlan::Unavailable => {}
+        }
+    }
+
+    fn enqueue_still(&mut self, url: String) {
+        if self.media_cache.contains_key(&url) || self.media_queue.contains(&url) {
+            return;
+        }
+        self.media_cache.insert(url.clone(), MediaState::Loading);
+        self.media_queue.push_back(url);
+    }
+
+    fn enqueue_frame(&mut self, video: String) {
+        let key = preview::frame_cache_key(&video);
+        if self.media_cache.contains_key(&key) || self.frame_queue.iter().any(|queued| queued == &video) {
+            return;
+        }
+        self.media_cache.insert(key, MediaState::Loading);
+        self.frame_queue.push_back(video);
+    }
+
+    fn drain_frame_queue(&mut self, cx: &mut Context<Self>) {
+        if self.frames_inflight > 0 {
+            return;
+        }
+        while let Some(video) = self.frame_queue.pop_front() {
+            let key = preview::frame_cache_key(&video);
+            if matches!(
+                self.media_cache.get(&key),
+                Some(MediaState::Ready(_) | MediaState::Failed)
+            ) {
+                continue;
+            }
+            self.frames_inflight = 1;
+            self.spawn_frame(video, cx);
+            return;
+        }
+    }
+
+    fn spawn_frame(&mut self, video: String, cx: &mut Context<Self>) {
+        let key = preview::frame_cache_key(&video);
+        self.media_cache.insert(key.clone(), MediaState::Loading);
+        let started = key.clone();
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { preview::derive_frame(&video) })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.frames_inflight = panel.frames_inflight.saturating_sub(1);
+                if panel.media_cache.contains_key(&started) {
+                    let state = match image {
+                        Ok(buffer) => {
+                            let (width, height) = (buffer.width(), buffer.height());
+                            MediaState::Ready(CachedImage {
+                                image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                                width,
+                                height,
+                            })
+                        }
+                        Err(_) => MediaState::Failed,
+                    };
+                    panel.media_cache.insert(started, state);
+                }
+                panel.drain_frame_queue(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn drain_media_queue(&mut self, cx: &mut Context<Self>) {
@@ -7467,7 +7531,10 @@ impl XPanel {
                             let Some(url) = panel.media_queue.pop_front() else {
                                 break;
                             };
-                            if panel.media_cache.contains_key(&url) {
+                            if matches!(
+                                panel.media_cache.get(&url),
+                                Some(MediaState::Ready(_) | MediaState::Failed)
+                            ) {
                                 continue;
                             }
                             panel.spawn_media_fetch(url, cx);
@@ -7491,7 +7558,10 @@ impl XPanel {
     }
 
     fn spawn_media_fetch(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.media_cache.contains_key(&url) {
+        if matches!(
+            self.media_cache.get(&url),
+            Some(MediaState::Ready(_) | MediaState::Failed)
+        ) {
             return;
         }
         self.media_cache.insert(url.clone(), MediaState::Loading);
@@ -7513,7 +7583,14 @@ impl XPanel {
                     }
                     Err(_) => MediaState::Failed,
                 };
+                let failed = matches!(state, MediaState::Failed);
                 panel.media_cache.insert(url.clone(), state);
+                if let Some(video) = panel.preview_fallback.remove(&url) {
+                    if failed {
+                        panel.enqueue_frame(video);
+                        panel.drain_frame_queue(cx);
+                    }
+                }
                 cx.notify();
             });
         })
@@ -7784,6 +7861,15 @@ impl XPanel {
         card_el.into_any_element()
     }
 
+    fn preview_lookup(&self, key: &str) -> preview::CacheLookup {
+        match self.media_cache.get(key) {
+            Some(MediaState::Loading) => preview::CacheLookup::Loading,
+            Some(MediaState::Ready(_)) => preview::CacheLookup::Ready,
+            Some(MediaState::Failed) => preview::CacheLookup::Failed,
+            None => preview::CacheLookup::Missing,
+        }
+    }
+
     #[allow(dead_code)]
     fn media_box(&self, post: &Post, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
         self.media_box_scoped(post, "main", cx)
@@ -7797,7 +7883,6 @@ impl XPanel {
     ) -> Option<gpui_kit::AnyElement> {
         let media = post.media.first()?;
         let kind = media.kind;
-        let poster = media.poster.clone().unwrap_or_default();
         let viewer_media = media.clone();
         let post_id = post.id.clone();
         let aspect = self.media_aspect(media);
@@ -7826,42 +7911,27 @@ impl XPanel {
             .border_1()
             .border_color(tint(0x7af6ff, 55))
             .cursor_pointer();
-        match self.media_cache.get(&poster) {
-            Some(MediaState::Ready(cached)) => {
-                let source: ImageSource = ImageSource::Render(cached.image.clone());
-                area = area.child(
-                    img(source)
-                        .w(px(fit_w))
-                        .h(px(fit_h))
-                        .object_fit(ObjectFit::Contain),
-                );
-            }
-            Some(MediaState::Failed) => {
-                area = area.child(
-                    div()
-                        .p(px(10.0))
-                        .text_size(px(12.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo {
-                            "Photo (could not load preview)"
-                        } else {
-                            "Video (could not load preview)"
-                        }),
-                );
-            }
-            _ => {
-                area = area.child(
-                    div()
-                        .p(px(10.0))
-                        .text_size(px(12.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo {
-                            "Loading photo\u{2026}"
-                        } else {
-                            "Loading video preview\u{2026}"
-                        }),
-                );
-            }
+        let plan = preview::preview_plan(media);
+        let view = preview::preview_view(&plan, |key| self.preview_lookup(key));
+        if view == preview::PreviewView::Image
+            && let Some(key) = preview::ready_key(&plan, |key| self.preview_lookup(key))
+            && let Some(MediaState::Ready(cached)) = self.media_cache.get(&key)
+        {
+            let source: ImageSource = ImageSource::Render(cached.image.clone());
+            area = area.child(
+                img(source)
+                    .w(px(fit_w))
+                    .h(px(fit_h))
+                    .object_fit(ObjectFit::Contain),
+            );
+        } else if view != preview::PreviewView::Image {
+            area = area.child(
+                div()
+                    .p(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(preview::preview_caption(kind, view)),
+            );
         }
         {
             let label = if extra > 0 {
