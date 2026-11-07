@@ -238,11 +238,15 @@ enum WriteOp {
         to: String,
         text: String,
     },
-    /// Quote one status with twitter quote, the same path as the Q-tweet button.
+    /// Quote one status from its repost menu, the same path as the Q-tweet button.
     Quote {
         #[arg(long)]
         to: String,
-        text: String,
+        /// Omit with --inspect. Required before a real quote.
+        text: Option<String>,
+        /// Open the quote composer and report the card. Does not click Post.
+        #[arg(long)]
+        inspect: bool,
     },
     /// Repost one status.
     Repost {
@@ -384,7 +388,8 @@ fn print_help_guide() {
     println!("  x stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
     println!("  x write post \"text\"                  Dry-run. Does not start the GUI or post.");
     println!("  x write reply --to ID \"text\"         Dry-run a reply");
-    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet (twitter quote, not a plain post)");
+    println!("  x write quote --to ID --inspect        Look at the quote card. Does not click Post");
+    println!("  x write quote --to ID \"text\"         Dry-run a Q-tweet");
     println!("  x write repost --to ID                Dry-run a repost");
     println!("  x write post \"text\" --confirm yes    One real post. No retry.");
     println!("  x post \"text\"");
@@ -1443,6 +1448,31 @@ fn publish_draft(
     )
 }
 
+fn inspect_quote(target: &str, io: &CliIo) -> i32 {
+    let id = crate::model::post_id_from_input(target);
+    if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
+        eprintln!("The target must be a status id or a status URL. Post was not clicked.");
+        return 2;
+    }
+    if !io.runner.exists(&io.config.opencli_bin) {
+        eprintln!("OpenCLI is not installed. Post was not clicked.");
+        return 1;
+    }
+    match crate::providers::inspect_quote_attachment(&io.config.opencli_bin, io.runner.as_ref(), &id)
+    {
+        Ok(line) => {
+            println!("quote inspect — Post was not clicked");
+            println!("{line}");
+            0
+        }
+        Err(error) => {
+            eprintln!("quote inspect failed — Post was not clicked");
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -> i32 {
     use crate::publish::{GuiWrite, GuiWriteRequest, run_gui_write};
     let write = match op {
@@ -1451,10 +1481,15 @@ fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -
             target_id: to,
             text,
         },
-        WriteOp::Quote { to, text } => GuiWrite::Quote {
-            target_id: to,
-            text,
-        },
+        WriteOp::Quote { to, text, inspect } => {
+            if inspect {
+                return inspect_quote(&to, io);
+            }
+            GuiWrite::Quote {
+                target_id: to,
+                text: text.unwrap_or_default(),
+            }
+        }
         WriteOp::Repost { to } => GuiWrite::Repost { target_id: to },
     };
     let approved = confirm.as_deref() == Some("yes");

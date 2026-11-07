@@ -1677,6 +1677,186 @@ fn json_failure_message(value: &Value) -> Option<String> {
     None
 }
 
+const QUOTE_SESSION: &str = "termyx-quote";
+const QUOTE_READ_SESSION: &str = "termyx-quote-read";
+
+fn sanitize_browser_note(raw: &str) -> String {
+    let collapsed = raw.split_whitespace().take(12).collect::<Vec<_>>().join(" ");
+    let lower = collapsed.to_ascii_lowercase();
+    if lower.contains("token") || lower.contains("cookie") || lower.contains("authorization") {
+        return "browser error omitted".into();
+    }
+    let mut out = String::new();
+    for ch in collapsed.chars().take(80) {
+        if ch != '{' && ch != '}' {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn close_quote_session(bin: &str, runner: &dyn crate::io::CommandRunner, session: &str) {
+    let _ = runner.run_timeout(
+        bin,
+        &["browser".into(), session.into(), "close".into()],
+        Duration::from_secs(15),
+    );
+}
+
+fn browser_page_json(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    session: &str,
+    url: &str,
+    js: &str,
+) -> Result<serde_json::Value, String> {
+    let opened = match runner.run_timeout(
+        bin,
+        &[
+            "browser".into(),
+            session.into(),
+            "open".into(),
+            url.into(),
+            "--window".into(),
+            "background".into(),
+        ],
+        Duration::from_secs(60),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(format!(
+                "Could not open the quote page. Post was not clicked. {}",
+                sanitize_browser_note(&error)
+            ));
+        }
+    };
+    if opened.status != 0 {
+        close_quote_session(bin, runner, session);
+        return Err(format!(
+            "Could not open the quote page. Post was not clicked. {}",
+            sanitize_browser_note(&opened.stderr)
+        ));
+    }
+    for _ in 0..8 {
+        match runner.run_timeout(
+            bin,
+            &[
+                "browser".into(),
+                session.into(),
+                "eval".into(),
+                "location.href".into(),
+            ],
+            Duration::from_secs(20),
+        ) {
+            Ok(probe) if probe.stdout.contains("https://x.com") => break,
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let b64 = b64_encode(js.as_bytes());
+    for (index, chunk) in b64.as_bytes().chunks(6000).enumerate() {
+        let piece = std::str::from_utf8(chunk).unwrap_or("");
+        let arg = if index == 0 {
+            format!("window.__qx='{piece}'")
+        } else {
+            format!("window.__qx+='{piece}'")
+        };
+        let loaded = runner.run_timeout(
+            bin,
+            &["browser".into(), session.into(), "eval".into(), arg],
+            Duration::from_secs(30),
+        );
+        if loaded.map(|output| output.status != 0).unwrap_or(true) {
+            close_quote_session(bin, runner, session);
+            return Err("Could not load the quote check. Post was not clicked.".into());
+        }
+    }
+    let evaluated = runner.run_timeout(
+        bin,
+        &[
+            "browser".into(),
+            session.into(),
+            "eval".into(),
+            "eval(atob(window.__qx))".into(),
+        ],
+        Duration::from_secs(90),
+    );
+    close_quote_session(bin, runner, session);
+    let evaluated = evaluated.map_err(|error| {
+        format!(
+            "Quote check failed. Post was not clicked. {}",
+            sanitize_browser_note(&error)
+        )
+    })?;
+    if evaluated.status != 0 {
+        return Err(format!(
+            "Quote check failed. Post was not clicked. {}",
+            sanitize_browser_note(&evaluated.stderr)
+        ));
+    }
+    let start = evaluated
+        .stdout
+        .find('{')
+        .ok_or_else(|| "Quote page returned no report. Post was not clicked.".to_string())?;
+    let end = evaluated
+        .stdout
+        .rfind('}')
+        .ok_or_else(|| "Quote page returned no report. Post was not clicked.".to_string())?;
+    serde_json::from_str(&evaluated.stdout[start..=end])
+        .map_err(|_| "Quote page report was not readable. Post was not clicked.".to_string())
+}
+
+fn run_quote_attachment(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    target_id: &str,
+    text: &str,
+    inspect: bool,
+) -> Result<crate::publish::QuotePageReport, String> {
+    let page = format!("https://x.com/i/status/{target_id}");
+    let script = crate::publish::quote_page_script(target_id, Some(text), inspect);
+    let value = browser_page_json(bin, runner, QUOTE_SESSION, &page, &script)?;
+    let report = crate::publish::parse_quote_page_report(&value.to_string())?;
+    if inspect {
+        return Ok(report);
+    }
+    if report.clicked_repost_confirm
+        || !report.clicked_post
+        || !report.card
+        || report.quoted_status_id.as_deref() != Some(target_id)
+        || report.message != "Quote tweet posted successfully."
+    {
+        return Err(if report.message.is_empty() {
+            crate::publish::quote_report_line(&report)
+        } else {
+            report.message
+        });
+    }
+    let Some(new_id) = report.new_status_id.as_deref().filter(|id| {
+        !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && *id != target_id
+    }) else {
+        return Err(
+            "Post was clicked once but the sent toast had no new status id. Not marked sent. Nothing was retried."
+                .into(),
+        );
+    };
+    let read_page = format!("https://x.com/i/status/{new_id}");
+    let read_script = crate::publish::quote_read_script(target_id);
+    let read_value = browser_page_json(bin, runner, QUOTE_READ_SESSION, &read_page, &read_script)?;
+    let read = crate::publish::parse_quote_page_report(&read_value.to_string())?;
+    crate::publish::quote_read_confirms(&read, target_id)
+        .map_err(|error| format!("Post was clicked once. {error}"))?;
+    Ok(report)
+}
+
+pub fn inspect_quote_attachment(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    target_id: &str,
+) -> Result<String, String> {
+    let report = run_quote_attachment(bin, runner, target_id, "", true)?;
+    Ok(crate::publish::quote_report_line(&report))
+}
+
 struct OpenCliPublisher {
     bin: String,
     runner: Arc<dyn CommandRunner>,
@@ -1892,11 +2072,11 @@ fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
 
 impl OpenCliPublisher {
     /// `opencli twitter like|unlike|retweet|unretweet <url>` through
-    /// the same silent-background shim as posts/replies. A quote uses
-    /// `twitter quote`, which refuses to click Post unless the quoted
-    /// card for that status is on the composer. A normal post is not
-    /// used as a fallback: appending the status URL does not create
-    /// the quote relation.
+    /// the same silent-background shim as posts/replies. A quote does
+    /// not call `twitter quote` or `twitter post`. Those commands open
+    /// `/compose/post`, which can show a text box with no quote card.
+    /// The quote path opens the status page, uses the Quote menu, and
+    /// clicks Post only after that card links the original id.
     fn engage_opencli(
         &self,
         action: crate::publish::EngageAction,
@@ -1915,32 +2095,33 @@ impl OpenCliPublisher {
             if text.is_empty() {
                 return Err("write your quote first — nothing was posted".into());
             }
-            crate::publish::validate_media_paths(media)?;
-            if media.len() > 1 {
+            if !media.is_empty() {
                 return Err(
-                    "Quotes can attach 1 image (OpenCLI limit) — remove the extra image first. Nothing was posted."
-                        .into(),
+                    "Remove the image before this quote. Nothing was posted.".into(),
                 );
             }
             let target_id = crate::model::post_id_from_input(target_url);
-            let mut args = vec![
-                "twitter".into(),
-                "quote".into(),
-                target_url.into(),
-                text.to_string(),
-            ];
-            if let Some(image) = media.first() {
-                args.push("--image".into());
-                args.push(image.display().to_string());
-            }
-            let args = opencli_json(&args);
-            let output = match self.runner.run_timeout(&self.bin, &args, POST_TIMEOUT) {
-                Ok(output) => output,
+            let report = match run_quote_attachment(
+                &self.bin,
+                self.runner.as_ref(),
+                &target_id,
+                text,
+                false,
+            ) {
+                Ok(report) => report,
                 Err(error) => {
-                    return Err(write_timeout_error(error, "quoting", POST_TIMEOUT));
+                    write_perf_line("engage quote proof=rejected");
+                    return Err(error);
                 }
             };
-            let stdout = check_opencli_output(&output, "opencli quote")?;
+            let stdout = serde_json::json!([{
+                "status": "success",
+                "message": "Quote tweet posted successfully.",
+                "quoted_status_id_str": target_id,
+                "text": text,
+                "id": report.new_status_id,
+            }])
+            .to_string();
             if let Err(error) = crate::publish::prove_quote(&stdout, &target_id) {
                 write_perf_line("engage quote proof=rejected");
                 return Err(error);
@@ -4036,13 +4217,21 @@ mod tests {
         use crate::publish::{GuiWrite, GuiWriteOutcome, GuiWriteRequest, run_gui_write};
         let post_ok = r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#;
         let reply_ok = r#"[{"status":"success","message":"Reply posted successfully."}]"#;
-        let quote_ok = r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"harness quote"}]"#;
         let retweet_ok = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
+        let quote_page = r#"{"stage":"posted","path":"/i/status/2118971448614334959","testid_count":40,"composer":true,"card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":true,"clicked_repost_confirm":false,"text_landed":true,"quoted_status_id":"2118971448614334959","new_status_id":"2119069999999999999","message":"Quote tweet posted successfully."}"#;
+        let quote_read = r#"{"stage":"read","path":"/cryptoXRPwhale/status/2119069999999999999","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
         runner.script("opencli", &["twitter", "post"], post_ok);
         runner.script("opencli", &["twitter", "reply"], reply_ok);
-        runner.script("opencli", &["twitter", "quote"], quote_ok);
         runner.script("opencli", &["twitter", "retweet"], retweet_ok);
+        runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_page);
+        runner.script("opencli", &["browser", "termyx-quote-read", "open"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote-read", "close"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote-read", "eval"], "https://x.com/i/status/2119069999999999999");
+        runner.script("opencli", &["browser", "termyx-quote-read", "eval", "eval(atob(window.__qx))"], quote_read);
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let mut db = ActionDb::default();
         let request = |write| GuiWriteRequest {
@@ -4102,19 +4291,25 @@ mod tests {
             Some(true)
         );
         let calls = runner.calls.lock().unwrap().clone();
-        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert!(calls.len() > 4, "{calls:?}");
         assert_eq!(calls[0].1[1], "post");
         assert_eq!(calls[0].1[2], "harness post");
         assert!(!calls[0].1.iter().any(|arg| arg == "reply"));
         assert_eq!(calls[1].1[1], "reply");
         assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
         assert_eq!(calls[1].1[3], "harness reply");
-        assert_eq!(calls[2].1[1], "quote");
-        assert_eq!(calls[2].1[2], "https://x.com/i/status/2118971448614334959");
-        assert_eq!(calls[2].1[3], "harness quote");
-        assert!(!calls[2].1.iter().any(|arg| arg == "post"));
-        assert_eq!(calls[3].1[1], "retweet");
-        assert!(calls[3].1.iter().any(|arg| arg.contains("2118971448614334959")));
+        assert!(calls.iter().any(|(_, args)| {
+            args.first().map(String::as_str) == Some("browser")
+                && args.iter().any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
+        }));
+        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.get(1).map(String::as_str) == Some("post")
+                && args.iter().any(|arg| arg.contains("harness quote"))
+        }));
+        let retweet = calls.iter().find(|(_, args)| args.get(1).map(String::as_str) == Some("retweet"));
+        assert!(retweet.is_some(), "{calls:?}");
+        assert!(retweet.unwrap().1.iter().any(|arg| arg.contains("2118971448614334959")));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x-action-state.db");
         db.save(&path).unwrap();
@@ -4160,104 +4355,37 @@ mod tests {
     }
 
     #[test]
-    fn quote_uses_the_quote_command_and_rejects_a_plain_post() {
+    fn quote_opens_the_status_menu_and_stops_when_the_card_is_missing() {
         use crate::publish::EngageAction;
-        use std::sync::Mutex as StdMutex;
-        struct RecRunner {
-            calls: StdMutex<Vec<Vec<String>>>,
-            fail: bool,
-        }
-        impl CommandRunner for RecRunner {
-            fn exists(&self, _program: &str) -> bool {
-                true
-            }
-            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
-                self.calls.lock().unwrap().push(args.to_vec());
-                if self.fail {
-                    return Ok(CommandOutput {
-                        status: 0,
-                        stdout: r#"{"ok":false,"error":{"code":"command_exec","message":"Quote target did not render in the composer."}}"#.into(),
-                        stderr: String::new(),
-                    });
-                }
-                Ok(CommandOutput {
-                    status: 0,
-                    stdout: r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"my words"}]"#
-                        .into(),
-                    stderr: String::new(),
-                })
-            }
-        }
-        let rec = Arc::new(RecRunner {
-            calls: StdMutex::new(Vec::new()),
-            fail: false,
-        });
-        let publisher = OpenCliPublisher {
-            bin: "opencli".into(),
-            runner: rec.clone(),
-            post_ok: StdMutex::new(Some(true)),
-        };
-        let url = "https://x.com/jack/status/20";
-        publisher
-            .engage(EngageAction::Quote, url, Some("my words"), &[])
-            .expect("quote command should succeed");
-        let calls = rec.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let args = &calls[0];
-        assert_eq!(args[1], "quote", "quote must use twitter quote: {args:?}");
-        assert_eq!(args[2], url);
-        assert_eq!(args[3], "my words");
-        assert!(!args.iter().any(|arg| arg == "post"), "{args:?}");
-        drop(calls);
-        // A runner that answers the quote verb with a generic post receipt
-        // must not be followed by a second post.
-        struct PlainPost {
-            calls: StdMutex<Vec<Vec<String>>>,
-        }
-        impl CommandRunner for PlainPost {
-            fn exists(&self, _program: &str) -> bool {
-                true
-            }
-            fn run(&self, _program: &str, args: &[String]) -> Result<CommandOutput, String> {
-                self.calls.lock().unwrap().push(args.to_vec());
-                Ok(CommandOutput {
-                    status: 0,
-                    stdout: r#"[{"status":"success","message":"Tweet posted successfully.","id":"2119067545567121679","text":"A token count alone doesn’t tell you whether a position fits your goals."}]"#.into(),
-                    stderr: String::new(),
-                })
-            }
-        }
-        let plain = Arc::new(PlainPost {
-            calls: StdMutex::new(Vec::new()),
-        });
-        let publisher = OpenCliPublisher {
-            bin: "opencli".into(),
-            runner: plain.clone(),
-            post_ok: StdMutex::new(Some(true)),
-        };
+        let missing = r#"{"stage":"composer","path":"/i/status/20","testid_count":12,"composer":true,"card":false,"status_ids":[],"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"text_landed":false,"quoted_status_id":null,"new_status_id":null,"message":"Quote card for 20 was not in the composer. Post was not clicked."}"#;
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
+            missing,
+        );
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let err = publisher
-            .engage(EngageAction::Quote, url, Some("my words"), &[])
+            .engage(
+                EngageAction::Quote,
+                "https://x.com/i/status/20",
+                Some("my words"),
+                &[],
+            )
             .unwrap_err();
-        assert!(err.contains("not a quote"), "{err}");
-        assert!(err.contains("Nothing was retried"), "{err}");
-        let calls = plain.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "no standalone fallback: {calls:?}");
-        assert_eq!(calls[0][1], "quote");
-        drop(calls);
-        // And a failure envelope on a like comes back humanized.
-        let rec2 = Arc::new(RecRunner {
-            calls: StdMutex::new(Vec::new()),
-            fail: true,
-        });
-        let publisher2 = OpenCliPublisher {
-            bin: "opencli".into(),
-            runner: rec2,
-            post_ok: StdMutex::new(Some(true)),
-        };
-        let err = publisher2
-            .engage(EngageAction::Like, url, None, &[])
-            .unwrap_err();
-        assert_eq!(err, "X didn't attach the quoted tweet.");
+        assert!(err.contains("Post was not clicked"), "{err}");
+        assert!(err.contains("not in the composer"), "{err}");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(_, args)| {
+            args.iter().any(|arg| arg == "https://x.com/i/status/20")
+        }));
+        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("post")));
+        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
+        assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
+        let _ = calls;
     }
 
     #[test]

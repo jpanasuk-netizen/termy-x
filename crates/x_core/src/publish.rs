@@ -415,7 +415,7 @@ impl PreparedWrite {
                 self.text
             ),
             PreparedKind::Quote { url, target_id } => format!(
-                "provider {} · twitter quote {url} · original {target_id} · commentary: {}",
+                "provider {} · quote menu on {url} · original {target_id} · commentary: {}",
                 provider.as_str(),
                 self.text
             ),
@@ -733,9 +733,10 @@ fn message_matches(kind: OpenCliWrite, message: &str) -> bool {
     }
 }
 
-/// A quote is confirmed only by OpenCLI's quote command after it has seen
-/// the quoted card. A normal post receipt is not a quote, even when the
-/// text contains the source URL.
+/// A quote is confirmed only when the receipt names the original status.
+/// OpenCLI's `twitter quote` message alone is not enough: that command
+/// opens `/compose/post?url=…`, and a missing card link is reported even
+/// when the composer itself loaded. A normal post receipt is not a quote.
 pub fn prove_quote(stdout: &str, target_id: &str) -> Result<(), String> {
     let target_id = crate::model::post_id_from_input(target_id);
     if target_id.is_empty() || !target_id.chars().all(|ch| ch.is_ascii_digit()) {
@@ -750,12 +751,15 @@ pub fn prove_quote(stdout: &str, target_id: &str) -> Result<(), String> {
         }
     }
     prove_opencli_write(OpenCliWrite::Quote, trimmed, None)?;
-    if let Some(found) = quoted_target_id(trimmed) {
-        if found != target_id {
-            return Err(format!(
-                "Quote names {found}, not {target_id}. Not marked sent. Nothing was retried."
-            ));
-        }
+    let Some(found) = quoted_target_id(trimmed) else {
+        return Err(format!(
+            "Quote of {target_id} was not in the receipt. Not marked sent. Nothing was retried."
+        ));
+    };
+    if found != target_id {
+        return Err(format!(
+            "Quote names {found}, not {target_id}. Not marked sent. Nothing was retried."
+        ));
     }
     if let Some(text) = first_text(trimmed) {
         for id in status_ids_in_text(&text) {
@@ -821,6 +825,287 @@ fn status_ids_in_text(text: &str) -> Vec<String> {
         rest = after;
     }
     ids
+}
+
+/// In-page quote attach. Opens the quote composer from the tweet's repost
+/// menu. Direct `/compose/post?url=` is not used: that page can show the
+/// text box without a quote card, which is the 8:32 CT failure. The script
+/// never clicks `retweetConfirm` or `unretweetConfirm`. Inspect mode never
+/// clicks Post.
+pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: bool) -> String {
+    let id_js = serde_json::to_string(target_id).unwrap_or_else(|_| "\"\"".into());
+    let text_js = if inspect {
+        "null".to_string()
+    } else {
+        commentary
+            .map(|text| serde_json::to_string(text).unwrap_or_else(|_| "null".into()))
+            .unwrap_or_else(|| "null".to_string())
+    };
+    let inspect_js = if inspect { "true" } else { "false" };
+    format!(
+        r#"(async () => {{
+  const TARGET = {id_js};
+  const TEXT = {text_js};
+  const INSPECT = {inspect_js};
+  const statusId = (href) => {{
+    try {{
+      const path = new URL(href, location.origin).pathname;
+      const match = path.match(/\/status\/(\d+)/);
+      return match ? match[1] : null;
+    }} catch (e) {{ return null; }}
+  }};
+  const statusIds = (root) => {{
+    const ids = [];
+    if (!root) return ids;
+    for (const link of root.querySelectorAll('a[href*="/status/"]')) {{
+      const id = statusId(link.href);
+      if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id);
+    }}
+    return ids;
+  }};
+  const hasCard = () => statusIds(document).indexOf(TARGET) >= 0;
+  const report = (stage, message) => {{
+    const button = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
+    return {{
+      stage: stage,
+      path: location.pathname,
+      testid_count: document.querySelectorAll("[data-testid]").length,
+      composer: !!document.querySelector('[data-testid="tweetTextarea_0"]'),
+      card: hasCard(),
+      status_ids: statusIds(document),
+      quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
+      retweet_button: !!document.querySelector('[data-testid="retweet"]'),
+      unretweet_button: !!document.querySelector('[data-testid="unretweet"]'),
+      post_enabled: !!button && !button.disabled && button.getAttribute("aria-disabled") !== "true",
+      text_landed: false,
+      clicked_post: false,
+      clicked_repost_confirm: false,
+      new_status_id: null,
+      quoted_status_id: hasCard() ? TARGET : null,
+      message: message
+    }};
+  }};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  for (let i = 0; i < 20; i++) {{
+    if (document.querySelector("article, [data-testid='primaryColumn']")) break;
+    await sleep(250);
+  }}
+  const articles = Array.from(document.querySelectorAll("article"));
+  const article = articles.find((node) => statusIds(node).indexOf(TARGET) >= 0) || articles[0] || document;
+  const opener = article.querySelector('[data-testid="retweet"], [data-testid="unretweet"]');
+  if (!opener) {{
+    const missing = report("page", "Repost menu button was not on the tweet. Post was not clicked.");
+    return JSON.stringify(missing);
+  }}
+  opener.click();
+  let quoteItem = null;
+  for (let i = 0; i < 20; i++) {{
+    const items = Array.from(document.querySelectorAll("[role='menuitem'], a[href*='compose/post'], [data-testid='quoteTweet']"));
+    quoteItem = items.find((el) => {{
+      const tid = el.getAttribute("data-testid") || "";
+      if (tid === "retweetConfirm" || tid === "unretweetConfirm") return false;
+      if (tid === "quoteTweet") return true;
+      const href = el.getAttribute("href") || "";
+      if (href.indexOf("compose/post") >= 0) return true;
+      return /^quote$/i.test((el.innerText || "").trim());
+    }});
+    if (quoteItem) break;
+    await sleep(250);
+  }}
+  if (!quoteItem) {{
+    return JSON.stringify(report("menu", "Quote menu item did not appear. Post was not clicked."));
+  }}
+  const chosen = quoteItem.getAttribute("data-testid") || "";
+  if (chosen === "retweetConfirm" || chosen === "unretweetConfirm") {{
+    return JSON.stringify(report("menu", "Refused the repost confirm. Post was not clicked."));
+  }}
+  quoteItem.click();
+  let card = false;
+  for (let i = 0; i < 40; i++) {{
+    card = hasCard();
+    if (card && document.querySelector('[data-testid="tweetTextarea_0"]')) break;
+    await sleep(250);
+  }}
+  if (!card) {{
+    return JSON.stringify(report("composer", "Quote card for " + TARGET + " was not in the composer. Post was not clicked."));
+  }}
+  if (INSPECT || TEXT == null) {{
+    const seen = report("inspect", "Inspect only. Post was not clicked.");
+    seen.card = true;
+    seen.quoted_status_id = TARGET;
+    return JSON.stringify(seen);
+  }}
+  const box = document.querySelector('[data-testid="tweetTextarea_0"]');
+  if (!box) {{
+    return JSON.stringify(report("composer", "Quote card is visible but the composer box is not. Post was not clicked."));
+  }}
+  box.focus();
+  if (!document.execCommand("insertText", false, TEXT)) {{
+    const data = new DataTransfer();
+    data.setData("text/plain", TEXT);
+    box.dispatchEvent(new ClipboardEvent("paste", {{ clipboardData: data, bubbles: true, cancelable: true }}));
+  }}
+  await sleep(600);
+  const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const landed = norm(box.innerText || box.textContent || "").indexOf(norm(TEXT)) >= 0;
+  const button = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
+    .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
+  if (!landed || !button || !hasCard()) {{
+    const stuck = report("editor", "Composer did not take the full commentary or Post stayed disabled. Post was not clicked.");
+    stuck.text_landed = landed;
+    stuck.post_enabled = !!button;
+    stuck.card = hasCard();
+    return JSON.stringify(stuck);
+  }}
+  button.click();
+  for (let i = 0; i < 30; i++) {{
+    await sleep(500);
+    const toasts = Array.from(document.querySelectorAll('[role="alert"], [data-testid="toast"]'));
+    const sent = toasts.find((el) => /sent|posted/i.test(el.textContent || ""));
+    if (sent) {{
+      const link = sent.querySelector('a[href*="/status/"]');
+      const done = report("posted", "Quote tweet posted successfully.");
+      done.clicked_post = true;
+      done.card = true;
+      done.text_landed = true;
+      done.quoted_status_id = TARGET;
+      done.new_status_id = link ? statusId(link.href) : null;
+      return JSON.stringify(done);
+    }}
+  }}
+  const unclear = report("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.");
+  unclear.clicked_post = true;
+  return JSON.stringify(unclear);
+}})()"#
+    )
+}
+
+pub fn quote_read_script(target_id: &str) -> String {
+    let id_js = serde_json::to_string(target_id).unwrap_or_else(|_| "\"\"".into());
+    format!(
+        r#"(async () => {{
+  const TARGET = {id_js};
+  const ids = [];
+  for (const link of document.querySelectorAll('a[href*="/status/"]')) {{
+    const match = (link.pathname || new URL(link.href, location.origin).pathname).match(/\/status\/(\d+)/);
+    if (match && ids.indexOf(match[1]) < 0 && ids.length < 8) ids.push(match[1]);
+  }}
+  return JSON.stringify({{
+    stage: "read",
+    path: location.pathname,
+    card: ids.indexOf(TARGET) >= 0,
+    status_ids: ids,
+    quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
+    clicked_post: false,
+    clicked_repost_confirm: false,
+    message: "Read only. Post was not clicked."
+  }});
+}})()"#
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotePageReport {
+    pub stage: String,
+    pub path: String,
+    pub testid_count: u64,
+    pub composer: bool,
+    pub card: bool,
+    pub status_ids: Vec<String>,
+    pub quote_testids: u64,
+    pub clicked_post: bool,
+    pub clicked_repost_confirm: bool,
+    pub text_landed: bool,
+    pub quoted_status_id: Option<String>,
+    pub new_status_id: Option<String>,
+    pub message: String,
+}
+
+pub fn parse_quote_page_report(stdout: &str) -> Result<QuotePageReport, String> {
+    let start = stdout
+        .find('{')
+        .ok_or_else(|| "Quote page returned no report. Post was not retried.".to_string())?;
+    let end = stdout
+        .rfind('}')
+        .ok_or_else(|| "Quote page returned no report. Post was not retried.".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&stdout[start..=end])
+        .map_err(|_| "Quote page report was not readable. Post was not retried.".to_string())?;
+    let text = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let ids = value
+        .get("status_ids")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(QuotePageReport {
+        stage: text("stage"),
+        path: text("path"),
+        testid_count: value.get("testid_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        composer: flag("composer"),
+        card: flag("card"),
+        status_ids: ids,
+        quote_testids: value
+            .get("quote_testids")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        clicked_post: flag("clicked_post"),
+        clicked_repost_confirm: flag("clicked_repost_confirm"),
+        text_landed: flag("text_landed"),
+        quoted_status_id: value
+            .get("quoted_status_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        new_status_id: value
+            .get("new_status_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        message: text("message"),
+    })
+}
+
+pub fn quote_report_line(report: &QuotePageReport) -> String {
+    let ids = if report.status_ids.is_empty() {
+        "none".to_string()
+    } else {
+        report.status_ids.join(",")
+    };
+    format!(
+        "stage {} · path {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · {}",
+        report.stage,
+        if report.path.is_empty() { "-" } else { &report.path },
+        if report.card { "yes" } else { "no" },
+        if report.composer { "yes" } else { "no" },
+        ids,
+        report.quote_testids,
+        report.testid_count,
+        if report.clicked_post { "yes" } else { "no" },
+        report.message
+    )
+}
+
+/// The posted status page must itself link the original. A composer toast
+/// is not that relation.
+pub fn quote_read_confirms(report: &QuotePageReport, target_id: &str) -> Result<(), String> {
+    let target_id = crate::model::post_id_from_input(target_id);
+    if report.clicked_post || report.clicked_repost_confirm {
+        return Err("The quote check tried to post. Not marked sent. Nothing was retried.".into());
+    }
+    if report.card && report.status_ids.iter().any(|id| id == &target_id) {
+        return Ok(());
+    }
+    Err(format!(
+        "The new status did not show a quote of {target_id}. Not marked sent. Nothing was retried."
+    ))
 }
 
 impl EngageAction {
@@ -1606,7 +1891,7 @@ mod tests {
                 if action == EngageAction::Retweet {
                     Ok(r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into())
                 } else {
-                    Ok(r#"[{"status":"success","message":"Quote tweet posted successfully.","text":"my words"}]"#.into())
+                    Ok(r#"[{"status":"success","message":"Quote tweet posted successfully.","quoted_status_id_str":"2118971448614334959","text":"my words"}]"#.into())
                 }
             }
         }
@@ -1797,8 +2082,36 @@ mod tests {
         let command_receipt = format!(
             "[{{\"status\":\"success\",\"message\":\"Quote tweet posted successfully.\",\"text\":\"{commentary}\"}}]"
         );
-        assert!(prove_quote(&command_receipt, original).is_ok());
+        let err = prove_quote(&command_receipt, original).unwrap_err();
+        assert!(err.contains("not in the receipt"), "{err}");
         assert!(prove_quote(r#"{"ok":true,"id":"2119067545567121679"}"#, original).is_err());
+    }
+
+    #[test]
+    fn quote_inspect_script_does_not_click_post_or_repost_confirm() {
+        let original = "2118971448614334959";
+        let inspect = quote_page_script(original, Some("words"), true);
+        let write = quote_page_script(original, Some("words"), false);
+        assert!(inspect.contains("const INSPECT = true"));
+        assert!(write.contains("const INSPECT = false"));
+        let inspect_stop = inspect.find("Inspect only").expect("inspect return");
+        let post_click = inspect.find("button.click()").expect("post click");
+        assert!(inspect_stop < post_click);
+        assert!(!inspect.contains("retweetConfirm'].click"));
+        assert!(!write.contains("retweetConfirm'].click"));
+        assert!(inspect.contains(r"\/status\/"));
+        assert!(inspect.contains(r"(\d+)"));
+        assert!(!inspect.contains("/i/api/"));
+        assert!(!write.contains("twitter post"));
+        let missing = r#"{"stage":"composer","path":"/i/status/2118971448614334959","testid_count":12,"composer":true,"card":false,"status_ids":[],"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"message":"Quote card for 2118971448614334959 was not in the composer. Post was not clicked."}"#;
+        let report = parse_quote_page_report(missing).unwrap();
+        assert!(!report.clicked_post);
+        assert!(!report.card);
+        assert!(quote_report_line(&report).contains("Post was not clicked"));
+        let read = r#"{"stage":"read","path":"/user/status/99","card":false,"status_ids":["99"],"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
+        assert!(quote_read_confirms(&parse_quote_page_report(read).unwrap(), original).is_err());
+        let linked = r#"{"stage":"read","path":"/user/status/99","card":true,"status_ids":["2118971448614334959"],"clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
+        assert!(quote_read_confirms(&parse_quote_page_report(linked).unwrap(), original).is_ok());
     }
 
     #[test]
