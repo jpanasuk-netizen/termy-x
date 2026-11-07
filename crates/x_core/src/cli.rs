@@ -1469,8 +1469,9 @@ fn inspect_quote(target: &str, io: &CliIo) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("quote inspect failed — Post was not clicked");
-            eprintln!("{error}");
+            println!("quote inspect — Post was not clicked");
+            println!("{error}");
+            eprintln!("quote inspect not ready — Post was not clicked");
             1
         }
     }

@@ -1003,6 +1003,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     if (/replying to/i.test(text)) return "reply";
     return "unknown";
   }};
+  let picked = {{ tag: "", testid: "", label: "", href_kind: "none", scope: "none" }};
   const report = (stage, message) => {{
     const button = document.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
     const attached = quoteAttachment();
@@ -1023,6 +1024,11 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
       clicked_repost_confirm: false,
       new_status_id: null,
       quoted_status_id: attached ? TARGET : null,
+      selected_tag: picked.tag,
+      selected_testid: picked.testid,
+      selected_label: picked.label,
+      selected_href_kind: picked.href_kind,
+      selected_scope: picked.scope,
       message: message
     }};
   }};
@@ -1040,13 +1046,16 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   }}
   opener.click();
   let quoteItem = null;
+  let menu = null;
   for (let i = 0; i < 20; i++) {{
-    const items = Array.from(document.querySelectorAll("[role='menuitem'], [data-testid='quoteTweet']"));
+    menu = document.querySelector('[role="menu"], [data-testid="Dropdown"]');
+    const root = menu || null;
+    const items = root ? Array.from(root.querySelectorAll('[role="menuitem"]')) : [];
     quoteItem = items.find((el) => {{
       const tid = el.getAttribute("data-testid") || "";
       if (tid === "retweetConfirm" || tid === "unretweetConfirm" || tid === "reply") return false;
-      if (tid === "quoteTweet" && (el.getAttribute("role") === "menuitem" || (el.innerText || "").trim().length < 40)) return true;
-      return /^quote$/i.test((el.innerText || "").trim());
+      const label = (el.innerText || "").trim().split("\\n")[0].trim();
+      return /^quote$/i.test(label);
     }});
     if (quoteItem) break;
     await sleep(250);
@@ -1054,9 +1063,23 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   if (!quoteItem) {{
     return finish(report("menu", "Quote menu item did not appear. Post was not clicked."));
   }}
-  const chosen = quoteItem.getAttribute("data-testid") || "";
-  if (chosen === "retweetConfirm" || chosen === "unretweetConfirm") {{
+  const href = quoteItem.getAttribute("href") || "";
+  let hrefKind = "none";
+  if (href.indexOf("in_reply_to") >= 0) hrefKind = "reply";
+  else if (href.indexOf("url=") >= 0) hrefKind = "quote-url";
+  else if (href) hrefKind = "other";
+  picked = {{
+    tag: quoteItem.tagName || "",
+    testid: quoteItem.getAttribute("data-testid") || "",
+    label: (quoteItem.innerText || "").trim().split("\\n")[0].trim().slice(0, 24),
+    href_kind: hrefKind,
+    scope: menu ? "menu" : "page"
+  }};
+  if (picked.testid === "retweetConfirm" || picked.testid === "unretweetConfirm" || hrefKind === "reply") {{
     return finish(report("menu", "Refused the repost confirm. Post was not clicked."));
+  }}
+  if (quoteItem.tagName === "A") {{
+    quoteItem.addEventListener("click", (event) => event.preventDefault(), true);
   }}
   quoteItem.click();
   let attached = false;
@@ -1067,9 +1090,10 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   }}
   if (!attached) {{
     const kind = composerKind();
-    const why = kind === "reply"
-      ? "Reply composer is open, not a quote of " + TARGET + ". Post was not clicked."
-      : "No quote attachment for " + TARGET + ". Post was not clicked.";
+    const why = (kind === "reply"
+      ? "Reply composer is open, not a quote of " + TARGET + "."
+      : "No quote attachment for " + TARGET + ".")
+      + " Selected " + picked.scope + " " + (picked.label || "-") + " " + picked.href_kind + ". Post was not clicked.";
     return finish(report(kind === "reply" ? "reply" : "composer", why));
   }}
   if (INSPECT || TEXT == null) {{
@@ -1199,6 +1223,10 @@ pub struct QuotePageReport {
     pub text_landed: bool,
     pub quoted_status_id: Option<String>,
     pub new_status_id: Option<String>,
+    pub selected_label: String,
+    pub selected_testid: String,
+    pub selected_href_kind: String,
+    pub selected_scope: String,
     pub message: String,
 }
 
@@ -1349,6 +1377,10 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
             .get("new_status_id")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
+        selected_label: text("selected_label"),
+        selected_testid: text("selected_testid"),
+        selected_href_kind: text("selected_href_kind"),
+        selected_scope: text("selected_scope"),
         message: text("message"),
     }
 }
@@ -1360,7 +1392,7 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         report.status_ids.join(",")
     };
     format!(
-        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · {}",
+        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · {}",
         report.stage,
         if report.path.is_empty() { "-" } else { &report.path },
         if report.composer_kind.is_empty() { "-" } else { &report.composer_kind },
@@ -1370,8 +1402,23 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         report.quote_testids,
         report.testid_count,
         if report.clicked_post { "yes" } else { "no" },
+        if report.selected_scope.is_empty() { "-" } else { &report.selected_scope },
+        if report.selected_label.is_empty() { "-" } else { &report.selected_label },
+        if report.selected_testid.is_empty() { "-" } else { &report.selected_testid },
+        if report.selected_href_kind.is_empty() { "-" } else { &report.selected_href_kind },
         report.message
     )
+}
+
+/// Post is allowed only for a quote attachment of this exact status.
+/// A reply composer that merely links the original is not enough.
+pub fn quote_inspect_ready(report: &QuotePageReport) -> bool {
+    report.composer_kind == "quote"
+        && report.card
+        && report.quote_testids > 0
+        && report.quoted_status_id.is_some()
+        && !report.clicked_post
+        && !report.clicked_repost_confirm
 }
 
 /// Post is allowed only for a quote attachment of this exact status.
@@ -2499,15 +2546,25 @@ mod tests {
         assert!(note.contains("a reply"), "{note}");
         assert!(note.contains("not a quote"), "{note}");
         let false_card = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"unknown","quote_testids":0,"status_ids":["2118971448614334959"],"testid_count":69,"clicked_post":false,"text_landed":true,"quoted_status_id":"2118971448614334959","message":"Inspect only. Post was not clicked."}"#;
-        assert!(!quote_post_allowed(&parse_quote_page_report(false_card).unwrap(), original));
+        assert!(!quote_inspect_ready(&parse_quote_page_report(false_card).unwrap()));
+        let live = r#"{"stage":"composer","path":"/compose/post","composer_kind":"unknown","composer":true,"card":false,"status_ids":["2118971448614334959"],"quote_testids":0,"testid_count":70,"clicked_post":false,"selected_scope":"menu","selected_label":"Quote","selected_href_kind":"quote-url","message":"No quote attachment. Post was not clicked."}"#;
+        let live_report = parse_quote_page_report(live).unwrap();
+        assert!(!quote_inspect_ready(&live_report));
+        assert!(!quote_post_allowed(&live_report, original));
+        let live_line = quote_report_line(&live_report);
+        assert!(live_line.contains("quote-url"), "{live_line}");
+        assert!(live_line.contains("menu"), "{live_line}");
+        let script = quote_page_script(original, Some("doesn’t"), false);
         let real = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"quote","quote_testids":1,"quoted_status_id":"2118971448614334959","text_landed":true,"clicked_repost_confirm":false,"message":"Inspect only. Post was not clicked."}"#;
         assert!(quote_post_allowed(&parse_quote_page_report(real).unwrap(), original));
-        let script = quote_page_script(original, Some("doesn’t"), false);
+        assert!(quote_inspect_ready(&parse_quote_page_report(real).unwrap()));
         assert!(script.is_ascii(), "quote script must stay ASCII so atob cannot mojibake");
         assert!(script.contains("\\u2019"), "{script}");
         assert!(!script.contains("compose/post"));
         assert!(!script.contains("seen.card = true"));
         assert!(script.contains("quoteTweet"));
+        assert!(script.contains("preventDefault"));
+        assert!(script.contains("[role=\"menu\"]"));
     }
 
     #[test]

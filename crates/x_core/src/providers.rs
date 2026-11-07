@@ -1954,7 +1954,12 @@ pub fn inspect_quote_attachment(
     target_id: &str,
 ) -> Result<String, String> {
     let report = run_quote_attachment(bin, runner, target_id, "", true)?;
-    Ok(crate::publish::quote_report_line(&report))
+    let line = crate::publish::quote_report_line(&report);
+    if crate::publish::quote_inspect_ready(&report) {
+        Ok(line)
+    } else {
+        Err(line)
+    }
 }
 
 struct OpenCliPublisher {
