@@ -355,7 +355,10 @@ unsafe fn read_one_video_sample(url: &str) -> Result<image::RgbaImage, String> {
     let mut wide: Vec<u16> = url.encode_utf16().collect();
     wide.push(0);
     let reader = unsafe {
-        MFCreateSourceReaderFromURL(windows::core::PCWSTR(wide.as_ptr()), None::<IMFAttributes>)
+        MFCreateSourceReaderFromURL(
+            windows::core::PCWSTR(wide.as_ptr()),
+            None::<&IMFAttributes>,
+        )
     }
     .map_err(|_| "preview source did not open".to_string())?;
     let all = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
