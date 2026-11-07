@@ -387,9 +387,9 @@ pub fn follow_click_status(click: &FollowClick) -> String {
 
 /// The sentence on the card. The Follow button itself does not become this.
 pub fn follow_confirm_prompt(handle: &str, follow: bool) -> String {
-    let verb = if follow { "Follow" } else { "Unfollow" };
+    let verb = if follow { "follow" } else { "unfollow" };
     let handle = handle.trim().trim_start_matches('@');
-    format!("{verb} @{handle}?")
+    format!("Do you want to {verb} @{handle}")
 }
 
 /// The confirm buttons belong on the card that was clicked, not at the
@@ -423,9 +423,19 @@ pub fn follow_step(
 /// Gap between rolling follow dots. Long enough that the redraw is not a spin.
 pub const FOLLOW_DOT_MS: u64 = 400;
 
-/// The dots keep moving only while this follow write is still the one in flight.
-pub fn follow_dots_keep_going(seq_matches: bool, pending: bool) -> bool {
-    seq_matches && pending
+/// Dots run from the first click through the confirm panel and the request.
+/// They stop when neither is active, or when a newer animation replaced this one.
+pub fn follow_dots_keep_going(seq_matches: bool, awaiting_confirm: bool, pending: bool) -> bool {
+    seq_matches && (awaiting_confirm || pending)
+}
+
+/// Neutral dots while the confirm panel is up. This is not a sent request.
+pub fn follow_wait_label(frame: u32) -> &'static str {
+    match frame % 3 {
+        0 => ".",
+        1 => "..",
+        _ => "...",
+    }
 }
 
 /// One frame of the rolling dots. Frame 3 matches frame 0.
@@ -441,19 +451,31 @@ pub fn follow_pending_label(following: bool, frame: u32) -> &'static str {
 }
 
 /// Action on the button. Someone you follow gets Unfollow. Followed is
-/// the success note, not this label. `frame` rolls the dots only while
-/// a confirmed request is in flight.
+/// the success note, not this label. While the confirm panel is open the
+/// button is only rolling dots. After Confirm those dots become Following
+/// or Unfollowing without starting again at the first dot.
 pub fn follow_button_label(
     viewer_following: Option<bool>,
     pending: Option<bool>,
+    awaiting_confirm: bool,
     frame: u32,
 ) -> &'static str {
     match pending {
         Some(target) => follow_pending_label(target, frame),
+        None if awaiting_confirm => follow_wait_label(frame),
         None => match viewer_following {
             Some(true) => "Unfollow",
             _ => "Follow",
         },
+    }
+}
+
+/// Beside the dots while Confirm and Cancel are showing. Not a sent request.
+pub fn follow_awaiting_note(awaiting_confirm: bool, pending: bool) -> Option<&'static str> {
+    if awaiting_confirm && !pending {
+        Some("Awaiting confirmation")
+    } else {
+        None
     }
 }
 
@@ -709,8 +731,10 @@ pub struct XPanel {
     follow_overrides: std::collections::HashMap<String, bool>,
     /// Generation of the follow write currently in flight.
     follow_seq: u64,
-    /// Which rolling-dot frame the in-flight Follow button is on.
+    /// Which rolling-dot frame the Follow button is on.
     follow_dots: u32,
+    /// Generation of the dot animation, from the first click until it ends.
+    follow_anim_seq: u64,
     /// Per-tweet generation for an in-flight like or repost.
     engage_seq: std::collections::HashMap<String, u64>,
     action_db: termy_x::action_state::ActionDb,
@@ -1103,6 +1127,7 @@ impl XPanel {
             follow_overrides: std::collections::HashMap::new(),
             follow_seq: 0,
             follow_dots: 0,
+            follow_anim_seq: 0,
             engage_seq: std::collections::HashMap::new(),
             action_db,
             action_seq: 0,
@@ -4391,7 +4416,8 @@ impl XPanel {
                 let keep_going = cx.update(|cx| {
                     this.update(cx, |panel, cx| {
                         let keep = follow_dots_keep_going(
-                            panel.follow_seq == seq,
+                            panel.follow_anim_seq == seq,
+                            panel.follow_ask.is_some(),
                             panel.follow_pending.is_some(),
                         );
                         if keep {
@@ -4800,7 +4826,14 @@ impl XPanel {
             }
             FollowClick::Confirm { handle, follow } => {
                 self.notice = None;
+                let already =
+                    self.follow_ask.is_some() || self.follow_pending.is_some();
                 self.follow_ask = Some((handle, follow));
+                if !already {
+                    self.follow_anim_seq = self.follow_anim_seq.wrapping_add(1);
+                    self.follow_dots = 0;
+                    self.spawn_follow_dots(cx, self.follow_anim_seq);
+                }
             }
         }
         cx.notify();
@@ -4830,9 +4863,7 @@ impl XPanel {
             now,
         );
         self.follow_seq = seq;
-        self.follow_dots = 0;
         self.follow_pending = Some((handle.clone(), target));
-        self.spawn_follow_dots(cx, seq);
         cx.notify();
         let handle_for_call = handle.clone();
         let live = self.live;
@@ -8452,7 +8483,11 @@ impl XPanel {
                         .eq_ignore_ascii_case(termy_x::model::strip_handle(&profile.handle))
                 })
                 .map(|(_, target)| *target);
-            let label = follow_button_label(viewer, pending, self.follow_dots);
+            let asking = follow_confirm_on_card(
+                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+                &profile.handle,
+            );
+            let label = follow_button_label(viewer, pending, asking, self.follow_dots);
             let click_handle = profile.handle.clone();
             card_el = card_el.child(
                 div()
@@ -8473,11 +8508,17 @@ impl XPanel {
                                     cx.stop_propagation();
                                 })
                             ))
-                            .children(follow_saved_mark(
+                            .children(follow_awaiting_note(asking, pending.is_some()).map(|note| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(note)
+                            }))
+                            .children((!asking).then(|| follow_saved_mark(
                                 viewer == Some(true),
                                 saved,
                                 pending.is_some(),
-                            ).map(|mark| {
+                            )).flatten().map(|mark| {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(rgb(0x8e8e93))
@@ -9788,9 +9829,13 @@ impl XPanel {
                 })
             ));
         if show_follow {
+            let asking = follow_confirm_on_card(
+                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+                &post.author_handle,
+            );
             row = row.child(x_action!(
                 format!("x-follow-{scope}-{}", post.id),
-                follow_button_label(follow_value, follow_pending, self.follow_dots),
+                follow_button_label(follow_value, follow_pending, asking, self.follow_dots),
                 follow_value == Some(true),
                 cx.listener(move |this, _, _, cx| {
                     this.request_follow(&follow_handle, cx);
@@ -9798,11 +9843,21 @@ impl XPanel {
                     cx.notify();
                 })
             ));
-            if let Some(mark) = follow_saved_mark(
-                follow_value == Some(true),
-                follow_saved,
-                follow_pending.is_some(),
-            ) {
+            if let Some(note) = follow_awaiting_note(asking, follow_pending.is_some()) {
+                row = row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8e8e93))
+                        .child(note),
+                );
+            }
+            if !asking
+                && let Some(mark) = follow_saved_mark(
+                    follow_value == Some(true),
+                    follow_saved,
+                    follow_pending.is_some(),
+                )
+            {
                 row = row.child(
                     div()
                         .text_size(px(11.0))
@@ -11489,9 +11544,9 @@ mod edit_keys_tests {
     use super::{
         BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
         FollowClick, FOLLOW_DOT_MS, XSection, burst_style_at, caret_visual_line, fetch_section,
-        follow_button_label, follow_click, follow_click_status, follow_confirm_on_card,
-        follow_confirm_prompt,
-        follow_dots_keep_going, follow_pending_label, follow_saved_mark, follow_step, is_own_profile,
+        follow_awaiting_note, follow_button_label, follow_click, follow_click_status,
+        follow_confirm_on_card, follow_confirm_prompt, follow_dots_keep_going, follow_pending_label,
+        follow_saved_mark, follow_step, follow_wait_label, is_own_profile,
         like_button_label,
         soft_wrap_ranges,
     };
@@ -11500,10 +11555,10 @@ mod edit_keys_tests {
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
         // Payload silent: honest Follow (no invented Following state).
-        assert_eq!(follow_button_label(None, None, 1), "Follow");
-        assert_eq!(follow_button_label(Some(false), None, 2), "Follow");
-        assert_eq!(follow_button_label(Some(true), None, 2), "Unfollow");
-        assert_eq!(follow_button_label(Some(true), None, 0), "Unfollow");
+        assert_eq!(follow_button_label(None, None, false, 1), "Follow");
+        assert_eq!(follow_button_label(Some(false), None, false, 2), "Follow");
+        assert_eq!(follow_button_label(Some(true), None, false, 2), "Unfollow");
+        assert_eq!(follow_button_label(Some(true), None, false, 0), "Unfollow");
         assert_eq!(follow_saved_mark(true, true, false), Some("saved"));
         assert_eq!(follow_saved_mark(true, false, false), None);
         assert_eq!(follow_saved_mark(true, true, true), None);
@@ -11511,8 +11566,8 @@ mod edit_keys_tests {
         assert_eq!(like_button_label(true, true, true), "\u{2026}");
         assert_eq!(like_button_label(true, false, false), "Liked");
         // In flight: progress label wins; the click guard ignores clicks.
-        assert_eq!(follow_button_label(None, Some(true), 1), "Following..");
-        assert_eq!(follow_button_label(Some(true), Some(false), 0), "Unfollowing.");
+        assert_eq!(follow_button_label(None, Some(true), false, 1), "Following..");
+        assert_eq!(follow_button_label(Some(true), Some(false), false, 0), "Unfollowing.");
     }
 
     #[test]
@@ -11523,14 +11578,21 @@ mod edit_keys_tests {
         assert_eq!(follow_pending_label(true, 3), "Following.");
         assert_ne!(follow_pending_label(true, 0), follow_pending_label(true, 1));
         assert_eq!(follow_pending_label(false, 2), "Unfollowing...");
-        assert_eq!(follow_button_label(Some(true), None, 2), "Unfollow");
+        assert_eq!(follow_button_label(Some(true), None, false, 2), "Unfollow");
+        assert_eq!(follow_wait_label(2), "...");
+        assert_eq!(follow_pending_label(true, 2), "Following...");
+        assert_eq!(follow_button_label(None, None, true, 2), "...");
+        assert_eq!(follow_button_label(None, Some(true), true, 2), "Following...");
+        assert_eq!(follow_awaiting_note(true, false), Some("Awaiting confirmation"));
+        assert_eq!(follow_awaiting_note(true, true), None);
+        assert!(follow_dots_keep_going(true, true, false));
+        assert!(follow_dots_keep_going(true, false, true));
+        assert!(!follow_dots_keep_going(true, false, false));
+        assert!(!follow_dots_keep_going(false, true, true));
         assert_eq!(
             termy_x::publish::follow_burst_label(true),
             "\u{2713} Followed"
         );
-        assert!(follow_dots_keep_going(true, true));
-        assert!(!follow_dots_keep_going(true, false));
-        assert!(!follow_dots_keep_going(false, true));
         assert!(FOLLOW_DOT_MS >= 200 && FOLLOW_DOT_MS <= 1000);
     }
 
@@ -11545,11 +11607,16 @@ mod edit_keys_tests {
             }
         );
         let status = follow_click_status(&ask);
-        assert_eq!(follow_confirm_prompt("Jack", true), "Follow @Jack?");
-        assert_eq!(follow_confirm_prompt("@Jack", false), "Unfollow @Jack?");
-        assert!(!follow_button_label(Some(false), None, 0).contains('?'));
-        assert!(!follow_button_label(Some(true), None, 0).contains('?'));
-        assert!(status.contains("Follow @Jack?"));
+        assert_eq!(follow_confirm_prompt("Jack", true), "Do you want to follow @Jack");
+        assert_eq!(
+            follow_confirm_prompt("@Jack", false),
+            "Do you want to unfollow @Jack"
+        );
+        assert!(!follow_confirm_prompt("Jack", true).contains('?'));
+        assert!(!follow_button_label(Some(false), None, false, 0).contains('?'));
+        assert!(!follow_button_label(Some(true), None, false, 0).contains('?'));
+        assert!(!follow_button_label(None, None, true, 1).contains('?'));
+        assert!(status.contains("Do you want to follow @Jack"));
         assert!(status.contains("Press Confirm"));
         assert!(status.contains("Nothing is sent"));
         assert!(follow_confirm_on_card(Some("Jack"), "jack"));
