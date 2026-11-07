@@ -958,8 +958,12 @@ fn status_ids_in_text(text: &str) -> Vec<String> {
 /// In-page quote attach. Opens the quote composer from the tweet's repost
 /// menu. Direct `/compose/post?url=` is not used: that page can show the
 /// text box without a quote card, which is the 8:32 CT failure. The script
-/// never clicks `retweetConfirm` or `unretweetConfirm`. Inspect mode never
-/// clicks Post.
+/// opens the repost menu and records the Quote row. It does not click that
+/// row: a capture-phase preventDefault left the page unchanged, and an
+/// untrusted click on the bare `/compose/post` anchor navigates without the
+/// quote id. The native click is `opencli browser click --role menuitem
+/// --name Quote`. This script never clicks `retweetConfirm`,
+/// `unretweetConfirm`, or Post.
 pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: bool) -> String {
     let id_js = js_ascii_string(target_id);
     let text_js = if inspect {
@@ -1114,68 +1118,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   if (picked.testid === "retweetConfirm" || picked.testid === "unretweetConfirm" || href.indexOf("in_reply_to") >= 0) {{
     return finish(report("menu", "Refused the repost confirm. Post was not clicked."));
   }}
-  if (quoteItem.tagName === "A") {{
-    quoteItem.addEventListener("click", (event) => event.preventDefault(), true);
-  }}
-  quoteItem.click();
-  let attached = false;
-  for (let i = 0; i < 40; i++) {{
-    attached = quoteAttachment();
-    if (attached && document.querySelector('[data-testid="tweetTextarea_0"]')) break;
-    await sleep(250);
-  }}
-  if (!attached) {{
-    const kind = composerKind();
-    const why = (kind === "reply"
-      ? "Reply composer is open, not a quote of " + TARGET + "."
-      : "No quote attachment for " + TARGET + ".")
-      + " Selected " + picked.scope + " " + (picked.label || "-") + " " + picked.href_kind + ". Post was not clicked.";
-    return finish(report(kind === "reply" ? "reply" : "composer", why));
-  }}
-  if (INSPECT || TEXT == null) {{
-    return finish(report("inspect", "Inspect only. Post was not clicked."));
-  }}
-  const box = document.querySelector('[data-testid="tweetTextarea_0"]');
-  if (!box) {{
-    return finish(report("composer", "Quote attachment is visible but the composer box is not. Post was not clicked."));
-  }}
-  box.focus();
-  if (!document.execCommand("insertText", false, TEXT)) {{
-    const data = new DataTransfer();
-    data.setData("text/plain", TEXT);
-    box.dispatchEvent(new ClipboardEvent("paste", {{ clipboardData: data, bubbles: true, cancelable: true }}));
-  }}
-  await sleep(600);
-  const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-  const landed = norm(box.innerText || box.textContent || "").indexOf(norm(TEXT)) >= 0;
-  const button = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
-    .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
-  if (!landed || !button || !quoteAttachment() || composerKind() !== "quote") {{
-    const stuck = report("editor", "Quote attachment, commentary, or Post button was not proven. Post was not clicked.");
-    stuck.text_landed = landed;
-    stuck.post_enabled = !!button;
-    stuck.card = quoteAttachment();
-    return finish(stuck);
-  }}
-  button.click();
-  for (let i = 0; i < 30; i++) {{
-    await sleep(500);
-    const toasts = Array.from(document.querySelectorAll('[role="alert"], [data-testid="toast"]'));
-    const sent = toasts.find((el) => /sent|posted/i.test(el.textContent || ""));
-    if (sent) {{
-      const link = sent.querySelector('a[href*="/status/"]');
-      const done = report("posted", "Quote tweet posted successfully.");
-      done.clicked_post = true;
-      done.card = quoteAttachment();
-      done.text_landed = true;
-      done.quoted_status_id = quoteAttachment() ? TARGET : null;
-      done.new_status_id = link ? statusId(link.href) : null;
-      return finish(done);
-    }}
-  }}
-  const unclear = report("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.");
-  unclear.clicked_post = true;
-  return finish(unclear);
+  return finish(report("menu", "Quote row recorded. Post was not clicked."));
 }})()"#
     )
 }
@@ -1241,6 +1184,115 @@ fn js_ascii_string(text: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// OpenCLI 2.0 trusted click. `--name Quote` is the accessible name of the
+/// menu row. It is not `unretweetConfirm` and it is not Post.
+pub fn quote_native_click_args(cli: BrowserCli, session: &str) -> Vec<String> {
+    let mut args = vec!["browser".to_string()];
+    if !cli.session_flag {
+        args.push(session.to_string());
+    }
+    args.push("click".into());
+    args.push("--role".into());
+    args.push("menuitem".into());
+    args.push("--name".into());
+    args.push("Quote".into());
+    if cli.session_flag {
+        args.push("--session".into());
+        args.push(session.to_string());
+    }
+    args
+}
+
+/// Types the commentary and clicks Post once. Runs only after a snap has
+/// already shown a quoteTweet that links the target. Refuses otherwise.
+pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
+    let id_js = js_ascii_string(target_id);
+    let text_js = js_ascii_string(commentary);
+    format!(
+        r#"(async () => {{
+  const TARGET = {id_js};
+  const TEXT = {text_js};
+  window.__qxReport = null;
+  const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
+  const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
+  const quoteAttachment = () => {{
+    const node = document.querySelector('[data-testid="quoteTweet"]');
+    if (!node) return false;
+    for (const link of node.querySelectorAll('a[href*="/status/"]')) {{ if (statusId(link.href) === TARGET) return true; }}
+    return false;
+  }};
+  const base = (stage, message, clicked) => ({{
+    stage: stage, path: location.pathname, composer: !!document.querySelector('[data-testid="tweetTextarea_0"]'),
+    composer_kind: quoteAttachment() ? "quote" : "unknown", card: quoteAttachment(),
+    quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
+    clicked_post: clicked, clicked_repost_confirm: false, text_landed: false,
+    quoted_status_id: quoteAttachment() ? TARGET : null, message: message
+  }});
+  if (!quoteAttachment()) {{
+    return finish(base("composer", "No quote attachment for " + TARGET + ". Post was not clicked.", false));
+  }}
+  const box = document.querySelector('[data-testid="tweetTextarea_0"]');
+  if (!box) {{
+    return finish(base("composer", "Quote attachment is visible but the composer box is not. Post was not clicked.", false));
+  }}
+  box.focus();
+  if (!document.execCommand("insertText", false, TEXT)) {{
+    const data = new DataTransfer();
+    data.setData("text/plain", TEXT);
+    box.dispatchEvent(new ClipboardEvent("paste", {{ clipboardData: data, bubbles: true, cancelable: true }}));
+  }}
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const landed = norm(box.innerText || box.textContent || "").indexOf(norm(TEXT)) >= 0;
+  const button = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
+    .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
+  if (!landed || !button || !quoteAttachment()) {{
+    const stuck = base("editor", "Quote attachment, commentary, or Post button was not proven. Post was not clicked.", false);
+    stuck.text_landed = landed;
+    return finish(stuck);
+  }}
+  button.click();
+  for (let i = 0; i < 30; i++) {{
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const toasts = Array.from(document.querySelectorAll('[role="alert"], [data-testid="toast"]'));
+    const sent = toasts.find((el) => /sent|posted/i.test(el.textContent || ""));
+    if (sent) {{
+      const link = sent.querySelector('a[href*="/status/"]');
+      const done = base("posted", "Quote tweet posted successfully.", true);
+      done.text_landed = true;
+      done.new_status_id = link ? statusId(link.href) : null;
+      return finish(done);
+    }}
+  }}
+  const unclear = base("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.", true);
+  return finish(unclear);
+}})()"#
+    )
+}
+
+/// Read-only snapshot after the native Quote click. No clicks.
+pub fn quote_snap_script(target_id: &str) -> String {
+    let id_js = js_ascii_string(target_id);
+    format!(
+        r#"( () => {{ const TERMY_QUOTE_SNAP = 1; const TARGET = {id_js};
+  const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
+  const ids = [];
+  for (const link of document.querySelectorAll('a[href*="/status/"]')) {{ const id = statusId(link.href); if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id); }}
+  const quoteNode = document.querySelector('[data-testid="quoteTweet"]');
+  let attached = false;
+  if (quoteNode) {{ for (const link of quoteNode.querySelectorAll('a[href*="/status/"]')) {{ if (statusId(link.href) === TARGET) attached = true; }} }}
+  const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
+  let place = "none";
+  if (boxes.length) {{ const box = boxes[boxes.length - 1]; if (box.closest('[role="dialog"], [aria-modal="true"]')) place = "dialog"; else if (box.closest("article")) place = "article"; else place = "page"; }}
+  const replying = /replying to/i.test((document.body && document.body.innerText || "").slice(0, 2500));
+  const kind = attached ? "quote" : (replying ? "reply" : "unknown");
+  const report = {{ stage: attached ? "inspect" : "composer", path: location.pathname, composer: boxes.length > 0, composer_kind: kind, card: attached, status_ids: ids, quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length, testid_count: document.querySelectorAll("[data-testid]").length, clicked_post: false, clicked_repost_confirm: false, quoted_status_id: attached ? TARGET : null, topo_after: place + " textareas=" + boxes.length + " quotes=" + document.querySelectorAll('[data-testid="quoteTweet"]').length + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length, message: attached ? "Quote attachment is visible. Post was not clicked." : "No quote attachment for " + TARGET + ". Post was not clicked." }};
+  window.__qxReport = report;
+  return JSON.stringify(report);
+}} )()"#
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2567,11 +2619,33 @@ mod tests {
         let write = quote_page_script(original, Some("words"), false);
         assert!(inspect.contains("const INSPECT = true"));
         assert!(write.contains("const INSPECT = false"));
-        let inspect_stop = inspect.find("Inspect only").expect("inspect return");
-        let post_click = inspect.find("button.click()").expect("post click");
-        assert!(inspect_stop < post_click);
+        assert!(!inspect.contains("preventDefault"));
+        assert!(!write.contains("preventDefault"));
+        assert!(!inspect.contains("quoteItem.click"));
+        assert!(!write.contains("button.click"));
+        assert!(inspect.contains("opener.click"));
         assert!(!inspect.contains("retweetConfirm'].click"));
         assert!(!write.contains("retweetConfirm'].click"));
+        let post = quote_type_and_post_script(original, "doesn’t");
+        let guard = post.find("!quoteAttachment()").expect("attachment guard");
+        let post_click = post.find("button.click()").expect("post click");
+        assert!(guard < post_click);
+        assert!(!post.contains("retweetConfirm"));
+        assert!(post.is_ascii());
+        assert!(post.contains("\\u2019"));
+        let snap = quote_snap_script(original);
+        assert!(!snap.contains("click("));
+        assert!(snap.contains("quoteTweet"));
+        let click = quote_native_click_args(browser_cli_from_help(""), "termyx-quote");
+        assert!(click.windows(2).any(|pair| pair[0] == "--role" && pair[1] == "menuitem"));
+        assert!(click.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
+        assert!(!click.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm")));
+        let positional = quote_native_click_args(
+            browser_cli_from_help("Usage: opencli browser <session> <command>\n"),
+            "termyx-quote",
+        );
+        assert_eq!(positional[1], "termyx-quote");
+        assert!(positional.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));
@@ -2608,7 +2682,7 @@ mod tests {
         assert!(!script.contains("compose/post"));
         assert!(!script.contains("seen.card = true"));
         assert!(script.contains("quoteTweet"));
-        assert!(script.contains("preventDefault"));
+        assert!(!script.contains("preventDefault"));
         assert!(script.contains("[role=\"menu\"]"));
         assert!(script.contains("textareas="));
         assert!(script.contains("keys="));

@@ -1745,9 +1745,12 @@ fn browser_page_json(
     runner: &dyn crate::io::CommandRunner,
     cli: crate::publish::BrowserCli,
     session: &str,
-    url: &str,
+    url: Option<&str>,
     js: &str,
+    marker: &str,
+    and_close: bool,
 ) -> Result<crate::publish::QuotePageReport, String> {
+    if let Some(url) = url {
     let open_args = crate::publish::browser_command(cli, session, "open", Some(url));
     let open_public = crate::publish::browser_argv_public(&open_args);
     let opened = match runner.run_timeout(bin, &open_args, Duration::from_secs(60)) {
@@ -1782,13 +1785,14 @@ fn browser_page_json(
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
+    }
     let b64 = b64_encode(js.as_bytes());
     for (index, chunk) in b64.as_bytes().chunks(6000).enumerate() {
         let piece = std::str::from_utf8(chunk).unwrap_or("");
         let arg = if index == 0 {
-            format!("window.__qx='{piece}'")
+            format!("window.__{marker}='{piece}'")
         } else {
-            format!("window.__qx+='{piece}'")
+            format!("window.__{marker}+='{piece}'")
         };
         let loaded = runner.run_timeout(
             bin,
@@ -1804,7 +1808,12 @@ fn browser_page_json(
         }
     }
     let eval_args =
-        crate::publish::browser_command(cli, session, "eval", Some("eval(atob(window.__qx))"));
+        crate::publish::browser_command(
+            cli,
+            session,
+            "eval",
+            Some(&format!("eval(atob(window.__{marker}))")),
+        );
     let eval_public = crate::publish::browser_argv_public(&eval_args);
     let evaluated = runner.run_timeout(bin, &eval_args, Duration::from_secs(90));
     let evaluated = match evaluated {
@@ -1887,7 +1896,9 @@ fn browser_page_json(
             }
         }
     };
-    close_quote_session(bin, runner, cli, session);
+    if and_close {
+        close_quote_session(bin, runner, cli, session);
+    }
     Ok(report)
 }
 
@@ -1900,11 +1911,117 @@ fn run_quote_attachment(
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
-    let script = crate::publish::quote_page_script(target_id, Some(text), inspect);
-    let report = browser_page_json(bin, runner, cli, QUOTE_SESSION, &page, &script)?;
-    if inspect {
-        return Ok(report);
+    let script = crate::publish::quote_page_script(target_id, Some(text), true);
+    let menu = browser_page_json(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        Some(&page),
+        &script,
+        "qx",
+        false,
+    )?;
+    if !menu.selected_label.eq_ignore_ascii_case("Quote") || menu.selected_scope != "menu" {
+        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        return Err(crate::publish::quote_report_line(&menu));
     }
+    if menu.selected_href_kind.contains("in_reply_to") {
+        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        return Err(crate::publish::quote_report_line(&menu));
+    }
+    let click_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION);
+    let click_public = crate::publish::browser_argv_public(&click_args);
+    let clicked = runner.run_timeout(bin, &click_args, Duration::from_secs(30));
+    let clicked = match clicked {
+        Ok(output) => output,
+        Err(error) => {
+            close_quote_session(bin, runner, cli, QUOTE_SESSION);
+            return Err(crate::publish::explain_opencli_failure(
+                "menu",
+                &click_public,
+                -1,
+                "",
+                &error,
+            ));
+        }
+    };
+    let click_rejected = clicked.stdout.contains("\"ok\":false")
+        || clicked.stdout.contains("\"ok\": false");
+    if clicked.status != 0 || click_rejected {
+        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        return Err(crate::publish::explain_opencli_failure(
+            "menu",
+            &click_public,
+            clicked.status,
+            &clicked.stdout,
+            &clicked.stderr,
+        ));
+    }
+    let snap_js = crate::publish::quote_snap_script(target_id);
+    let apply_menu = |mut parsed: crate::publish::QuotePageReport| {
+        parsed.selected_label = menu.selected_label.clone();
+        parsed.selected_testid = menu.selected_testid.clone();
+        parsed.selected_href_kind = menu.selected_href_kind.clone();
+        parsed.selected_scope = menu.selected_scope.clone();
+        parsed.menu_shape = menu.menu_shape.clone();
+        parsed.topo_before = menu.topo_before.clone();
+        parsed
+    };
+    let mut after = apply_menu(browser_page_json(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        None,
+        &snap_js,
+        "qxSnap",
+        false,
+    )?);
+    if !crate::publish::quote_inspect_ready(&after) {
+        for _ in 0..7 {
+            std::thread::sleep(Duration::from_millis(250));
+            let again = crate::publish::browser_command(
+                cli,
+                QUOTE_SESSION,
+                "eval",
+                Some("eval(atob(window.__qxSnap))"),
+            );
+            let Ok(output) = runner.run_timeout(bin, &again, Duration::from_secs(20)) else {
+                break;
+            };
+            if output.status != 0 {
+                break;
+            }
+            if let Ok(parsed) = crate::publish::parse_quote_page_report(&output.stdout) {
+                after = apply_menu(parsed);
+                if crate::publish::quote_inspect_ready(&after) {
+                    break;
+                }
+            }
+        }
+    }
+    if inspect || !crate::publish::quote_inspect_ready(&after) {
+        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        let line = crate::publish::quote_report_line(&after);
+        return if crate::publish::quote_inspect_ready(&after) {
+            Ok(after)
+        } else {
+            Err(line)
+        };
+    }
+    let post_script = crate::publish::quote_type_and_post_script(target_id, text);
+    let posted = browser_page_json(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        None,
+        &post_script,
+        "qxPost",
+        true,
+    )?;
+    let report = posted;
     if report.clicked_post
         && (report.quote_testids == 0 || report.composer_kind == "reply" || !report.card)
     {
@@ -1943,7 +2060,16 @@ fn run_quote_attachment(
     };
     let read_page = format!("https://x.com/i/status/{new_id}");
     let read_script = crate::publish::quote_read_script(target_id);
-    let read = browser_page_json(bin, runner, cli, QUOTE_READ_SESSION, &read_page, &read_script)?;
+    let read = browser_page_json(
+        bin,
+        runner,
+        cli,
+        QUOTE_READ_SESSION,
+        Some(&read_page),
+        &read_script,
+        "qx",
+        true,
+    )?;
     crate::publish::quote_outcome(Some(new_id), &read, target_id)?;
     Ok(report)
 }
@@ -4323,6 +4449,8 @@ mod tests {
         let post_ok = r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#;
         let reply_ok = r#"[{"status":"success","message":"Reply posted successfully."}]"#;
         let retweet_ok = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
+        let quote_menu = r#"{"stage":"menu","path":"/cryptoXRPwhale/status/2118971448614334959","selected_label":"Quote","selected_scope":"menu","selected_testid":"-","selected_href_kind":"path=/compose/post keys=none","clicked_post":false,"card":false,"quote_testids":0,"message":"Quote row recorded. Post was not clicked."}"#;
+        let quote_snap = r#"{"stage":"inspect","path":"/cryptoXRPwhale/status/2118971448614334959","composer":true,"composer_kind":"quote","card":true,"quote_testids":1,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"message":"Quote attachment is visible. Post was not clicked."}"#;
         let quote_page = r#"{"stage":"posted","path":"/compose/post","testid_count":40,"composer":true,"composer_kind":"quote","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"clicked_post":true,"clicked_repost_confirm":false,"text_landed":true,"quoted_status_id":"2118971448614334959","new_status_id":"2119069999999999999","message":"Quote tweet posted successfully."}"#;
         let quote_read = r#"{"stage":"read","path":"/cryptoXRPwhale/status/2119069999999999999","composer_kind":"quote","card":true,"status_ids":["2118971448614334959"],"quote_testids":1,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"message":"Read only. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
@@ -4337,7 +4465,10 @@ mod tests {
         runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
-        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_page);
+        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_menu);
+        runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"], quote_snap);
+        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxPost))"], quote_page);
         runner.script("opencli", &["browser", "termyx-quote-read", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote-read", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote-read", "eval"], "https://x.com/i/status/2119069999999999999");
@@ -4411,6 +4542,9 @@ mod tests {
         assert!(calls.iter().any(|(_, args)| {
             args.first().map(String::as_str) == Some("browser")
                 && args.iter().any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
+        }));
+        assert!(calls.iter().any(|(_, args)| {
+            args.iter().any(|arg| arg == "--name") && args.iter().any(|arg| arg == "Quote")
         }));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| {
@@ -4498,7 +4632,8 @@ mod tests {
     #[test]
     fn quote_opens_the_status_menu_and_stops_when_the_card_is_missing() {
         use crate::publish::EngageAction;
-        let missing = r#"{"stage":"composer","path":"/i/status/20","testid_count":12,"composer":true,"card":false,"status_ids":[],"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"text_landed":false,"quoted_status_id":null,"new_status_id":null,"message":"Quote card for 20 was not in the composer. Post was not clicked."}"#;
+        let menu = r#"{"stage":"menu","path":"/i/status/20","selected_label":"Quote","selected_scope":"menu","selected_testid":"-","selected_href_kind":"path=/compose/post keys=none","menu_shape":"A:menuitem:-:Quote:path=/compose/post keys=none","topo_before":"page textareas=1 quotes=0 dialogs=0","clicked_post":false,"card":false,"quote_testids":0,"composer":true,"composer_kind":"unknown","message":"Quote row recorded. Post was not clicked."}"#;
+        let missing = r#"{"stage":"composer","path":"/i/status/20","testid_count":12,"composer":true,"composer_kind":"unknown","card":false,"status_ids":[],"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"topo_after":"page textareas=1 quotes=0 dialogs=0","message":"No quote attachment for 20. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
         runner.script(
             "opencli",
@@ -4511,6 +4646,12 @@ mod tests {
         runner.script(
             "opencli",
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
+            menu,
+        );
+        runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
             missing,
         );
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
@@ -4523,11 +4664,17 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("Post was not clicked"), "{err}");
-        assert!(err.contains("not in the composer"), "{err}");
+        assert!(err.contains("No quote attachment"), "{err}");
+        assert!(err.contains("path=/compose/post keys=none"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
             args.iter().any(|arg| arg == "https://x.com/i/status/20")
         }));
+        assert!(calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")
+                && !args.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm"))
+        }));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("qxPost"))));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("post")));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
