@@ -975,6 +975,8 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   const TARGET = {id_js};
   const TEXT = {text_js};
   const INSPECT = {inspect_js};
+  window.__qxReport = null;
+  const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
   const statusId = (href) => {{
     try {{
       const path = new URL(href, location.origin).pathname;
@@ -1023,7 +1025,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   const opener = article.querySelector('[data-testid="retweet"], [data-testid="unretweet"]');
   if (!opener) {{
     const missing = report("page", "Repost menu button was not on the tweet. Post was not clicked.");
-    return JSON.stringify(missing);
+    return finish(missing);
   }}
   opener.click();
   let quoteItem = null;
@@ -1041,11 +1043,11 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     await sleep(250);
   }}
   if (!quoteItem) {{
-    return JSON.stringify(report("menu", "Quote menu item did not appear. Post was not clicked."));
+    return finish(report("menu", "Quote menu item did not appear. Post was not clicked."));
   }}
   const chosen = quoteItem.getAttribute("data-testid") || "";
   if (chosen === "retweetConfirm" || chosen === "unretweetConfirm") {{
-    return JSON.stringify(report("menu", "Refused the repost confirm. Post was not clicked."));
+    return finish(report("menu", "Refused the repost confirm. Post was not clicked."));
   }}
   quoteItem.click();
   let card = false;
@@ -1055,17 +1057,17 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     await sleep(250);
   }}
   if (!card) {{
-    return JSON.stringify(report("composer", "Quote card for " + TARGET + " was not in the composer. Post was not clicked."));
+    return finish(report("composer", "Quote card for " + TARGET + " was not in the composer. Post was not clicked."));
   }}
   if (INSPECT || TEXT == null) {{
     const seen = report("inspect", "Inspect only. Post was not clicked.");
     seen.card = true;
     seen.quoted_status_id = TARGET;
-    return JSON.stringify(seen);
+    return finish(seen);
   }}
   const box = document.querySelector('[data-testid="tweetTextarea_0"]');
   if (!box) {{
-    return JSON.stringify(report("composer", "Quote card is visible but the composer box is not. Post was not clicked."));
+    return finish(report("composer", "Quote card is visible but the composer box is not. Post was not clicked."));
   }}
   box.focus();
   if (!document.execCommand("insertText", false, TEXT)) {{
@@ -1083,7 +1085,7 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
     stuck.text_landed = landed;
     stuck.post_enabled = !!button;
     stuck.card = hasCard();
-    return JSON.stringify(stuck);
+    return finish(stuck);
   }}
   button.click();
   for (let i = 0; i < 30; i++) {{
@@ -1098,12 +1100,12 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
       done.text_landed = true;
       done.quoted_status_id = TARGET;
       done.new_status_id = link ? statusId(link.href) : null;
-      return JSON.stringify(done);
+      return finish(done);
     }}
   }}
   const unclear = report("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.");
   unclear.clicked_post = true;
-  return JSON.stringify(unclear);
+  return finish(unclear);
 }})()"#
     )
 }
@@ -1118,7 +1120,7 @@ pub fn quote_read_script(target_id: &str) -> String {
     const match = (link.pathname || new URL(link.href, location.origin).pathname).match(/\/status\/(\d+)/);
     if (match && ids.indexOf(match[1]) < 0 && ids.length < 8) ids.push(match[1]);
   }}
-  return JSON.stringify({{
+  const report = {{
     stage: "read",
     path: location.pathname,
     card: ids.indexOf(TARGET) >= 0,
@@ -1127,7 +1129,9 @@ pub fn quote_read_script(target_id: &str) -> String {
     clicked_post: false,
     clicked_repost_confirm: false,
     message: "Read only. Post was not clicked."
-  }});
+  }};
+  window.__qxReport = report;
+  return JSON.stringify(report);
 }})()"#
     )
 }
@@ -1149,15 +1153,113 @@ pub struct QuotePageReport {
     pub message: String,
 }
 
+fn first_json_value(stdout: &str) -> Option<serde_json::Value> {
+    let start = stdout.find('{')?;
+    let end = stdout.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str(&stdout[start..=end]).ok()
+}
+
+fn unwrap_opencli_data(value: serde_json::Value) -> serde_json::Value {
+    let mut current = value;
+    for _ in 0..4 {
+        if current.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+            return current;
+        }
+        if let Some(data) = current.get("data").cloned() {
+            current = json_if_string(data);
+            continue;
+        }
+        if let Some(nested) = current
+            .get("result")
+            .cloned()
+            .or_else(|| current.get("value").cloned())
+        {
+            let nested = json_if_string(nested);
+            if nested != current {
+                current = nested;
+                continue;
+            }
+        }
+        break;
+    }
+    current
+}
+
+fn json_if_string(value: serde_json::Value) -> serde_json::Value {
+    let Some(text) = value.as_str() else {
+        return value;
+    };
+    if text.trim().is_empty() || text == "pending" {
+        return serde_json::Value::String(text.to_string());
+    }
+    serde_json::from_str(text).unwrap_or(serde_json::Value::String(text.to_string()))
+}
+
+fn payload_summary(value: &serde_json::Value) -> String {
+    let keys = value
+        .as_object()
+        .map(|map| {
+            map.keys()
+                .take(6)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_else(|| value_kind(value));
+    let data = value.get("data").map(value_kind).unwrap_or_else(|| "missing".into());
+    format!("payload keys {keys} · data {data}")
+}
+
+fn value_kind(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "null".into(),
+        serde_json::Value::String(text) if text == "pending" => "pending".into(),
+        serde_json::Value::String(_) => "string".into(),
+        serde_json::Value::Array(rows) => format!("array {}", rows.len()),
+        serde_json::Value::Object(map) if map.is_empty() => "empty object".into(),
+        serde_json::Value::Object(_) => "object".into(),
+        serde_json::Value::Bool(flag) => format!("bool {flag}"),
+        serde_json::Value::Number(_) => "number".into(),
+    }
+}
+
 pub fn parse_quote_page_report(stdout: &str) -> Result<QuotePageReport, String> {
-    let start = stdout
-        .find('{')
-        .ok_or_else(|| "Quote page returned no report. Post was not retried.".to_string())?;
-    let end = stdout
-        .rfind('}')
-        .ok_or_else(|| "Quote page returned no report. Post was not retried.".to_string())?;
-    let value: serde_json::Value = serde_json::from_str(&stdout[start..=end])
-        .map_err(|_| "Quote page report was not readable. Post was not retried.".to_string())?;
+    let value = first_json_value(stdout).ok_or_else(|| {
+        "stage result · eval returned no JSON · Post was not clicked".to_string()
+    })?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(explain_opencli_failure("result", "browser eval", 0, stdout, ""));
+    }
+    let inner = unwrap_opencli_data(value.clone());
+    let report = report_from_value(&inner);
+    if report.stage.is_empty() {
+        return Err(format!(
+            "stage result · {} · no quote report · Post was not clicked",
+            payload_summary(&value)
+        ));
+    }
+    Ok(report)
+}
+
+/// An empty `{ok:true,data:{}}` envelope is what an un-awaited eval looks like.
+/// Poll `window.__qxReport` for that. A real error envelope is final.
+pub fn eval_needs_poll(stdout: &str) -> bool {
+    if stdout.contains("pending") && !stdout.contains("\"stage\"") {
+        return true;
+    }
+    let Some(value) = first_json_value(stdout) else {
+        return false;
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return false;
+    }
+    report_from_value(&unwrap_opencli_data(value)).stage.is_empty()
+}
+
+fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
     let text = |key: &str| {
         value
             .get(key)
@@ -1175,7 +1277,7 @@ pub fn parse_quote_page_report(stdout: &str) -> Result<QuotePageReport, String> 
                 .collect()
         })
         .unwrap_or_default();
-    Ok(QuotePageReport {
+    QuotePageReport {
         stage: text("stage"),
         path: text("path"),
         testid_count: value.get("testid_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
@@ -1198,7 +1300,7 @@ pub fn parse_quote_page_report(stdout: &str) -> Result<QuotePageReport, String> 
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
         message: text("message"),
-    })
+    }
 }
 
 pub fn quote_report_line(report: &QuotePageReport) -> String {
@@ -2257,6 +2359,27 @@ mod tests {
         let empty = explain_opencli_failure("bridge", "browser --help", 1, "", "");
         assert!(empty.contains("printed nothing"), "{empty}");
         assert!(empty.contains("stage bridge"), "{empty}");
+        let wrapped = r#"{"ok":true,"data":"{\"stage\":\"composer\",\"path\":\"/i/status/20\",\"message\":\"Quote card for 20 was not in the composer. Post was not clicked.\",\"card\":false,\"composer\":true,\"status_ids\":[],\"quote_testids\":0,\"testid_count\":12,\"clicked_post\":false}"}"#;
+        let report = parse_quote_page_report(wrapped).unwrap();
+        assert_eq!(report.stage, "composer");
+        assert!(!report.card);
+        assert!(report.message.contains("Post was not clicked"));
+        let nested = r#"{"ok":true,"data":{"stage":"menu","path":"/i/status/20","message":"Quote menu item did not appear. Post was not clicked.","card":false,"testid_count":4}}"#;
+        assert_eq!(parse_quote_page_report(nested).unwrap().stage, "menu");
+        let blank = r#"{"ok":true,"data":{}}"#;
+        let err = parse_quote_page_report(blank).unwrap_err();
+        assert!(err.contains("stage result"), "{err}");
+        assert!(err.contains("empty object"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
+        assert!(eval_needs_poll(blank));
+        assert!(!eval_needs_poll(r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#));
+        let failed = parse_quote_page_report(
+            r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#,
+        )
+        .unwrap_err();
+        assert!(failed.contains("Navigation rejected"), "{failed}");
+        assert!(!failed.contains("ct0"));
+        assert!(parse_quote_page_report("").is_err());
     }
 
     #[test]

@@ -1747,7 +1747,7 @@ fn browser_page_json(
     session: &str,
     url: &str,
     js: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<crate::publish::QuotePageReport, String> {
     let open_args = crate::publish::browser_command(cli, session, "open", Some(url));
     let open_public = crate::publish::browser_argv_public(&open_args);
     let opened = match runner.run_timeout(bin, &open_args, Duration::from_secs(60)) {
@@ -1807,17 +1807,21 @@ fn browser_page_json(
         crate::publish::browser_command(cli, session, "eval", Some("eval(atob(window.__qx))"));
     let eval_public = crate::publish::browser_argv_public(&eval_args);
     let evaluated = runner.run_timeout(bin, &eval_args, Duration::from_secs(90));
+    let evaluated = match evaluated {
+        Ok(output) => output,
+        Err(error) => {
             close_quote_session(bin, runner, cli, session);
-    let evaluated = evaluated.map_err(|error| {
-        crate::publish::explain_opencli_failure(
-            "editor",
-            &eval_public,
-            -1,
-            "",
-            &sanitize_browser_note(&error),
-        )
-    })?;
+            return Err(crate::publish::explain_opencli_failure(
+                "editor",
+                &eval_public,
+                -1,
+                "",
+                &error,
+            ));
+        }
+    };
     if evaluated.status != 0 {
+        close_quote_session(bin, runner, cli, session);
         return Err(crate::publish::explain_opencli_failure(
             "editor",
             &eval_public,
@@ -1826,16 +1830,65 @@ fn browser_page_json(
             &evaluated.stderr,
         ));
     }
-    let start = evaluated.stdout.find('{').ok_or_else(|| {
-        "stage editor · the quote page opened but returned no report · Post was not clicked"
-            .to_string()
-    })?;
-    let end = evaluated.stdout.rfind('}').ok_or_else(|| {
-        "stage editor · the quote page opened but returned no report · Post was not clicked"
-            .to_string()
-    })?;
-    serde_json::from_str(&evaluated.stdout[start..=end])
-        .map_err(|_| "Quote page report was not readable. Post was not clicked.".to_string())
+    let mut last = evaluated.stdout;
+    let mut tries = 0;
+    let report = loop {
+        tries += 1;
+        if tries > 8 {
+            close_quote_session(bin, runner, cli, session);
+            return match crate::publish::parse_quote_page_report(&last) {
+                Err(error) => Err(error),
+                Ok(_) => Err("stage result · eval stayed empty · Post was not clicked".into()),
+            };
+        }
+        match crate::publish::parse_quote_page_report(&last) {
+            Ok(report) => break report,
+            Err(error) if !crate::publish::eval_needs_poll(&last) => {
+                close_quote_session(bin, runner, cli, session);
+                return Err(error);
+            }
+            Err(error) => {
+                let poll = crate::publish::browser_command(
+                    cli,
+                    session,
+                    "eval",
+                    Some("window.__qxReport?JSON.stringify(window.__qxReport):\"pending\""),
+                );
+                let polled = runner.run_timeout(bin, &poll, Duration::from_secs(20));
+                let polled = match polled {
+                    Ok(output) if output.status == 0 => output.stdout,
+                    Ok(output) => {
+                        close_quote_session(bin, runner, cli, session);
+                        return Err(crate::publish::explain_opencli_failure(
+                            "result",
+                            "browser eval",
+                            output.status,
+                            &output.stdout,
+                            &output.stderr,
+                        ));
+                    }
+                    Err(poll_error) => {
+                        close_quote_session(bin, runner, cli, session);
+                        return Err(crate::publish::explain_opencli_failure(
+                            "result",
+                            "browser eval",
+                            -1,
+                            "",
+                            &poll_error,
+                        ));
+                    }
+                };
+                if polled == last {
+                    close_quote_session(bin, runner, cli, session);
+                    return Err(error);
+                }
+                last = polled;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+    close_quote_session(bin, runner, cli, session);
+    Ok(report)
 }
 
 fn run_quote_attachment(
@@ -1848,8 +1901,7 @@ fn run_quote_attachment(
     let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
     let script = crate::publish::quote_page_script(target_id, Some(text), inspect);
-    let value = browser_page_json(bin, runner, cli, QUOTE_SESSION, &page, &script)?;
-    let report = crate::publish::parse_quote_page_report(&value.to_string())?;
+    let report = browser_page_json(bin, runner, cli, QUOTE_SESSION, &page, &script)?;
     if inspect {
         return Ok(report);
     }
@@ -1875,8 +1927,7 @@ fn run_quote_attachment(
     };
     let read_page = format!("https://x.com/i/status/{new_id}");
     let read_script = crate::publish::quote_read_script(target_id);
-    let read_value = browser_page_json(bin, runner, cli, QUOTE_READ_SESSION, &read_page, &read_script)?;
-    let read = crate::publish::parse_quote_page_report(&read_value.to_string())?;
+    let read = browser_page_json(bin, runner, cli, QUOTE_READ_SESSION, &read_page, &read_script)?;
     crate::publish::quote_read_confirms(&read, target_id)
         .map_err(|error| format!("Post was clicked once. {error}"))?;
     Ok(report)
