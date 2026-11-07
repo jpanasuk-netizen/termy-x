@@ -4644,7 +4644,7 @@ impl XPanel {
     /// Ask before any follow write. Not connected and your own account
     /// never reach the publisher.
     fn request_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
-        if self.follow_pending.is_some() {
+        if !termy_x::action_state::follow_write_allowed(self.follow_pending.is_some()) {
             return;
         }
         let own = match &self.connection {
@@ -4677,7 +4677,7 @@ impl XPanel {
     /// payload's real flag or a session-verified override — never a
     /// guess; on failure nothing flips and the error is humanized.
     fn toggle_follow(&mut self, handle: &str, target: bool, cx: &mut Context<Self>) {
-        if self.follow_pending.is_some() {
+        if !termy_x::action_state::follow_write_allowed(self.follow_pending.is_some()) {
             return;
         }
         let handle = termy_x::model::strip_handle(handle).to_string();

@@ -1,8 +1,10 @@
 //! Account-scoped memory of likes, reposts, follows, and post receipts.
 //!
-//! The file is JSON next to the other Termy X config (`x-action-state.json`
-//! inside the termy config directory). It stores handles, tweet ids, and
-//! short receipts. It does not store passwords, tokens, or API keys.
+//! Stored in an embedded SQLite file, `x-action-state.db`, in the Termy
+//! config directory. No separate database server is installed or required.
+//! An older `x-action-state.json` in that directory is copied in once.
+//! The database stores handles, tweet ids, and short receipts. It does
+//! not store passwords, tokens, or API keys.
 //!
 //! A confirmed value is shown immediately on startup. It is labeled saved
 //! until a post loaded in this session carries a real like or follow flag,
@@ -12,9 +14,10 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Post, strip_handle};
@@ -22,7 +25,10 @@ use crate::model::{Post, strip_handle};
 /// Posts inspected on one login sync. One home page, not the whole account.
 pub const SYNC_POST_CAP: usize = 100;
 
-pub const FILE_NAME: &str = "x-action-state.json";
+pub const FILE_NAME: &str = "x-action-state.db";
+/// Previous store. Read once, then renamed so a later start does not import it again.
+pub const LEGACY_JSON_NAME: &str = "x-action-state.json";
+const SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,20 +203,47 @@ pub fn sync_coverage() -> &'static str {
 }
 
 pub fn database_location_note() -> &'static str {
-    "x-action-state.json in the Termy config directory (%APPDATA%\\termy on Windows, ~/.config/termy on Linux). Handles, tweet ids, and short receipts only."
+    "SQLite file x-action-state.db in the Termy config directory (%APPDATA%\\termy on Windows, ~/.config/termy on Linux). Handles, tweet ids, and short receipts only. No separate database server."
+}
+
+/// A second follow click does nothing while one follow write is in flight.
+pub fn follow_write_allowed(follow_in_flight: bool) -> bool {
+    !follow_in_flight
 }
 
 impl ActionDb {
     pub fn load(path: &Path) -> Result<Self, String> {
-        if !path.exists() {
-            let mut db = Self::default();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        if path.exists() {
+            if !sqlite_header_ok(path)? {
+                return Err(
+                    "action database is not a readable SQLite file. It was left in place."
+                        .into(),
+                );
+            }
+            let mut db = read_sqlite(path)?;
             db.session_started_ms = now_ms();
+            db.settle_abandoned();
+            db.save(path)?;
             return Ok(db);
         }
-        let text = fs::read_to_string(path).map_err(|error| error.to_string())?;
-        let mut db: Self = serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        let json_path = legacy_json_path(path);
+        if json_path.exists() {
+            let text = fs::read_to_string(&json_path).map_err(|error| error.to_string())?;
+            let mut db: Self = serde_json::from_str(&text)
+                .map_err(|error| format!("saved action file is unreadable: {error}"))?;
+            db.session_started_ms = now_ms();
+            db.settle_abandoned();
+            db.save(path)?;
+            let parked = json_path.with_file_name("x-action-state.json.migrated");
+            fs::rename(&json_path, &parked).map_err(|error| error.to_string())?;
+            return Ok(db);
+        }
+        let mut db = Self::default();
         db.session_started_ms = now_ms();
-        db.settle_abandoned();
+        db.save(path)?;
         Ok(db)
     }
 
@@ -218,10 +251,46 @@ impl ActionDb {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, &text).map_err(|error| error.to_string())?;
-        fs::rename(&tmp, path).or_else(|_| fs::write(path, text).map_err(|error| error.to_string()))
+        let conn = open_conn(path)?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| format!("action database: {error}"))?;
+        ensure_schema(&tx)?;
+        tx.execute("DELETE FROM receipts", [])
+            .map_err(|error| format!("action database: {error}"))?;
+        tx.execute("DELETE FROM toggles", [])
+            .map_err(|error| format!("action database: {error}"))?;
+        tx.execute("DELETE FROM accounts", [])
+            .map_err(|error| format!("action database: {error}"))?;
+        for (account, bucket) in &self.accounts {
+            tx.execute(
+                "INSERT INTO accounts(account, last_sync_ms, last_sync_error) VALUES(?1, ?2, ?3)",
+                params![account, bucket.last_sync_ms, bucket.last_sync_error],
+            )
+            .map_err(|error| format!("action database: {error}"))?;
+            write_toggles(&tx, account, ToggleKind::Like, &bucket.likes)?;
+            write_toggles(&tx, account, ToggleKind::Repost, &bucket.reposts)?;
+            write_toggles(&tx, account, ToggleKind::Follow, &bucket.follows)?;
+            for receipt in &bucket.receipts {
+                tx.execute(
+                    "INSERT INTO receipts(account, kind, tweet_id, text, seq, at_ms) VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        account,
+                        receipt_kind_str(receipt.kind),
+                        receipt.tweet_id,
+                        receipt.text,
+                        receipt.seq,
+                        receipt.at_ms as i64
+                    ],
+                )
+                .map_err(|error| format!("action database: {error}"))?;
+            }
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|error| format!("action database: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("action database: {error}"))?;
+        Ok(())
     }
 
     pub fn begin_sync(&mut self, account: &str) -> u64 {
@@ -649,6 +718,288 @@ impl ActionDb {
     }
 }
 
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS accounts (
+    account TEXT PRIMARY KEY,
+    last_sync_ms INTEGER,
+    last_sync_error TEXT
+);
+CREATE TABLE IF NOT EXISTS toggles (
+    account TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    item_key TEXT NOT NULL,
+    confirmed INTEGER,
+    pending_seq INTEGER,
+    pending_desired INTEGER,
+    pending_at_ms INTEGER,
+    last_error TEXT,
+    source TEXT,
+    verified_at_ms INTEGER NOT NULL DEFAULT 0,
+    seq INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (account, kind, item_key)
+);
+CREATE TABLE IF NOT EXISTS receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    tweet_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    seq INTEGER NOT NULL,
+    at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_account ON receipts(account, kind);
+";
+
+fn legacy_json_path(db_path: &Path) -> PathBuf {
+    db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(LEGACY_JSON_NAME)
+}
+
+fn sqlite_header_ok(path: &Path) -> Result<bool, String> {
+    let bytes = fs::read(path).map_err(|error| error.to_string())?;
+    if bytes.len() < 16 {
+        return Ok(false);
+    }
+    Ok(&bytes[..16] == b"SQLite format 3\0")
+}
+
+fn open_conn(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|error| format!("action database: {error}"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(2))
+        .map_err(|error| format!("action database: {error}"))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|error| format!("action database: {error}"))?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .map_err(|error| format!("action database: {error}"))?;
+    Ok(conn)
+}
+
+fn ensure_schema(conn: &Connection) -> Result<(), String> {
+    let version: i64 = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| format!("action database: {error}"))?;
+    if version != 0 && version != SCHEMA_VERSION {
+        return Err(format!(
+            "action database version {version} is not supported. The file was left in place."
+        ));
+    }
+    conn.execute_batch(SCHEMA)
+        .map_err(|error| format!("action database: {error}"))?;
+    Ok(())
+}
+
+fn read_sqlite(path: &Path) -> Result<ActionDb, String> {
+    let conn = open_conn(path)?;
+    ensure_schema(&conn)?;
+    let mut db = ActionDb::default();
+    let mut accounts = conn
+        .prepare("SELECT account, last_sync_ms, last_sync_error FROM accounts")
+        .map_err(|error| format!("action database: {error}"))?;
+    let rows = accounts
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(|error| format!("action database: {error}"))?;
+    for row in rows {
+        let (account, last_sync_ms, last_sync_error) =
+            row.map_err(|error| format!("action database: {error}"))?;
+        let bucket = db.bucket(&account);
+        bucket.last_sync_ms = last_sync_ms.map(|ms| ms as u64);
+        bucket.last_sync_error = last_sync_error;
+    }
+    let mut toggles = conn
+        .prepare(
+            "SELECT account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq FROM toggles",
+        )
+        .map_err(|error| format!("action database: {error}"))?;
+    let toggle_rows = toggles
+        .query_map([], |row| {
+            Ok(ToggleRow {
+                account: row.get(0)?,
+                kind: row.get(1)?,
+                item_key: row.get(2)?,
+                confirmed: row.get(3)?,
+                pending_seq: row.get(4)?,
+                pending_desired: row.get(5)?,
+                pending_at_ms: row.get(6)?,
+                last_error: row.get(7)?,
+                source: row.get(8)?,
+                verified_at_ms: row.get(9)?,
+                seq: row.get(10)?,
+            })
+        })
+        .map_err(|error| format!("action database: {error}"))?;
+    for row in toggle_rows {
+        let row = row.map_err(|error| format!("action database: {error}"))?;
+        let kind = toggle_kind(&row.kind).ok_or_else(|| {
+            format!("action database has an unknown toggle kind {}", row.kind)
+        })?;
+        let toggle = db.toggle_mut(&row.account, kind, &row.item_key);
+        *toggle = row.into_state()?;
+    }
+    let mut receipts = conn
+        .prepare("SELECT account, kind, tweet_id, text, seq, at_ms FROM receipts ORDER BY id")
+        .map_err(|error| format!("action database: {error}"))?;
+    let receipt_rows = receipts
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|error| format!("action database: {error}"))?;
+    for row in receipt_rows {
+        let (account, kind, tweet_id, text, seq, at_ms) =
+            row.map_err(|error| format!("action database: {error}"))?;
+        let kind = receipt_kind(&kind)
+            .ok_or_else(|| format!("action database has an unknown receipt kind {kind}"))?;
+        db.bucket(&account).receipts.push(Receipt {
+            kind,
+            tweet_id,
+            text,
+            seq: seq as u64,
+            at_ms: at_ms as u64,
+        });
+    }
+    Ok(db)
+}
+
+struct ToggleRow {
+    account: String,
+    kind: String,
+    item_key: String,
+    confirmed: Option<i64>,
+    pending_seq: Option<i64>,
+    pending_desired: Option<i64>,
+    pending_at_ms: Option<i64>,
+    last_error: Option<String>,
+    source: Option<String>,
+    verified_at_ms: i64,
+    seq: i64,
+}
+
+impl ToggleRow {
+    fn into_state(self) -> Result<ToggleState, String> {
+        let pending = match (self.pending_seq, self.pending_desired, self.pending_at_ms) {
+            (Some(seq), Some(desired), Some(at_ms)) => Some(PendingWrite {
+                seq: seq as u64,
+                desired: desired != 0,
+                at_ms: at_ms as u64,
+            }),
+            (None, None, None) => None,
+            _ => {
+                return Err(
+                    "action database has a partial pending follow or like. The file was left in place."
+                        .into(),
+                );
+            }
+        };
+        Ok(ToggleState {
+            confirmed: self.confirmed.map(|value| value != 0),
+            pending,
+            last_error: self.last_error,
+            source: self.source.as_deref().and_then(record_source),
+            verified_at_ms: self.verified_at_ms as u64,
+            seq: self.seq as u64,
+        })
+    }
+}
+
+fn write_toggles(
+    conn: &Connection,
+    account: &str,
+    kind: ToggleKind,
+    map: &HashMap<String, ToggleState>,
+) -> Result<(), String> {
+    for (item_key, toggle) in map {
+        let (pending_seq, pending_desired, pending_at_ms) = match &toggle.pending {
+            Some(pending) => (
+                Some(pending.seq as i64),
+                Some(i64::from(pending.desired)),
+                Some(pending.at_ms as i64),
+            ),
+            None => (None, None, None),
+        };
+        conn.execute(
+            "INSERT INTO toggles(account, kind, item_key, confirmed, pending_seq, pending_desired, pending_at_ms, last_error, source, verified_at_ms, seq) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                account,
+                toggle_kind_str(kind),
+                item_key,
+                toggle.confirmed.map(i64::from),
+                pending_seq,
+                pending_desired,
+                pending_at_ms,
+                toggle.last_error,
+                toggle.source.map(source_str),
+                toggle.verified_at_ms as i64,
+                toggle.seq as i64
+            ],
+        )
+        .map_err(|error| format!("action database: {error}"))?;
+    }
+    Ok(())
+}
+
+fn toggle_kind_str(kind: ToggleKind) -> &'static str {
+    match kind {
+        ToggleKind::Like => "like",
+        ToggleKind::Repost => "repost",
+        ToggleKind::Follow => "follow",
+    }
+}
+
+fn toggle_kind(value: &str) -> Option<ToggleKind> {
+    match value {
+        "like" => Some(ToggleKind::Like),
+        "repost" => Some(ToggleKind::Repost),
+        "follow" => Some(ToggleKind::Follow),
+        _ => None,
+    }
+}
+
+fn receipt_kind_str(kind: ReceiptKind) -> &'static str {
+    match kind {
+        ReceiptKind::Reply => "reply",
+        ReceiptKind::QTweet => "q_tweet",
+        ReceiptKind::Post => "post",
+    }
+}
+
+fn receipt_kind(value: &str) -> Option<ReceiptKind> {
+    match value {
+        "reply" => Some(ReceiptKind::Reply),
+        "q_tweet" => Some(ReceiptKind::QTweet),
+        "post" => Some(ReceiptKind::Post),
+        _ => None,
+    }
+}
+
+fn source_str(source: RecordSource) -> &'static str {
+    match source {
+        RecordSource::LocalWrite => "local_write",
+        RecordSource::LiveRead => "live_read",
+    }
+}
+
+fn record_source(value: &str) -> Option<RecordSource> {
+    match value {
+        "local_write" => Some(RecordSource::LocalWrite),
+        "live_read" => Some(RecordSource::LiveRead),
+        _ => None,
+    }
+}
+
 fn walk_post(post: &Post, visit: &mut dyn FnMut(&Post)) {
     visit(post);
     if let Some(inner) = &post.retweeted {
@@ -852,5 +1203,61 @@ mod tests {
         assert_eq!(db.confirmed("ada", ToggleKind::Repost, "9"), None);
         assert!(database_location_note().contains(FILE_NAME));
         assert!(!database_location_note().to_ascii_lowercase().contains("token"));
+        assert!(!follow_write_allowed(true));
+        assert!(follow_write_allowed(false));
+    }
+
+    #[test]
+    fn json_rows_move_into_sqlite_once_and_survive_restart() {
+        let dir = std::env::temp_dir().join(format!("termy-actions-mig-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut db = ActionDb::default();
+        db.force_confirm("Ada", ToggleKind::Follow, "@Jack", true, 50);
+        db.record_receipt("ada", ReceiptKind::Reply, "9", "Reply sent", 2, 60);
+        let json = serde_json::to_string(&db).unwrap();
+        fs::write(dir.join(LEGACY_JSON_NAME), json).unwrap();
+        let db_path = dir.join(FILE_NAME);
+        let loaded = ActionDb::load(&db_path).unwrap();
+        assert_eq!(loaded.confirmed("ada", ToggleKind::Follow, "jack"), Some(true));
+        assert_eq!(loaded.receipt_ids("ada", ReceiptKind::Reply), vec!["9".to_string()]);
+        assert!(!dir.join(LEGACY_JSON_NAME).exists());
+        assert!(dir.join("x-action-state.json.migrated").is_file());
+        let again = ActionDb::load(&db_path).unwrap();
+        assert_eq!(again.receipt_ids("ada", ReceiptKind::Reply), vec!["9".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_database_is_left_in_place() {
+        let dir = std::env::temp_dir().join(format!("termy-actions-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(FILE_NAME);
+        fs::write(&db_path, b"this is not sqlite").unwrap();
+        let error = ActionDb::load(&db_path).unwrap_err();
+        assert!(error.contains("left in place"));
+        assert_eq!(fs::read(&db_path).unwrap(), b"this is not sqlite");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sqlite_columns_do_not_hold_secrets() {
+        let dir = std::env::temp_dir().join(format!("termy-actions-cols-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join(FILE_NAME);
+        let mut db = ActionDb::default();
+        db.record_receipt("ada", ReceiptKind::Post, "", "1 part posted", 1, 5);
+        db.save(&db_path).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(receipts)").unwrap();
+        let names: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|name| name.unwrap()).collect();
+        for banned in ["token", "password", "secret", "cookie", "authorization"] {
+            assert!(!names.iter().any(|name| name.contains(banned)), "{names:?}");
+        }
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        assert_eq!(version, 1);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
