@@ -2464,22 +2464,30 @@ fn run_quote_attachment(
         &post_script,
         "qxPost",
         true,
-        true,
+        false,
     )?;
     let report = posted;
+    let write_failure = |report: &crate::publish::QuotePageReport| {
+        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        let leftover = quote_owned_leftover(bin, runner);
+        format!(
+            "{} · {shot} · {close_note} · {leftover}",
+            with_quote_view(crate::publish::quote_report_line(report), &view)
+        )
+    };
     if report.clicked_post
         && (report.quote_testids == 0 || report.composer_kind == "reply" || !report.card)
     {
-        return match crate::publish::quote_outcome(
+        let detail = match crate::publish::quote_outcome(
             report.new_status_id.as_deref(),
             &report,
             target_id,
         ) {
-            Err(error) => Err(error),
-            Ok(()) => Err(
-                "Quote evidence was ambiguous. Not marked sent. Nothing was retried.".into(),
-            ),
+            Err(error) => error,
+            Ok(()) => "Quote evidence was ambiguous. Not marked sent. Nothing was retried.".into(),
         };
+        return Err(format!("{detail} · {}", write_failure(&report)));
     }
     if report.clicked_repost_confirm
         || !report.clicked_post
@@ -2489,23 +2497,19 @@ fn run_quote_attachment(
         || report.quoted_status_id.as_deref() != Some(target_id)
         || report.message != "Quote tweet posted successfully."
     {
-        return Err(if report.message.is_empty() {
-            crate::publish::quote_report_line(&report)
-        } else {
-            report.message
-        });
+        return Err(write_failure(&report));
     }
-    let Some(new_id) = report.new_status_id.as_deref().filter(|id| {
-        !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && *id != target_id
+    let Some(new_id) = report.new_status_id.clone().filter(|id| {
+        !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && id != target_id
     }) else {
-        return Err(
-            "Post was clicked once but the sent toast had no new status id. Not marked sent. Nothing was retried."
-                .into(),
-        );
+        return Err(format!(
+            "Post was clicked once but the sent toast had no new status id. Not marked sent. Nothing was retried. · {}",
+            write_failure(&report)
+        ));
     };
     let read_page = format!("https://x.com/i/status/{new_id}");
     let read_script = crate::publish::quote_read_script(target_id);
-    let read = browser_page_json(
+    let read = match browser_page_json(
         bin,
         runner,
         cli,
@@ -2515,8 +2519,16 @@ fn run_quote_attachment(
         "qx",
         false,
         true,
-    )?;
-    crate::publish::quote_outcome(Some(new_id), &read, target_id)?;
+    ) {
+        Ok(read) => read,
+        Err(error) => {
+            return Err(format!("{error} · {}", write_failure(&report)));
+        }
+    };
+    if let Err(error) = crate::publish::quote_outcome(Some(&new_id), &read, target_id) {
+        return Err(format!("{error} · {}", write_failure(&report)));
+    }
+    let _ = close_quote_session(bin, runner, cli, QUOTE_SESSION);
     Ok(report)
 }
 
@@ -5170,6 +5182,95 @@ mod tests {
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
         let _ = calls;
+    }
+
+    #[test]
+    fn quote_write_failure_keeps_the_card_counts_and_cleans_up() {
+        use crate::publish::EngageAction;
+        let ready = r#"{"stage":"inspect","path":"/cryptoXRPwhale/status/2118971448614334959","composer":true,"composer_kind":"quote","card":true,"quote_testids":2,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"attach":"card-bind article text-equal yes","message":"Quote attachment is visible. Post was not clicked."}"#;
+        let missed = r#"{"stage":"composer","path":"/cryptoXRPwhale/status/2118971448614334959","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"attach":"textareas 2 dialogs 1 | d1 box yes quotes 0 target-links 1 card-bind miss attach-count 1 text-equal no diff-at 16","message":"No quote attachment for 2118971448614334959. Post was not clicked."}"#;
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "open"],
+            r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "tab", "select"],
+            r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        let vis = crate::publish::quote_visibility_expr("2118971448614334959");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", vis.as_str()],
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
+            r#"{"stage":"menu","path":"/cryptoXRPwhale/status/2118971448614334959","selected_label":"Quote","selected_scope":"menu","clicked_post":false,"card":false,"quote_testids":0,"message":"Quote row recorded. Post was not clicked."}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "click"],
+            r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
+            ready,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxPost))"],
+            missed,
+        );
+        runner.script("opencli", &["browser", "termyx-quote", "screenshot"], "Screenshot saved");
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "tabGroups.query"],
+            r#"{"ok":true,"data":[]}"#,
+        );
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let err = publisher
+            .engage(
+                EngageAction::Quote,
+                "https://x.com/i/status/2118971448614334959",
+                Some("100 is enough"),
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("No quote attachment"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
+        assert!(err.contains("textareas 2"), "{err}");
+        assert!(err.contains("dialogs 1"), "{err}");
+        assert!(err.contains("card-bind miss"), "{err}");
+        assert!(err.contains("text-equal no"), "{err}");
+        assert!(err.contains("diff-at 16"), "{err}");
+        assert!(err.contains("quote nodes 0"), "{err}");
+        assert!(err.contains("screenshot saved"), "{err}");
+        assert!(err.contains("quote-inspect.png"), "{err}");
+        assert!(err.contains("session close acknowledged"), "{err}");
+        assert!(err.contains("owned group OpenCLI Browser groups 0 tabs 0"), "{err}");
+        let calls = runner.calls.lock().unwrap().clone();
+        let posts = calls
+            .iter()
+            .filter(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxPost))"))
+            .count();
+        assert_eq!(posts, 1);
+        let shot_at = calls.iter().position(|(_, args)| args.iter().any(|arg| arg == "screenshot")).expect("screenshot");
+        let close_at = calls.iter().rposition(|(_, args)| args.windows(2).any(|pair| pair[0] == "termyx-quote" && pair[1] == "close")).expect("close");
+        assert!(shot_at < close_at, "screenshot must run before session close");
+        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("termyx-quote-read")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove" || arg == "tabs.remove")));
     }
 
     #[test]

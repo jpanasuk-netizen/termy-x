@@ -2070,71 +2070,19 @@ pub fn quote_type_and_post_script_bound(
   window.__qxReport = null;
   const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
-  const quoteAttachment = () => {{
-    const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
-    const box = boxes.length ? boxes[boxes.length - 1] : null;
-    const dialog = box ? box.closest('[role="dialog"], [aria-modal="true"]') : null;
-    if (!dialog) return false;
-    const hits = Array.from(dialog.querySelectorAll('a[href*="/status/"]')).filter((link) => {{
-      if (statusId(link.href) !== TARGET) return false;
-      if ((link.getAttribute("href") || "").indexOf("in_reply_to") >= 0) return false;
-      if (link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]')) return false;
-      return true;
-    }});
-    if (!hits.length) {{
-      const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-      const tokenExact = (value) => {{
-        const text = String(value || "");
-        const at = text.indexOf(TARGET);
-        if (at < 0) return false;
-        const prev = at > 0 ? text.charAt(at - 1) : "";
-        const next = text.charAt(at + TARGET.length);
-        const digit = (ch) => ch >= "0" && ch <= "9";
-        return !digit(prev) && !digit(next);
-      }};
-      const card = Array.from(dialog.querySelectorAll('[data-testid="attachments"]')).find((node) => !node.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]'));
-      if (!card) return false;
-      const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
-      const textNode = card.querySelector('[data-testid="tweetText"]');
-      if (!avatar || !textNode) return false;
-      const cardText = visibleText(textNode);
-      const blob = norm(card.innerText || card.textContent).toLowerCase();
-      let attrExact = false;
-      let attrOther = false;
-      card.querySelectorAll("*").forEach((el) => {{
-        ["href", "aria-label", "title", "id", "datetime"].forEach((key) => {{
-          const value = el.getAttribute ? (el.getAttribute(key) || "") : "";
-          if (!value) return;
-          const sid = statusId(value);
-          if (sid === TARGET || tokenExact(value)) attrExact = true;
-          else if (sid) attrOther = true;
-        }});
-      }});
-      if (attrOther) return false;
-      const source = norm(SOURCE);
-      const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
-      const textOk = !!source && !!cardText && cardText === source;
-      return attrExact || (handleOk && textOk);
-    }}
-    if (hits.some((link) => !!link.closest('[data-testid="quoteTweet"]'))) return true;
-    let paramId = null;
-    try {{ const raw = new URL(location.href).searchParams.get("url") || ""; const match = raw.match(/status\/(\d+)/); paramId = match ? match[1] : null; }} catch (e) {{ paramId = null; }}
-    return location.pathname === "/compose/post" && paramId === TARGET;
-  }};
-  const base = (stage, message, clicked) => ({{
+  const quoteAttachment = () => findProvenQuote().ok;
+  const base = (stage, message, clicked, proof) => ({{
     stage: stage, path: location.pathname, composer: !!document.querySelector('[data-testid="tweetTextarea_0"]'),
-    composer_kind: quoteAttachment() ? "quote" : "unknown", card: quoteAttachment(),
-    quote_testids: quoteAttachment() ? 1 : 0,
+    composer_kind: proof.ok ? "quote" : "unknown", card: proof.ok,
+    quote_testids: proof.ok ? Math.max(proof.quotes, proof.linkHits, 1) : 0,
     clicked_post: clicked, clicked_repost_confirm: false, text_landed: false,
-    quoted_status_id: quoteAttachment() ? TARGET : null, message: message
+    quoted_status_id: proof.ok ? TARGET : null, attach: proof.attach || "", message: message
   }});
-  if (!quoteAttachment()) {{
-    return finish(base("composer", "No quote attachment for " + TARGET + ". Post was not clicked.", false));
+  const before = findProvenQuote();
+  if (!quoteAttachment() || !before.box) {{
+    return finish(base("composer", "No quote attachment for " + TARGET + ". Post was not clicked.", false, before));
   }}
-  const box = document.querySelector('[data-testid="tweetTextarea_0"]');
-  if (!box) {{
-    return finish(base("composer", "Quote attachment is visible but the composer box is not. Post was not clicked.", false));
-  }}
+  const box = before.box;
   box.focus();
   if (!document.execCommand("insertText", false, TEXT)) {{
     const data = new DataTransfer();
@@ -2144,10 +2092,11 @@ pub fn quote_type_and_post_script_bound(
   await new Promise((resolve) => setTimeout(resolve, 600));
   const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
   const landed = norm(box.innerText || box.textContent || "").indexOf(norm(TEXT)) >= 0;
-  const button = Array.from(document.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
-    .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true");
-  if (!landed || !button || !quoteAttachment()) {{
-    const stuck = base("editor", "Quote attachment, commentary, or Post button was not proven. Post was not clicked.", false);
+  const after = findProvenQuote();
+  const button = after.dialog ? Array.from(after.dialog.querySelectorAll('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'))
+    .find((el) => !el.disabled && el.getAttribute("aria-disabled") !== "true") : null;
+  if (!landed || !button || !after.ok) {{
+    const stuck = base("editor", "Quote attachment, commentary, or Post button was not proven. Post was not clicked.", false, after);
     stuck.text_landed = landed;
     return finish(stuck);
   }}
@@ -2158,17 +2107,21 @@ pub fn quote_type_and_post_script_bound(
     const sent = toasts.find((el) => /sent|posted/i.test(el.textContent || ""));
     if (sent) {{
       const link = sent.querySelector('a[href*="/status/"]');
-      const done = base("posted", "Quote tweet posted successfully.", true);
+      const done = base("posted", "Quote tweet posted successfully.", true, findProvenQuote());
       done.text_landed = true;
       done.new_status_id = link ? statusId(link.href) : null;
       return finish(done);
     }}
   }}
-  const unclear = base("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.", true);
+  const unclear = base("posted", "Post was clicked once but no sent toast appeared. Not marked sent. Nothing was retried.", true, findProvenQuote());
+  unclear.text_landed = true;
   return finish(unclear);
 }})()"#
     )
-    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
+    .replace(
+        "VISIBLE_TEXT_PLACEHOLDER",
+        &format!("{}{}", quote_visible_text_js(), quote_card_proof_js()),
+    )
 }
 
 fn quote_visible_text_js() -> &'static str {
@@ -2239,6 +2192,112 @@ fn quote_visible_text_js() -> &'static str {
 "#
 }
 
+/// Shared quote-card decision for inspect and the publish recheck.
+/// A dialog is the card only when its composer box sits with a quoteTweet
+/// of this status, a compose URL whose link is outside the editor, or an
+/// attachment whose handle and visible text match the source article.
+/// A status link by itself is not a card. The price chip after a cashtag
+/// is not part of the authored text.
+fn quote_card_proof_js() -> &'static str {
+    r#"const proofOne = (dlg) => {
+  const statusId = (href) => { try { const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; } catch (e) { return null; } };
+  const inEditor = (node) => !!(node && node.closest && node.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]'));
+  const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const tokenExact = (value) => {
+    const text = String(value || "");
+    const at = text.indexOf(TARGET);
+    if (at < 0) return false;
+    const prev = at > 0 ? text.charAt(at - 1) : "";
+    const next = text.charAt(at + TARGET.length);
+    const digit = (ch) => ch >= "0" && ch <= "9";
+    return !digit(prev) && !digit(next);
+  };
+  const hasBox = !!dlg.querySelector('[data-testid="tweetTextarea_0"]');
+  const box = dlg.querySelector('[data-testid="tweetTextarea_0"]');
+  const qNodes = Array.from(dlg.querySelectorAll('[data-testid="quoteTweet"]'));
+  const qHits = qNodes.filter((node) => Array.from(node.querySelectorAll('a[href*="/status/"]')).some((link) => statusId(link.href) === TARGET));
+  const links = Array.from(dlg.querySelectorAll('a[href*="/status/"]')).filter((link) => statusId(link.href) === TARGET && (link.getAttribute("href") || "").indexOf("in_reply_to") < 0 && !inEditor(link));
+  let paramId = null;
+  try { const raw = new URL(location.href).searchParams.get("url") || ""; const match = raw.match(/status\/(\d+)/); paramId = match ? match[1] : null; } catch (e) { paramId = null; }
+  const composeHit = hasBox && location.pathname === "/compose/post" && paramId === TARGET && links.length > 0;
+  const card = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).find((node) => !inEditor(node)) || null;
+  let bind = "none";
+  let attrExact = false;
+  let attrOther = false;
+  if (card) {
+    const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
+    const textNode = card.querySelector('[data-testid="tweetText"]');
+    const cardText = visibleText(textNode);
+    const blob = norm(card.innerText || card.textContent).toLowerCase();
+    card.querySelectorAll("*").forEach((el) => {
+      ["href", "aria-label", "title", "id", "datetime"].forEach((key) => {
+        const value = el.getAttribute ? (el.getAttribute(key) || "") : "";
+        if (!value) return;
+        const sid = statusId(value);
+        if (sid === TARGET || tokenExact(value)) attrExact = true;
+        else if (sid) attrOther = true;
+      });
+    });
+    const source = norm(SOURCE);
+    const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
+    const textOk = !!source && !!cardText && cardText === source;
+    if (hasBox && avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) bind = attrExact ? "id" : "article";
+    else if (attrOther) bind = "other-id";
+    else bind = "miss";
+  }
+  const articleHit = bind === "article" || bind === "id";
+  const proven = !!(hasBox && (qHits.length || composeHit || articleHit));
+  const quotes = (hasBox && qHits.length ? qHits.length : 0) + (articleHit ? 1 : 0);
+  const attachNodes = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).filter((node) => !inEditor(node));
+  const dialogTextNode = Array.from(dlg.querySelectorAll('[data-testid="tweetText"]')).find((node) => !inEditor(node)) || null;
+  const dialogAvatar = Array.from(dlg.querySelectorAll('[data-testid="Tweet-User-Avatar"]')).find((node) => !inEditor(node)) || null;
+  const textIn = !!(card && dialogTextNode && card.contains(dialogTextNode));
+  const avatarIn = !!(card && dialogAvatar && card.contains(dialogAvatar));
+  const fold = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const sourceNorm = fold(SOURCE);
+  const cardNorm = dialogTextNode ? visibleText(dialogTextNode) : "";
+  const asciiFold = (value) => value.replace(/[^\u0000-\u007F]/g, "");
+  const attachBlob = fold(card && (card.innerText || card.textContent)).toLowerCase();
+  const dialogBlob = fold(dlg.innerText || dlg.textContent).toLowerCase();
+  const needle = SCREEN ? ("@" + String(SCREEN).toLowerCase()) : "";
+  let diffAt = -1;
+  const limit = Math.min(sourceNorm.length, cardNorm.length);
+  for (let i = 0; i < limit; i++) { if (sourceNorm.charCodeAt(i) !== cardNorm.charCodeAt(i)) { diffAt = i; break; } }
+  if (diffAt < 0 && sourceNorm.length !== cardNorm.length) diffAt = limit;
+  const compare = "attach-count " + attachNodes.length
+    + " avatar-in " + (avatarIn ? "yes" : "no")
+    + " text-in " + (textIn ? "yes" : "no")
+    + " dialog-avatar " + (dialogAvatar ? "yes" : "no")
+    + " dialog-text " + (dialogTextNode ? "yes" : "no")
+    + " source-chars " + sourceNorm.length
+    + " card-chars " + cardNorm.length
+    + " text-equal " + (sourceNorm && cardNorm && sourceNorm === cardNorm ? "yes" : "no")
+    + " handle-attach " + (needle && attachBlob.indexOf(needle) >= 0 ? "yes" : "no")
+    + " handle-dialog " + (needle && dialogBlob.indexOf(needle) >= 0 ? "yes" : "no")
+    + " diff-at " + diffAt;
+  return { proven: proven, quotes: quotes, bind: bind, card: card, box: box, dialog: dlg, hasBox: hasBox, qCount: qNodes.length, links: links, composeHit: composeHit, compare: compare };
+};
+const findProvenQuote = () => {
+  const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'));
+  let chosen = null;
+  let quotes = 0;
+  let linkHits = 0;
+  const parts = [];
+  dialogs.forEach((dlg, index) => {
+    const proof = proofOne(dlg);
+    quotes += proof.quotes;
+    if (proof.composeHit) linkHits += proof.links.length;
+    parts.push("d" + (index + 1) + " box " + (proof.hasBox ? "yes" : "no") + " quotes " + proof.qCount + " target-links " + proof.links.length + " card-bind " + proof.bind + " " + proof.compare);
+    if (!proof.proven) return;
+    const rank = proof.bind === "article" || proof.bind === "id" ? 2 : 1;
+    if (!chosen || rank > chosen.rank) chosen = { dialog: proof.dialog, box: proof.box, bind: proof.bind, rank: rank };
+  });
+  const boxes = document.querySelectorAll('[data-testid="tweetTextarea_0"]').length;
+  return { ok: !!chosen, dialog: chosen ? chosen.dialog : null, box: chosen ? chosen.box : null, bind: chosen ? chosen.bind : "none", quotes: quotes, linkHits: linkHits, attach: "textareas " + boxes + " dialogs " + dialogs.length + (parts.length ? " | " + parts.join(" | ") : "") };
+};
+"#
+}
+
 /// Reads the clicked article's handle and tweet text. No clicks.
 pub fn quote_source_script(target_id: &str) -> String {
     let id_js = js_ascii_string(target_id);
@@ -2263,7 +2322,10 @@ pub fn quote_source_script(target_id: &str) -> String {
   return JSON.stringify(report);
 }} )()"#
     )
-    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
+    .replace(
+        "VISIBLE_TEXT_PLACEHOLDER",
+        &format!("{}{}", quote_visible_text_js(), quote_card_proof_js()),
+    )
 }
 
 pub fn quote_snap_script(target_id: &str) -> String {
@@ -2404,49 +2466,11 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
     }}
     const hasBox = !!dlg.querySelector('[data-testid="tweetTextarea_0"]');
     const hasPost = !!dlg.querySelector('[data-testid="tweetButton"], [data-testid="tweetButtonInline"]');
-    if (hasBox && qHits.length) {{ attached = true; proofQuotes += qHits.length; }}
-    if (hasBox && location.pathname === "/compose/post" && paramId === TARGET && links.length) {{
-      attached = true;
-      links.forEach((link) => hits.push(link));
-    }}
-    const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-    const tokenExact = (value) => {{
-      const text = String(value || "");
-      const at = text.indexOf(TARGET);
-      if (at < 0) return false;
-      const prev = at > 0 ? text.charAt(at - 1) : "";
-      const next = text.charAt(at + TARGET.length);
-      const digit = (ch) => ch >= "0" && ch <= "9";
-      return !digit(prev) && !digit(next);
-    }};
-    const card = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).find((node) => !inEditor(node));
-    let bind = "none";
-    if (card) {{
-      const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
-      const textNode = card.querySelector('[data-testid="tweetText"]');
-      const cardText = visibleText(textNode);
-      const blob = norm(card.innerText || card.textContent).toLowerCase();
-      let attrExact = false;
-      let attrOther = false;
-      card.querySelectorAll("*").forEach((el) => {{
-        ["href", "aria-label", "title", "id", "datetime"].forEach((key) => {{
-          const value = el.getAttribute ? (el.getAttribute(key) || "") : "";
-          if (!value) return;
-          const sid = statusId(value);
-          if (sid === TARGET || tokenExact(value)) attrExact = true;
-          else if (sid) attrOther = true;
-        }});
-      }});
-      const source = norm(SOURCE);
-      const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
-      const textOk = !!source && !!cardText && cardText === source;
-      if (hasBox && avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) {{
-        attached = true;
-        proofQuotes += 1;
-        bind = attrExact ? "id" : "article";
-      }} else if (attrOther) bind = "other-id";
-      else bind = "miss";
-    }}
+    const proof = proofOne(dlg);
+    if (proof.proven) {{ attached = true; proofQuotes += proof.quotes; }}
+    if (proof.composeHit) {{ proof.links.forEach((link) => hits.push(link)); }}
+    const card = proof.card;
+    const bind = proof.bind;
     const attachNodes = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).filter((node) => !inEditor(node));
     const dialogTextNode = Array.from(dlg.querySelectorAll('[data-testid="tweetText"]')).find((node) => !inEditor(node)) || null;
     const dialogAvatar = Array.from(dlg.querySelectorAll('[data-testid="Tweet-User-Avatar"]')).find((node) => !inEditor(node)) || null;
@@ -2517,7 +2541,10 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
   return JSON.stringify(report);
 }} )()"#
     )
-    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
+    .replace(
+        "VISIBLE_TEXT_PLACEHOLDER",
+        &format!("{}{}", quote_visible_text_js(), quote_card_proof_js()),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3904,7 +3931,8 @@ mod tests {
         assert!(crate::publish::quote_click_trusted(r#"{"ok":true,"data":{"click_method":"ax"}}"#));
         assert!(snap.contains("A visible link is not the card"));
         assert!(snap.contains("ancestors"));
-        assert!(snap.contains("hasBox && qHits.length"));
+        assert!(snap.contains("proofOne(dlg)"));
+        assert!(post.contains("findProvenQuote"));
         let composer = quote_composer_url(original);
         assert!(composer.starts_with("https://x.com/compose/post?url=https://x.com/i/status/"));
         assert!(composer.contains("2118971448614334959"));
@@ -4335,6 +4363,77 @@ mod tests {
         assert_eq!(price["card"], true, "{}", price["attach"]);
         assert!(price["attach"].as_str().unwrap().contains("text-equal yes"), "{}", price["attach"]);
     }
+
+    #[test]
+    fn quote_publish_rechecks_the_same_card_bind_after_the_commentary() {
+        let target = "2118971448614334959";
+        let source = "IS OWNING 1,000 $XRP ENOUGH?";
+        let snap = quote_snap_script_bound(target, "cryptoXRPwhale", source);
+        let post = quote_type_and_post_script_bound(target, "100 is enough", "cryptoXRPwhale", source);
+        let dir = std::env::temp_dir();
+        let snap_path = dir.join("termy-quote-publish-snap.js");
+        let post_path = dir.join("termy-quote-publish-post.js");
+        let harness_path = dir.join("termy-quote-publish-harness.js");
+        std::fs::write(&snap_path, &snap).unwrap();
+        std::fs::write(&post_path, &post).unwrap();
+        std::fs::write(&harness_path, QUOTE_PUBLISH_DOM_HARNESS).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(&snap_path)
+            .arg(&post_path)
+            .output()
+            .expect("node");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stderr),
+            stdout
+        );
+        let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        let row = |name: &str| {
+            reports
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let stray = row("stray");
+        assert_eq!(stray["snap"]["card"], true, "{}", stray["snap"]["attach"]);
+        assert!(stray["snap"]["attach"].as_str().unwrap().contains("card-bind article"), "{}", stray["snap"]["attach"]);
+        assert!(stray["snap"]["attach"].as_str().unwrap().contains("text-equal yes"), "{}", stray["snap"]["attach"]);
+        assert_eq!(stray["post"]["card"], true, "{}", stray["post"]["attach"]);
+        assert_eq!(stray["post"]["clicked_post"], true, "{}", stray["post"]);
+        assert_eq!(stray["post"]["text_landed"], true, "{}", stray["post"]);
+        assert!(stray["post"]["attach"].as_str().unwrap().contains("card-bind article"), "{}", stray["post"]["attach"]);
+        assert_eq!(stray["clicks"], serde_json::json!(["modal-post"]));
+        assert_eq!(stray["focused"], "modal-box");
+        assert_eq!(stray["inline"], "");
+
+        let spoiled = row("spoiled");
+        assert_eq!(spoiled["snap"]["card"], true, "{}", spoiled["snap"]["attach"]);
+        assert_eq!(spoiled["post"]["clicked_post"], false, "{}", spoiled["post"]);
+        assert_eq!(spoiled["post"]["text_landed"], true, "{}", spoiled["post"]);
+        assert!(spoiled["post"]["message"].as_str().unwrap().contains("not proven"), "{}", spoiled["post"]["message"]);
+        assert!(spoiled["post"]["attach"].as_str().unwrap().contains("text-equal no"), "{}", spoiled["post"]["attach"]);
+        assert!(spoiled["post"]["attach"].as_str().unwrap().contains("card-bind miss"), "{}", spoiled["post"]["attach"]);
+        assert_eq!(spoiled["clicks"].as_array().unwrap().len(), 0);
+
+        let wrong = row("wrong");
+        assert_eq!(wrong["snap"]["card"], false, "{}", wrong["snap"]["attach"]);
+        assert_eq!(wrong["post"]["card"], false, "{}", wrong["post"]["attach"]);
+        assert_eq!(wrong["post"]["clicked_post"], false, "{}", wrong["post"]);
+        assert!(wrong["post"]["message"].as_str().unwrap().contains("No quote attachment"), "{}", wrong["post"]["message"]);
+        assert!(wrong["post"]["attach"].as_str().unwrap().contains("text-equal no"), "{}", wrong["post"]["attach"]);
+        assert_eq!(wrong["clicks"].as_array().unwrap().len(), 0);
+
+        let link_only = row("linkonly");
+        assert_eq!(link_only["snap"]["card"], false, "{}", link_only["snap"]["attach"]);
+        assert_eq!(link_only["post"]["card"], false, "{}", link_only["post"]["attach"]);
+        assert_eq!(link_only["post"]["clicked_post"], false);
+        assert_eq!(link_only["clicks"].as_array().unwrap().len(), 0);
+    }
 }
 
 const QUOTE_SNAP_DOM_HARNESS: &str = r#"
@@ -4561,4 +4660,131 @@ const rows = [
   ])
 ];
 process.stdout.write(JSON.stringify(rows.map((row) => Object.assign({ name: row.name }, row.report))));
+"#;
+
+const QUOTE_PUBLISH_DOM_HARNESS: &str = r#"
+const fs = require("fs");
+const snap = fs.readFileSync(process.argv[2], "utf8");
+const post = fs.readFileSync(process.argv[3], "utf8");
+function el(tag, attrs, kids) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    attrs: attrs || {},
+    children: [],
+    parentElement: null,
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; },
+    get href() { const raw = this.getAttribute("href"); if (!raw) return ""; try { return new URL(raw, globalThis.location.origin).href; } catch (e) { return raw; } },
+    closest(sel) { return matchAny(this, sel) ? this : (this.parentElement ? this.parentElement.closest(sel) : null); },
+    querySelectorAll(sel) { const out = []; walk(this, (n) => { if (n !== this && matchAny(n, sel)) out.push(n); }); return out; },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    contains(other) { let cur = other; while (cur) { if (cur === this) return true; cur = cur.parentElement; } return false; },
+    focus() { globalThis.__focused = this; },
+    click() { globalThis.__clicks.push(this.getAttribute("id") || ""); },
+    get innerText() {
+      const own = this.attrs.innerText || "";
+      const nested = (this.children || []).map((kid) => kid.innerText || "").join(" ");
+      return [own, nested].filter(Boolean).join(" ");
+    }
+  };
+  for (const kid of kids || []) { kid.parentElement = node; node.children.push(kid); }
+  return node;
+}
+function matchOne(node, sel) {
+  sel = sel.trim();
+  if (!sel) return false;
+  if (sel === "article") return node.tagName === "ARTICLE";
+  let rest = sel;
+  const tag = rest.match(/^([a-zA-Z]+)/);
+  if (tag) {
+    if (node.tagName !== tag[1].toUpperCase()) return false;
+    rest = rest.slice(tag[1].length);
+  }
+  const attrs = [...rest.matchAll(/\[([^\]=*~|^]+)(\*=|=|\^=)?(?:"([^"]*)")?\]/g)];
+  if (!attrs.length) return !!tag;
+  for (const found of attrs) {
+    const got = node.getAttribute(found[1]);
+    if (got == null) return false;
+    if (found[2] === "=" && got !== found[3]) return false;
+    if (found[2] === "*=" && String(got).indexOf(found[3]) < 0) return false;
+  }
+  return true;
+}
+function matchAny(node, sel) { return sel.split(",").some((part) => matchOne(node, part)); }
+function walk(node, fn) { fn(node); for (const kid of node.children) walk(kid, fn); }
+async function run(name, kids, spoil) {
+  globalThis.__clicks = [];
+  globalThis.__focused = null;
+  globalThis.__spoil = spoil || null;
+  globalThis.setTimeout = (fn) => { fn(); return 0; };
+  const body = el("body", {}, kids);
+  globalThis.document = {
+    body,
+    querySelectorAll(sel) { return body.querySelectorAll(sel); },
+    querySelector(sel) { return body.querySelector(sel); },
+    execCommand(_cmd, _ui, text) {
+      if (globalThis.__focused) globalThis.__focused.attrs.innerText = String(text || "");
+      if (globalThis.__spoil) globalThis.__spoil.attrs.innerText = "NOT THE POST";
+      return true;
+    }
+  };
+  globalThis.location = new URL("https://x.com/cryptoXRPwhale/status/2118971448614334959");
+  globalThis.window = {};
+  const snapReport = JSON.parse((0, eval)(snap));
+  const postReport = JSON.parse(await (0, eval)(post));
+  let inline = "";
+  walk(body, (node) => { if (node.getAttribute && node.getAttribute("id") === "inline-box") inline = node.getAttribute("innerText") || ""; });
+  return {
+    name,
+    snap: snapReport,
+    post: postReport,
+    clicks: globalThis.__clicks,
+    focused: globalThis.__focused ? globalThis.__focused.getAttribute("id") : "",
+    inline: inline
+  };
+}
+const target = "2118971448614334959";
+const source = "IS OWNING 1,000 $XRP ENOUGH?";
+const card = (text) => {
+  const textNode = el("div", { "data-testid": "tweetText", innerText: text }, []);
+  const dialog = el("div", { role: "dialog" }, [
+    el("div", { id: "modal-box", "data-testid": "tweetTextarea_0", innerText: "" }, []),
+    el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+      el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+      textNode
+    ]),
+    el("a", { href: "/cryptoXRPwhale/status/" + target }, []),
+    el("div", { id: "modal-post", "data-testid": "tweetButton" }, [])
+  ]);
+  return { dialog, textNode };
+};
+(async () => {
+  const matching = card(source);
+  const spoiled = card(source);
+  const wrong = card("IS OWNING 2,000 $XRP ENOUGH?");
+  const rows = [
+    await run("stray", [
+      matching.dialog,
+      el("div", { id: "inline-box", "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { id: "page-post", "data-testid": "tweetButton" }, [])
+    ], null),
+    await run("spoiled", [
+      spoiled.dialog,
+      el("div", { id: "inline-box", "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { id: "page-post", "data-testid": "tweetButton" }, [])
+    ], spoiled.textNode),
+    await run("wrong", [
+      wrong.dialog,
+      el("div", { id: "inline-box", "data-testid": "tweetTextarea_0", innerText: "" }, [])
+    ], null),
+    await run("linkonly", [
+      el("div", { role: "dialog" }, [
+        el("div", { id: "modal-box", "data-testid": "tweetTextarea_0", innerText: "" }, []),
+        el("a", { href: "/cryptoXRPwhale/status/" + target }, []),
+        el("div", { id: "modal-post", "data-testid": "tweetButton" }, [])
+      ]),
+      el("div", { id: "inline-box", "data-testid": "tweetTextarea_0", innerText: "" }, [])
+    ], null)
+  ];
+  process.stdout.write(JSON.stringify(rows));
+})().catch((error) => { console.error(error); process.exit(1); });
 "#;
