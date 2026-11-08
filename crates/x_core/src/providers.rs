@@ -2106,6 +2106,43 @@ fn chrome_call_args(method: &str, json_args: &str) -> Vec<String> {
     ]
 }
 
+fn quote_owned_leftover(bin: &str, runner: &dyn crate::io::CommandRunner) -> String {
+    let listed = quote_run(
+        bin,
+        runner,
+        &chrome_call_args("tabGroups.query", r#"[{"title":"OpenCLI Browser"}]"#),
+        Duration::from_secs(15),
+    );
+    let Ok(listed) = listed else {
+        return "owned group unread".into();
+    };
+    if listed.status != 0 {
+        return "owned group unread".into();
+    }
+    let ids = crate::publish::quote_owned_group_ids(&listed.stdout);
+    if ids.is_empty() {
+        return "owned group OpenCLI Browser groups 0 tabs 0".into();
+    }
+    let mut tabs = 0usize;
+    for id in &ids {
+        let queried = quote_run(
+            bin,
+            runner,
+            &chrome_call_args("tabs.query", &format!(r#"[{{"groupId":{id}}}]"#)),
+            Duration::from_secs(15),
+        );
+        if let Ok(output) = queried {
+            if output.status == 0 {
+                tabs += crate::publish::quote_tab_count(&output.stdout).unwrap_or(0);
+            }
+        }
+    }
+    format!(
+        "owned group OpenCLI Browser groups {} tabs {tabs} · session list is not chrome clean",
+        ids.len()
+    )
+}
+
 /// Read-only Chrome facts for the status tab. `windows.update` is not called:
 /// OpenCLI 2.0.2 rejects it for the owned group with managed_resource_conflict.
 fn quote_container_note(
@@ -2253,7 +2290,11 @@ fn run_quote_attachment(
     }
     if inspect || !crate::publish::quote_inspect_ready(&after) {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        let line = with_quote_view(crate::publish::quote_report_line(&after), &view);
+        let leftover = quote_owned_leftover(bin, runner);
+        let line = format!(
+            "{} · {leftover}",
+            with_quote_view(crate::publish::quote_report_line(&after), &view)
+        );
         return if crate::publish::quote_inspect_ready(&after) {
             Ok(after)
         } else {
@@ -4965,7 +5006,7 @@ mod tests {
 
     #[test]
     fn quote_compose_route_reaches_the_attachment_check() {
-        let missing = r#"{"stage":"composer","path":"/compose/post","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"attach":"dialog testids none target-links 0 chain none","message":"No quote attachment for 20. Post was not clicked."}"#;
+        let missing = r#"{"stage":"composer","path":"/compose/post","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"attach":"textareas 2 in-dialog-textareas 0 dialogs 2 page-quotes 0 ancestors DIV:-:- | d1 box no post no quotes 0 target-links 0 testids none | d2 box no post no quotes 0 target-links 0 testids none","message":"No quote attachment for 20. Post was not clicked."}"#;
         let runner = Arc::new(ScriptedRunner::new());
         runner.script(
             "opencli",
@@ -4996,13 +5037,33 @@ mod tests {
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
             missing,
         );
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "tabGroups.query"],
+            r#"{"ok":true,"data":[{"id":9,"title":"OpenCLI Browser","windowId":5}]}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "tabs.query"],
+            r#"{"ok":true,"data":[{"id":3,"groupId":9}]}"#,
+        );
         let err = inspect_quote_attachment("opencli", runner.as_ref(), "20").unwrap_err();
         assert!(err.contains("stage composer"), "{err}");
         assert!(!err.starts_with("stage visibility"), "{err}");
         assert!(err.contains("No quote attachment"), "{err}");
         assert!(err.contains("route compose"), "{err}");
+        assert!(err.contains("in-dialog-textareas 0"), "{err}");
         assert!(err.contains("target-links 0"), "{err}");
         assert!(!err.contains("card yes"), "{err}");
+        assert!(err.contains("owned group OpenCLI Browser groups 1 tabs 1"), "{err}");
+        assert!(err.contains("session list is not chrome clean"), "{err}");
+        let calls = runner.calls.lock().unwrap().clone();
+        let encoded = b64_encode(crate::publish::quote_snap_script("20").as_bytes());
+        assert!(calls.iter().any(|(_, args)| {
+            args.iter().any(|arg| arg.starts_with("window.__qxSnap='") && encoded.starts_with(arg.trim_start_matches("window.__qxSnap='").trim_end_matches('\'')))
+        }));
+        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxSnap))")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove")));
     }
 
     #[test]
