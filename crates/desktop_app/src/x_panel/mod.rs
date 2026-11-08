@@ -1574,7 +1574,7 @@ impl XPanel {
                     label: "\u{2713} Posted",
                 });
                 self.notice =
-                    Some("Posted in-app \u{2014} no browser opened. 1 part(s) posted".into());
+                    Some("Preview of the Posted note. Nothing was posted.".into());
             }
             "confirm" => {
                 self.open_section(XSection::Compose, cx);
@@ -5086,17 +5086,25 @@ impl XPanel {
                             panel.action_db.note_opencli_contract(&account, kind, &id);
                         }
                         panel.persist_actions();
-                        panel.status = format!(
-                            "{} @{}",
-                            match action {
-                                termy_x::publish::EngageAction::Like => "liked",
-                                termy_x::publish::EngageAction::Unlike => "unliked",
-                                termy_x::publish::EngageAction::Retweet => "retweeted",
-                                termy_x::publish::EngageAction::Unretweet => "retweet removed from",
-                                termy_x::publish::EngageAction::Quote => "quoted",
-                            },
-                            author
-                        );
+                        panel.status = match action {
+                            termy_x::publish::EngageAction::Like => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Like)
+                            }
+                            termy_x::publish::EngageAction::Unlike => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Unlike)
+                            }
+                            termy_x::publish::EngageAction::Retweet => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Retweet)
+                            }
+                            termy_x::publish::EngageAction::Unretweet => termy_x::publish::success_note(
+                                termy_x::publish::UserWrite::Unretweet,
+                            ),
+                            termy_x::publish::EngageAction::Quote => termy_x::publish::success_note(
+                                termy_x::publish::UserWrite::QTweet,
+                            ),
+                        }
+                        .to_string();
+                        let _ = author;
                         // Verified success only. Like, unlike, retweet, and
                         // unretweet each have their own card note.
                         if let Some(label) = termy_x::publish::engage_burst_label(action) {
@@ -5314,11 +5322,8 @@ impl XPanel {
             return;
         }
         let media = self.quote_media.clone();
-        let author = self.quote_author.clone();
         self.quote_posting = true;
-        self.notice = Some(format!(
-            "Quoting @{author} in-app, silently in the background\u{2026} no browser will open."
-        ));
+        self.notice = Some(termy_x::publish::quote_visible_window_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -5363,9 +5368,13 @@ impl XPanel {
                         panel.quote_text.clear();
                         panel.quote_media.clear();
                         panel.notice = Some(
-                            "Q-tweet sent \u{b7} posted in-app, no browser opened.".into(),
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
+                                .to_string(),
                         );
-                        panel.status = format!("Q-tweet @{author}");
+                        panel.status = termy_x::publish::success_note(
+                            termy_x::publish::UserWrite::QTweet,
+                        )
+                        .to_string();
                         panel.remember_receipt(
                             termy_x::action_state::ReceiptKind::QTweet,
                             &target_id,
@@ -5436,9 +5445,7 @@ impl XPanel {
         let author = self.reply_author.clone();
         let target_id_for_update = target_id.clone();
         self.reply_posting = true;
-        self.notice = Some(format!(
-            "Replying to @{author} in-app, silently in the background\u{2026} no browser will open."
-        ));
+        self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -5496,9 +5503,10 @@ impl XPanel {
                         }
                         panel.reply_text.clear();
                         panel.reply_media.clear();
-                        panel.notice = Some(format!(
-                            "Replied to @{author} \u{b7} posted in-app, no browser opened."
-                        ));
+                        panel.notice = Some(
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::Reply)
+                                .to_string(),
+                        );
                         panel.status = format!("replied to @{author}");
                         panel.remember_receipt(
                             termy_x::action_state::ReceiptKind::Reply,
@@ -5518,7 +5526,7 @@ impl XPanel {
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not reply: {} Nothing was posted; no browser opened.",
+                            "Could not reply: {} Nothing was posted.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
@@ -11184,7 +11192,7 @@ impl XPanel {
                             div()
                                 .text_size(px(12.0))
                                 .text_color(rgb(0xffd0ea))
-                                .child("Post now sends these in-app via OpenCLI --images (no browser). If you choose Open in browser instead, attach them there — a web link can't upload files."),
+                                .child("Post now sends these through your X session in the background. If you choose Open in browser instead, attach them there — a web link can't upload files."),
                         ),
                 )
                 .children(media_lines.into_iter().map(|name| {
@@ -11414,14 +11422,7 @@ impl XPanel {
         }
         let queue_id = self.confirm_queue_id.clone();
         self.posting = true;
-        self.notice = Some(if media.is_empty() {
-            "Posting in-app via your X session… no browser will open.".into()
-        } else {
-            format!(
-                "Posting in-app with {} image(s) via your X session… no browser will open.",
-                media.len()
-            )
-        });
+        self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -11488,9 +11489,10 @@ impl XPanel {
                             panel.reply_media.clear();
                             panel.confirm_reply_author.clear();
                             panel.close_reply();
-                            panel.notice = Some(format!(
-                                "Replied in-app \u{2014} no browser opened. {receipt}"
-                            ));
+                            panel.notice = Some(
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Reply)
+                                    .to_string(),
+                            );
                             panel.begin_post_burst(
                                 BurstTarget::Reply,
                                 termy_x::publish::reply_sent_label(),
@@ -11501,9 +11503,10 @@ impl XPanel {
                             panel.compose.clear();
                             panel.caret = 0;
                             panel.sel_anchor = None;
-                            panel.notice = Some(format!(
-                                "Posted in-app — no browser opened. {receipt}"
-                            ));
+                            panel.notice = Some(
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Post)
+                                    .to_string(),
+                            );
                             panel.focus_compose_editor();
                             panel.pending_focus = true;
                             panel.remember_receipt(
@@ -11530,7 +11533,7 @@ impl XPanel {
                         // Stay on confirm so the user can retry or explicitly
                         // choose 'Open in browser'. Nothing auto-opens.
                         panel.notice = Some(format!(
-                            "Could not post in-app: {} Nothing was posted; no browser opened.",
+                            "Could not post: {} Nothing was posted.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }

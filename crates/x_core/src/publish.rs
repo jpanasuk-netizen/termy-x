@@ -90,7 +90,7 @@ pub fn success_note(action: UserWrite) -> &'static str {
         UserWrite::Unlike => "\u{2713} Unliked",
         UserWrite::Retweet => "\u{2713} Retweeted",
         UserWrite::Unretweet => "\u{2713} Unretweeted",
-        UserWrite::QTweet => "\u{2713} Q-tweet",
+        UserWrite::QTweet => "\u{2713} Q-retweeted",
         UserWrite::Reply => "\u{2713} Reply sent",
         UserWrite::Follow => "\u{2713} Followed",
         UserWrite::Unfollow => "\u{2713} Unfollowed",
@@ -167,6 +167,21 @@ pub fn follow_burst_label(follow: bool) -> &'static str {
 /// Button and heading for the quote composer. The provider verb stays `quote`.
 pub fn quote_action_label() -> &'static str {
     "Q-tweet"
+}
+
+/// Posts, replies, and retweets pass OpenCLI `--window background`.
+/// That flag stops focus theft. The window can still exist; on Windows the
+/// automation window is minimized while the command runs. Visibility is
+/// never spoofed, and the window is not moved off-screen.
+pub fn background_write_note() -> &'static str {
+    "Posting through your X session in the background. OpenCLI is asked not to take focus."
+}
+
+/// Native Quote clicks are refused when Chrome reports the page hidden or
+/// unfocused. Parking the window at -32000 failed the same check. This step
+/// stays visible and focused; it is not a background write.
+pub fn quote_visible_window_note() -> &'static str {
+    "Quoting through your X session. The Quote click needs the OpenCLI window visible and focused, so this step is not put in the background."
 }
 
 /// Actions under a tweet. Reply is the one comment control. Video cards
@@ -3563,8 +3578,10 @@ mod tests {
             assert!(success.starts_with('\u{2713}'), "{action:?} {success}");
             assert!(seen.insert(success), "duplicate success note {success}");
             if *action == UserWrite::QTweet {
-                assert!(success.contains(quote_action_label()));
+                assert_eq!(success, "\u{2713} Q-retweeted");
+                assert!(!success.contains(quote_action_label()));
                 assert_ne!(success, success_note(UserWrite::Post));
+                assert_ne!(success, success_note(UserWrite::Retweet));
             }
             for outcome in withheld_outcomes() {
                 let withheld = withheld_note(*action, *outcome);
@@ -3573,6 +3590,11 @@ mod tests {
                 assert!(!withheld.contains(success), "{action:?} {outcome:?}");
             }
         }
+        assert!(background_write_note().contains("background"));
+        assert!(!background_write_note().contains("no browser"));
+        assert!(quote_visible_window_note().contains("visible"));
+        assert!(quote_visible_window_note().contains("focused"));
+        assert!(quote_visible_window_note().contains("not put in the background"));
         assert_eq!(
             withheld_note(UserWrite::Follow, WriteOutcome::Cancelled),
             "Follow cancelled. Nothing was changed."

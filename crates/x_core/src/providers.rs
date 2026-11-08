@@ -1678,7 +1678,6 @@ fn json_failure_message(value: &Value) -> Option<String> {
 }
 
 const QUOTE_SESSION: &str = "termyx-quote";
-const QUOTE_READ_SESSION: &str = "termyx-quote-read";
 
 fn sanitize_browser_note(raw: &str) -> String {
     let collapsed = raw.split_whitespace().take(12).collect::<Vec<_>>().join(" ");
@@ -2515,37 +2514,26 @@ fn run_quote_attachment(
     {
         return Err(write_failure(&report));
     }
-    let Some(new_id) = report.new_status_id.clone().filter(|id| {
+    let acked = report.new_status_id.as_deref().is_some_and(|id| {
         !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) && id != target_id
-    }) else {
+    });
+    if !acked {
         return Err(format!(
             "Post was clicked once but the sent toast had no new status id. Not marked sent. Nothing was retried. · {}",
             write_failure(&report)
         ));
-    };
-    let read_page = format!("https://x.com/i/status/{new_id}");
-    let read_script = crate::publish::quote_read_script_bound(target_id, &screen, &source_text, text);
-    let read = match browser_page_json(
-        bin,
-        runner,
-        cli,
-        QUOTE_READ_SESSION,
-        Some(&read_page),
-        &read_script,
-        "qx",
-        false,
-        true,
-    ) {
-        Ok(read) => read,
-        Err(error) => {
-            return Err(format!("{error} · {}", write_failure(&report)));
-        }
-    };
-    if let Err(error) = crate::publish::quote_outcome(Some(&new_id), &read, target_id) {
-        return Err(format!("{error} · {}", write_failure(&report)));
     }
-    let _ = close_quote_session(bin, runner, cli, QUOTE_SESSION);
+    // Toast, new id, and the card proof already on this report are the
+    // acknowledgement. Session close runs after the caller is released.
     Ok(report)
+}
+
+fn release_quote_session_later(bin: String, runner: Arc<dyn crate::io::CommandRunner>) {
+    std::thread::spawn(move || {
+        if let Ok(cli) = browser_cli_for(&bin, runner.as_ref()) {
+            let _ = close_quote_session(&bin, runner.as_ref(), cli, QUOTE_SESSION);
+        }
+    });
 }
 
 pub fn inspect_quote_attachment(
@@ -2827,7 +2815,9 @@ impl OpenCliPublisher {
                 "id": report.new_status_id,
             }])
             .to_string();
-            if let Err(error) = crate::publish::prove_quote(&stdout, &target_id) {
+            let proved = crate::publish::prove_quote(&stdout, &target_id);
+            release_quote_session_later(self.bin.clone(), self.runner.clone());
+            if let Err(error) = proved {
                 write_perf_line("engage quote proof=rejected");
                 return Err(error);
             }
@@ -5006,6 +4996,13 @@ mod tests {
             3,
         );
         assert!(matches!(quote, GuiWriteOutcome::Sent { .. }), "{quote:?}");
+        {
+            let calls = runner.calls.lock().unwrap();
+            assert!(
+                !calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("termyx-quote-read"))),
+                "the confirmed quote must not wait on a second status read"
+            );
+        }
         assert_eq!(
             db.receipt_ids("jasper_black", ReceiptKind::QTweet),
             vec!["2118971448614334959".to_string()]
