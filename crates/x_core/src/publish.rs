@@ -328,7 +328,11 @@ pub fn standalone_reply_to() -> Option<&'static str> {
 pub enum GuiWrite {
     Post { text: String },
     Reply { target_id: String, text: String },
-    Quote { target_id: String, text: String },
+    Quote {
+        target_id: String,
+        text: String,
+        media: Vec<PathBuf>,
+    },
     Repost { target_id: String },
 }
 
@@ -426,8 +430,8 @@ pub fn run_gui_write(
                 },
             }
         }
-        PreparedKind::Quote { url, target_id } => {
-            match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &[]) {
+        PreparedKind::Quote { url, target_id, media } => {
+            match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &media) {
                 Ok(receipt) => match prove_quote(&receipt, &target_id) {
                     Ok(()) => {
                         let receipt = quote_saved_receipt(&target_id);
@@ -514,7 +518,11 @@ pub fn run_gui_write(
 
 enum PreparedKind {
     Text { reply_to: Option<String> },
-    Quote { url: String, target_id: String },
+    Quote {
+        url: String,
+        target_id: String,
+        media: Vec<PathBuf>,
+    },
     Repost { url: String, target_id: String },
 }
 
@@ -532,9 +540,10 @@ impl PreparedWrite {
                 reply_to.as_deref().unwrap_or("none"),
                 self.text
             ),
-            PreparedKind::Quote { url, target_id } => format!(
-                "provider {} · quote menu on {url} · original {target_id} · commentary: {}",
+            PreparedKind::Quote { url, target_id, media } => format!(
+                "provider {} · quote menu on {url} · original {target_id} · image {} · commentary: {}",
                 provider.as_str(),
+                if media.is_empty() { "none" } else { "one" },
                 self.text
             ),
             PreparedKind::Repost { url, target_id } => format!(
@@ -572,15 +581,26 @@ fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
                 text: text.to_string(),
             })
         }
-        GuiWrite::Quote { target_id, text } => {
+        GuiWrite::Quote { target_id, text, media } => {
             let target_id = require_status_id(target_id)?;
             let text = text.trim();
             if text.is_empty() {
                 return Err("Write the quote first. Nothing was sent.".into());
             }
+            if media.len() > 1 {
+                return Err(
+                    "Quote can attach one image. Remove the extras. Nothing was sent.".into(),
+                );
+            }
+            validate_media_paths(media)
+                .map_err(|error| format!("{error} Nothing was sent."))?;
             let url = crate::model::post_url("", &target_id);
             Ok(PreparedWrite {
-                kind: PreparedKind::Quote { url, target_id },
+                kind: PreparedKind::Quote {
+                    url,
+                    target_id,
+                    media: media.clone(),
+                },
                 text: text.to_string(),
             })
         }
@@ -1061,6 +1081,96 @@ pub fn quote_browser_args(
         args.push("foreground".into());
     }
     args
+}
+
+/// `opencli browser upload` as confirmed on OpenCLI 2.0.2:
+/// `upload [options] [targetOrFile] [files...]` with `--testid`,
+/// `--session`, the returned `--tab` page id, and `--window`.
+/// One call. A hidden-input or file-chooser failure is not retried.
+pub fn quote_upload_args(
+    cli: BrowserCli,
+    session: &str,
+    tab: Option<&str>,
+    path: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "browser".into(),
+        "upload".into(),
+        "--testid".into(),
+        "fileInput".into(),
+        path.into(),
+    ];
+    if let Some(tab) = tab.filter(|value| is_browser_target_id(value)) {
+        args.push("--tab".into());
+        args.push(tab.into());
+    }
+    args.push("--session".into());
+    args.push(session.into());
+    if cli.window_flag {
+        args.push("--window".into());
+        args.push("foreground".into());
+    }
+    args
+}
+
+/// Read-only check that a composer image preview is on screen.
+/// The quoted-tweet avatar and emoji inside the quoted text do not count.
+pub fn quote_media_preview_expr() -> &'static str {
+    "(() => { const dlg = Array.from(document.querySelectorAll('[role=\"dialog\"], [aria-modal=\"true\"]')).find((node) => node.querySelector('[data-testid=\"tweetTextarea_0\"]')); if (!dlg) return 'media-preview no'; const nodes = dlg.querySelectorAll('[data-testid=\"tweetPhoto\"], [data-testid=\"attachmentCell\"] img, [data-testid=\"attachments\"] img'); let preview = 0; nodes.forEach((img) => { if (img.closest && (img.closest('[data-testid=\"Tweet-User-Avatar\"]') || img.closest('[data-testid=\"tweetText\"]'))) return; preview += 1; }); return preview ? 'media-preview yes' : 'media-preview no'; })()"
+}
+
+/// `uploaded: true` plus the file name. `Not allowed` and file-chooser
+/// failures are blocked and must not be retried.
+pub fn quote_upload_read(stdout: &str, file_name: &str) -> Result<(), String> {
+    let flat = format!("{stdout}");
+    let lower = flat.to_ascii_lowercase();
+    if lower.contains("not allowed")
+        || lower.contains("-32000")
+        || lower.contains("filechooser")
+        || lower.contains("not_file_input")
+    {
+        return Err(
+            "image upload blocked: the bridge rejected the file input. Upload was not retried. Post was not clicked.".into(),
+        );
+    }
+    let Some(value) = first_json_value(&flat) else {
+        return Err("image upload returned no envelope. Not marked attached. Post was not clicked.".into());
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err("image upload was rejected. Not marked attached. Post was not clicked.".into());
+    }
+    let node = value.get("data").unwrap_or(&value);
+    let uploaded = node.get("uploaded").and_then(serde_json::Value::as_bool) == Some(true);
+    let files_count = match node.get("files") {
+        Some(serde_json::Value::Array(rows)) => rows.len() as u64,
+        Some(other) => other.as_u64().unwrap_or(0),
+        None => 0,
+    };
+    let mut names = node
+        .get("file_names")
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.as_str())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(rows) = node.get("files").and_then(serde_json::Value::as_array) {
+        names.extend(rows.iter().filter_map(|row| row.as_str()).map(|row| {
+            std::path::Path::new(row)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(row)
+                .to_string()
+        }));
+    }
+    let named = names.iter().any(|name| name == file_name);
+    if uploaded && files_count >= 1 && named {
+        Ok(())
+    } else {
+        Err("image upload envelope did not name the file. Not marked attached. Post was not clicked.".into())
+    }
 }
 
 pub fn is_browser_target_id(value: &str) -> bool {
@@ -3816,7 +3926,7 @@ mod tests {
         use crate::action_state::{ActionDb, ReceiptKind, ToggleKind};
         struct LogPublisher {
             publish: Mutex<Vec<(Vec<String>, Option<String>)>>,
-            engage: Mutex<Vec<(EngageAction, String, Option<String>)>>,
+            engage: Mutex<Vec<(EngageAction, String, Option<String>, Vec<PathBuf>)>>,
             fail: Mutex<bool>,
         }
         impl Publisher for LogPublisher {
@@ -3849,12 +3959,13 @@ mod tests {
                 action: EngageAction,
                 target_url: &str,
                 text: Option<&str>,
-                _media: &[PathBuf],
+                media: &[PathBuf],
             ) -> Result<String, String> {
                 self.engage.lock().expect("engage").push((
                     action,
                     target_url.to_string(),
                     text.map(str::to_string),
+                    media.to_vec(),
                 ));
                 if *self.fail.lock().expect("fail") {
                     return Err("provider rejected".into());
@@ -3942,6 +4053,7 @@ mod tests {
                 write: GuiWrite::Quote {
                     target_id: "2118971448614334959".into(),
                     text: "my words".into(),
+                    media: Vec::new(),
                 },
                 confirm: Some("yes".into()),
                 account: "jasper_black".into(),
@@ -4021,6 +4133,52 @@ mod tests {
         );
         assert!(matches!(not_yes, GuiWriteOutcome::DryRun { .. }));
         assert_eq!(publisher.publish.lock().expect("publish").len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("marked-quote-probe.png");
+        std::fs::write(&image, b"png").unwrap();
+        let before = publisher.engage.lock().expect("engage").len();
+        let dry_image = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Quote {
+                    target_id: "2118971448614334959".into(),
+                    text: "100 is enough".into(),
+                    media: vec![image.clone()],
+                },
+                confirm: None,
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            17,
+            8,
+        );
+        match dry_image {
+            GuiWriteOutcome::DryRun { detail, .. } => assert!(detail.contains("image one"), "{detail}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(publisher.engage.lock().expect("engage").len(), before);
+        *publisher.fail.lock().expect("fail") = false;
+        let confirmed = run_gui_write(
+            &publisher,
+            &mut db,
+            &GuiWriteRequest {
+                write: GuiWrite::Quote {
+                    target_id: "2118971448614334959".into(),
+                    text: "100 is enough".into(),
+                    media: vec![image.clone()],
+                },
+                confirm: Some("yes".into()),
+                account: "jasper_black".into(),
+                char_limit: 280,
+            },
+            18,
+            9,
+        );
+        assert!(matches!(confirmed, GuiWriteOutcome::Sent { .. }), "{confirmed:?}");
+        let logged = publisher.engage.lock().expect("engage").clone();
+        assert_eq!(logged.last().map(|row| row.3.clone()), Some(vec![image]));
     }
 
     #[test]
@@ -4073,6 +4231,31 @@ mod tests {
         assert!(other_words.contains("did not match"), "{other_words}");
         let other_quote = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"20","type":"quoted"}],"text":"100 is enough https://t.co/WYHmAufIq0"}}"#;
         assert!(quote_x_record_confirms(other_quote, original, "291497074", "100 is enough").is_err());
+        let upload = quote_upload_args(
+            browser_cli_from_help("Usage: opencli browser open <url> --session <name>\n--window <mode>\n"),
+            "termyx-quote",
+            Some("A03BB6CCAE9402E75FCA7CB1AAED51FA"),
+            "marked-quote-probe.png",
+        );
+        assert!(upload.windows(2).any(|pair| pair[0] == "--testid" && pair[1] == "fileInput"));
+        assert!(upload.windows(2).any(|pair| pair[0] == "--session" && pair[1] == "termyx-quote"));
+        assert!(upload.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA"));
+        assert!(upload.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground"));
+        assert!(upload.iter().any(|arg| arg == "marked-quote-probe.png"));
+        assert!(quote_upload_read(
+            r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["marked-quote-probe.png"],"target":"fileInput","matches_n":1}}"#,
+            "marked-quote-probe.png",
+        ).is_ok());
+        let blocked = quote_upload_read(r#"{"ok":false,"error":{"message":"Not allowed"}}"#, "marked-quote-probe.png").unwrap_err();
+        assert!(blocked.contains("not retried"), "{blocked}");
+        assert!(blocked.contains("Post was not clicked"), "{blocked}");
+        let chooser = quote_upload_read("Page.fileChooserOpened timed out", "marked-quote-probe.png").unwrap_err();
+        assert!(chooser.contains("not retried"), "{chooser}");
+        let unnamed = quote_upload_read(
+            r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["other.png"],"target":"fileInput","matches_n":1}}"#,
+            "marked-quote-probe.png",
+        ).unwrap_err();
+        assert!(unnamed.contains("did not name the file"), "{unnamed}");
         assert_eq!(quote_close_note(0, "Browser session tab lease released"), "session close acknowledged");
         let unknown = quote_close_note(75, "managed_resource_conflict");
         assert_eq!(unknown, "session close exit 75");

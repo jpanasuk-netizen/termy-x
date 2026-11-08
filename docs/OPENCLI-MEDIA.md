@@ -55,3 +55,21 @@ Legacy check-only wrapper: `scripts/patch-opencli-media.ps1` (now calls the reap
 
 - Live keep post with image: https://x.com/Jasper_Black/status/2107570911679246724 (`has_media: true`)
 - Free OpenCLI path only — no X API credits used
+
+## Quote image (OpenCLI 2.0.2)
+
+A quote image does not use `twitter post --images` and does not use the local Hermes `post.js` patch. After the native quote card is proven, Termy calls the documented command once:
+
+```text
+opencli browser upload --testid fileInput <file> --tab <returned-page-id> --session termyx-quote --window foreground
+```
+
+The envelope must say `uploaded: true` and name the file. Termy then reads the composer preview. Avatar and quoted-text emoji do not count. `Not allowed`, `-32000`, `fileChooserOpened`, or `not_file_input` stops. There is no second upload and Post is not clicked. A missing card, a card that changes after the upload, or a missing preview also leaves Post unclicked.
+
+This command does not post:
+
+```text
+termy-xcli write quote --to 2118971448614334959 --inspect --media marked-quote-probe.png
+```
+
+Use one allowlisted jpg, png, gif, or webp that a worker generated for the probe. Do not pass `--confirm yes`.

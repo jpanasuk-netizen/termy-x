@@ -21,7 +21,7 @@ use crate::splash::{render_splash, splash_ansi};
     name = "termy-xcli",
     version,
     about = "Termy X - read and post without X API credits",
-    after_help = "The program file is termy-xcli.exe. Do not run a file named x.exe.\nExamples:\n  termy-xcli doctor\n  termy-xcli connect --check\n  termy-xcli write quote --to ID --inspect",
+    after_help = "The program file is termy-xcli.exe. Do not run a file named x.exe.\nExamples:\n  termy-xcli doctor\n  termy-xcli connect --check\n  termy-xcli write quote --to ID --inspect\n  termy-xcli write quote --to ID --inspect --media marked-quote-probe.png",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -245,8 +245,12 @@ enum WriteOp {
         /// Omit with --inspect. Required before a real quote.
         text: Option<String>,
         /// Open the quote composer and report the card. Does not click Post.
+        /// With --media, also attaches that one image and checks the preview.
         #[arg(long)]
         inspect: bool,
+        /// One jpg, png, gif, or webp. With --inspect, Post is not clicked.
+        #[arg(long)]
+        media: Option<PathBuf>,
     },
     /// Repost one status.
     Repost {
@@ -390,6 +394,8 @@ fn print_help_guide() {
     println!("  termy-xcli write post \"text\"                  Dry-run. Does not start the GUI or post.");
     println!("  termy-xcli write reply --to ID \"text\"         Dry-run a reply");
     println!("  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post");
+    println!("  termy-xcli write quote --to ID --inspect --media marked-quote-probe.png");
+    println!("                                              Attach one image and check the preview. Does not click Post");
     println!("  termy-xcli write quote --to ID \"text\"         Dry-run a Q-tweet");
     println!("  termy-xcli write repost --to ID                Dry-run a repost");
     println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
@@ -1451,7 +1457,7 @@ fn publish_draft(
     )
 }
 
-fn inspect_quote(target: &str, io: &CliIo) -> i32 {
+fn inspect_quote(target: &str, media: Option<PathBuf>, io: &CliIo) -> i32 {
     let id = crate::model::post_id_from_input(target);
     if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
         eprintln!("The target must be a status id or a status URL. Post was not clicked.");
@@ -1461,7 +1467,13 @@ fn inspect_quote(target: &str, io: &CliIo) -> i32 {
         eprintln!("OpenCLI is not installed. Post was not clicked.");
         return 1;
     }
-    match crate::providers::inspect_quote_attachment(&io.config.opencli_bin, io.runner.as_ref(), &id)
+    let media_paths = media.into_iter().collect::<Vec<_>>();
+    match crate::providers::inspect_quote_attachment(
+        &io.config.opencli_bin,
+        io.runner.as_ref(),
+        &id,
+        &media_paths,
+    )
     {
         Ok(line) => {
             println!("quote inspect — Post was not clicked");
@@ -1485,13 +1497,14 @@ fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -
             target_id: to,
             text,
         },
-        WriteOp::Quote { to, text, inspect } => {
+        WriteOp::Quote { to, text, inspect, media } => {
             if inspect {
-                return inspect_quote(&to, io);
+                return inspect_quote(&to, media, io);
             }
             GuiWrite::Quote {
                 target_id: to,
                 text: text.unwrap_or_default(),
+                media: media.into_iter().collect(),
             }
         }
         WriteOp::Repost { to } => GuiWrite::Repost { target_id: to },
