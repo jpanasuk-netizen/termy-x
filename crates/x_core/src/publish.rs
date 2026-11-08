@@ -1290,8 +1290,14 @@ pub fn quote_window_bounds(stdout: &str) -> &'static str {
     let Some(height) = data.get("height").and_then(serde_json::Value::as_i64) else {
         return "absent";
     };
-    if left < -8 || top < -8 || left > 20000 || top > 20000 || width < 50 || height < 50 {
-        "offscreen"
+    if width < 50 || height < 50 {
+        return "tiny";
+    }
+    // (-32000, -32000) is the position Termy used to park a window off the
+    // desktop. A monitor to the left of the primary uses a small negative
+    // origin and is still on screen.
+    if left <= -30_000 || top <= -30_000 {
+        "parked"
     } else {
         "onscreen"
     }
@@ -3185,9 +3191,15 @@ mod tests {
         );
         assert_eq!(
             quote_window_bounds(
+                r#"{"ok":true,"data":{"state":"normal","focused":true,"left":-1920,"top":0,"width":1920,"height":1080}}"#
+            ),
+            "onscreen"
+        );
+        assert_eq!(
+            quote_window_bounds(
                 r#"{"ok":true,"data":{"state":"normal","focused":true,"left":-32000,"top":-32000,"width":1280,"height":900}}"#
             ),
-            "offscreen"
+            "parked"
         );
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));

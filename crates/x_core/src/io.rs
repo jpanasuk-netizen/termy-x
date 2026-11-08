@@ -247,11 +247,11 @@ fn silence_sweep(baseline: &[isize], tracked: &Arc<Mutex<Vec<isize>>>) {
 
 #[cfg(windows)]
 fn minimize_window(hwnd: isize) {
-    // Park off-screen first (no activate, no resize) so neither the window
-    // nor the minimize animation is seen, then SW_SHOWMINNOACTIVE (7):
-    // minimized without moving focus off whatever the user is doing.
+    // SW_SHOWMINNOACTIVE (7): minimize without taking focus. Do not move the
+    // window. SetWindowPos to (-32000, -32000) made Chrome restore it there,
+    // so the window stayed state normal and focused while the document was
+    // hidden because it had no pixels on a monitor.
     unsafe {
-        win32::park_offscreen(hwnd as win32::Hwnd);
         win32::show_window(hwnd as win32::Hwnd, 7);
     }
 }
@@ -280,15 +280,6 @@ mod win32 {
         fn IsWindowVisible(hwnd: Hwnd) -> Bool;
         fn IsIconic(hwnd: Hwnd) -> Bool;
         fn ShowWindow(hwnd: Hwnd, cmd: i32) -> Bool;
-        fn SetWindowPos(
-            hwnd: Hwnd,
-            after: Hwnd,
-            x: i32,
-            y: i32,
-            cx: i32,
-            cy: i32,
-            flags: u32,
-        ) -> Bool;
         fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
         fn GetWindowThreadProcessId(hwnd: Hwnd, pid: *mut u32) -> u32;
         fn OpenProcess(access: u32, inherit: Bool, pid: u32) -> Hwnd;
@@ -307,18 +298,6 @@ mod win32 {
         unsafe {
             if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
                 ShowWindow(hwnd, cmd);
-            }
-        }
-    }
-
-    /// Move a visible, non-minimized window to (-32000, -32000) without
-    /// activating, resizing or re-ordering it.
-    pub unsafe fn park_offscreen(hwnd: Hwnd) {
-        // SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER
-        const FLAGS: u32 = 0x0001 | 0x0004 | 0x0010 | 0x0200;
-        unsafe {
-            if !hwnd.is_null() && IsWindowVisible(hwnd) != 0 && IsIconic(hwnd) == 0 {
-                SetWindowPos(hwnd, std::ptr::null_mut(), -32000, -32000, 0, 0, FLAGS);
             }
         }
     }

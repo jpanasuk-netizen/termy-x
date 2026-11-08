@@ -2130,8 +2130,13 @@ fn quote_container_note(
         }
         _ => ("unread".into(), "unread".into(), "absent"),
     };
+    let note = if bounds == "parked" {
+        " · close only the Chrome window with the OpenCLI Browser group · it is off the desktop · the next inspect opens a new window on the desktop"
+    } else {
+        ""
+    };
     format!(
-        "chrome match 1 active {} group {group} window state {state} focused {focused} bounds {bounds} · windows.update not called",
+        "chrome match 1 active {} group {group} window state {state} focused {focused} bounds {bounds} · windows.update not called{note}",
         if tab.active { "yes" } else { "no" }
     )
 }
