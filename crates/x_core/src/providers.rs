@@ -2853,8 +2853,13 @@ impl OpenCliPublisher {
                 return Err("write your quote first — nothing was posted".into());
             }
             if !media.is_empty() {
+                // The quote card is attached by the native Quote click. OpenCLI's
+                // `twitter post --images` path is the one that sets the file input
+                // (CDP DOM.setFileInputFiles). `browser upload` clicks the hidden
+                // file input and waits for a chooser that does not open, so this
+                // path refuses the image before any click.
                 return Err(
-                    "Remove the image before this quote. Nothing was posted.".into(),
+                    "This quote cannot attach an image. Use post --media for the image, or remove it. Nothing was posted.".into(),
                 );
             }
             let target_id = crate::model::post_id_from_input(target_url);
@@ -2906,7 +2911,9 @@ impl OpenCliPublisher {
         let args = opencli_json(&args);
         crate::publish::log_action(action.opencli_verb(), "cli", &[("ack", "pending")]);
         let call_started = Instant::now();
-        let output = match self.runner.run_timeout(&self.bin, &args, ENGAGE_TIMEOUT) {
+        // Same visibility rule as post: do not minimize over a native click.
+        let _composer = composer_gate();
+        let output = match self.runner.run_keeping_window(&self.bin, &args, ENGAGE_TIMEOUT) {
             Ok(output) => {
                 write_perf_line(&format!(
                     "write engage {} cli_ms={} status={}",
@@ -6588,6 +6595,84 @@ mod tests {
         assert_eq!(args[1], "post");
         assert!(args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background"));
         assert!(!args.iter().any(|arg| arg == "foreground"));
+    }
+
+    #[test]
+    fn retweet_stays_visible_and_confirms_only_from_the_receipt() {
+        use crate::io::{CommandOutput, CommandRunner};
+        use crate::publish::EngageAction;
+        struct VisibleRunner {
+            mode: Mutex<Option<&'static str>>,
+        }
+        impl CommandRunner for VisibleRunner {
+            fn exists(&self, _: &str) -> bool {
+                true
+            }
+            fn run(&self, _: &str, _: &[String]) -> Result<CommandOutput, String> {
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into(),
+                    stderr: String::new(),
+                })
+            }
+            fn run_timeout(
+                &self,
+                program: &str,
+                args: &[String],
+                _: Duration,
+            ) -> Result<CommandOutput, String> {
+                *self.mode.lock().expect("mode") = Some("minimized");
+                self.run(program, args)
+            }
+            fn run_keeping_window(
+                &self,
+                program: &str,
+                args: &[String],
+                _: Duration,
+            ) -> Result<CommandOutput, String> {
+                *self.mode.lock().expect("mode") = Some("visible");
+                self.run(program, args)
+            }
+        }
+        let runner = Arc::new(VisibleRunner {
+            mode: Mutex::new(None),
+        });
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let receipt = publisher
+            .engage(
+                EngageAction::Retweet,
+                "https://x.com/i/status/2118971448614334959",
+                None,
+                &[],
+            )
+            .expect("retweet receipt");
+        assert!(receipt.contains("Tweet successfully retweeted"));
+        assert_eq!(runner.mode.lock().expect("mode").as_deref(), Some("visible"));
+    }
+
+    #[test]
+    fn quote_refuses_an_image_before_any_browser_command() {
+        use crate::publish::EngageAction;
+        let runner = Arc::new(ScriptedRunner::new());
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("pic.png");
+        std::fs::write(&image, b"png").unwrap();
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let err = publisher
+            .engage(
+                EngageAction::Quote,
+                "https://x.com/i/status/2118971448614334959",
+                Some("100 is enough"),
+                &[image],
+            )
+            .unwrap_err();
+        assert!(err.contains("cannot attach an image"), "{err}");
+        assert!(err.contains("Nothing was posted"), "{err}");
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            !calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "upload" || arg.contains("fileInput") || arg == "click")),
+            "{calls:?}"
+        );
     }
 
     #[test]

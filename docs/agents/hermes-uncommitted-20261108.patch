@@ -1,0 +1,127 @@
+diff --git a/crates/x_core/src/providers.rs b/crates/x_core/src/providers.rs
+index e48f710e..e6383a55 100644
+--- a/crates/x_core/src/providers.rs
++++ b/crates/x_core/src/providers.rs
+@@ -2363,11 +2363,12 @@ fn run_quote_attachment(
+     runner: &dyn crate::io::CommandRunner,
+     target_id: &str,
+     text: &str,
++    media: &[PathBuf],
+     inspect: bool,
+ ) -> Result<(crate::publish::QuotePageReport, u64), String> {
+     let epoch = begin_quote_lease();
+     crate::publish::log_action("quote", "start", &[("ack", "pending"), ("epoch", &epoch.to_string())]);
+-    match run_quote_attachment_epoch(bin, runner, target_id, text, inspect, epoch) {
++    match run_quote_attachment_epoch(bin, runner, target_id, text, media, inspect, epoch) {
+         Ok(report) => Ok((report, epoch)),
+         Err(error) => {
+             crate::publish::log_action("quote", "ack", &[("ack", "rejected"), ("epoch", &epoch.to_string())]);
+@@ -2381,6 +2382,7 @@ fn run_quote_attachment_epoch(
+     runner: &dyn crate::io::CommandRunner,
+     target_id: &str,
+     text: &str,
++    media: &[PathBuf],
+     inspect: bool,
+     _epoch: u64,
+ ) -> Result<crate::publish::QuotePageReport, String> {
+@@ -2502,6 +2504,72 @@ fn run_quote_attachment_epoch(
+             Err(line)
+         };
+     }
++    if !media.is_empty() {
++        let path = media[0].to_string_lossy().into_owned();
++        let upload_args = crate::publish::quote_browser_args(
++            cli,
++            QUOTE_SESSION,
++            &["upload", "--testid", "fileInput", path.as_str()],
++            surface.target.as_deref(),
++            true,
++        );
++        let upload_public = crate::publish::browser_argv_public(&upload_args);
++        let upload_fail = |note: String| -> String {
++            let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
++            let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
++            let leftover = quote_owned_leftover(bin, runner);
++            format!("stage upload · {note} · {shot} · {close_note} · {leftover} · Post was not clicked")
++        };
++        let uploaded = quote_run(bin, runner, &upload_args, Duration::from_secs(90));
++        let upload_ok = matches!(&uploaded, Ok(output) if output.status == 0
++            && !output.stdout.contains("\"ok\":false")
++            && !output.stdout.contains("\"ok\": false"));
++        if !upload_ok {
++            let detail = match uploaded {
++                Ok(output) => crate::publish::explain_opencli_failure(
++                    "upload",
++                    &upload_public,
++                    output.status,
++                    &output.stdout,
++                    &output.stderr,
++                ),
++                Err(error) => crate::publish::explain_opencli_failure(
++                    "upload",
++                    &upload_public,
++                    -1,
++                    "",
++                    &error,
++                ),
++            };
++            return Err(upload_fail(detail));
++        }
++        // Wait until the attachment renders before Post is clicked, so a
++        // confirmed quote always carries the image.
++        let probe = crate::publish::browser_command(
++            cli,
++            QUOTE_SESSION,
++            "eval",
++            Some(
++                "(() => { const cell = document.querySelector('[data-testid=attachmentCell],[data-testid=attachments]'); if (cell) return 'media-attached'; const input = document.querySelector('input[type=file][data-testid=fileInput]'); if (input && input.files && input.files.length) return 'media-attached'; return 'media-none'; })()",
++            ),
++        );
++        let mut attached = false;
++        for _ in 0..20 {
++            std::thread::sleep(Duration::from_millis(500));
++            let Ok(output) = quote_run(bin, runner, &probe, Duration::from_secs(20)) else {
++                continue;
++            };
++            if output.status == 0 && output.stdout.contains("media-attached") {
++                attached = true;
++                break;
++            }
++        }
++        if !attached {
++            return Err(upload_fail(
++                "the image did not attach to the quote composer".into(),
++            ));
++        }
++    }
+     let post_script = crate::publish::quote_type_and_post_script_bound(target_id, text, &screen, &source_text);
+     let posted = browser_page_json(
+         bin,
+@@ -2852,9 +2920,9 @@ impl OpenCliPublisher {
+             if text.is_empty() {
+                 return Err("write your quote first — nothing was posted".into());
+             }
+-            if !media.is_empty() {
++            if media.len() > 1 {
+                 return Err(
+-                    "Remove the image before this quote. Nothing was posted.".into(),
++                    "Quote can attach one image. Remove the extras. Nothing was posted.".into(),
+                 );
+             }
+             let target_id = crate::model::post_id_from_input(target_url);
+@@ -2864,6 +2932,7 @@ impl OpenCliPublisher {
+                 self.runner.as_ref(),
+                 &target_id,
+                 text,
++                media,
+                 false,
+             ) {
+                 Ok(pair) => pair,
+@@ -2878,6 +2947,7 @@ impl OpenCliPublisher {
+                 "quoted_status_id_str": target_id,
+                 "text": text,
+                 "id": report.new_status_id,
++                "image_attached": !media.is_empty(),
+             }])
+             .to_string();
+             let new_id = crate::publish::action_new_id(&stdout);
