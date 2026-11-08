@@ -39,6 +39,15 @@ Anyone can clone it, download the source archive, and fork it.
 git clone https://github.com/jpanasuk-netizen/termy-x.git
 ```
 
+The validated `1.0.0-rc.10` source, including the release workflow that passed
+CI, is `371f0d80db04b7f97ee3344452cb8ce4f6c8cc65` on branch
+`ci/release-workflow-371f0d80`. Tag `v1.0.0-rc.10` is
+`e21ecf156b2158b696f56cf4392e1b8417d7bcc0` and does not include those later
+workflow commits. Source archives:
+
+- https://github.com/jpanasuk-netizen/termy-x/archive/refs/heads/ci/release-workflow-371f0d80.tar.gz
+- https://github.com/jpanasuk-netizen/termy-x/archive/refs/tags/v1.0.0-rc.10.tar.gz
+
 The source license is the MIT license in [`LICENSE`](./LICENSE), copyright 2026 Lasse Vestergaard.
 That copyright and license are unchanged.
 
