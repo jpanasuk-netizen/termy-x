@@ -2074,6 +2074,7 @@ fn open_visible_quote_page(
             ));
         }
     }
+    let mut eval_location = "eval location unread".to_string();
     for _ in 0..8 {
         let probe_args = crate::publish::quote_browser_args(
             cli,
@@ -2083,14 +2084,19 @@ fn open_visible_quote_page(
             true,
         );
         match quote_run(bin, runner, &probe_args, Duration::from_secs(20)) {
-            Ok(probe) if probe.stdout.contains("https://x.com") => break,
+            Ok(probe) if probe.status == 0 => {
+                eval_location = crate::publish::quote_eval_location(&probe.stdout, status_id);
+                if probe.stdout.contains("https://x.com") {
+                    break;
+                }
+            }
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
     let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
-    let landed = crate::publish::quote_landed_query(&opened.stdout, status_id);
+    let echoed = crate::publish::quote_landed_query(&opened.stdout, status_id);
     let trace = format!(
-        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {landed} · visibility after open {} · select {select_public} {select_note} · visibility after select {}",
+        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {echoed} · visibility after open {} · select {select_public} {select_note} · {eval_location} · visibility after select {}",
         after_open.summary, after_select.summary
     );
     if !after_select.ready {
@@ -4996,7 +5002,7 @@ mod tests {
         assert!(err.contains("No quote attachment"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("status%2F20"))
+            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("https://x.com/i/status/20"))
         }));
         assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
@@ -5072,7 +5078,7 @@ mod tests {
         assert!(err.contains("owned group OpenCLI Browser groups 1 tabs 1"), "{err}");
         assert!(err.contains("session list is not chrome clean"), "{err}");
         assert!(err.contains("session close acknowledged"), "{err}");
-        assert!(err.contains("landed url-key no"), "{err}");
+        assert!(err.contains("open echo url-key no"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         let encoded = b64_encode(crate::publish::quote_snap_script("20").as_bytes());
         assert!(calls.iter().any(|(_, args)| {

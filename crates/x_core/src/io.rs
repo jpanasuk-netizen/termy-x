@@ -536,9 +536,9 @@ fn cmd_c_argument(path: &Path, args: &[String]) -> String {
     format!("\"{inner} \"")
 }
 
-/// Quote one `cmd.exe /S /C` token. `cmd` expands `%NAME%` inside quotes, so
-/// a compose URL's `%3A%` and `%2F%` would be deleted before OpenCLI sees
-/// them. `%%` is the literal percent.
+/// Quote one `cmd.exe /S /C` token. The quote composer URL does not use
+/// percent-encoding: `cmd` and the OpenCLI `.cmd` shim expand `%3A%`, and
+/// doubling those percents made the evaluated page leave x.com.
 fn quote_cmd_token(token: &str) -> String {
     if token.is_empty() {
         return "\"\"".to_string();
@@ -549,18 +549,11 @@ fn quote_cmd_token(token: &str) -> String {
             ' ' | '\t' | '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!' | '(' | ')'
         )
     });
-    let mut escaped = String::new();
-    for ch in token.chars() {
-        if ch == '%' {
-            escaped.push('%');
-        }
-        escaped.push(ch);
-    }
     if !needs_quotes {
-        return escaped;
+        return token.to_string();
     }
     let mut quoted = String::from('"');
-    for ch in escaped.chars() {
+    for ch in token.chars() {
         if ch == '"' {
             quoted.push('"');
         }
@@ -1041,19 +1034,15 @@ mod tests {
     #[test]
     fn cmd_quoting_keeps_percent_encoded_compose_urls() {
         let url = crate::publish::quote_composer_url("2118971448614334959");
-        assert!(url.contains("%3A"));
-        assert!(url.contains("%2F"));
-        let quoted = super::quote_cmd_token(&url);
-        assert!(quoted.contains("%%3A%%"), "{quoted}");
-        assert!(quoted.contains("%%2F%%"), "{quoted}");
-        assert_eq!(quoted.matches("%%").count() > 4, true, "{quoted}");
+        assert!(!url.contains('%'), "{url}");
+        assert!(url.contains("url=https://x.com/i/status/2118971448614334959"), "{url}");
         let line = super::cmd_c_argument(std::path::Path::new("opencli.cmd"), &[
             "browser".into(),
             "open".into(),
             url,
         ]);
-        assert!(line.contains("%%3A%%"), "{line}");
-        assert!(line.contains("compose/post?url="), "{line}");
+        assert!(line.contains("url=https://x.com/i/status/2118971448614334959"), "{line}");
+        assert!(!line.contains('%'), "{line}");
     }
 
     #[test]

@@ -1204,33 +1204,28 @@ fn known_visibility(text: &str) -> String {
 pub fn quote_visibility_expr(status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
     format!(
-        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:(location.pathname.indexOf(\"/status/{id}\")>=0||(location.search||\"\").indexOf(\"{id}\")>=0),c:(location.pathname===\"/compose/post\"||location.pathname.slice(-13)===\"/compose/post\"),host:location.host}})"
+        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:(location.pathname.indexOf(\"/status/{id}\")>=0||(location.search||\"\").indexOf(\"{id}\")>=0),c:(location.pathname===\"/compose/post\"||location.pathname.slice(-13)===\"/compose/post\"),host:location.hostname,n:location.pathname,s:location.protocol}})"
     )
 }
 
 /// OpenCLI's quote composer. The `url` query attaches the source tweet.
-/// A bare `/compose/post` does not.
+/// The status URL is not percent-encoded. It has no `&` or `?`, and
+/// `URLSearchParams` reads the same value as `encodeURIComponent` would
+/// produce. Percent-encoding is expanded by Windows `cmd` and by the
+/// OpenCLI `.cmd` shim; doubling those percents moved the evaluated page
+/// off x.com. A bare `/compose/post` does not attach a quote.
 pub fn quote_composer_url(status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
-    let status = format!("https://x.com/i/status/{id}");
-    let mut encoded = String::new();
-    for byte in status.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(byte as char)
-            }
-            _ => encoded.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    format!("https://x.com/compose/post?url={encoded}")
+    format!("https://x.com/compose/post?url=https://x.com/i/status/{id}")
 }
 
-/// Sanitized compose-query shape. Never returns the URL itself.
-/// `url-key` is whether a `url` parameter is present. `id-match` is whether
-/// that parameter's status id is this target.
+/// Sanitized shape of the URL OpenCLI echoed from `browser open`.
+/// That echo is the URL the command was given, not `location.href`.
+/// `id-match` requires the decoded `url` parameter to be this status.
+/// A leftover digit inside a damaged percent sequence does not match.
 pub fn quote_landed_query(stdout: &str, status_id: &str) -> String {
     let Some(value) = first_json_value(stdout) else {
-        return "landed unread".into();
+        return "open echo unread".into();
     };
     let url = value
         .pointer("/data/url")
@@ -1238,14 +1233,14 @@ pub fn quote_landed_query(stdout: &str, status_id: &str) -> String {
         .or_else(|| value.get("url").and_then(serde_json::Value::as_str));
     match url {
         Some(url) => quote_query_shape(url, status_id),
-        None => "landed url absent".into(),
+        None => "open echo url absent".into(),
     }
 }
 
 pub fn quote_query_shape(url: &str, status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
     let Some(query) = url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or("")) else {
-        return "landed url-key no id-match no".into();
+        return "open echo url-key no id-match no".into();
     };
     let mut url_key = false;
     let mut id_match = false;
@@ -1255,16 +1250,30 @@ pub fn quote_query_shape(url: &str, status_id: &str) -> String {
             continue;
         }
         url_key = true;
-        let decoded = percent_decode_lossy(value);
-        if !id.is_empty() && (decoded.contains(&format!("/status/{id}")) || value.contains(&id)) {
+        if status_param_matches(&percent_decode_lossy(value), &id) {
             id_match = true;
         }
     }
     format!(
-        "landed url-key {} id-match {}",
+        "open echo url-key {} id-match {}",
         if url_key { "yes" } else { "no" },
         if id_match { "yes" } else { "no" }
     )
+}
+
+fn status_param_matches(value: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let Some(url) = value.split(['?', '#']).next() else {
+        return false;
+    };
+    let path = url.split("://").nth(1).and_then(|rest| rest.find('/').map(|i| &rest[i..])).unwrap_or(url);
+    let marker = format!("/status/{id}");
+    let Some(at) = path.find(&marker) else {
+        return false;
+    };
+    path[at + marker.len()..].chars().next().is_none_or(|ch| !ch.is_ascii_digit())
 }
 
 fn percent_decode_lossy(value: &str) -> String {
@@ -1368,6 +1377,9 @@ fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibi
     } else {
         "no"
     };
+    let host_name = safe_location_token(fields.get("hn").or_else(|| fields.get("host")).and_then(serde_json::Value::as_str).unwrap_or(""), true);
+    let path_name = safe_location_token(fields.get("n").and_then(serde_json::Value::as_str).unwrap_or(""), false);
+    let scheme = safe_scheme(fields.get("s").and_then(serde_json::Value::as_str).unwrap_or(""));
     let ready = token == "visible"
         && hidden_flag != "yes"
         && top == "yes"
@@ -1377,7 +1389,7 @@ fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibi
     QuoteVisibilityRead {
         token: token.to_string(),
         summary: format!(
-            "eval data {kind} visibility {token} hidden-flag {hidden_flag} prerender {prerender} focus {focus} top {top} path {path} route {route} host {host}"
+            "eval data {kind} visibility {token} hidden-flag {hidden_flag} prerender {prerender} focus {focus} top {top} path {path} route {route} host {host} eval-host {host_name} eval-path {path_name} scheme {scheme}"
         ),
         ready,
     }
@@ -1410,6 +1422,69 @@ fn yes_no(value: Option<&serde_json::Value>) -> &'static str {
         Some(false) => "no",
         None => "absent",
     }
+}
+
+fn safe_scheme(protocol: &str) -> &'static str {
+    match protocol.trim().trim_end_matches(':') {
+        "https" => "https",
+        "http" => "http",
+        "chrome" => "chrome",
+        "about" => "about",
+        "" => "absent",
+        _ => "other",
+    }
+}
+
+fn safe_location_token(value: &str, host: bool) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return "absent".into();
+    }
+    let ok = value.len() <= 120
+        && value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'));
+    let shaped = if host { !value.contains('/') } else { value.starts_with('/') };
+    if ok && shaped {
+        value.to_ascii_lowercase()
+    } else {
+        "unreadable".into()
+    }
+}
+
+/// Sanitized `location.href` from an eval. Scheme, host, and path only.
+pub fn quote_eval_location(stdout: &str, status_id: &str) -> String {
+    let Some(value) = first_json_value(stdout) else {
+        return location_shape(stdout, status_id);
+    };
+    let text = value
+        .as_str()
+        .or_else(|| value.get("data").and_then(serde_json::Value::as_str))
+        .or_else(|| value.pointer("/data/url").and_then(serde_json::Value::as_str));
+    match text {
+        Some(text) => location_shape(text, status_id),
+        None => "eval location unread".into(),
+    }
+}
+
+fn location_shape(text: &str, status_id: &str) -> String {
+    let trimmed = text.trim().trim_matches('"');
+    let Some(rest) = trimmed.split("://").nth(1) else {
+        return "eval location unread".into();
+    };
+    let scheme = safe_scheme(trimmed.split("://").next().unwrap_or(""));
+    let (host, path_and_more) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.split('@').next_back().unwrap_or(host).split(':').next().unwrap_or(host);
+    let path_tail = path_and_more.split(['?', '#']).next().unwrap_or("");
+    let path = if path_tail.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{path_tail}")
+    };
+    let query = quote_query_shape(trimmed, status_id).replace("open echo ", "");
+    format!(
+        "eval location scheme {scheme} host {} path {} {query}",
+        safe_location_token(host, true),
+        safe_location_token(&path, false)
+    )
 }
 
 fn host_class(host: &str) -> &'static str {
@@ -3339,9 +3414,9 @@ mod tests {
         assert!(snap.contains("ancestors"));
         assert!(snap.contains("hasBox && qHits.length"));
         let composer = quote_composer_url(original);
-        assert!(composer.starts_with("https://x.com/compose/post?url="));
-        assert!(composer.contains("status%2F2118971448614334959"));
-        assert!(!composer.contains("https://x.com/i/status/"));
+        assert!(composer.starts_with("https://x.com/compose/post?url=https://x.com/i/status/"));
+        assert!(composer.contains("2118971448614334959"));
+        assert!(!composer.contains('%'));
         let pages = quote_session_pages(
             r#"{"ok":true,"data":[{"page":"E54BF7E091EA017B99E02EF7373E08BC","url":"https://x.com/compose/post"},{"page":"not-an-id"}]}"#,
         );
@@ -3557,17 +3632,33 @@ mod tests {
         let compose = quote_composer_url(id);
         let intact = format!(r#"{{"ok":true,"data":{{"url":"{compose}","page":"B94452EA22F530887AF90E615F8D7031"}}}}"#);
         let line = quote_landed_query(&intact, id);
-        assert_eq!(line, "landed url-key yes id-match yes");
+        assert_eq!(line, "open echo url-key yes id-match yes");
         assert!(!line.contains("https://"), "{line}");
         assert_eq!(
             quote_query_shape("https://x.com/compose/post", id),
-            "landed url-key no id-match no"
+            "open echo url-key no id-match no"
         );
         assert_eq!(
-            quote_query_shape("https://x.com/compose/post?url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F111", id),
-            "landed url-key yes id-match no"
+            quote_query_shape("https://x.com/compose/post?url=https://x.com/i/status/111", id),
+            "open echo url-key yes id-match no"
         );
-        assert_eq!(quote_landed_query("not json", id), "landed unread");
+        let damaged = format!(
+            "https://x.com/compose/post?url=https2Fx.com2Fstatus%2F{id}"
+        );
+        assert!(quote_query_shape(&damaged, id).ends_with("id-match no"), "{damaged}");
+        assert_eq!(quote_landed_query("not json", id), "open echo unread");
+        let href = quote_eval_location(
+            r#"{"ok":true,"data":"https://www.google.com/_/chrome/newtab"}"#,
+            id,
+        );
+        assert!(href.contains("scheme https"), "{href}");
+        assert!(href.contains("host www.google.com"), "{href}");
+        assert!(href.contains("path /_/chrome/newtab"), "{href}");
+        assert!(!href.contains("google.com/_"), "{href}");
+        let compose = quote_eval_location(&format!(r#"{{"ok":true,"data":"{compose}"}}"#), id);
+        assert!(compose.contains("host x.com"), "{compose}");
+        assert!(compose.contains("path /compose/post"), "{compose}");
+        assert!(compose.contains("id-match yes"), "{compose}");
     }
 
     #[test]
