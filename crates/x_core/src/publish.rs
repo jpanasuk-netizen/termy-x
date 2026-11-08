@@ -1987,8 +1987,9 @@ pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
 /// Read-only snapshot of the compose page. No clicks.
 /// A quote counts only when the dialog that contains the composer textarea
 /// also holds a quoteTweet or a non-editor source link for this status.
-/// Dialogs that do not contain the textarea are described, not treated as
-/// the attachment. Page links and pasted URLs are not an attachment.
+/// Other visible links are described, including links inside the editor.
+/// A described link is not the card. Page links and pasted URLs are not
+/// an attachment.
 pub fn quote_snap_script(target_id: &str) -> String {
     let id_js = js_ascii_string(target_id);
     format!(
@@ -2010,7 +2011,56 @@ pub fn quote_snap_script(target_id: &str) -> String {
     }}
     return parts.join(">") || "none";
   }};
-  const outsideEditor = (link) => statusId(link.href) === TARGET && (link.getAttribute("href") || "").indexOf("in_reply_to") < 0 && !link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]');
+  const inEditor = (node) => !!(node && node.closest && node.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]'));
+  const outsideEditor = (link) => statusId(link.href) === TARGET && (link.getAttribute("href") || "").indexOf("in_reply_to") < 0 && !inEditor(link);
+  const relTo = (node, editor) => {{
+    if (!editor) return "no-editor";
+    if (inEditor(node)) return "inside-editor";
+    if (typeof editor.compareDocumentPosition !== "function") return "other";
+    const pos = editor.compareDocumentPosition(node);
+    if (pos & 4) return "after-editor";
+    if (pos & 2) return "before-editor";
+    return "other";
+  }};
+  const pathClass = (pathname, sid) => {{
+    const exact = sid === TARGET;
+    if (/^\/i\/status\/\d+\/?$/.test(pathname)) return exact ? "/i/status/exact" : "/i/status/other";
+    if (/^\/i\/web\/status\/\d+\/?$/.test(pathname)) return exact ? "/i/web/status/exact" : "/i/web/status/other";
+    if (/^\/[A-Za-z0-9_]{{1,15}}\/status\/\d+\/?$/.test(pathname)) return exact ? "/screen/status/exact" : "/screen/status/other";
+    if (pathname.indexOf("/status/") >= 0) return exact ? "/status/exact" : "/status/other";
+    if (/^\/[A-Za-z0-9_./-]{{0,40}}$/.test(pathname)) return pathname.slice(0, 40) || "/";
+    return "other";
+  }};
+  const linkBits = (node) => {{
+    const raw = node.getAttribute ? (node.getAttribute("href") || "") : "";
+    const role = node.getAttribute ? (node.getAttribute("role") || "-") : "-";
+    const tid = node.getAttribute ? (safeName(node.getAttribute("data-testid")) || "-") : "-";
+    let path = "none";
+    let id = "none";
+    let host = "none";
+    let substr = "no";
+    if (raw) {{
+      substr = raw.indexOf("/status/") >= 0 ? "yes" : "no";
+      try {{
+        const parsed = new URL(raw, location.origin);
+        const sid = statusId(parsed.href);
+        host = (parsed.hostname === "x.com" || parsed.hostname === "twitter.com" || parsed.hostname === "mobile.twitter.com") ? "x" : "other";
+        path = pathClass(parsed.pathname || "/", sid);
+        if (sid === TARGET) id = "exact";
+        else if (sid) id = "other";
+        else if (raw.indexOf(TARGET) >= 0) id = "digits";
+      }} catch (e) {{
+        path = "unparsed";
+        if (raw.indexOf(TARGET) >= 0) id = "digits";
+      }}
+    }}
+    const label = (node.getAttribute && (node.getAttribute("aria-label") || node.getAttribute("title"))) || "";
+    let name = "none";
+    if (label.indexOf(TARGET) >= 0 || label.indexOf("/status/") >= 0) name = "url";
+    else if (label && label.length <= 24 && /^[A-Za-z0-9 .@_-]+$/.test(label)) name = label.replace(/ /g, "-");
+    else if (label) name = "prose";
+    return (node.tagName || "-") + " role " + role + " testid " + tid + " path " + path + " id " + id + " host " + host + " status-substr " + substr + " name " + name;
+  }};
   const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).slice(0, 3);
   const pageQuotes = document.querySelectorAll('[data-testid="quoteTweet"]').length;
   const inDialogBoxes = boxes.filter((el) => !!el.closest('[role="dialog"], [aria-modal="true"]')).length;
@@ -2043,7 +2093,21 @@ pub fn quote_snap_script(target_id: &str) -> String {
       attached = true;
       links.forEach((link) => hits.push(link));
     }}
-    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " testids " + (names.join(",") || "none"));
+    const editor = dlg.querySelector('[data-testid="tweetTextarea_0"]');
+    const seen = [];
+    const add = (node) => {{ if (node && seen.indexOf(node) < 0) seen.push(node); }};
+    dlg.querySelectorAll('a, [role="link"]').forEach(add);
+    dlg.querySelectorAll("[href]").forEach((node) => {{
+      const href = node.getAttribute("href") || "";
+      if (href.indexOf("/status/") >= 0 || href.indexOf(TARGET) >= 0) add(node);
+    }});
+    const ranked = seen.slice().sort((left, right) => {{
+      const score = (node) => {{ const rel = relTo(node, editor); return rel === "inside-editor" ? 2 : (rel === "other" || rel === "no-editor" ? 1 : 0); }};
+      return score(left) - score(right);
+    }});
+    const shown = ranked.slice(0, 3).map((node) => relTo(node, editor) + " " + linkBits(node));
+    const inside = seen.filter((node) => relTo(node, editor) === "inside-editor").length;
+    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
   }});
   const ids = [];
   const composer = dialogs.find((dlg) => dlg.querySelector('[data-testid="tweetTextarea_0"]')) || null;
@@ -2054,7 +2118,7 @@ pub fn quote_snap_script(target_id: &str) -> String {
   const dialogText = scope ? String(scope.innerText || "").slice(0, 500) : "";
   const replying = /replying to/i.test(dialogText);
   const kind = attached ? "quote" : (replying ? "reply" : "unknown");
-  const report = {{ stage: attached ? "inspect" : "composer", path: location.pathname, composer: boxes.length > 0, composer_kind: kind, card: attached, status_ids: ids, quote_testids: attached ? Math.max(proofQuotes, hits.length, 1) : 0, testid_count: document.querySelectorAll("[data-testid]").length, clicked_post: false, clicked_repost_confirm: false, quoted_status_id: attached ? TARGET : null, topo_after: place + " textareas=" + boxes.length + " quotes=" + pageQuotes + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length, attach: attach, message: attached ? "Quote attachment is visible. Post was not clicked." : "No quote attachment for " + TARGET + ". Post was not clicked." }};
+  const report = {{ stage: attached ? "inspect" : "composer", path: location.pathname, composer: boxes.length > 0, composer_kind: kind, card: attached, status_ids: ids, quote_testids: attached ? Math.max(proofQuotes, hits.length, 1) : 0, testid_count: document.querySelectorAll("[data-testid]").length, clicked_post: false, clicked_repost_confirm: false, quoted_status_id: attached ? TARGET : null, topo_after: place + " textareas=" + boxes.length + " quotes=" + pageQuotes + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length, attach: attach, message: attached ? "Quote attachment is visible. Post was not clicked." : "Quote card was not proven for " + TARGET + ". A visible link is not the card. Post was not clicked." }};
   window.__qxReport = report;
   return JSON.stringify(report);
 }} )()"#
@@ -3411,6 +3475,9 @@ mod tests {
         assert!(snap.contains("tweetTextarea_0"));
         assert!(snap.contains("in-dialog-textareas"));
         assert!(snap.contains("page-quotes"));
+        assert!(snap.contains("inside-editor"));
+        assert!(snap.contains("rolelinks"));
+        assert!(snap.contains("A visible link is not the card"));
         assert!(snap.contains("ancestors"));
         assert!(snap.contains("hasBox && qHits.length"));
         let composer = quote_composer_url(original);
@@ -3718,7 +3785,21 @@ mod tests {
         let pasted = one("pasted");
         assert_eq!(pasted["card"], false);
         assert_eq!(pasted["status_ids"].as_array().unwrap().len(), 0);
-        assert!(pasted["attach"].as_str().unwrap().contains("target-links 0"));
+        let pasted_attach = pasted["attach"].as_str().unwrap();
+        assert!(pasted_attach.contains("target-links 0"), "{pasted_attach}");
+        assert!(pasted_attach.contains("inside-editor"), "{pasted_attach}");
+        assert!(pasted_attach.contains("id exact"), "{pasted_attach}");
+        assert!(pasted_attach.contains("/i/status/exact"), "{pasted_attach}");
+
+        let seen = one("seen");
+        assert_eq!(seen["card"], false);
+        assert_eq!(seen["quote_testids"], 0);
+        let seen_attach = seen["attach"].as_str().unwrap();
+        assert!(seen_attach.contains("rolelinks 1"), "{seen_attach}");
+        assert!(seen_attach.contains("after-editor"), "{seen_attach}");
+        assert!(seen_attach.contains("path /i/web/status/exact"), "{seen_attach}");
+        assert!(seen_attach.contains("id exact"), "{seen_attach}");
+        assert!(!seen_attach.contains(target), "{seen_attach}");
 
         let urlcard = one("urlcard");
         assert_eq!(urlcard["card"], true);
@@ -3751,6 +3832,19 @@ function el(tag, attrs, kids) {
     querySelectorAll(sel) { const out = []; walk(this, (n) => { if (n !== this && matchAny(n, sel)) out.push(n); }); return out; },
     querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
     contains(other) { let cur = other; while (cur) { if (cur === this) return true; cur = cur.parentElement; } return false; },
+    compareDocumentPosition(other) {
+      if (!other || other === this) return 0;
+      if (this.contains(other)) return 24;
+      if (other.contains && other.contains(this)) return 18;
+      const order = [];
+      let root = this;
+      while (root.parentElement) root = root.parentElement;
+      walk(root, (n) => order.push(n));
+      const a = order.indexOf(this);
+      const b = order.indexOf(other);
+      if (a < 0 || b < 0) return 1;
+      return a < b ? 4 : 2;
+    },
     get innerText() { return this.attrs.innerText || ""; }
   };
   for (const kid of kids || []) { kid.parentElement = node; node.children.push(kid); }
@@ -3807,6 +3901,13 @@ const rows = [
   run("pasted", compose, [
     el("div", { role: "dialog" }, [el("div", { "data-testid": "tweetTextarea_0", contenteditable: "true" }, [link(quoteHref)])]),
     el("article", {}, [link(quoteHref)])
+  ]),
+  run("seen", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      box(),
+      el("div", { role: "link" }, []),
+      link("https://x.com/i/web/status/" + target)
+    ])
   ]),
   run("urlcard", compose, [
     el("div", { role: "dialog" }, [box(), link(quoteHref)])
