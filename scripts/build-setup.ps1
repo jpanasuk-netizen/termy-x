@@ -147,6 +147,14 @@ if (-not $Arch) {
     $Arch = Arch-FromTarget -TargetTriple $Target
 }
 
+if ($Arch -eq "arm64") {
+    throw @"
+Refusing to package an arm64 Setup with the official VLC 3.0.24 win64 runtime.
+That zip is AMD64 (PE machine 0x8664). VideoLAN also publishes vlc-3.0.24-winarm64.zip (sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5).
+Termy embeds only AMD64 libVLC, so this script does not stage the win64 DLLs onto an arm64 build and does not stage the winarm64 archive either. No Setup.exe is produced for arm64.
+"@
+}
+
 $exePath = Join-Path $repoRoot "target\$Target\release\termy.exe"
 $cliExePath = Join-Path $repoRoot "target\$Target\release\termy-cli.exe"
 

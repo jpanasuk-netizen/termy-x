@@ -161,6 +161,21 @@ require_pattern './scripts/build-dmg-signed\.sh' \
 require_pattern 'dist/Termy-\$\{\{ env.VERSION \}\}-macos-\$\{\{ matrix.arch \}\}-signed\.dmg' \
   ".github/workflows/release.yml" \
   "release workflow must upload the documented signed macOS DMG path"
+require_pattern 'dist/Termy-\$\{\{ env.VERSION \}\}-macos-\$\{\{ matrix.arch \}\}\.dmg' \
+  ".github/workflows/release.yml" \
+  "release workflow must upload an unsigned DMG under its unsigned file name"
+require_pattern 'It is not notarized' \
+  ".github/workflows/release.yml" \
+  "an unsigned macOS DMG must say it is not notarized"
+require_pattern 'fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323' \
+  ".github/workflows/release.yml" \
+  "Windows x64 release must pin the official VLC 3.0.24 win64 zip"
+require_pattern 'vlc-3.0.24-winarm64.zip' \
+  ".github/workflows/release.yml" \
+  "Windows arm64 release must name the official arm64 archive and not the win64 zip"
+require_pattern "if: github.event_name == 'release'" \
+  ".github/workflows/release.yml" \
+  "artifact attachment must run only for a published release"
 require_pattern 'types: \[released\]' \
   ".github/workflows/finalize-stable-release.yml" \
   "stable release finalization must run for initial stable releases and prerelease promotions"

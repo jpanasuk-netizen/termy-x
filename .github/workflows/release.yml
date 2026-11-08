@@ -3,6 +3,14 @@ name: Release
 on:
   release:
     types: [published]
+  # Builds artifacts for the selected ref and does not publish a release,
+  # move a tag, or upload to an existing release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version label used only in artifact file names
+        required: true
+        default: ci
 
 permissions:
   contents: read
@@ -12,7 +20,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  VERSION: ${{ github.event.release.tag_name }}
+  VERSION: ${{ github.event.release.tag_name || inputs.version }}
   INNOSETUP_VERSION: 6.7.1
   # Microsoft.Windows.Console.ConPTY NuGet package bundled with the Windows
   # installer. Update both together; the hash is of the .nupkg file.
@@ -39,7 +47,7 @@ jobs:
             target: x86_64-apple-darwin
             runner: macos-26
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       TERMY_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       TERMY_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
@@ -47,7 +55,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Decide whether this DMG is signed
+        id: signing
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          TERMY_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          TERMY_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          mode="$(./scripts/macos-release-mode.sh)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [[ "$mode" == "unsigned" ]]; then
+            echo "No Apple signing credentials. The DMG will be unsigned and is not notarized."
+          fi
+
       - name: Import Developer ID and notarization credentials
+        if: steps.signing.outputs.mode == 'signed'
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -67,9 +92,17 @@ jobs:
         run: cargo install cargo-bundle --locked
 
       - name: Build, sign, and notarize DMG
+        if: steps.signing.outputs.mode == 'signed'
         run: ./scripts/build-dmg-signed.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --no-layout
 
+      - name: Build unsigned DMG
+        if: steps.signing.outputs.mode == 'unsigned'
+        run: |
+          echo "Building an unsigned DMG. It is not notarized and is not named as a signed release."
+          ./scripts/build-dmg.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --no-layout
+
       - name: Sign DMG for Sparkle
+        if: steps.signing.outputs.mode == 'signed'
         env:
           SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
         run: |
@@ -89,13 +122,22 @@ jobs:
             rm -rf "$TERMY_SIGNING_DIR"
           fi
 
-      - name: Upload DMG artifact
+      - name: Upload signed DMG artifact
+        if: steps.signing.outputs.mode == 'signed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: termy-dmg-${{ matrix.arch }}
           path: |
             dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}-signed.dmg
             dist/sparkle-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+      - name: Upload unsigned DMG artifact
+        if: steps.signing.outputs.mode == 'unsigned'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-dmg-${{ matrix.arch }}-unsigned
+          path: dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
   build-windows-setup:
@@ -110,12 +152,8 @@ jobs:
         include:
           - arch: x64
             target: x86_64-pc-windows-msvc
-          # Cross-compiled on the x64 runner; the asset name carries "arm64",
-          # which release_core's asset selection matches on ARM64 Windows.
-          - arch: arm64
-            target: aarch64-pc-windows-msvc
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -154,6 +192,18 @@ jobs:
       # Microsoft's out-of-band ConPTY (conpty.dll + OpenConsole.exe), newer
       # than the one in older Windows builds. Termy loads it from beside
       # termy.exe when present; termy.iss packs whatever is there.
+      - name: Stage official VLC 3.0.24 win64
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "vlc-3.0.24-win64.zip"
+          $url = "https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          $expect = "fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323"
+          if ($hash -ne $expect) { throw "VLC zip sha256 $hash != $expect" }
+          "TERMY_VLC_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Bundle ConPTY
         shell: pwsh
         run: |
@@ -181,6 +231,19 @@ jobs:
           path: target/dist/Termy-${{ env.VERSION }}-windows-${{ matrix.arch }}-Setup.exe
           if-no-files-found: error
 
+  refuse-windows-arm64-setup:
+    name: Do not build Windows arm64 Setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Refuse the AMD64 VLC runtime for arm64
+        run: |
+          echo "No arm64 Setup.exe is produced."
+          echo "vlc-3.0.24-win64.zip is AMD64 (PE machine 0x8664) and is not staged onto an aarch64 build."
+          echo "VideoLAN publishes vlc-3.0.24-winarm64.zip sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5."
+          echo "Termy embeds only AMD64 libVLC, so that archive is not staged either."
+          exit 1
+
   build-linux:
     name: Build Linux ${{ matrix.arch }}
     runs-on: ubuntu-24.04
@@ -194,7 +257,7 @@ jobs:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -280,6 +343,7 @@ jobs:
 
   attach-and-finalize-release:
     name: Attach release artifacts
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:

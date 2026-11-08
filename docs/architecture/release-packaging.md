@@ -72,6 +72,14 @@ Zip: `https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win
 
 sha256: `fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
 
+The x64 release job downloads that zip, checks the sha256, and stages it. The
+combined package still carries the GPL plugins named below; staging them is
+not a claim that the combination is cleared. There is no arm64 Setup. The
+official `vlc-3.0.24-winarm64.zip` (sha256
+`f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5`) is a
+different file, and Termy embeds only AMD64 libVLC, so the win64 DLLs are not
+staged onto an arm64 build.
+
 `TERMY_VLC_SOURCE` may point at an extracted 3.0.24 tree, including
 `C:\Program Files\VideoLAN\VLC`. The script copies. It does not install, uninstall,
 or edit that tree. A source directory is accepted only when `libvlc.dll` contains

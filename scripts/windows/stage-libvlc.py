@@ -106,6 +106,20 @@ def find_runtime_root(extracted: Path) -> Path:
     return found[0].parent
 
 
+AMD64_MACHINE = 0x8664
+ARM64_MACHINE = 0xAA64
+
+
+def pe_machine(path: Path) -> int | None:
+    data = path.read_bytes()[:4096]
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        return None
+    pe_off = int.from_bytes(data[0x3C:0x40], "little")
+    if len(data) < pe_off + 6 or data[pe_off : pe_off + 4] != b"PE\0\0":
+        return None
+    return int.from_bytes(data[pe_off + 4 : pe_off + 6], "little")
+
+
 def dll_says_version(path: Path, version: str) -> bool:
     data = path.read_bytes()
     return version.encode("ascii") in data
@@ -187,6 +201,14 @@ def verify_dest(dest: Path) -> None:
             fail(f"staged runtime is missing {name}")
     if not dll_says_version(dest / "libvlc.dll", PINNED_VERSION):
         fail(f"staged libvlc.dll does not contain version {PINNED_VERSION}")
+    libvlc_machine = pe_machine(dest / "libvlc.dll")
+    core_machine = pe_machine(dest / "libvlccore.dll")
+    if libvlc_machine != AMD64_MACHINE or core_machine != AMD64_MACHINE:
+        fail(
+            "staged libVLC is not the AMD64 win64 runtime "
+            f"(libvlc={libvlc_machine}, core={core_machine}). "
+            "The official winarm64 zip is a different archive and is not staged here."
+        )
     for relative in REQUIRED_PLUGINS:
         if not (dest / relative).is_file():
             fail(f"staged runtime is missing {relative}")
@@ -298,7 +320,35 @@ def stage(source: Path, dest: Path, source_tar: Path, ffmpeg: Path, x264: Path, 
     print(f"stage-libvlc: {copied} plugins -> {dest}")
 
 
+def self_check() -> None:
+    import tempfile
+
+    def header(machine: int) -> bytes:
+        blob = bytearray(b"MZ" + b"\0" * 0x3C)
+        pe_off = 0x40
+        blob[0x3C:0x40] = pe_off.to_bytes(4, "little")
+        blob.extend(b"\0" * (pe_off - len(blob)))
+        blob.extend(b"PE\0\0")
+        blob.extend(machine.to_bytes(2, "little"))
+        return bytes(blob)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        amd = root / "amd.dll"
+        arm = root / "arm.dll"
+        amd.write_bytes(header(AMD64_MACHINE))
+        arm.write_bytes(header(ARM64_MACHINE))
+        if pe_machine(amd) != AMD64_MACHINE or pe_machine(arm) != ARM64_MACHINE:
+            fail("pe_machine did not read the PE machine field")
+        if pe_machine(amd) == pe_machine(arm):
+            fail("AMD64 and ARM64 machines must stay distinct")
+    print("stage-libvlc: self-check ok")
+
+
 def main() -> None:
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-check":
+        self_check()
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--zip", type=Path, help="official vlc-3.0.24-win64.zip")
