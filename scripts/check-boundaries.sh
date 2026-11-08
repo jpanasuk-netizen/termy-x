@@ -172,7 +172,16 @@ require_pattern 'fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca632
   "Windows x64 release must pin the official VLC 3.0.24 win64 zip"
 require_pattern 'vlc-3.0.24-winarm64.zip' \
   ".github/workflows/release.yml" \
-  "Windows arm64 release must name the official arm64 archive and not the win64 zip"
+  "Windows arm64 must be named unsupported, not built from the win64 zip"
+require_pattern 'Windows ARM64 Setup is not offered' \
+  ".github/workflows/release.yml" \
+  "the release workflow must say Windows ARM64 Setup is not offered"
+require_pattern 'termy-xcli.exe' \
+  ".github/workflows/release.yml" \
+  "the Windows release build must produce termy-xcli.exe"
+require_pattern 'termy-xcli.exe' \
+  "scripts/installer/termy.iss" \
+  "the Windows installer must package termy-xcli.exe"
 require_pattern "if: github.event_name == 'release'" \
   ".github/workflows/release.yml" \
   "artifact attachment must run only for a published release"

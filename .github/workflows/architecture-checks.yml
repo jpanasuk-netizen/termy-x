@@ -67,12 +67,12 @@ jobs:
         run: |
           $release = "target\iscc-smoke\release"
           New-Item -ItemType Directory -Force -Path $release | Out-Null
-          foreach ($name in @("termy.exe", "termy-cli.exe", "Microsoft.UI.Xaml.dll", "resources.pri")) {
+          foreach ($name in @("termy.exe", "termy-cli.exe", "termy-xcli.exe", "Microsoft.UI.Xaml.dll", "resources.pri")) {
             Set-Content -Path (Join-Path $release $name) -Value "placeholder"
           }
           $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
           $output = Join-Path $env:RUNNER_TEMP "iscc-smoke"
-          foreach ($arch in @("x64", "arm64")) {
+          foreach ($arch in @("x64")) {
             & $iscc /Q "/O$output" "/DMyAppVersion=0.0.0-smoke" "/DMyOutputVersion=v0.0.0-smoke" "/DMyArch=$arch" "/DMyTarget=iscc-smoke" scripts\installer\termy.iss
             if ($LASTEXITCODE -ne 0) { throw "ISCC failed for $arch with exit code $LASTEXITCODE" }
           }

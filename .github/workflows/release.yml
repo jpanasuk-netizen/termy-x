@@ -169,25 +169,21 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # ring builds its aarch64 assembly with clang; the runner image ships
-      # LLVM but does not always put it on PATH.
-      - name: Put clang on PATH
-        if: matrix.arch == 'arm64'
+      - name: Record the supported Windows matrix
         shell: pwsh
         run: |
-          if (Get-Command clang -ErrorAction SilentlyContinue) { exit 0 }
-          $llvm = Join-Path $env:ProgramFiles "LLVM\bin"
-          if (-not (Test-Path (Join-Path $llvm "clang.exe"))) {
-            throw "clang.exe not found; install LLVM for the aarch64-pc-windows-msvc build"
-          }
-          $llvm | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          @"
+          ## Windows matrix
+          Windows x64 Setup is the supported Windows package. It includes termy.exe, termy-cli.exe, and termy-xcli.exe. It does not include x.exe.
+          Windows ARM64 Setup is not offered. Termy embeds only AMD64 libVLC (PE machine 0x8664). vlc-3.0.24-win64.zip is not staged for arm64. VideoLAN publishes vlc-3.0.24-winarm64.zip (sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5); that archive is not staged either. No arm64 Setup artifact is uploaded.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Install Inno Setup
         run: choco install innosetup --version="$env:INNOSETUP_VERSION" --no-progress -y
 
-      - name: Build termy.exe and termy-cli.exe
+      - name: Build termy.exe, termy-cli.exe, and termy-xcli.exe
         shell: pwsh
-        run: cargo build --release --target ${{ matrix.target }} -p termy -p termy_cli
+        run: cargo build --release --target ${{ matrix.target }} -p termy -p termy_cli -p termy_x_cli
 
       # Microsoft's out-of-band ConPTY (conpty.dll + OpenConsole.exe), newer
       # than the one in older Windows builds. Termy loads it from beside
@@ -230,19 +226,6 @@ jobs:
           name: termy-setup-${{ matrix.arch }}
           path: target/dist/Termy-${{ env.VERSION }}-windows-${{ matrix.arch }}-Setup.exe
           if-no-files-found: error
-
-  refuse-windows-arm64-setup:
-    name: Do not build Windows arm64 Setup
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Refuse the AMD64 VLC runtime for arm64
-        run: |
-          echo "No arm64 Setup.exe is produced."
-          echo "vlc-3.0.24-win64.zip is AMD64 (PE machine 0x8664) and is not staged onto an aarch64 build."
-          echo "VideoLAN publishes vlc-3.0.24-winarm64.zip sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5."
-          echo "Termy embeds only AMD64 libVLC, so that archive is not staged either."
-          exit 1
 
   build-linux:
     name: Build Linux ${{ matrix.arch }}

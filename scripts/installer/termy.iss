@@ -25,6 +25,10 @@
   #define MyCliExeName "termy-cli.exe"
 #endif
 
+#ifndef MyXCliExeName
+  #define MyXCliExeName "termy-xcli.exe"
+#endif
+
 ; Must match the AppUserModelID the app sets on its windows, so pinned
 ; taskbar shortcuts and running windows group together.
 #define MyAppUserModelID "lassejlv.Termy"
@@ -33,10 +37,9 @@
   #define MyArchAllowed "x64compatible"
   #define MyArchInstallMode "x64compatible"
 #elif MyArch == "arm64"
-  #define MyArchAllowed "arm64"
-  #define MyArchInstallMode "arm64"
+  #error Windows ARM64 Setup is not offered. Termy embeds only AMD64 libVLC. Do not stage the win64 or winarm64 VLC runtime for this target.
 #else
-  #error Unsupported MyArch value. Use x64 or arm64.
+  #error Unsupported MyArch value. Windows ARM64 Setup is not offered.
 #endif
 
 [Setup]
@@ -77,6 +80,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 Source: "..\..\target\{#MyTarget}\release\{#MyExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\target\{#MyTarget}\release\{#MyCliExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\..\target\{#MyTarget}\release\{#MyXCliExeName}"; DestDir: "{app}"; Flags: ignoreversion
 ; WinUI 2 (Microsoft.UI.Xaml) for the native tab strip, staged beside
 ; termy.exe by the desktop crate's build script.
 Source: "..\..\target\{#MyTarget}\release\Microsoft.UI.Xaml.dll"; DestDir: "{app}"; Flags: ignoreversion

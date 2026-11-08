@@ -157,10 +157,11 @@ Termy embeds only AMD64 libVLC, so this script does not stage the win64 DLLs ont
 
 $exePath = Join-Path $repoRoot "target\$Target\release\termy.exe"
 $cliExePath = Join-Path $repoRoot "target\$Target\release\termy-cli.exe"
+$xCliExePath = Join-Path $repoRoot "target\$Target\release\termy-xcli.exe"
 
 if (-not $NoBuild) {
-    Write-Host "Building termy.exe and termy-cli.exe for target '$Target'..."
-    & cargo build --release --target $Target -p termy -p termy_cli
+    Write-Host "Building termy.exe, termy-cli.exe, and termy-xcli.exe for target '$Target'..."
+    & cargo build --release --target $Target -p termy -p termy_cli -p termy_x_cli
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
@@ -171,6 +172,12 @@ if (-not (Test-Path $exePath)) {
 }
 if (-not (Test-Path $cliExePath)) {
     throw "Expected CLI binary not found at $cliExePath"
+}
+if (-not (Test-Path $xCliExePath)) {
+    throw "Expected X CLI binary not found at $xCliExePath"
+}
+if (Test-Path (Join-Path $repoRoot "target\$Target\release\x.exe")) {
+    throw "Refusing to package x.exe. The X command is termy-xcli.exe."
 }
 
 # The WinUI tab strip needs termy.manifest in termy.exe and the WinUI 2
@@ -229,6 +236,7 @@ foreach ($conptyFile in @("conpty.dll", "OpenConsole.exe")) {
     "/DMyTarget=$Target" `
     "/DMyExeName=termy.exe" `
     "/DMyCliExeName=termy-cli.exe" `
+    "/DMyXCliExeName=termy-xcli.exe" `
     $issPath
 
 if ($LASTEXITCODE -ne 0) {
