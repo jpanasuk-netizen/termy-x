@@ -838,6 +838,110 @@ pub fn browser_argv_public(args: &[String]) -> String {
         .join(" ")
 }
 
+/// Quote-session browser command. `foreground` asks OpenCLI to show the
+/// owned window. Native click is refused on a hidden page, so the quote
+/// open never passes `--window background`. Tab list omits the window
+/// flag so listing does not move the window.
+pub fn quote_browser_args(
+    cli: BrowserCli,
+    session: &str,
+    words: &[&str],
+    tab: Option<&str>,
+    foreground: bool,
+) -> Vec<String> {
+    let mut args = vec!["browser".to_string()];
+    if !cli.session_flag {
+        args.push(session.to_string());
+    }
+    args.extend(words.iter().map(|word| (*word).to_string()));
+    if let Some(tab) = tab.filter(|value| is_browser_target_id(value)) {
+        args.push("--tab".into());
+        args.push(tab.to_string());
+    }
+    if cli.session_flag {
+        args.push("--session".into());
+        args.push(session.to_string());
+    }
+    if foreground && cli.window_flag {
+        args.push("--window".into());
+        args.push("foreground".into());
+    }
+    args
+}
+
+pub fn is_browser_target_id(value: &str) -> bool {
+    let len = value.len();
+    (16..=64).contains(&len) && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+/// Hex `targetId` from an open or tab payload. Other strings are ignored.
+pub fn quote_surface_target(stdout: &str) -> Option<String> {
+    let value = first_json_value(stdout)?;
+    find_browser_target(&value)
+}
+
+fn find_browser_target(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let text = text.trim().trim_matches('"');
+        return is_browser_target_id(text).then(|| text.to_string());
+    }
+    if let Some(rows) = value.as_array() {
+        return rows.iter().find_map(find_browser_target);
+    }
+    let obj = value.as_object()?;
+    for key in ["targetId", "target_id", "target"] {
+        if let Some(found) = obj.get(key).and_then(find_browser_target) {
+            return Some(found);
+        }
+    }
+    if let Some(found) = obj.get("data").and_then(find_browser_target) {
+        return Some(found);
+    }
+    None
+}
+
+/// `data: []` is zero tabs. Unreadable output is `None` (not a guess of zero).
+pub fn quote_tab_count(stdout: &str) -> Option<usize> {
+    let value = first_json_value(stdout)?;
+    let data = value.get("data").unwrap_or(&value);
+    data.as_array().map(|rows| rows.len())
+}
+
+/// Page Visibility values only. Anything else, including a URL, is `unknown`.
+pub fn quote_visibility(stdout: &str) -> String {
+    let Some(value) = first_json_value(stdout) else {
+        return known_visibility(stdout);
+    };
+    if let Some(text) = value.as_str() {
+        return known_visibility(text);
+    }
+    if let Some(text) = value.get("visibility").and_then(serde_json::Value::as_str) {
+        return known_visibility(text);
+    }
+    if let Some(data) = value.get("data") {
+        if let Some(text) = data.as_str() {
+            return known_visibility(text);
+        }
+        if let Some(text) = data.get("visibility").and_then(serde_json::Value::as_str) {
+            return known_visibility(text);
+        }
+    }
+    "unknown".into()
+}
+
+fn known_visibility(text: &str) -> String {
+    match text.trim().trim_matches('"') {
+        "visible" | "hidden" | "prerender" | "unloaded" => text.trim().trim_matches('"').to_string(),
+        _ => "unknown".into(),
+    }
+}
+
+pub fn quote_view_line(tabs: &str, target: &str, opened: &str, click: &str) -> String {
+    format!(
+        "session termyx-quote · window foreground · tabs before {tabs} · target {target} · visibility open {opened} click {click}"
+    )
+}
+
 /// Keep OpenCLI's own code and message. Drop credential-shaped lines.
 pub fn explain_opencli_failure(stage: &str, argv: &str, status: i32, stdout: &str, stderr: &str) -> String {
     let cause = opencli_error_cause(stdout)
@@ -1188,7 +1292,7 @@ fn js_ascii_string(text: &str) -> String {
 
 /// OpenCLI 2.0 trusted click. `--name Quote` is the accessible name of the
 /// menu row. It is not `unretweetConfirm` and it is not Post.
-pub fn quote_native_click_args(cli: BrowserCli, session: &str) -> Vec<String> {
+pub fn quote_native_click_args(cli: BrowserCli, session: &str, tab: Option<&str>) -> Vec<String> {
     let mut args = vec!["browser".to_string()];
     if !cli.session_flag {
         args.push(session.to_string());
@@ -1198,9 +1302,17 @@ pub fn quote_native_click_args(cli: BrowserCli, session: &str) -> Vec<String> {
     args.push("menuitem".into());
     args.push("--name".into());
     args.push("Quote".into());
+    if let Some(tab) = tab.filter(|value| is_browser_target_id(value)) {
+        args.push("--tab".into());
+        args.push(tab.to_string());
+    }
     if cli.session_flag {
         args.push("--session".into());
         args.push(session.to_string());
+    }
+    if cli.window_flag {
+        args.push("--window".into());
+        args.push("foreground".into());
     }
     args
 }
@@ -2636,16 +2748,33 @@ mod tests {
         let snap = quote_snap_script(original);
         assert!(!snap.contains("click("));
         assert!(snap.contains("quoteTweet"));
-        let click = quote_native_click_args(browser_cli_from_help(""), "termyx-quote");
+        let click = quote_native_click_args(browser_cli_from_help(""), "termyx-quote", None);
         assert!(click.windows(2).any(|pair| pair[0] == "--role" && pair[1] == "menuitem"));
         assert!(click.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
+        assert!(click.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground"));
+        assert!(!click.iter().any(|arg| arg == "background"));
         assert!(!click.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm")));
         let positional = quote_native_click_args(
             browser_cli_from_help("Usage: opencli browser <session> <command>\n"),
             "termyx-quote",
+            None,
         );
         assert_eq!(positional[1], "termyx-quote");
         assert!(positional.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
+        let tab = "A03BB6CCAE9402E75FCA7CB1AAED51FA";
+        let targeted = quote_native_click_args(browser_cli_from_help(""), "termyx-quote", Some(tab));
+        assert!(targeted.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == tab));
+        assert_eq!(quote_tab_count(r#"{"ok":true,"data":[]}"#), Some(0));
+        assert_eq!(
+            quote_surface_target(
+                r#"{"ok":true,"data":{"targetId":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#
+            )
+            .as_deref(),
+            Some(tab)
+        );
+        assert_eq!(quote_visibility(r#"{"ok":true,"data":"hidden"}"#), "hidden");
+        assert_eq!(quote_visibility("https://x.com/i/status/20"), "unknown");
+        assert!(quote_view_line("0", tab, "visible", "hidden").contains("window foreground"));
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));

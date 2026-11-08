@@ -37,6 +37,19 @@ pub trait CommandRunner: Send + Sync {
     ) -> Result<CommandOutput, String> {
         self.run(program, args)
     }
+
+    /// Like `run_timeout`, but does not minimize the Chrome window.
+    /// Quote native input is refused when the page is hidden, so that
+    /// flow must leave the owned window visible. Other OpenCLI calls
+    /// still use `run_timeout` and stay quiet.
+    fn run_keeping_window(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.run_timeout(program, args, timeout)
+    }
 }
 
 pub struct SystemRunner;
@@ -56,20 +69,44 @@ impl CommandRunner for SystemRunner {
         args: &[String],
         timeout: Duration,
     ) -> Result<CommandOutput, String> {
+        self.execute(program, args, timeout, true)
+    }
+
+    fn run_keeping_window(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.execute(program, args, timeout, false)
+    }
+}
+
+impl SystemRunner {
+    fn execute(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        silence_opencli: bool,
+    ) -> Result<CommandOutput, String> {
         let resolved =
             resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
         let mut command = command_for(&resolved, args);
         hide_console(&mut command);
-        // OpenCLI drives Chrome through a separate, visible "automation"
-        // window that cycles x.com pages and parks on about:blank. Keep
-        // that window minimized for the whole call so it runs silently.
+        // OpenCLI's owned window is visible unless `--window background`
+        // or this minimizer parks it. Native click/key input is refused
+        // while Chrome reports the page hidden, so quote commands pass
+        // `silence_opencli = false` and open with `--window foreground`.
+        // Reads and other writes still minimize.
         let silence = OpencliSilence::begin(
-            is_opencli_program(program)
-                || resolved
-                    .path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(is_opencli_program),
+            silence_opencli
+                && (is_opencli_program(program)
+                    || resolved
+                        .path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(is_opencli_program)),
         );
         let result = output_with_timeout(command, timeout);
         silence.finish();

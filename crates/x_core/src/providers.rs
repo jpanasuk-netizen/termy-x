@@ -1748,12 +1748,24 @@ fn browser_page_json(
     url: Option<&str>,
     js: &str,
     marker: &str,
+    keep_window: bool,
     and_close: bool,
 ) -> Result<crate::publish::QuotePageReport, String> {
+    let run = |args: &[String], timeout: Duration| {
+        if keep_window {
+            runner.run_keeping_window(bin, args, timeout)
+        } else {
+            runner.run_timeout(bin, args, timeout)
+        }
+    };
     if let Some(url) = url {
-    let open_args = crate::publish::browser_command(cli, session, "open", Some(url));
+    let open_args = if keep_window {
+        crate::publish::quote_browser_args(cli, session, &["open", url], None, true)
+    } else {
+        crate::publish::browser_command(cli, session, "open", Some(url))
+    };
     let open_public = crate::publish::browser_argv_public(&open_args);
-    let opened = match runner.run_timeout(bin, &open_args, Duration::from_secs(60)) {
+    let opened = match run(&open_args, Duration::from_secs(60)) {
         Ok(output) => output,
         Err(error) => {
             return Err(crate::publish::explain_opencli_failure(
@@ -1776,8 +1788,7 @@ fn browser_page_json(
         ));
     }
     for _ in 0..8 {
-        match runner.run_timeout(
-            bin,
+        match run(
             &crate::publish::browser_command(cli, session, "eval", Some("location.href")),
             Duration::from_secs(20),
         ) {
@@ -1794,8 +1805,7 @@ fn browser_page_json(
         } else {
             format!("window.__{marker}+='{piece}'")
         };
-        let loaded = runner.run_timeout(
-            bin,
+        let loaded = run(
             &crate::publish::browser_command(cli, session, "eval", Some(&arg)),
             Duration::from_secs(30),
         );
@@ -1815,7 +1825,7 @@ fn browser_page_json(
             Some(&format!("eval(atob(window.__{marker}))")),
         );
     let eval_public = crate::publish::browser_argv_public(&eval_args);
-    let evaluated = runner.run_timeout(bin, &eval_args, Duration::from_secs(90));
+    let evaluated = run(&eval_args, Duration::from_secs(90));
     let evaluated = match evaluated {
         Ok(output) => output,
         Err(error) => {
@@ -1863,7 +1873,7 @@ fn browser_page_json(
                     "eval",
                     Some("window.__qxReport?JSON.stringify(window.__qxReport):\"pending\""),
                 );
-                let polled = runner.run_timeout(bin, &poll, Duration::from_secs(20));
+                let polled = run(&poll, Duration::from_secs(20));
                 let polled = match polled {
                     Ok(output) if output.status == 0 => output.stdout,
                     Ok(output) => {
@@ -1902,6 +1912,161 @@ fn browser_page_json(
     Ok(report)
 }
 
+fn quote_run(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    args: &[String],
+    timeout: Duration,
+) -> Result<crate::io::CommandOutput, String> {
+    runner.run_keeping_window(bin, args, timeout)
+}
+
+struct QuoteSurface {
+    tabs_before: String,
+    target: Option<String>,
+    visibility: String,
+}
+
+fn quote_surface_view(tabs: &str, target: &str, opened: &str, click: &str) -> String {
+    crate::publish::quote_view_line(tabs, target, opened, click)
+}
+
+fn with_quote_view(line: String, view: &str) -> String {
+    if view.is_empty() || line.contains("tabs before") {
+        line
+    } else {
+        format!("{line} · {view}")
+    }
+}
+
+/// Open the status in the owned quote session and record whether that
+/// page is actually visible. Does not click.
+fn open_visible_quote_page(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    session: &str,
+    url: &str,
+) -> Result<QuoteSurface, String> {
+    let list_args = crate::publish::quote_browser_args(cli, session, &["tab", "list"], None, false);
+    let listed = quote_run(bin, runner, &list_args, Duration::from_secs(20));
+    let tabs_before = match listed {
+        Ok(output) if output.status == 0 => crate::publish::quote_tab_count(&output.stdout)
+            .map(|count| count.to_string())
+            .unwrap_or_else(|| "unread".into()),
+        _ => "unread".into(),
+    };
+    let open_args = crate::publish::quote_browser_args(cli, session, &["open", url], None, true);
+    let open_public = crate::publish::browser_argv_public(&open_args);
+    let opened = match quote_run(bin, runner, &open_args, Duration::from_secs(60)) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(with_quote_view(
+                crate::publish::explain_opencli_failure("navigation", &open_public, -1, "", &error),
+                &quote_surface_view(&tabs_before, "none", "unknown", "not-sent"),
+            ));
+        }
+    };
+    if opened.status != 0 || opened.stdout.contains("\"ok\":false") || opened.stdout.contains("\"ok\": false")
+    {
+        close_quote_session(bin, runner, cli, session);
+        return Err(with_quote_view(
+            crate::publish::explain_opencli_failure(
+                "navigation",
+                &open_public,
+                opened.status,
+                &opened.stdout,
+                &opened.stderr,
+            ),
+            &quote_surface_view(&tabs_before, "none", "unknown", "not-sent"),
+        ));
+    }
+    let target = crate::publish::quote_surface_target(&opened.stdout);
+    let target_label = target.clone().unwrap_or_else(|| "none".into());
+    if let Some(target) = target.as_deref() {
+        let select_args = crate::publish::quote_browser_args(
+            cli,
+            session,
+            &["tab", "select", target],
+            None,
+            false,
+        );
+        let select_public = crate::publish::browser_argv_public(&select_args);
+        let selected = match quote_run(bin, runner, &select_args, Duration::from_secs(20)) {
+            Ok(output) => output,
+            Err(error) => {
+                close_quote_session(bin, runner, cli, session);
+                return Err(with_quote_view(
+                    crate::publish::explain_opencli_failure("tab", &select_public, -1, "", &error),
+                    &quote_surface_view(&tabs_before, &target_label, "unknown", "not-sent"),
+                ));
+            }
+        };
+        if selected.status != 0
+            || selected.stdout.contains("\"ok\":false")
+            || selected.stdout.contains("\"ok\": false")
+        {
+            close_quote_session(bin, runner, cli, session);
+            return Err(with_quote_view(
+                crate::publish::explain_opencli_failure(
+                    "tab",
+                    &select_public,
+                    selected.status,
+                    &selected.stdout,
+                    &selected.stderr,
+                ),
+                &quote_surface_view(&tabs_before, &target_label, "unknown", "not-sent"),
+            ));
+        }
+    }
+    for _ in 0..8 {
+        let probe_args = crate::publish::quote_browser_args(
+            cli,
+            session,
+            &["eval", "location.href"],
+            target.as_deref(),
+            false,
+        );
+        match quote_run(bin, runner, &probe_args, Duration::from_secs(20)) {
+            Ok(probe) if probe.stdout.contains("https://x.com") => break,
+            _ => std::thread::sleep(Duration::from_millis(200)),
+        }
+    }
+    let visibility = read_quote_visibility(bin, runner, cli, session, target.as_deref());
+    if visibility != "visible" {
+        close_quote_session(bin, runner, cli, session);
+        return Err(format!(
+            "stage visibility · {} · native click was not sent · Post was not clicked",
+            quote_surface_view(&tabs_before, &target_label, &visibility, "not-sent")
+        ));
+    }
+    Ok(QuoteSurface {
+        tabs_before,
+        target,
+        visibility,
+    })
+}
+
+fn read_quote_visibility(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    session: &str,
+    tab: Option<&str>,
+) -> String {
+    let args = crate::publish::quote_browser_args(
+        cli,
+        session,
+        &["eval", "document.visibilityState"],
+        tab,
+        false,
+    );
+    match quote_run(bin, runner, &args, Duration::from_secs(20)) {
+        Ok(output) if output.status == 0 => crate::publish::quote_visibility(&output.stdout),
+        _ => "unknown".into(),
+    }
+}
+
 fn run_quote_attachment(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
@@ -1911,38 +2076,51 @@ fn run_quote_attachment(
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
+    let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page)?;
+    let target_label = surface.target.clone().unwrap_or_else(|| "none".into());
     let script = crate::publish::quote_page_script(target_id, Some(text), true);
     let menu = browser_page_json(
         bin,
         runner,
         cli,
         QUOTE_SESSION,
-        Some(&page),
+        None,
         &script,
         "qx",
+        true,
         false,
     )?;
+    let click_visibility = read_quote_visibility(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+    let view = quote_surface_view(
+        &surface.tabs_before,
+        &target_label,
+        &surface.visibility,
+        &click_visibility,
+    );
     if !menu.selected_label.eq_ignore_ascii_case("Quote") || menu.selected_scope != "menu" {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(crate::publish::quote_report_line(&menu));
+        return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
     }
     if menu.selected_href_kind.contains("in_reply_to") {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(crate::publish::quote_report_line(&menu));
+        return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
     }
-    let click_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION);
+    if click_visibility != "visible" {
+        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        return Err(format!(
+            "stage visibility · {view} · native click was not sent · Post was not clicked"
+        ));
+    }
+    let click_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
     let click_public = crate::publish::browser_argv_public(&click_args);
-    let clicked = runner.run_timeout(bin, &click_args, Duration::from_secs(30));
+    let clicked = quote_run(bin, runner, &click_args, Duration::from_secs(30));
     let clicked = match clicked {
         Ok(output) => output,
         Err(error) => {
             close_quote_session(bin, runner, cli, QUOTE_SESSION);
-            return Err(crate::publish::explain_opencli_failure(
-                "menu",
-                &click_public,
-                -1,
-                "",
-                &error,
+            return Err(with_quote_view(
+                crate::publish::explain_opencli_failure("menu", &click_public, -1, "", &error),
+                &view,
             ));
         }
     };
@@ -1950,12 +2128,15 @@ fn run_quote_attachment(
         || clicked.stdout.contains("\"ok\": false");
     if clicked.status != 0 || click_rejected {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(crate::publish::explain_opencli_failure(
-            "menu",
-            &click_public,
-            clicked.status,
-            &clicked.stdout,
-            &clicked.stderr,
+        return Err(with_quote_view(
+            crate::publish::explain_opencli_failure(
+                "menu",
+                &click_public,
+                clicked.status,
+                &clicked.stdout,
+                &clicked.stderr,
+            ),
+            &view,
         ));
     }
     let snap_js = crate::publish::quote_snap_script(target_id);
@@ -1976,6 +2157,7 @@ fn run_quote_attachment(
         None,
         &snap_js,
         "qxSnap",
+        true,
         false,
     )?);
     if !crate::publish::quote_inspect_ready(&after) {
@@ -1987,7 +2169,7 @@ fn run_quote_attachment(
                 "eval",
                 Some("eval(atob(window.__qxSnap))"),
             );
-            let Ok(output) = runner.run_timeout(bin, &again, Duration::from_secs(20)) else {
+            let Ok(output) = quote_run(bin, runner, &again, Duration::from_secs(20)) else {
                 break;
             };
             if output.status != 0 {
@@ -2003,7 +2185,7 @@ fn run_quote_attachment(
     }
     if inspect || !crate::publish::quote_inspect_ready(&after) {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        let line = crate::publish::quote_report_line(&after);
+        let line = with_quote_view(crate::publish::quote_report_line(&after), &view);
         return if crate::publish::quote_inspect_ready(&after) {
             Ok(after)
         } else {
@@ -2019,6 +2201,7 @@ fn run_quote_attachment(
         None,
         &post_script,
         "qxPost",
+        true,
         true,
     )?;
     let report = posted;
@@ -2068,6 +2251,7 @@ fn run_quote_attachment(
         Some(&read_page),
         &read_script,
         "qx",
+        false,
         true,
     )?;
     crate::publish::quote_outcome(Some(new_id), &read, target_id)?;
@@ -4465,6 +4649,11 @@ mod tests {
         runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "document.visibilityState"],
+            r#"{"ok":true,"data":"visible"}"#,
+        );
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_menu);
         runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"], quote_snap);
@@ -4645,6 +4834,11 @@ mod tests {
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");
         runner.script(
             "opencli",
+            &["browser", "termyx-quote", "eval", "document.visibilityState"],
+            r#"{"ok":true,"data":"visible"}"#,
+        );
+        runner.script(
+            "opencli",
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
             menu,
         );
@@ -4671,6 +4865,12 @@ mod tests {
             args.iter().any(|arg| arg == "https://x.com/i/status/20")
         }));
         assert!(calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+        }));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
+        }));
+        assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")
                 && !args.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm"))
         }));
@@ -4679,6 +4879,61 @@ mod tests {
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
         let _ = calls;
+    }
+
+    #[test]
+    fn quote_native_click_is_not_sent_when_the_owned_page_stays_hidden() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser open <url> --session <name>\n--window <mode>\n",
+        );
+        runner.script(
+            "opencli",
+            &["browser", "tab", "list"],
+            r#"{"ok":true,"data":[]}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "open"],
+            r#"{"ok":true,"data":{"targetId":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        runner.script("opencli", &["browser", "tab", "select"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "eval", "location.href"],
+            "https://x.com/cryptoXRPwhale/status/2118971448614334959",
+        );
+        runner.script(
+            "opencli",
+            &["browser", "eval", "document.visibilityState"],
+            r#"{"ok":true,"data":"hidden"}"#,
+        );
+        runner.script("opencli", &["browser", "close"], "ok");
+        let err = inspect_quote_attachment(
+            "opencli",
+            runner.as_ref(),
+            "2118971448614334959",
+        )
+        .unwrap_err();
+        assert!(err.contains("stage visibility"), "{err}");
+        assert!(err.contains("window foreground"), "{err}");
+        assert!(err.contains("tabs before 0"), "{err}");
+        assert!(err.contains("A03BB6CCAE9402E75FCA7CB1AAED51FA"), "{err}");
+        assert!(err.contains("visibility open hidden"), "{err}");
+        assert!(err.contains("native click was not sent"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+                && args.iter().any(|arg| arg == "open")
+        }));
+        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
+        }));
     }
 
     #[test]
