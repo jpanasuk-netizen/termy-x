@@ -951,6 +951,87 @@ pub fn quote_open_shape(stdout: &str) -> String {
     format!("open keys {top} · data {data_desc} · page {page}")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteSelectAck {
+    pub ok: bool,
+    pub selected: Option<String>,
+    pub note: String,
+}
+
+/// `tab select` prints `{ok:true,data:{selected:<target id>}}`. Keep the id
+/// and the ok/error flag. Drop every other field.
+pub fn quote_select_ack(stdout: &str) -> QuoteSelectAck {
+    if stdout.trim().eq_ignore_ascii_case("ok") {
+        return QuoteSelectAck {
+            ok: true,
+            selected: None,
+            note: "ok selected absent".into(),
+        };
+    }
+    let Some(value) = first_json_value(stdout) else {
+        return QuoteSelectAck {
+            ok: false,
+            selected: None,
+            note: "unparsed".into(),
+        };
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        let code = value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error");
+        let message = value
+            .pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        return QuoteSelectAck {
+            ok: false,
+            selected: None,
+            note: format!("error {} {}", safe_ack_token(code), safe_ack_token(message)),
+        };
+    }
+    let selected = value
+        .get("data")
+        .and_then(|data| data.get("selected"))
+        .or_else(|| value.get("selected"));
+    match selected {
+        Some(serde_json::Value::String(text)) if is_browser_target_id(text) => QuoteSelectAck {
+            ok: true,
+            selected: Some(text.clone()),
+            note: format!("ok selected {text}"),
+        },
+        Some(serde_json::Value::Bool(true)) => QuoteSelectAck {
+            ok: true,
+            selected: None,
+            note: "ok selected bool".into(),
+        },
+        Some(_) => QuoteSelectAck {
+            ok: true,
+            selected: None,
+            note: "ok selected other".into(),
+        },
+        None => QuoteSelectAck {
+            ok: true,
+            selected: None,
+            note: "ok selected absent".into(),
+        },
+    }
+}
+
+fn safe_ack_token(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("token") || lower.contains("cookie") || lower.contains("authorization") {
+        return "omitted".into();
+    }
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-' || *ch == ' ')
+        .take(40)
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn object_key_list(map: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
     let Some(map) = map else {
         return "none".into();
@@ -2864,6 +2945,12 @@ mod tests {
         assert_eq!(quote_visibility(r#"{"ok":true,"data":"hidden"}"#), "hidden");
         assert_eq!(quote_visibility("https://x.com/i/status/20"), "unknown");
         assert!(quote_view_line("0", tab, "page", "visible", "hidden").contains("target field page"));
+        let selected = quote_select_ack(
+            r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        assert!(selected.ok);
+        assert_eq!(selected.selected.as_deref(), Some(tab));
+        assert_eq!(quote_select_ack("ok").note, "ok selected absent");
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));

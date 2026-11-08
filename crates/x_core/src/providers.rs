@@ -1713,7 +1713,7 @@ fn browser_cli_for(
     runner: &dyn crate::io::CommandRunner,
 ) -> Result<crate::publish::BrowserCli, String> {
     let output = runner
-        .run_timeout(
+        .run_keeping_window(
             bin,
             &["browser".into(), "--help".into()],
             Duration::from_secs(20),
@@ -1922,10 +1922,8 @@ fn quote_run(
 }
 
 struct QuoteSurface {
-    tabs_before: String,
     target: Option<String>,
-    field: &'static str,
-    visibility: String,
+    trace: String,
 }
 
 fn quote_surface_view(tabs: &str, target: &str, field: &str, opened: &str, click: &str) -> String {
@@ -1994,39 +1992,38 @@ fn open_visible_quote_page(
     let target_label = parsed.id.clone();
     let target_field = parsed.field;
     let target = Some(parsed.id);
-    if let Some(target) = target.as_deref() {
-        let select_args = crate::publish::quote_browser_args(
-            cli,
-            session,
-            &["tab", "select", target],
-            None,
-            false,
-        );
-        let select_public = crate::publish::browser_argv_public(&select_args);
-        let selected = match quote_run(bin, runner, &select_args, Duration::from_secs(20)) {
-            Ok(output) => output,
-            Err(error) => {
-                close_quote_session(bin, runner, cli, session);
-                return Err(with_quote_view(
-                    crate::publish::explain_opencli_failure("tab", &select_public, -1, "", &error),
-                    &quote_surface_view(&tabs_before, &target_label, target_field, "not-read", "not-sent"),
-                ));
-            }
-        };
-        if selected.status != 0
-            || selected.stdout.contains("\"ok\":false")
-            || selected.stdout.contains("\"ok\": false")
-        {
+    let after_open = read_quote_visibility(bin, runner, cli, session, target.as_deref());
+    let select_args = crate::publish::quote_browser_args(
+        cli,
+        session,
+        &["tab", "select", &target_label],
+        None,
+        true,
+    );
+    let select_public = crate::publish::browser_argv_public(&select_args);
+    let selected = match quote_run(bin, runner, &select_args, Duration::from_secs(20)) {
+        Ok(output) => output,
+        Err(error) => {
             close_quote_session(bin, runner, cli, session);
-            return Err(with_quote_view(
-                crate::publish::explain_opencli_failure(
-                    "tab",
-                    &select_public,
-                    selected.status,
-                    &selected.stdout,
-                    &selected.stderr,
-                ),
-                &quote_surface_view(&tabs_before, &target_label, target_field, "not-read", "not-sent"),
+            return Err(format!(
+                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} unread · {} · native click was not sent · Post was not clicked",
+                crate::publish::explain_opencli_failure("tab", &select_public, -1, "", &error)
+            ));
+        }
+    };
+    let ack = crate::publish::quote_select_ack(&selected.stdout);
+    let select_note = if selected.status != 0 { format!("exit {}", selected.status) } else { ack.note };
+    if selected.status != 0 || !ack.ok {
+        close_quote_session(bin, runner, cli, session);
+        return Err(format!(
+            "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} {select_note} · native click was not sent · Post was not clicked"
+        ));
+    }
+    if let Some(selected_id) = ack.selected.as_deref() {
+        if selected_id != target_label {
+            close_quote_session(bin, runner, cli, session);
+            return Err(format!(
+                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} ok selected {selected_id} · selected mismatch · native click was not sent · Post was not clicked"
             ));
         }
     }
@@ -2036,26 +2033,26 @@ fn open_visible_quote_page(
             session,
             &["eval", "location.href"],
             target.as_deref(),
-            false,
+            true,
         );
         match quote_run(bin, runner, &probe_args, Duration::from_secs(20)) {
             Ok(probe) if probe.stdout.contains("https://x.com") => break,
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
-    let visibility = read_quote_visibility(bin, runner, cli, session, target.as_deref());
-    if visibility != "visible" {
+    let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref());
+    let trace = format!(
+        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} {select_note} · visibility after select {after_select}"
+    );
+    if after_select != "visible" {
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
-            "stage visibility · {} · native click was not sent · Post was not clicked",
-            quote_surface_view(&tabs_before, &target_label, target_field, &visibility, "not-sent")
+            "stage visibility · {trace} · native click was not sent · Post was not clicked"
         ));
     }
     Ok(QuoteSurface {
-        tabs_before,
         target,
-        field: target_field,
-        visibility,
+        trace,
     })
 }
 
@@ -2071,7 +2068,7 @@ fn read_quote_visibility(
         session,
         &["eval", "document.visibilityState"],
         tab,
-        false,
+        true,
     );
     match quote_run(bin, runner, &args, Duration::from_secs(20)) {
         Ok(output) if output.status == 0 => crate::publish::quote_visibility(&output.stdout),
@@ -2089,7 +2086,6 @@ fn run_quote_attachment(
     let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
     let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page)?;
-    let target_label = surface.target.clone().unwrap_or_else(|| "none".into());
     let script = crate::publish::quote_page_script(target_id, Some(text), true);
     let menu = browser_page_json(
         bin,
@@ -2103,13 +2099,7 @@ fn run_quote_attachment(
         false,
     )?;
     let click_visibility = read_quote_visibility(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
-    let view = quote_surface_view(
-        &surface.tabs_before,
-        &target_label,
-        surface.field,
-        &surface.visibility,
-        &click_visibility,
-    );
+    let view = format!("{} · visibility before click {click_visibility}", surface.trace);
     if !menu.selected_label.eq_ignore_ascii_case("Quote") || menu.selected_scope != "menu" {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
@@ -4951,9 +4941,11 @@ mod tests {
         assert!(err.contains("stage visibility"), "{err}");
         assert!(err.contains("window foreground"), "{err}");
         assert!(err.contains("tabs before 0"), "{err}");
-        assert!(err.contains("target field page"), "{err}");
+        assert!(err.contains("field page"), "{err}");
         assert!(err.contains("A03BB6CCAE9402E75FCA7CB1AAED51FA"), "{err}");
-        assert!(err.contains("visibility open hidden"), "{err}");
+        assert!(err.contains("visibility after open hidden"), "{err}");
+        assert!(err.contains("visibility after select hidden"), "{err}");
+        assert!(err.contains("ok selected absent"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
