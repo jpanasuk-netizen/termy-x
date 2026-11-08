@@ -1924,11 +1924,12 @@ fn quote_run(
 struct QuoteSurface {
     tabs_before: String,
     target: Option<String>,
+    field: &'static str,
     visibility: String,
 }
 
-fn quote_surface_view(tabs: &str, target: &str, opened: &str, click: &str) -> String {
-    crate::publish::quote_view_line(tabs, target, opened, click)
+fn quote_surface_view(tabs: &str, target: &str, field: &str, opened: &str, click: &str) -> String {
+    crate::publish::quote_view_line(tabs, target, field, opened, click)
 }
 
 fn with_quote_view(line: String, view: &str) -> String {
@@ -1963,7 +1964,7 @@ fn open_visible_quote_page(
         Err(error) => {
             return Err(with_quote_view(
                 crate::publish::explain_opencli_failure("navigation", &open_public, -1, "", &error),
-                &quote_surface_view(&tabs_before, "none", "unknown", "not-sent"),
+                &quote_surface_view(&tabs_before, "none", "absent", "not-read", "not-sent"),
             ));
         }
     };
@@ -1978,11 +1979,21 @@ fn open_visible_quote_page(
                 &opened.stdout,
                 &opened.stderr,
             ),
-            &quote_surface_view(&tabs_before, "none", "unknown", "not-sent"),
+            &quote_surface_view(&tabs_before, "none", "absent", "not-read", "not-sent"),
         ));
     }
-    let target = crate::publish::quote_surface_target(&opened.stdout);
-    let target_label = target.clone().unwrap_or_else(|| "none".into());
+    let parsed = crate::publish::quote_surface_target(&opened.stdout);
+    let Some(parsed) = parsed else {
+        close_quote_session(bin, runner, cli, session);
+        return Err(format!(
+            "stage open · {} · {} · native click was not sent · Post was not clicked",
+            quote_surface_view(&tabs_before, "none", "absent", "not-read", "not-sent"),
+            crate::publish::quote_open_shape(&opened.stdout)
+        ));
+    };
+    let target_label = parsed.id.clone();
+    let target_field = parsed.field;
+    let target = Some(parsed.id);
     if let Some(target) = target.as_deref() {
         let select_args = crate::publish::quote_browser_args(
             cli,
@@ -1998,7 +2009,7 @@ fn open_visible_quote_page(
                 close_quote_session(bin, runner, cli, session);
                 return Err(with_quote_view(
                     crate::publish::explain_opencli_failure("tab", &select_public, -1, "", &error),
-                    &quote_surface_view(&tabs_before, &target_label, "unknown", "not-sent"),
+                    &quote_surface_view(&tabs_before, &target_label, target_field, "not-read", "not-sent"),
                 ));
             }
         };
@@ -2015,7 +2026,7 @@ fn open_visible_quote_page(
                     &selected.stdout,
                     &selected.stderr,
                 ),
-                &quote_surface_view(&tabs_before, &target_label, "unknown", "not-sent"),
+                &quote_surface_view(&tabs_before, &target_label, target_field, "not-read", "not-sent"),
             ));
         }
     }
@@ -2037,12 +2048,13 @@ fn open_visible_quote_page(
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
             "stage visibility · {} · native click was not sent · Post was not clicked",
-            quote_surface_view(&tabs_before, &target_label, &visibility, "not-sent")
+            quote_surface_view(&tabs_before, &target_label, target_field, &visibility, "not-sent")
         ));
     }
     Ok(QuoteSurface {
         tabs_before,
         target,
+        field: target_field,
         visibility,
     })
 }
@@ -2094,6 +2106,7 @@ fn run_quote_attachment(
     let view = quote_surface_view(
         &surface.tabs_before,
         &target_label,
+        surface.field,
         &surface.visibility,
         &click_visibility,
     );
@@ -4646,7 +4659,16 @@ mod tests {
             &["browser", "--help"],
             "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
         );
-        runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "open"],
+            r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "tab", "select"],
+            r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
         runner.script(
@@ -4829,7 +4851,16 @@ mod tests {
             &["browser", "--help"],
             "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
         );
-        runner.script("opencli", &["browser", "termyx-quote", "open"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "open"],
+            r#"{"ok":true,"data":{"url":"https://x.com/i/status/20","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "tab", "select"],
+            r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+        );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");
         runner.script(
@@ -4897,7 +4928,7 @@ mod tests {
         runner.script(
             "opencli",
             &["browser", "open"],
-            r#"{"ok":true,"data":{"targetId":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
+            r#"{"ok":true,"data":{"url":"https://x.com/cryptoXRPwhale/status/2118971448614334959","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
         );
         runner.script("opencli", &["browser", "tab", "select"], "ok");
         runner.script(
@@ -4920,6 +4951,7 @@ mod tests {
         assert!(err.contains("stage visibility"), "{err}");
         assert!(err.contains("window foreground"), "{err}");
         assert!(err.contains("tabs before 0"), "{err}");
+        assert!(err.contains("target field page"), "{err}");
         assert!(err.contains("A03BB6CCAE9402E75FCA7CB1AAED51FA"), "{err}");
         assert!(err.contains("visibility open hidden"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
@@ -4930,10 +4962,42 @@ mod tests {
                 && args.iter().any(|arg| arg == "open")
         }));
         assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
+        assert!(calls.iter().any(|(_, args)| {
+            args.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")
+                && args.iter().any(|arg| arg == "document.visibilityState")
+        }));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
+    }
+
+    #[test]
+    fn quote_open_without_a_page_id_does_not_read_visibility() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser open <url> --session <name>\n--window <mode>\n",
+        );
+        runner.script("opencli", &["browser", "tab", "list"], r#"{"ok":true,"data":[]}"#);
+        runner.script(
+            "opencli",
+            &["browser", "open"],
+            r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959"}}"#,
+        );
+        runner.script("opencli", &["browser", "close"], "ok");
+        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959").unwrap_err();
+        assert!(err.contains("stage open"), "{err}");
+        assert!(err.contains("target none"), "{err}");
+        assert!(err.contains("target field absent"), "{err}");
+        assert!(err.contains("page absent"), "{err}");
+        assert!(err.contains("visibility open not-read"), "{err}");
+        assert!(err.contains("native click was not sent"), "{err}");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "document.visibilityState")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
     }
 
     #[test]

@@ -874,30 +874,113 @@ pub fn is_browser_target_id(value: &str) -> bool {
     (16..=64).contains(&len) && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
-/// Hex `targetId` from an open or tab payload. Other strings are ignored.
-pub fn quote_surface_target(stdout: &str) -> Option<String> {
+/// Hex page id from an OpenCLI browser result. `browser open` in 2.0.2
+/// returns `{ok:true,data:{url,page}}`, where `page` is the target id
+/// string. `targetId` is accepted for older envelopes.
+pub fn quote_surface_target(stdout: &str) -> Option<ParsedBrowserTarget> {
     let value = first_json_value(stdout)?;
     find_browser_target(&value)
 }
 
-fn find_browser_target(value: &serde_json::Value) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedBrowserTarget {
+    pub id: String,
+    pub field: &'static str,
+}
+
+fn find_browser_target(value: &serde_json::Value) -> Option<ParsedBrowserTarget> {
     if let Some(text) = value.as_str() {
         let text = text.trim().trim_matches('"');
-        return is_browser_target_id(text).then(|| text.to_string());
+        return is_browser_target_id(text).then(|| ParsedBrowserTarget {
+            id: text.to_string(),
+            field: "string",
+        });
     }
     if let Some(rows) = value.as_array() {
         return rows.iter().find_map(find_browser_target);
     }
     let obj = value.as_object()?;
     for key in ["targetId", "target_id", "target"] {
-        if let Some(found) = obj.get(key).and_then(find_browser_target) {
-            return Some(found);
+        if let Some(text) = obj.get(key).and_then(serde_json::Value::as_str) {
+            if is_browser_target_id(text) {
+                return Some(ParsedBrowserTarget {
+                    id: text.to_string(),
+                    field: match key {
+                        "targetId" => "targetId",
+                        "target_id" => "target_id",
+                        _ => "target",
+                    },
+                });
+            }
+        }
+    }
+    if let Some(text) = obj.get("page").and_then(serde_json::Value::as_str) {
+        if is_browser_target_id(text) {
+            return Some(ParsedBrowserTarget {
+                id: text.to_string(),
+                field: "page",
+            });
         }
     }
     if let Some(found) = obj.get("data").and_then(find_browser_target) {
-        return Some(found);
+        let field = if found.field == "string" { "page" } else { found.field };
+        return Some(ParsedBrowserTarget {
+            id: found.id,
+            field,
+        });
     }
     None
+}
+
+/// Field names and value kinds from an open envelope. No URL, title, or page text.
+pub fn quote_open_shape(stdout: &str) -> String {
+    let Some(value) = first_json_value(stdout) else {
+        return "open json none".into();
+    };
+    let top = object_key_list(value.as_object());
+    let data = value.get("data");
+    let data_desc = match data {
+        Some(serde_json::Value::Object(map)) => format!("keys {}", object_key_list(Some(map))),
+        Some(other) => open_value_kind(other),
+        None => "absent".into(),
+    };
+    let page = data
+        .and_then(|item| item.get("page"))
+        .map(open_value_kind)
+        .unwrap_or_else(|| "absent".into());
+    format!("open keys {top} · data {data_desc} · page {page}")
+}
+
+fn object_key_list(map: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
+    let Some(map) = map else {
+        return "none".into();
+    };
+    let mut keys: Vec<&str> = map
+        .keys()
+        .filter(|key| key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+        .map(String::as_str)
+        .take(8)
+        .collect();
+    if keys.is_empty() {
+        return "none".into();
+    }
+    keys.sort_unstable();
+    keys.join(",")
+}
+
+fn open_value_kind(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) if is_browser_target_id(text) => "target".into(),
+        serde_json::Value::String(text) if text.starts_with("http://") || text.starts_with("https://") => {
+            "url".into()
+        }
+        serde_json::Value::String(_) => "string".into(),
+        serde_json::Value::Array(rows) => format!("array {}", rows.len()),
+        serde_json::Value::Object(_) => "object".into(),
+        serde_json::Value::Number(_) => "number".into(),
+        serde_json::Value::Bool(_) => "bool".into(),
+        serde_json::Value::Null => "null".into(),
+    }
 }
 
 /// `data: []` is zero tabs. Unreadable output is `None` (not a guess of zero).
@@ -936,9 +1019,9 @@ fn known_visibility(text: &str) -> String {
     }
 }
 
-pub fn quote_view_line(tabs: &str, target: &str, opened: &str, click: &str) -> String {
+pub fn quote_view_line(tabs: &str, target: &str, field: &str, opened: &str, click: &str) -> String {
     format!(
-        "session termyx-quote · window foreground · tabs before {tabs} · target {target} · visibility open {opened} click {click}"
+        "session termyx-quote · window foreground · tabs before {tabs} · target {target} · target field {field} · visibility open {opened} click {click}"
     )
 }
 
@@ -2769,12 +2852,18 @@ mod tests {
             quote_surface_target(
                 r#"{"ok":true,"data":{"targetId":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#
             )
-            .as_deref(),
-            Some(tab)
+            .map(|target| target.id),
+            Some(tab.to_string())
         );
+        let opened = r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#;
+        let parsed = quote_surface_target(opened).expect("page id");
+        assert_eq!(parsed.id, tab);
+        assert_eq!(parsed.field, "page");
+        assert!(quote_open_shape(opened).contains("page target"), "{}", quote_open_shape(opened));
+        assert!(quote_open_shape(r#"{"ok":true,"data":{"url":"https://x.com/i/status/20"}}"#).contains("page absent"));
         assert_eq!(quote_visibility(r#"{"ok":true,"data":"hidden"}"#), "hidden");
         assert_eq!(quote_visibility("https://x.com/i/status/20"), "unknown");
-        assert!(quote_view_line("0", tab, "visible", "hidden").contains("window foreground"));
+        assert!(quote_view_line("0", tab, "page", "visible", "hidden").contains("target field page"));
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));
