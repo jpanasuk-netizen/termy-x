@@ -1993,7 +1993,7 @@ fn open_visible_quote_page(
     let target_label = parsed.id.clone();
     let target_field = parsed.field;
     let target = Some(parsed.id);
-    let after_open = read_quote_visibility(bin, runner, cli, session, target.as_deref());
+    let after_open = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
     let select_args = crate::publish::quote_browser_args(
         cli,
         session,
@@ -2007,7 +2007,8 @@ fn open_visible_quote_page(
         Err(error) => {
             close_quote_session(bin, runner, cli, session);
             return Err(format!(
-                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} unread · {} · native click was not sent · Post was not clicked",
+                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {} · select {select_public} unread · {} · native click was not sent · Post was not clicked",
+                after_open.summary,
                 crate::publish::explain_opencli_failure("tab", &select_public, -1, "", &error)
             ));
         }
@@ -2017,14 +2018,16 @@ fn open_visible_quote_page(
     if selected.status != 0 || !ack.ok {
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
-            "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} {select_note} · native click was not sent · Post was not clicked"
+            "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {} · select {select_public} {select_note} · native click was not sent · Post was not clicked",
+            after_open.summary
         ));
     }
     if let Some(selected_id) = ack.selected.as_deref() {
         if selected_id != target_label {
             close_quote_session(bin, runner, cli, session);
             return Err(format!(
-                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} ok selected {selected_id} · selected mismatch · native click was not sent · Post was not clicked"
+                "stage select · open {open_public} ok page {target_label} field {target_field} · visibility after open {} · select {select_public} ok selected {selected_id} · selected mismatch · native click was not sent · Post was not clicked",
+                after_open.summary
             ));
         }
     }
@@ -2041,11 +2044,12 @@ fn open_visible_quote_page(
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
-    let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref());
+    let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
     let trace = format!(
-        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} {select_note} · visibility after select {after_select}"
+        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · visibility after open {} · select {select_public} {select_note} · visibility after select {}",
+        after_open.summary, after_select.summary
     );
-    if after_select != "visible" {
+    if !after_select.ready {
         let container = quote_container_note(bin, runner, status_id);
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
@@ -2105,19 +2109,29 @@ fn quote_container_note(
     } else {
         "none"
     };
-    let (state, focused) = match quote_run(
+    let window = quote_run(
         bin,
         runner,
         &chrome_call_args("windows.get", &format!("[{}]", tab.window_id)),
         Duration::from_secs(20),
-    ) {
-        Ok(output) if output.status == 0 => crate::publish::quote_window_state(&output.stdout)
-            .map(|(state, focused)| (state.to_string(), if focused { "yes" } else { "no" }.to_string()))
-            .unwrap_or_else(|| ("unread".into(), "unread".into())),
-        _ => ("unread".into(), "unread".into()),
+    );
+    let (state, focused, bounds) = match window {
+        Ok(output) if output.status == 0 => {
+            let parsed = crate::publish::quote_window_state(&output.stdout);
+            let bounds = crate::publish::quote_window_bounds(&output.stdout);
+            match parsed {
+                Some((state, focused)) => (
+                    state.to_string(),
+                    if focused { "yes" } else { "no" }.to_string(),
+                    bounds,
+                ),
+                None => ("unread".into(), "unread".into(), bounds),
+            }
+        }
+        _ => ("unread".into(), "unread".into(), "absent"),
     };
     format!(
-        "chrome match 1 active {} group {group} window state {state} focused {focused} · windows.update not called",
+        "chrome match 1 active {} group {group} window state {state} focused {focused} bounds {bounds} · windows.update not called",
         if tab.active { "yes" } else { "no" }
     )
 }
@@ -2128,17 +2142,13 @@ fn read_quote_visibility(
     cli: crate::publish::BrowserCli,
     session: &str,
     tab: Option<&str>,
-) -> String {
-    let args = crate::publish::quote_browser_args(
-        cli,
-        session,
-        &["eval", "document.visibilityState"],
-        tab,
-        true,
-    );
+    status_id: &str,
+) -> crate::publish::QuoteVisibilityRead {
+    let expr = crate::publish::quote_visibility_expr(status_id);
+    let args = crate::publish::quote_browser_args(cli, session, &["eval", &expr], tab, true);
     match quote_run(bin, runner, &args, Duration::from_secs(20)) {
-        Ok(output) if output.status == 0 => crate::publish::quote_visibility(&output.stdout),
-        _ => "unknown".into(),
+        Ok(output) if output.status == 0 => crate::publish::quote_visibility_read(&output.stdout),
+        _ => crate::publish::quote_visibility_read(""),
     }
 }
 
@@ -2164,8 +2174,15 @@ fn run_quote_attachment(
         true,
         false,
     )?;
-    let click_visibility = read_quote_visibility(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
-    let view = format!("{} · visibility before click {click_visibility}", surface.trace);
+    let click_visibility = read_quote_visibility(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        surface.target.as_deref(),
+        target_id,
+    );
+    let view = format!("{} · visibility before click {}", surface.trace, click_visibility.summary);
     if !menu.selected_label.eq_ignore_ascii_case("Quote") || menu.selected_scope != "menu" {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
@@ -2174,7 +2191,7 @@ fn run_quote_attachment(
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
     }
-    if click_visibility != "visible" {
+    if !click_visibility.ready {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(format!(
             "stage visibility · {view} · native click was not sent · Post was not clicked"
@@ -4727,10 +4744,11 @@ mod tests {
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        let vis = crate::publish::quote_visibility_expr("2118971448614334959");
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "document.visibilityState"],
-            r#"{"ok":true,"data":"visible"}"#,
+            &["browser", "termyx-quote", "eval", vis.as_str()],
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_menu);
         runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
@@ -4919,10 +4937,11 @@ mod tests {
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");
+        let vis = crate::publish::quote_visibility_expr("20");
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "document.visibilityState"],
-            r#"{"ok":true,"data":"visible"}"#,
+            &["browser", "termyx-quote", "eval", vis.as_str()],
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
         );
         runner.script(
             "opencli",
@@ -4992,10 +5011,11 @@ mod tests {
             &["browser", "eval", "location.href"],
             "https://x.com/cryptoXRPwhale/status/2118971448614334959",
         );
+        let vis = crate::publish::quote_visibility_expr("2118971448614334959");
         runner.script(
             "opencli",
-            &["browser", "eval", "document.visibilityState"],
-            r#"{"ok":true,"data":"hidden"}"#,
+            &["browser", "eval", vis.as_str()],
+            r#"{"ok":true,"data":"{\"v\":\"hidden\",\"h\":true,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
         );
         runner.script(
             "opencli",
@@ -5010,7 +5030,7 @@ mod tests {
         runner.script(
             "opencli",
             &["browser", "chrome", "call", "windows.get"],
-            r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false,"type":"normal"}}"#,
+            r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false,"type":"normal","left":120,"top":80,"width":1280,"height":900}}"#,
         );
         runner.script("opencli", &["browser", "close"], "ok");
         let err = inspect_quote_attachment(
@@ -5024,8 +5044,11 @@ mod tests {
         assert!(err.contains("tabs before 0"), "{err}");
         assert!(err.contains("field page"), "{err}");
         assert!(err.contains("A03BB6CCAE9402E75FCA7CB1AAED51FA"), "{err}");
-        assert!(err.contains("visibility after open hidden"), "{err}");
-        assert!(err.contains("visibility after select hidden"), "{err}");
+        assert!(err.contains("visibility hidden"), "{err}");
+        assert!(err.contains("path yes"), "{err}");
+        assert!(err.contains("top yes"), "{err}");
+        assert!(err.contains("focus yes"), "{err}");
+        assert!(err.contains("bounds onscreen"), "{err}");
         assert!(err.contains("group OpenCLI Browser"), "{err}");
         assert!(err.contains("window state minimized"), "{err}");
         assert!(err.contains("focused no"), "{err}");
@@ -5041,7 +5064,7 @@ mod tests {
         assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
         assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")
-                && args.iter().any(|arg| arg == "document.visibilityState")
+                && args.iter().any(|arg| arg.contains("document.visibilityState"))
         }));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update")));
@@ -5073,7 +5096,7 @@ mod tests {
         assert!(err.contains("visibility open not-read"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "document.visibilityState")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("document.visibilityState"))));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
     }

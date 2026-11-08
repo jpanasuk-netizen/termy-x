@@ -1179,6 +1179,124 @@ fn known_visibility(text: &str) -> String {
     }
 }
 
+pub fn quote_visibility_expr(status_id: &str) -> String {
+    let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    format!(
+        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:location.pathname.indexOf(\"/status/{id}\")>=0,host:location.host}})"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteVisibilityRead {
+    pub token: String,
+    pub summary: String,
+    pub ready: bool,
+}
+
+/// Decode one visibility eval. A bare word and a JSON object are both read.
+/// `ready` requires the top document of this status to report `visible`.
+pub fn quote_visibility_read(stdout: &str) -> QuoteVisibilityRead {
+    let outer = first_json_value(stdout);
+    let data = outer.as_ref().and_then(|value| value.get("data")).or(outer.as_ref());
+    let (kind, fields) = match data {
+        Some(serde_json::Value::String(text)) => {
+            if let Some(inner) = first_json_value(text) {
+                ("string", inner)
+            } else {
+                return plain_visibility(text);
+            }
+        }
+        Some(serde_json::Value::Object(_)) => ("object", data.cloned().unwrap_or(serde_json::Value::Null)),
+        _ => {
+            return QuoteVisibilityRead {
+                token: "unknown".into(),
+                summary: "eval data absent visibility unknown hidden-flag absent prerender absent focus absent top absent path absent host absent".into(),
+                ready: false,
+            };
+        }
+    };
+    visibility_from_fields(kind, &fields)
+}
+
+fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibilityRead {
+    let token = visibility_token(fields.get("v").and_then(serde_json::Value::as_str).unwrap_or(""));
+    let hidden_flag = yes_no(fields.get("h"));
+    let prerender = yes_no(fields.get("p"));
+    let focus = yes_no(fields.get("f"));
+    let top = yes_no(fields.get("t"));
+    let path = yes_no(fields.get("m"));
+    let host = host_class(fields.get("host").and_then(serde_json::Value::as_str).unwrap_or(""));
+    let ready = token == "visible" && path == "yes" && top == "yes" && prerender != "yes";
+    QuoteVisibilityRead {
+        token: token.to_string(),
+        summary: format!(
+            "eval data {kind} visibility {token} hidden-flag {hidden_flag} prerender {prerender} focus {focus} top {top} path {path} host {host}"
+        ),
+        ready,
+    }
+}
+
+fn plain_visibility(text: &str) -> QuoteVisibilityRead {
+    let token = visibility_token(text);
+    QuoteVisibilityRead {
+        token: token.to_string(),
+        summary: format!(
+            "eval data string visibility {token} hidden-flag absent prerender absent focus absent top absent path absent host absent"
+        ),
+        ready: false,
+    }
+}
+
+fn visibility_token(text: &str) -> &'static str {
+    match text.trim().trim_matches('"') {
+        "visible" => "visible",
+        "hidden" => "hidden",
+        "prerender" => "prerender",
+        "unloaded" => "unloaded",
+        _ => "unknown",
+    }
+}
+
+fn yes_no(value: Option<&serde_json::Value>) -> &'static str {
+    match value.and_then(serde_json::Value::as_bool) {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "absent",
+    }
+}
+
+fn host_class(host: &str) -> &'static str {
+    match host {
+        "x.com" | "twitter.com" | "mobile.twitter.com" => "x.com",
+        "" => "absent",
+        _ => "other",
+    }
+}
+
+pub fn quote_window_bounds(stdout: &str) -> &'static str {
+    let Some(value) = first_json_value(stdout) else {
+        return "absent";
+    };
+    let data = value.get("data").unwrap_or(&value);
+    let Some(left) = data.get("left").and_then(serde_json::Value::as_i64) else {
+        return "absent";
+    };
+    let Some(top) = data.get("top").and_then(serde_json::Value::as_i64) else {
+        return "absent";
+    };
+    let Some(width) = data.get("width").and_then(serde_json::Value::as_i64) else {
+        return "absent";
+    };
+    let Some(height) = data.get("height").and_then(serde_json::Value::as_i64) else {
+        return "absent";
+    };
+    if left < -8 || top < -8 || left > 20000 || top > 20000 || width < 50 || height < 50 {
+        "offscreen"
+    } else {
+        "onscreen"
+    }
+}
+
 pub fn quote_view_line(tabs: &str, target: &str, field: &str, opened: &str, click: &str) -> String {
     format!(
         "session termyx-quote · window foreground · tabs before {tabs} · target {target} · target field {field} · visibility open {opened} click {click}"
@@ -3047,6 +3165,30 @@ mod tests {
             "OpenCLI Browser"
         );
         assert_eq!(quote_group_name(r#"{"ok":true,"data":{"title":"Mail"}}"#), "other");
+        let hidden_eval = r#"{"ok":true,"data":"{\"v\":\"hidden\",\"h\":true,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#;
+        let hidden_read = quote_visibility_read(hidden_eval);
+        assert_eq!(hidden_read.token, "hidden");
+        assert!(!hidden_read.ready);
+        assert!(hidden_read.summary.contains("focus yes"));
+        assert!(hidden_read.summary.contains("path yes"));
+        assert!(hidden_read.summary.contains("top yes"));
+        assert!(quote_visibility_read(
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#
+        )
+        .ready);
+        assert!(!quote_visibility_read(r#"{"ok":true,"data":"hidden"}"#).ready);
+        assert_eq!(
+            quote_window_bounds(
+                r#"{"ok":true,"data":{"state":"normal","focused":true,"left":120,"top":80,"width":1280,"height":900}}"#
+            ),
+            "onscreen"
+        );
+        assert_eq!(
+            quote_window_bounds(
+                r#"{"ok":true,"data":{"state":"normal","focused":true,"left":-32000,"top":-32000,"width":1280,"height":900}}"#
+            ),
+            "offscreen"
+        );
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));
