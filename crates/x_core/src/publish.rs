@@ -762,7 +762,8 @@ pub fn prove_quote(stdout: &str, target_id: &str) -> Result<(), String> {
         ));
     }
     if let Some(text) = first_text(trimmed) {
-        for id in status_ids_in_text(&text) {
+        let body = quote_text_without_auto_url(&text);
+        for id in status_ids_in_text(&body) {
             if id != target_id {
                 return Err(format!(
                     "Quote text names {id}, not {target_id}. Not marked sent. Nothing was retried."
@@ -771,6 +772,81 @@ pub fn prove_quote(stdout: &str, target_id: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The published quote record. X keeps the commentary and appends one
+/// `t.co` link. `referenced_tweets` type `quoted` is the original id.
+/// A reply reference is not this quote.
+pub fn quote_x_record_confirms(
+    stdout: &str,
+    target_id: &str,
+    author_id: &str,
+    commentary: &str,
+) -> Result<(), String> {
+    let target_id = crate::model::post_id_from_input(target_id);
+    let author_id = author_id.trim();
+    let commentary = commentary.trim();
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| "Quote record was not readable. Not marked sent. Nothing was retried.".to_string())?;
+    let data = value.get("data").unwrap_or(&value);
+    let found_author = data.get("author_id").and_then(serde_json::Value::as_str).unwrap_or("");
+    let new_id = data.get("id").and_then(serde_json::Value::as_str).unwrap_or("");
+    let text = data.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+    let refs = data.get("referenced_tweets").and_then(serde_json::Value::as_array);
+    let quoted = refs.and_then(|rows| {
+        rows.iter().find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("quoted")
+                && row.get("id").and_then(serde_json::Value::as_str) == Some(target_id.as_str())
+        })
+    });
+    let other_ref = refs.and_then(|rows| {
+        rows.iter().find(|row| row.get("type").and_then(serde_json::Value::as_str) != Some("quoted"))
+    });
+    if found_author != author_id || author_id.is_empty() {
+        return Err(format!(
+            "Quote author {found_author} is not {author_id}. Not marked sent. Nothing was retried."
+        ));
+    }
+    if quoted.is_none() {
+        let kind = other_ref
+            .and_then(|row| row.get("type").and_then(serde_json::Value::as_str))
+            .unwrap_or("missing");
+        return Err(format!(
+            "Quote reference for {target_id} was {kind}. Not marked sent. Nothing was retried."
+        ));
+    }
+    if new_id.is_empty() || new_id == target_id || !new_id.chars().all(|ch| ch.is_ascii_digit()) {
+        return Err("Quote record had no new status id. Not marked sent. Nothing was retried.".into());
+    }
+    let body = quote_text_without_auto_url(text);
+    if body != commentary || commentary.is_empty() {
+        return Err(
+            "Quote text did not match the commentary. Not marked sent. Nothing was retried.".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Drops the one trailing `t.co` link X appends to a quote. The commentary itself stays.
+fn quote_text_without_auto_url(text: &str) -> String {
+    let folded = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let Some((body, last)) = folded.rsplit_once(' ') else {
+        return folded;
+    };
+    if last.starts_with("https://t.co/") || last.starts_with("http://t.co/") {
+        body.to_string()
+    } else {
+        folded
+    }
+}
+
+/// Close result. Exit 75 is reported as that exit. It is not a protected-resource label.
+pub fn quote_close_note(status: i32, _stdout: &str) -> String {
+    if status == 0 {
+        "session close acknowledged".into()
+    } else {
+        format!("session close exit {status}")
+    }
 }
 
 pub fn quote_saved_receipt(target_id: &str) -> String {
@@ -1817,39 +1893,51 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
 }
 
 pub fn quote_read_script(target_id: &str) -> String {
+    quote_read_script_bound(target_id, "", "", "")
+}
+
+/// Reads the published status. The quote card matches the source article
+/// the same way inspect does. The new tweet's text is the commentary,
+/// plus the one `t.co` link X appends. A status link by itself is not the card.
+pub fn quote_read_script_bound(
+    target_id: &str,
+    screen: &str,
+    source_text: &str,
+    commentary: &str,
+) -> String {
     let id_js = js_ascii_string(target_id);
+    let screen_js = js_ascii_string(screen);
+    let source_js = js_ascii_string(source_text);
+    let text_js = js_ascii_string(commentary);
     format!(
         r#"(async () => {{
   const TARGET = {id_js};
-  const statusId = (href) => {{
-    try {{
-      const path = new URL(href, location.origin).pathname;
-      const match = path.match(/\/status\/(\d+)/);
-      return match ? match[1] : null;
-    }} catch (e) {{ return null; }}
-  }};
-  const ids = [];
-  for (const link of document.querySelectorAll('a[href*="/status/"]')) {{
-    const id = statusId(link.href);
-    if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id);
+  const SCREEN = {screen_js};
+  const SOURCE = {source_js};
+  const TEXT = {text_js};
+  VISIBLE_TEXT_PLACEHOLDER
+  const fold = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+  const stripAuto = (value) => fold(value).replace(/ ?https?:\/\/t\.co\/[A-Za-z0-9]+$/i, "");
+  const article = document.querySelector("article") || document.body;
+  const proof = proofOne(article);
+  const quoted = proof.bind === "article" || proof.bind === "id" || proof.quoteLink;
+  let outer = null;
+  for (const node of article.querySelectorAll('[data-testid="tweetText"]')) {{
+    if (node.closest('[data-testid="attachments"], [data-testid="quoteTweet"]')) continue;
+    outer = node;
+    break;
   }}
-  const quoteNode = document.querySelector('[data-testid="quoteTweet"]');
-  const quoteIds = [];
-  if (quoteNode) {{
-    for (const link of quoteNode.querySelectorAll('a[href*="/status/"]')) {{
-      const id = statusId(link.href);
-      if (id && quoteIds.indexOf(id) < 0) quoteIds.push(id);
-    }}
-  }}
-  const attached = quoteIds.indexOf(TARGET) >= 0;
-  const replying = /replying to/i.test((document.body && document.body.innerText || "").slice(0, 2500));
+  const shown = outer ? stripAuto(visibleText(outer)) : "";
+  const wrote = fold(TEXT);
+  const textOk = !!wrote && shown === wrote;
+  const attached = !!(quoted && textOk);
   const report = {{
     stage: "read",
     path: location.pathname,
-    composer_kind: attached ? "quote" : (replying || ids.indexOf(TARGET) >= 0 ? "reply" : "unknown"),
+    composer_kind: attached ? "quote" : "unknown",
     card: attached,
-    status_ids: ids,
-    quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
+    status_ids: [],
+    quote_testids: attached ? Math.max(proof.quotes, 1) : 0,
     clicked_post: false,
     clicked_repost_confirm: false,
     quoted_status_id: attached ? TARGET : null,
@@ -1858,6 +1946,10 @@ pub fn quote_read_script(target_id: &str) -> String {
   window.__qxReport = report;
   return JSON.stringify(report);
 }})()"#
+    )
+    .replace(
+        "VISIBLE_TEXT_PLACEHOLDER",
+        &format!("{}{}", quote_visible_text_js(), quote_card_proof_js()),
     )
 }
 
@@ -2241,7 +2333,7 @@ fn quote_card_proof_js() -> &'static str {
     const source = norm(SOURCE);
     const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
     const textOk = !!source && !!cardText && cardText === source;
-    if (hasBox && avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) bind = attrExact ? "id" : "article";
+    if (avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) bind = attrExact ? "id" : "article";
     else if (attrOther) bind = "other-id";
     else bind = "miss";
   }
@@ -2275,7 +2367,7 @@ fn quote_card_proof_js() -> &'static str {
     + " handle-attach " + (needle && attachBlob.indexOf(needle) >= 0 ? "yes" : "no")
     + " handle-dialog " + (needle && dialogBlob.indexOf(needle) >= 0 ? "yes" : "no")
     + " diff-at " + diffAt;
-  return { proven: proven, quotes: quotes, bind: bind, card: card, box: box, dialog: dlg, hasBox: hasBox, qCount: qNodes.length, links: links, composeHit: composeHit, compare: compare };
+  return { proven: proven, quotes: quotes, bind: bind, card: card, box: box, dialog: dlg, hasBox: hasBox, qCount: qNodes.length, links: links, quoteLink: qHits.length > 0, composeHit: composeHit, compare: compare };
 };
 const findProvenQuote = () => {
   const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]'));
@@ -3807,6 +3899,68 @@ mod tests {
         let err = prove_quote(&command_receipt, original).unwrap_err();
         assert!(err.contains("not in the receipt"), "{err}");
         assert!(prove_quote(r#"{"ok":true,"id":"2119067545567121679"}"#, original).is_err());
+
+        let published = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"2118971448614334959","type":"quoted"}],"text":"100 is enough https://t.co/WYHmAufIq0","url":"https://x.com/Jasper_Black/status/2119413665547821165"}}"#;
+        assert!(quote_x_record_confirms(published, original, "291497074", "100 is enough").is_ok());
+        let with_link = format!(
+            "[{{\"status\":\"success\",\"message\":\"Quote tweet posted successfully.\",\"quoted_status_id_str\":\"{original}\",\"text\":\"100 is enough https://t.co/WYHmAufIq0\"}}]"
+        );
+        assert!(prove_quote(&with_link, original).is_ok());
+        let replied = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"2118971448614334959","type":"replied_to"}],"text":"100 is enough https://t.co/WYHmAufIq0"}}"#;
+        let err = quote_x_record_confirms(replied, original, "291497074", "100 is enough").unwrap_err();
+        assert!(err.contains("replied_to"), "{err}");
+        assert!(err.contains("Nothing was retried"), "{err}");
+        let other_author = quote_x_record_confirms(published, original, "20", "100 is enough").unwrap_err();
+        assert!(other_author.contains("291497074"), "{other_author}");
+        let other_words = quote_x_record_confirms(published, original, "291497074", "101 is enough").unwrap_err();
+        assert!(other_words.contains("did not match"), "{other_words}");
+        let other_quote = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"20","type":"quoted"}],"text":"100 is enough https://t.co/WYHmAufIq0"}}"#;
+        assert!(quote_x_record_confirms(other_quote, original, "291497074", "100 is enough").is_err());
+        assert_eq!(quote_close_note(0, "Browser session tab lease released"), "session close acknowledged");
+        let unknown = quote_close_note(75, "managed_resource_conflict");
+        assert_eq!(unknown, "session close exit 75");
+        assert!(!unknown.contains("conflict"), "{unknown}");
+    }
+
+    #[test]
+    fn quote_read_accepts_the_published_commentary_and_tco_link() {
+        let target = "2118971448614334959";
+        let source = "IS OWNING 1,000 $XRP ENOUGH?";
+        let script = quote_read_script_bound(target, "cryptoXRPwhale", source, "100 is enough");
+        let dir = std::env::temp_dir();
+        let script_path = dir.join("termy-quote-read.js");
+        let harness_path = dir.join("termy-quote-read-harness.js");
+        std::fs::write(&script_path, &script).unwrap();
+        std::fs::write(&harness_path, QUOTE_READ_DOM_HARNESS).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(&script_path)
+            .output()
+            .expect("node");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stderr),
+            stdout
+        );
+        let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        let row = |name: &str| {
+            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+        };
+        let live = parse_quote_page_report(&row("live")["report"].to_string()).unwrap();
+        assert_eq!(live.composer_kind, "quote", "{}", row("live"));
+        assert!(live.card);
+        assert_eq!(live.quoted_status_id.as_deref(), Some(target));
+        assert!(live.quote_testids > 0);
+        assert!(quote_outcome(Some("2119413665547821165"), &live, target).is_ok());
+        let wrong_card = parse_quote_page_report(&row("wrongcard")["report"].to_string()).unwrap();
+        let err = quote_outcome(Some("2119413665547821165"), &wrong_card, target).unwrap_err();
+        assert!(err.contains("not a quote"), "{err}");
+        assert!(err.contains("2119413665547821165"), "{err}");
+        assert!(err.contains("No retry"), "{err}");
+        let wrong_words = parse_quote_page_report(&row("wrongwords")["report"].to_string()).unwrap();
+        assert!(quote_outcome(Some("2119413665547821165"), &wrong_words, target).is_err());
     }
 
     #[test]
@@ -4784,6 +4938,78 @@ const card = (text) => {
       ]),
       el("div", { id: "inline-box", "data-testid": "tweetTextarea_0", innerText: "" }, [])
     ], null)
+  ];
+  process.stdout.write(JSON.stringify(rows));
+})().catch((error) => { console.error(error); process.exit(1); });
+"#;
+
+const QUOTE_READ_DOM_HARNESS: &str = r#"
+const fs = require("fs");
+const script = fs.readFileSync(process.argv[2], "utf8");
+function el(tag, attrs, kids) {
+  const node = {
+    tagName: String(tag).toUpperCase(),
+    attrs: attrs || {},
+    children: [],
+    parentElement: null,
+    getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; },
+    get href() { const raw = this.getAttribute("href"); if (!raw) return ""; try { return new URL(raw, "https://x.com").href; } catch (e) { return raw; } },
+    closest(sel) { return matchAny(this, sel) ? this : (this.parentElement ? this.parentElement.closest(sel) : null); },
+    querySelectorAll(sel) { const out = []; walk(this, (n) => { if (n !== this && matchAny(n, sel)) out.push(n); }); return out; },
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+    contains(other) { let cur = other; while (cur) { if (cur === this) return true; cur = cur.parentElement; } return false; },
+    get innerText() {
+      const own = this.attrs.innerText || "";
+      const nested = (this.children || []).map((kid) => kid.innerText || "").join(" ");
+      return [own, nested].filter(Boolean).join(" ");
+    }
+  };
+  for (const kid of kids || []) { kid.parentElement = node; node.children.push(kid); }
+  return node;
+}
+function matchOne(node, sel) {
+  sel = sel.trim();
+  if (!sel) return false;
+  let rest = sel;
+  const tag = rest.match(/^([a-zA-Z]+)/);
+  if (tag) {
+    if (node.tagName !== tag[1].toUpperCase()) return false;
+    rest = rest.slice(tag[1].length);
+  }
+  const attrs = [...rest.matchAll(/\[([^\]=*~|^]+)(\*=|=|\^=)?(?:"([^"]*)")?\]/g)];
+  if (!attrs.length) return !!tag;
+  for (const found of attrs) {
+    const got = node.getAttribute(found[1]);
+    if (got == null) return false;
+    if (found[2] === "=" && got !== found[3]) return false;
+    if (found[2] === "*=" && String(got).indexOf(found[3]) < 0) return false;
+  }
+  return true;
+}
+function matchAny(node, sel) { return sel.split(",").some((part) => matchOne(node, part)); }
+function walk(node, fn) { fn(node); for (const kid of node.children) walk(kid, fn); }
+async function run(name, kids) {
+  const body = el("body", {}, kids);
+  globalThis.document = { body, querySelectorAll(sel) { return body.querySelectorAll(sel); }, querySelector(sel) { return body.querySelector(sel); } };
+  globalThis.location = new URL("https://x.com/Jasper_Black/status/2119413665547821165");
+  globalThis.window = {};
+  const report = JSON.parse(await (0, eval)(script));
+  return { name, report };
+}
+const source = "IS OWNING 1,000 $XRP ENOUGH?";
+const card = (quoted) => el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+  el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+  el("div", { "data-testid": "tweetText", innerText: quoted }, [])
+]);
+const outer = (words) => el("div", { "data-testid": "tweetText" }, [
+  el("span", { innerText: words + " " }, []),
+  el("a", { href: "https://t.co/WYHmAufIq0", innerText: "https://t.co/WYHmAufIq0" }, [])
+]);
+(async () => {
+  const rows = [
+    await run("live", [el("article", {}, [outer("100 is enough"), card(source)])]),
+    await run("wrongcard", [el("article", {}, [outer("100 is enough"), card("a different post")])]),
+    await run("wrongwords", [el("article", {}, [outer("101 is enough"), card(source)])])
   ];
   process.stdout.write(JSON.stringify(rows));
 })().catch((error) => { console.error(error); process.exit(1); });

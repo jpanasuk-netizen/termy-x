@@ -1732,23 +1732,39 @@ fn close_quote_session(
     unsafe {
         std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", "1");
     }
-    let closed = quote_run(
-        bin,
-        runner,
-        &crate::publish::browser_command(cli, session, "close", None),
-        Duration::from_secs(15),
-    );
+    // The lease release that exited 0 was `browser close --session <name>`
+    // with OPENCLI_CLOSE_OWNED_TAB=1, and its data said the tab lease was
+    // released. Exit 75 is that exit code, not a protected-resource label.
+    // The positional session form is the other shape this CLI may document.
+    let session_form = vec![
+        "browser".to_string(),
+        "close".to_string(),
+        "--session".into(),
+        session.to_string(),
+    ];
+    let positional = crate::publish::browser_command(cli, session, "close", None);
+    let mut attempts = vec![session_form];
+    if positional != attempts[0] {
+        attempts.push(positional);
+    }
+    let mut note = "session close unread".to_string();
+    for args in attempts {
+        match quote_run(bin, runner, &args, Duration::from_secs(15)) {
+            Ok(output) if output.status == 0 => {
+                note = crate::publish::quote_close_note(0, &output.stdout);
+                break;
+            }
+            Ok(output) => note = crate::publish::quote_close_note(output.status, &output.stdout),
+            Err(_) => {}
+        }
+    }
     unsafe {
         match previous {
             Some(value) => std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", value),
             None => std::env::remove_var("OPENCLI_CLOSE_OWNED_TAB"),
         }
     }
-    match closed {
-        Ok(output) if output.status == 0 => "session close acknowledged".into(),
-        Ok(output) => format!("session close exit {}", output.status),
-        Err(_) => "session close unread".into(),
-    }
+    note
 }
 
 fn browser_cli_for(
@@ -2508,7 +2524,7 @@ fn run_quote_attachment(
         ));
     };
     let read_page = format!("https://x.com/i/status/{new_id}");
-    let read_script = crate::publish::quote_read_script(target_id);
+    let read_script = crate::publish::quote_read_script_bound(target_id, &screen, &source_text, text);
     let read = match browser_page_json(
         bin,
         runner,
