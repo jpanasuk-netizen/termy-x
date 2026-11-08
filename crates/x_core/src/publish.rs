@@ -2061,6 +2061,34 @@ pub fn quote_snap_script(target_id: &str) -> String {
     else if (label) name = "prose";
     return (node.tagName || "-") + " role " + role + " testid " + tid + " path " + path + " id " + id + " host " + host + " status-substr " + substr + " name " + name;
   }};
+  const textClass = (text) => {{
+    const trimmed = String(text || "").replace(/\s+/g, " ").trim();
+    if (!trimmed) return "empty";
+    const marker = "/status/" + TARGET;
+    const at = trimmed.indexOf(marker);
+    const next = at < 0 ? "" : trimmed.charAt(at + marker.length);
+    const exact = at >= 0 && (next < "0" || next > "9");
+    const anyStatus = /\/status\/\d+/.test(trimmed);
+    const words = trimmed.split(" ");
+    const short = trimmed.length <= 180 && words.length <= 4;
+    if (short && exact) return "url-exact";
+    if (short && anyStatus) return "url-other";
+    if (short && /https?:\/\//i.test(trimmed)) return "url-nonstatus";
+    if (exact || trimmed.indexOf(TARGET) >= 0) return "prose-has-id";
+    return "prose";
+  }};
+  const nearEditor = (editor) => {{
+    if (!editor || !editor.parentElement) return "none";
+    const kids = Array.from(editor.parentElement.children).slice(0, 6);
+    if (!kids.length) return "none";
+    return kids.map((kid) => {{
+      const role = kid.getAttribute ? (kid.getAttribute("role") || "-") : "-";
+      const tid = kid.getAttribute ? (safeName(kid.getAttribute("data-testid")) || "-") : "-";
+      const text = String(kid.innerText || kid.textContent || "").replace(/\u00a0/g, " ");
+      const mark = kid === editor ? "self" : "sib";
+      return mark + " " + (kid.tagName || "-") + ":" + role + ":" + tid + " " + textClass(text) + " chars " + text.trim().length;
+    }}).join(" ;; ");
+  }};
   const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"]')).slice(0, 3);
   const pageQuotes = document.querySelectorAll('[data-testid="quoteTweet"]').length;
   const inDialogBoxes = boxes.filter((el) => !!el.closest('[role="dialog"], [aria-modal="true"]')).length;
@@ -2094,6 +2122,7 @@ pub fn quote_snap_script(target_id: &str) -> String {
       links.forEach((link) => hits.push(link));
     }}
     const editor = dlg.querySelector('[data-testid="tweetTextarea_0"]');
+    const plain = editor ? String(editor.innerText || editor.textContent || "").replace(/\u00a0/g, " ") : "";
     const seen = [];
     const add = (node) => {{ if (node && seen.indexOf(node) < 0) seen.push(node); }};
     dlg.querySelectorAll('a, [role="link"]').forEach(add);
@@ -2107,7 +2136,7 @@ pub fn quote_snap_script(target_id: &str) -> String {
     }});
     const shown = ranked.slice(0, 3).map((node) => relTo(node, editor) + " " + linkBits(node));
     const inside = seen.filter((node) => relTo(node, editor) === "inside-editor").length;
-    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
+    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " editor " + textClass(plain) + " chars " + plain.trim().length + " near " + nearEditor(editor) + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
   }});
   const ids = [];
   const composer = dialogs.find((dlg) => dlg.querySelector('[data-testid="tweetTextarea_0"]')) || null;
@@ -3477,6 +3506,7 @@ mod tests {
         assert!(snap.contains("page-quotes"));
         assert!(snap.contains("inside-editor"));
         assert!(snap.contains("rolelinks"));
+        assert!(snap.contains("url-exact"));
         assert!(snap.contains("A visible link is not the card"));
         assert!(snap.contains("ancestors"));
         assert!(snap.contains("hasBox && qHits.length"));
@@ -3801,6 +3831,17 @@ mod tests {
         assert!(seen_attach.contains("id exact"), "{seen_attach}");
         assert!(!seen_attach.contains(target), "{seen_attach}");
 
+        let plain = one("plain");
+        assert_eq!(plain["card"], false);
+        assert_eq!(plain["quote_testids"], 0);
+        let plain_attach = plain["attach"].as_str().unwrap();
+        assert!(plain_attach.contains("anchors 0"), "{plain_attach}");
+        assert!(plain_attach.contains("rolelinks 0"), "{plain_attach}");
+        assert!(plain_attach.contains("editor url-exact"), "{plain_attach}");
+        assert!(plain_attach.contains("self"), "{plain_attach}");
+        assert!(plain_attach.contains("url-exact"), "{plain_attach}");
+        assert!(!plain_attach.contains(target), "{plain_attach}");
+
         let urlcard = one("urlcard");
         assert_eq!(urlcard["card"], true);
         assert_eq!(urlcard["quoted_status_id"], target);
@@ -3907,6 +3948,12 @@ const rows = [
       box(),
       el("div", { role: "link" }, []),
       link("https://x.com/i/web/status/" + target)
+    ])
+  ]),
+  run("plain", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", contenteditable: "true", innerText: "https://x.com/i/status/" + target }, []),
+      el("div", { "data-testid": "tweetButton", innerText: "Post" }, [])
     ])
   ]),
   run("urlcard", compose, [

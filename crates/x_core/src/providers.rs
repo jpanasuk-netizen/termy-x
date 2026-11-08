@@ -2122,6 +2122,26 @@ fn chrome_call_args(method: &str, json_args: &str) -> Vec<String> {
     ]
 }
 
+fn quote_inspect_screenshot(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    session: &str,
+    tab: Option<&str>,
+) -> String {
+    let dir = crate::config::default_config_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return "screenshot unread".into();
+    }
+    let path = dir.join("quote-inspect.png");
+    let path_text = path.to_string_lossy().to_string();
+    let args = crate::publish::quote_browser_args(cli, session, &["screenshot", &path_text], tab, true);
+    match quote_run(bin, runner, &args, Duration::from_secs(20)) {
+        Ok(output) if output.status == 0 => format!("screenshot saved {path_text}"),
+        _ => "screenshot unread".into(),
+    }
+}
+
 fn quote_owned_leftover(bin: &str, runner: &dyn crate::io::CommandRunner) -> String {
     let listed = quote_run(
         bin,
@@ -2305,10 +2325,11 @@ fn run_quote_attachment(
         }
     }
     if inspect || !crate::publish::quote_inspect_ready(&after) {
+        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let line = format!(
-            "{} · {close_note} · {leftover}",
+            "{} · {shot} · {close_note} · {leftover}",
             with_quote_view(crate::publish::quote_report_line(&after), &view)
         );
         return if crate::publish::quote_inspect_ready(&after) {
@@ -5067,6 +5088,11 @@ mod tests {
             &["browser", "chrome", "call", "tabs.query"],
             r#"{"ok":true,"data":[{"id":3,"groupId":9}]}"#,
         );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "screenshot"],
+            "Screenshot saved",
+        );
         let err = inspect_quote_attachment("opencli", runner.as_ref(), "20").unwrap_err();
         assert!(err.contains("stage composer"), "{err}");
         assert!(!err.starts_with("stage visibility"), "{err}");
@@ -5079,6 +5105,8 @@ mod tests {
         assert!(err.contains("session list is not chrome clean"), "{err}");
         assert!(err.contains("session close acknowledged"), "{err}");
         assert!(err.contains("open echo url-key no"), "{err}");
+        assert!(err.contains("screenshot saved"), "{err}");
+        assert!(err.contains("quote-inspect.png"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         let encoded = b64_encode(crate::publish::quote_snap_script("20").as_bytes());
         assert!(calls.iter().any(|(_, args)| {
@@ -5096,6 +5124,15 @@ mod tests {
                 triple[0] == "tab" && triple[1] == "close" && triple[2] == "B94452EA22F530887AF90E615F8D7031"
             })
         }));
+        let shot_at = calls
+            .iter()
+            .position(|(_, args)| args.iter().any(|arg| arg == "screenshot"))
+            .expect("screenshot");
+        let close_at = calls
+            .iter()
+            .rposition(|(_, args)| args.windows(2).any(|pair| pair[0] == "termyx-quote" && pair[1] == "close"))
+            .expect("session close");
+        assert!(shot_at < close_at, "screenshot must run before session close");
     }
 
     #[test]
