@@ -1701,8 +1701,29 @@ fn close_quote_session(
     cli: crate::publish::BrowserCli,
     session: &str,
 ) {
-    let _ = runner.run_timeout(
+    // Session-scoped tabs only. Close extras before the session release so
+    // a failed inspect does not leave status tabs behind. The last owned
+    // tab becomes OpenCLI's blank placeholder; personal Chrome tabs are
+    // not in this session. Do not call windows.update or windows.remove.
+    let list_args = crate::publish::quote_browser_args(cli, session, &["tab", "list"], None, false);
+    if let Ok(listed) = quote_run(bin, runner, &list_args, Duration::from_secs(15)) {
+        if listed.status == 0 {
+            let pages = crate::publish::quote_session_pages(&listed.stdout);
+            for page in pages.iter().rev().skip(1) {
+                let close_tab = crate::publish::quote_browser_args(
+                    cli,
+                    session,
+                    &["tab", "close", page],
+                    None,
+                    false,
+                );
+                let _ = quote_run(bin, runner, &close_tab, Duration::from_secs(15));
+            }
+        }
+    }
+    let _ = quote_run(
         bin,
+        runner,
         &crate::publish::browser_command(cli, session, "close", None),
         Duration::from_secs(15),
     );
@@ -2165,20 +2186,8 @@ fn run_quote_attachment(
     inspect: bool,
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
-    let page = format!("https://x.com/i/status/{target_id}");
+    let page = crate::publish::quote_composer_url(target_id);
     let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page, target_id)?;
-    let script = crate::publish::quote_page_script(target_id, Some(text), true);
-    let menu = browser_page_json(
-        bin,
-        runner,
-        cli,
-        QUOTE_SESSION,
-        None,
-        &script,
-        "qx",
-        true,
-        false,
-    )?;
     let click_visibility = read_quote_visibility(
         bin,
         runner,
@@ -2187,60 +2196,15 @@ fn run_quote_attachment(
         surface.target.as_deref(),
         target_id,
     );
-    let view = format!("{} · visibility before click {}", surface.trace, click_visibility.summary);
-    if !menu.selected_label.eq_ignore_ascii_case("Quote") || menu.selected_scope != "menu" {
-        close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
-    }
-    if menu.selected_href_kind.contains("in_reply_to") {
-        close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(with_quote_view(crate::publish::quote_report_line(&menu), &view));
-    }
+    let view = format!("{} · visibility before composer {}", surface.trace, click_visibility.summary);
     if !click_visibility.ready {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(format!(
             "stage visibility · {view} · native click was not sent · Post was not clicked"
         ));
     }
-    let click_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
-    let click_public = crate::publish::browser_argv_public(&click_args);
-    let clicked = quote_run(bin, runner, &click_args, Duration::from_secs(30));
-    let clicked = match clicked {
-        Ok(output) => output,
-        Err(error) => {
-            close_quote_session(bin, runner, cli, QUOTE_SESSION);
-            return Err(with_quote_view(
-                crate::publish::explain_opencli_failure("menu", &click_public, -1, "", &error),
-                &view,
-            ));
-        }
-    };
-    let click_rejected = clicked.stdout.contains("\"ok\":false")
-        || clicked.stdout.contains("\"ok\": false");
-    if clicked.status != 0 || click_rejected {
-        close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        return Err(with_quote_view(
-            crate::publish::explain_opencli_failure(
-                "menu",
-                &click_public,
-                clicked.status,
-                &clicked.stdout,
-                &clicked.stderr,
-            ),
-            &view,
-        ));
-    }
     let snap_js = crate::publish::quote_snap_script(target_id);
-    let apply_menu = |mut parsed: crate::publish::QuotePageReport| {
-        parsed.selected_label = menu.selected_label.clone();
-        parsed.selected_testid = menu.selected_testid.clone();
-        parsed.selected_href_kind = menu.selected_href_kind.clone();
-        parsed.selected_scope = menu.selected_scope.clone();
-        parsed.menu_shape = menu.menu_shape.clone();
-        parsed.topo_before = menu.topo_before.clone();
-        parsed
-    };
-    let mut after = apply_menu(browser_page_json(
+    let mut after = browser_page_json(
         bin,
         runner,
         cli,
@@ -2250,7 +2214,7 @@ fn run_quote_attachment(
         "qxSnap",
         true,
         false,
-    )?);
+    )?;
     if !crate::publish::quote_inspect_ready(&after) {
         for _ in 0..7 {
             std::thread::sleep(Duration::from_millis(250));
@@ -2267,7 +2231,7 @@ fn run_quote_attachment(
                 break;
             }
             if let Ok(parsed) = crate::publish::parse_quote_page_report(&output.stdout) {
-                after = apply_menu(parsed);
+                after = parsed;
                 if crate::publish::quote_inspect_ready(&after) {
                     break;
                 }
@@ -4830,11 +4794,7 @@ mod tests {
         assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
         assert_eq!(calls[1].1[3], "harness reply");
         assert!(calls.iter().any(|(_, args)| {
-            args.first().map(String::as_str) == Some("browser")
-                && args.iter().any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
-        }));
-        assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg == "--name") && args.iter().any(|arg| arg == "Quote")
+            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("2118971448614334959"))
         }));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| {
@@ -4970,10 +4930,9 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("Post was not clicked"), "{err}");
         assert!(err.contains("No quote attachment"), "{err}");
-        assert!(err.contains("path=/compose/post keys=none"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg == "https://x.com/i/status/20")
+            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("status%2F20"))
         }));
         assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
@@ -4981,9 +4940,8 @@ mod tests {
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
-        assert!(calls.iter().any(|(_, args)| {
+        assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")
-                && !args.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm"))
         }));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("qxPost"))));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("post")));

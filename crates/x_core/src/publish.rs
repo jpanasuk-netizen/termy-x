@@ -1182,8 +1182,51 @@ fn known_visibility(text: &str) -> String {
 pub fn quote_visibility_expr(status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
     format!(
-        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:location.pathname.indexOf(\"/status/{id}\")>=0,host:location.host}})"
+        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:(location.pathname.indexOf(\"/status/{id}\")>=0||(location.search||\"\").indexOf(\"{id}\")>=0),host:location.host}})"
     )
+}
+
+/// OpenCLI's quote composer. The `url` query attaches the source tweet.
+/// A bare `/compose/post` does not.
+pub fn quote_composer_url(status_id: &str) -> String {
+    let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let status = format!("https://x.com/i/status/{id}");
+    let mut encoded = String::new();
+    for byte in status.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    format!("https://x.com/compose/post?url={encoded}")
+}
+
+/// Target ids from `browser tab list` for this session only.
+pub fn quote_session_pages(stdout: &str) -> Vec<String> {
+    let Some(value) = first_json_value(stdout) else {
+        return Vec::new();
+    };
+    let rows = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+    let mut pages = Vec::new();
+    for row in rows {
+        let text = row
+            .get("page")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| row.as_str())
+            .unwrap_or("");
+        if is_browser_target_id(text) && !pages.iter().any(|have: &String| have == text) {
+            pages.push(text.to_string());
+        }
+    }
+    pages
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1697,15 +1740,26 @@ pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
   const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
   const quoteAttachment = () => {{
-    const node = document.querySelector('[data-testid="quoteTweet"]');
-    if (!node) return false;
-    for (const link of node.querySelectorAll('a[href*="/status/"]')) {{ if (statusId(link.href) === TARGET) return true; }}
-    return false;
+    const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
+    const box = boxes.length ? boxes[boxes.length - 1] : null;
+    const dialog = box ? box.closest('[role="dialog"], [aria-modal="true"]') : null;
+    if (!dialog) return false;
+    const hits = Array.from(dialog.querySelectorAll('a[href*="/status/"]')).filter((link) => {{
+      if (statusId(link.href) !== TARGET) return false;
+      if ((link.getAttribute("href") || "").indexOf("in_reply_to") >= 0) return false;
+      if (link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]')) return false;
+      return true;
+    }});
+    if (!hits.length) return false;
+    if (hits.some((link) => !!link.closest('[data-testid="quoteTweet"]'))) return true;
+    let paramId = null;
+    try {{ const raw = new URL(location.href).searchParams.get("url") || ""; const match = raw.match(/status\/(\d+)/); paramId = match ? match[1] : null; }} catch (e) {{ paramId = null; }}
+    return location.pathname === "/compose/post" && paramId === TARGET;
   }};
   const base = (stage, message, clicked) => ({{
     stage: stage, path: location.pathname, composer: !!document.querySelector('[data-testid="tweetTextarea_0"]'),
     composer_kind: quoteAttachment() ? "quote" : "unknown", card: quoteAttachment(),
-    quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length,
+    quote_testids: quoteAttachment() ? 1 : 0,
     clicked_post: clicked, clicked_repost_confirm: false, text_landed: false,
     quoted_status_id: quoteAttachment() ? TARGET : null, message: message
   }});
@@ -1752,22 +1806,59 @@ pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
 }
 
 /// Read-only snapshot after the native Quote click. No clicks.
+/// A quote is a quoteTweet inside the composer dialog that links this
+/// status. Page-wide status links, including the thread behind the modal,
+/// are not an attachment.
 pub fn quote_snap_script(target_id: &str) -> String {
     let id_js = js_ascii_string(target_id);
     format!(
         r#"( () => {{ const TERMY_QUOTE_SNAP = 1; const TARGET = {id_js};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
-  const ids = [];
-  for (const link of document.querySelectorAll('a[href*="/status/"]')) {{ const id = statusId(link.href); if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id); }}
-  const quoteNode = document.querySelector('[data-testid="quoteTweet"]');
-  let attached = false;
-  if (quoteNode) {{ for (const link of quoteNode.querySelectorAll('a[href*="/status/"]')) {{ if (statusId(link.href) === TARGET) attached = true; }} }}
   const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
+  const box = boxes.length ? boxes[boxes.length - 1] : null;
+  const dialog = box ? box.closest('[role="dialog"], [aria-modal="true"]') : null;
   let place = "none";
-  if (boxes.length) {{ const box = boxes[boxes.length - 1]; if (box.closest('[role="dialog"], [aria-modal="true"]')) place = "dialog"; else if (box.closest("article")) place = "article"; else place = "page"; }}
-  const replying = /replying to/i.test((document.body && document.body.innerText || "").slice(0, 2500));
+  if (box) {{ if (dialog) place = "dialog"; else if (box.closest("article")) place = "article"; else place = "page"; }}
+  const scope = dialog || null;
+  const quoteNodes = scope ? Array.from(scope.querySelectorAll('[data-testid="quoteTweet"]')) : [];
+  const paramId = (() => {{ try {{ const raw = new URL(location.href).searchParams.get("url") || ""; const match = raw.match(/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }})();
+  const hits = scope ? Array.from(scope.querySelectorAll('a[href*="/status/"]')).filter((link) => {{
+    if (statusId(link.href) !== TARGET) return false;
+    if ((link.getAttribute("href") || "").indexOf("in_reply_to") >= 0) return false;
+    if (link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]')) return false;
+    return true;
+  }}) : [];
+  const quoteCard = hits.some((link) => !!link.closest('[data-testid="quoteTweet"]'));
+  const urlCard = location.pathname === "/compose/post" && paramId === TARGET && hits.length > 0;
+  const attached = quoteCard || urlCard;
+  const ids = [];
+  if (scope) {{ for (const link of scope.querySelectorAll('a[href*="/status/"]')) {{ const id = statusId(link.href); if (id && ids.indexOf(id) < 0 && ids.length < 8) ids.push(id); }} }}
+  const safeName = (value) => String(value || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32);
+  let attach = "composer-dialog none";
+  if (scope) {{
+    const names = [];
+    for (const el of scope.querySelectorAll("[data-testid]")) {{
+      const name = safeName(el.getAttribute("data-testid"));
+      if (!name || !/quote|attach|card|tweet|media|photo|poll/i.test(name)) continue;
+      if (names.indexOf(name) < 0 && names.length < 12) names.push(name);
+    }}
+    const hits = Array.from(scope.querySelectorAll('a[href*="/status/"]')).filter((link) => statusId(link.href) === TARGET && (link.getAttribute("href") || "").indexOf("in_reply_to") < 0 && !link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]'));
+    let chain = "none";
+    if (hits.length) {{
+      const parts = [];
+      let node = hits[0];
+      for (let i = 0; i < 5 && node && node !== scope; i++) {{
+        parts.push((node.tagName || "-") + ":" + (node.getAttribute("role") || "-") + ":" + (safeName(node.getAttribute("data-testid")) || "-"));
+        node = node.parentElement;
+      }}
+      chain = parts.join(">");
+    }}
+    attach = "dialog testids " + (names.join(",") || "none") + " target-links " + hits.length + " chain " + chain;
+  }}
+  const dialogText = scope ? String(scope.innerText || "").slice(0, 500) : "";
+  const replying = /replying to/i.test(dialogText);
   const kind = attached ? "quote" : (replying ? "reply" : "unknown");
-  const report = {{ stage: attached ? "inspect" : "composer", path: location.pathname, composer: boxes.length > 0, composer_kind: kind, card: attached, status_ids: ids, quote_testids: document.querySelectorAll('[data-testid="quoteTweet"]').length, testid_count: document.querySelectorAll("[data-testid]").length, clicked_post: false, clicked_repost_confirm: false, quoted_status_id: attached ? TARGET : null, topo_after: place + " textareas=" + boxes.length + " quotes=" + document.querySelectorAll('[data-testid="quoteTweet"]').length + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length, message: attached ? "Quote attachment is visible. Post was not clicked." : "No quote attachment for " + TARGET + ". Post was not clicked." }};
+  const report = {{ stage: attached ? "inspect" : "composer", path: location.pathname, composer: boxes.length > 0, composer_kind: kind, card: attached, status_ids: ids, quote_testids: attached ? Math.max(quoteNodes.length, hits.length, 1) : 0, testid_count: document.querySelectorAll("[data-testid]").length, clicked_post: false, clicked_repost_confirm: false, quoted_status_id: attached ? TARGET : null, topo_after: place + " textareas=" + boxes.length + " quotes=" + quoteNodes.length + " dialogs=" + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length, attach: attach, message: attached ? "Quote attachment is visible. Post was not clicked." : "No quote attachment for " + TARGET + ". Post was not clicked." }};
   window.__qxReport = report;
   return JSON.stringify(report);
 }} )()"#
@@ -1797,6 +1888,8 @@ pub struct QuotePageReport {
     pub topo_before: String,
     pub topo_after: String,
     pub menu_shape: String,
+    /// Sanitized composer-dialog attachment shape. Not proof by itself.
+    pub attach: String,
     pub message: String,
 }
 
@@ -1954,6 +2047,7 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
         topo_before: text("topo_before"),
         topo_after: text("topo_after"),
         menu_shape: text("menu_shape"),
+        attach: text("attach"),
         message: text("message"),
     }
 }
@@ -1965,7 +2059,7 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         report.status_ids.join(",")
     };
     format!(
-        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · before {} · after {} · menu {} · {}",
+        "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · before {} · after {} · menu {} · attach {} · {}",
         report.stage,
         if report.path.is_empty() { "-" } else { &report.path },
         if report.composer_kind.is_empty() { "-" } else { &report.composer_kind },
@@ -1982,6 +2076,7 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         if report.topo_before.is_empty() { "-" } else { &report.topo_before },
         if report.topo_after.is_empty() { "-" } else { &report.topo_after },
         if report.menu_shape.is_empty() { "-" } else { &report.menu_shape },
+        if report.attach.is_empty() { "-" } else { &report.attach },
         report.message
     )
 }
@@ -3115,6 +3210,17 @@ mod tests {
         let snap = quote_snap_script(original);
         assert!(!snap.contains("click("));
         assert!(snap.contains("quoteTweet"));
+        assert!(snap.contains("searchParams"));
+        assert!(snap.contains("in_reply_to"));
+        assert!(snap.contains("tweetTextarea_0"));
+        let composer = quote_composer_url(original);
+        assert!(composer.starts_with("https://x.com/compose/post?url="));
+        assert!(composer.contains("status%2F2118971448614334959"));
+        assert!(!composer.contains("https://x.com/i/status/"));
+        let pages = quote_session_pages(
+            r#"{"ok":true,"data":[{"page":"E54BF7E091EA017B99E02EF7373E08BC","url":"https://x.com/compose/post"},{"page":"not-an-id"}]}"#,
+        );
+        assert_eq!(pages, vec!["E54BF7E091EA017B99E02EF7373E08BC".to_string()]);
         let click = quote_native_click_args(browser_cli_from_help(""), "termyx-quote", None);
         assert!(click.windows(2).any(|pair| pair[0] == "--role" && pair[1] == "menuitem"));
         assert!(click.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
