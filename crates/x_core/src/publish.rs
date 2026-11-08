@@ -184,6 +184,109 @@ pub fn quote_visible_window_note() -> &'static str {
     "Quoting through your X session. The Quote click needs the OpenCLI window visible and focused, so this step is not put in the background."
 }
 
+/// A confirmed acknowledgement stays confirmed if session cleanup fails later.
+/// Cleanup is reported beside it and does not replace the result.
+pub fn settle_confirmed(
+    ack: Result<String, String>,
+    cleanup: Result<(), String>,
+) -> (Result<String, String>, String) {
+    let cleanup = match cleanup {
+        Ok(()) => "ok".to_string(),
+        Err(error) => action_field(&error),
+    };
+    (ack, cleanup)
+}
+
+/// One privacy-safe lifecycle line. Kind and stage are short tokens.
+/// Values never keep authored text, tokens, or cookies.
+pub fn action_log_line(kind: &str, stage: &str, fields: &[(&str, &str)]) -> String {
+    let mut line = format!("action kind={} stage={}", action_token(kind), action_token(stage));
+    for (key, value) in fields {
+        let key = action_token(key);
+        if key == "text" || key == "body" || key == "commentary" || key == "secret" {
+            continue;
+        }
+        line.push(' ');
+        line.push_str(&key);
+        line.push('=');
+        line.push_str(&action_field(value));
+    }
+    line
+}
+
+pub fn log_action(kind: &str, stage: &str, fields: &[(&str, &str)]) {
+    let line = action_log_line(kind, stage, fields);
+    let _ = append_action_log(&action_log_path(), &line);
+}
+
+pub fn action_log_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("termy")
+        .join("logs")
+        .join("termy.log")
+}
+
+pub fn append_action_log(path: &std::path::Path, line: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+fn action_token(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(24) {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        }
+    }
+    if out.is_empty() { "none".into() } else { out }
+}
+
+fn action_field(value: &str) -> String {
+    let lower = value.to_ascii_lowercase();
+    if lower.contains("token")
+        || lower.contains("cookie")
+        || lower.contains("authorization")
+        || lower.contains("ct0")
+        || lower.contains("secret")
+    {
+        return "redacted".into();
+    }
+    let mut out = String::new();
+    for ch in value.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/') {
+            out.push(ch);
+        }
+    }
+    if out.is_empty() { "none".into() } else { out }
+}
+
+/// Digits of a new status id from a receipt. Anything else is `none`.
+pub fn action_new_id(receipt: &str) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(receipt.trim()) else {
+        return "none".into();
+    };
+    let node = value.get("data").unwrap_or(&value);
+    let node = node.as_array().and_then(|rows| rows.first()).unwrap_or(node);
+    match node.get("id") {
+        Some(serde_json::Value::String(id))
+            if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            id.clone()
+        }
+        Some(serde_json::Value::Number(id)) => id
+            .as_u64()
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "none".into()),
+        _ => "none".into(),
+    }
+}
+
 /// Actions under a tweet. Reply is the one comment control. Video cards
 /// use this same list; they do not drop Reply.
 pub fn card_action_labels(show_follow: bool) -> Vec<&'static str> {
@@ -3595,6 +3698,37 @@ mod tests {
         assert!(quote_visible_window_note().contains("visible"));
         assert!(quote_visible_window_note().contains("focused"));
         assert!(quote_visible_window_note().contains("not put in the background"));
+        let (kept, cleanup) = settle_confirmed(
+            Ok("2119413665547821165".into()),
+            Err("session close exit 75".into()),
+        );
+        assert_eq!(kept.as_deref(), Ok("2119413665547821165"));
+        assert!(cleanup.contains("exit"));
+        assert!(cleanup.contains("75"));
+        assert!(!cleanup.to_ascii_lowercase().contains("conflict"));
+        let line = action_log_line(
+            "post",
+            "ack",
+            &[
+                ("ack", "confirmed"),
+                ("new_id", "2119413665547821165"),
+                ("text", "100 is enough"),
+                ("cookie", "ct0=secret"),
+            ],
+        );
+        assert!(line.contains("kind=post"));
+        assert!(line.contains("stage=ack"));
+        assert!(line.contains("ack=confirmed"));
+        assert!(line.contains("new_id=2119413665547821165"));
+        assert!(!line.contains("100 is enough"));
+        assert!(!line.contains("secret"));
+        assert!(line.contains("cookie=redacted"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("logs").join("termy.log");
+        append_action_log(&path, &line).unwrap();
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.contains("stage=ack"));
+        assert!(!stored.contains("100 is enough"));
         assert_eq!(
             withheld_note(UserWrite::Follow, WriteOutcome::Cancelled),
             "Follow cancelled. Nothing was changed."

@@ -5004,6 +5004,14 @@ impl XPanel {
         self.engage_seq.insert(id.clone(), seq);
         self.set_engage_state(&id, is_like, now_active);
         self.engage_pending.push(id.clone());
+        let action_kind = match action {
+            EngageAction::Like => "like",
+            EngageAction::Unlike => "unlike",
+            EngageAction::Retweet => "retweet",
+            EngageAction::Unretweet => "unretweet",
+            EngageAction::Quote => "quote",
+        };
+        termy_x::publish::log_action(action_kind, "start", &[("ack", "pending"), ("new_id", "none")]);
         cx.notify();
         let live = self.live;
         let mock = self.mock_writes.clone();
@@ -5037,7 +5045,10 @@ impl XPanel {
                 "engage {action:?} confirmed_ms={}",
                 engage_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action(action_kind, "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 if panel.engage_seq.get(&id).copied() != Some(seq) {
                     return;
                 }
@@ -5131,6 +5142,11 @@ impl XPanel {
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                action_kind,
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
@@ -5323,6 +5339,7 @@ impl XPanel {
         }
         let media = self.quote_media.clone();
         self.quote_posting = true;
+        termy_x::publish::log_action("quote", "start", &[("ack", "pending"), ("new_id", "none")]);
         self.notice = Some(termy_x::publish::quote_visible_window_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
@@ -5358,7 +5375,10 @@ impl XPanel {
                 "submit quote confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("quote", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.quote_posting = false;
                 match result {
                     Ok(_) => {
@@ -5400,6 +5420,11 @@ impl XPanel {
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                "quote",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
@@ -5445,6 +5470,7 @@ impl XPanel {
         let author = self.reply_author.clone();
         let target_id_for_update = target_id.clone();
         self.reply_posting = true;
+        termy_x::publish::log_action("reply", "start", &[("ack", "pending"), ("new_id", "none")]);
         self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
@@ -5494,7 +5520,10 @@ impl XPanel {
                 "submit reply confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("reply", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.reply_posting = false;
                 match result {
                     Ok(_receipt) => {
@@ -5533,6 +5562,11 @@ impl XPanel {
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                "reply",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
@@ -11422,6 +11456,7 @@ impl XPanel {
         }
         let queue_id = self.confirm_queue_id.clone();
         self.posting = true;
+        termy_x::publish::log_action("post", "start", &[("ack", "pending"), ("new_id", "none")]);
         self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
@@ -11471,7 +11506,10 @@ impl XPanel {
                 })
                 .await;
             perf_log(&format!("submit post confirmed_ms={}", submit_started.elapsed().as_millis()));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("post", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.posting = false;
                 match result {
                     Ok(receipt) => {
@@ -11540,6 +11578,11 @@ impl XPanel {
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                "post",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }

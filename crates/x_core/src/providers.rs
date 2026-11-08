@@ -1678,6 +1678,15 @@ fn json_failure_message(value: &Value) -> Option<String> {
 }
 
 const QUOTE_SESSION: &str = "termyx-quote";
+static QUOTE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn begin_quote_lease() -> u64 {
+    QUOTE_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+fn quote_cleanup_current(epoch: u64) -> bool {
+    QUOTE_EPOCH.load(std::sync::atomic::Ordering::SeqCst) == epoch
+}
 
 fn sanitize_browser_note(raw: &str) -> String {
     let collapsed = raw.split_whitespace().take(12).collect::<Vec<_>>().join(" ");
@@ -2350,6 +2359,25 @@ fn run_quote_attachment(
     target_id: &str,
     text: &str,
     inspect: bool,
+) -> Result<(crate::publish::QuotePageReport, u64), String> {
+    let epoch = begin_quote_lease();
+    crate::publish::log_action("quote", "start", &[("ack", "pending"), ("epoch", &epoch.to_string())]);
+    match run_quote_attachment_epoch(bin, runner, target_id, text, inspect, epoch) {
+        Ok(report) => Ok((report, epoch)),
+        Err(error) => {
+            crate::publish::log_action("quote", "ack", &[("ack", "rejected"), ("epoch", &epoch.to_string())]);
+            Err(error)
+        }
+    }
+}
+
+fn run_quote_attachment_epoch(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    target_id: &str,
+    text: &str,
+    inspect: bool,
+    _epoch: u64,
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
     let page = crate::publish::quote_status_url(target_id);
@@ -2528,11 +2556,29 @@ fn run_quote_attachment(
     Ok(report)
 }
 
-fn release_quote_session_later(bin: String, runner: Arc<dyn crate::io::CommandRunner>) {
+fn release_quote_session_later(bin: String, runner: Arc<dyn crate::io::CommandRunner>, epoch: u64) {
     std::thread::spawn(move || {
-        if let Ok(cli) = browser_cli_for(&bin, runner.as_ref()) {
-            let _ = close_quote_session(&bin, runner.as_ref(), cli, QUOTE_SESSION);
+        if !quote_cleanup_current(epoch) {
+            crate::publish::log_action(
+                "quote",
+                "cleanup",
+                &[("ack", "confirmed"), ("cleanup", "skipped-newer-lease"), ("epoch", &epoch.to_string())],
+            );
+            return;
         }
+        let cleanup = match browser_cli_for(&bin, runner.as_ref()) {
+            Ok(cli) => Ok(close_quote_session(&bin, runner.as_ref(), cli, QUOTE_SESSION)),
+            Err(error) => Err(error),
+        };
+        let cleanup_note = match cleanup {
+            Ok(note) => note,
+            Err(error) => error,
+        };
+        crate::publish::log_action(
+            "quote",
+            "cleanup",
+            &[("ack", "confirmed"), ("cleanup", &cleanup_note), ("epoch", &epoch.to_string())],
+        );
     });
 }
 
@@ -2541,7 +2587,7 @@ pub fn inspect_quote_attachment(
     runner: &dyn crate::io::CommandRunner,
     target_id: &str,
 ) -> Result<String, String> {
-    let report = run_quote_attachment(bin, runner, target_id, "", true)?;
+    let (report, _) = run_quote_attachment(bin, runner, target_id, "", true)?;
     let line = crate::publish::quote_report_line(&report);
     if crate::publish::quote_inspect_ready(&report) {
         Ok(line)
@@ -2596,6 +2642,8 @@ impl Publisher for OpenCliPublisher {
         media: &[PathBuf],
     ) -> Result<String, String> {
         crate::publish::validate_media_paths(media)?;
+        let kind = if reply_to.is_some() { "reply" } else { "post" };
+        crate::publish::log_action(kind, "cli", &[("ack", "pending")]);
         let mut previous = reply_to.map(status_url);
         let mut last = String::new();
         for (index, part) in parts.iter().enumerate() {
@@ -2650,6 +2698,7 @@ impl Publisher for OpenCliPublisher {
                         "write post part={index} cli_ms={} runner-error",
                         call_started.elapsed().as_millis()
                     ));
+                    crate::publish::log_action(kind, "timeout", &[("ack", "pending")]);
                     return Err(write_timeout_error(error, "posting", POST_TIMEOUT));
                 }
             };
@@ -2671,10 +2720,13 @@ impl Publisher for OpenCliPublisher {
         match proved {
             Ok(receipt) => {
                 write_perf_line("write post proof=confirmed");
+                let new_id = crate::publish::action_new_id(&last);
+                crate::publish::log_action(kind, "ack", &[("ack", "confirmed"), ("new_id", &new_id)]);
                 Ok(format!("{receipt}{media_note}"))
             }
             Err(error) => {
                 write_perf_line("write post proof=rejected");
+                crate::publish::log_action(kind, "ack", &[("ack", "rejected"), ("new_id", "none")]);
                 Err(error)
             }
         }
@@ -2794,14 +2846,14 @@ impl OpenCliPublisher {
                 );
             }
             let target_id = crate::model::post_id_from_input(target_url);
-            let report = match run_quote_attachment(
+            let (report, epoch) = match run_quote_attachment(
                 &self.bin,
                 self.runner.as_ref(),
                 &target_id,
                 text,
                 false,
             ) {
-                Ok(report) => report,
+                Ok(pair) => pair,
                 Err(error) => {
                     write_perf_line("engage quote proof=rejected");
                     return Err(error);
@@ -2815,9 +2867,23 @@ impl OpenCliPublisher {
                 "id": report.new_status_id,
             }])
             .to_string();
+            let new_id = crate::publish::action_new_id(&stdout);
             let proved = crate::publish::prove_quote(&stdout, &target_id);
-            release_quote_session_later(self.bin.clone(), self.runner.clone());
-            if let Err(error) = proved {
+            let (result, _) = crate::publish::settle_confirmed(proved.map(|_| stdout.clone()), Ok(()));
+            match &result {
+                Ok(_) => crate::publish::log_action(
+                    "quote",
+                    "ack",
+                    &[("ack", "confirmed"), ("new_id", &new_id), ("epoch", &epoch.to_string())],
+                ),
+                Err(_) => crate::publish::log_action(
+                    "quote",
+                    "ack",
+                    &[("ack", "rejected"), ("new_id", &new_id), ("epoch", &epoch.to_string())],
+                ),
+            }
+            release_quote_session_later(self.bin.clone(), self.runner.clone(), epoch);
+            if let Err(error) = result {
                 write_perf_line("engage quote proof=rejected");
                 return Err(error);
             }
@@ -2825,6 +2891,7 @@ impl OpenCliPublisher {
             return Ok(stdout);
         }
         let args = opencli_json(&args);
+        crate::publish::log_action(action.opencli_verb(), "cli", &[("ack", "pending")]);
         let call_started = Instant::now();
         let output = match self.runner.run_timeout(&self.bin, &args, ENGAGE_TIMEOUT) {
             Ok(output) => {
@@ -2842,6 +2909,7 @@ impl OpenCliPublisher {
                     action.opencli_verb(),
                     call_started.elapsed().as_millis()
                 ));
+                crate::publish::log_action(action.opencli_verb(), "timeout", &[("ack", "pending")]);
                 return Err(write_timeout_error(error, "that action", ENGAGE_TIMEOUT));
             }
         };
@@ -2851,12 +2919,18 @@ impl OpenCliPublisher {
                 "engage {} proof=rejected",
                 action.opencli_verb()
             ));
+            crate::publish::log_action(action.opencli_verb(), "ack", &[("ack", "rejected"), ("new_id", "none")]);
             return Err(error);
         }
         write_perf_line(&format!(
             "engage {} proof=confirmed",
             action.opencli_verb()
         ));
+        crate::publish::log_action(
+            action.opencli_verb(),
+            "ack",
+            &[("ack", "confirmed"), ("new_id", &crate::publish::action_new_id(&stdout))],
+        );
         Ok(stdout)
     }
 }
@@ -5084,6 +5158,14 @@ mod tests {
             Some(true)
         );
         assert_eq!(bad.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn quote_cleanup_skips_a_newer_lease() {
+        let first = begin_quote_lease();
+        let second = begin_quote_lease();
+        assert!(second > first);
+        assert!(!quote_cleanup_current(first));
     }
 
     #[test]
