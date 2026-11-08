@@ -2248,6 +2248,50 @@ fn quote_container_note(
     )
 }
 
+fn eval_quote_script_keep_open(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    session: &str,
+    js: &str,
+    marker: &str,
+) -> Result<crate::publish::QuotePageReport, String> {
+    let b64 = b64_encode(js.as_bytes());
+    for (index, chunk) in b64.as_bytes().chunks(6000).enumerate() {
+        let piece = std::str::from_utf8(chunk).unwrap_or("");
+        let arg = if index == 0 {
+            format!("window.__{marker}='{piece}'")
+        } else {
+            format!("window.__{marker}+='{piece}'")
+        };
+        let loaded = quote_run(
+            bin,
+            runner,
+            &crate::publish::browser_command(cli, session, "eval", Some(&arg)),
+            Duration::from_secs(30),
+        );
+        if loaded.map(|output| output.status != 0).unwrap_or(true) {
+            return Err("script load unread".into());
+        }
+    }
+    let output = quote_run(
+        bin,
+        runner,
+        &crate::publish::browser_command(
+            cli,
+            session,
+            "eval",
+            Some(&format!("eval(atob(window.__{marker}))")),
+        ),
+        Duration::from_secs(30),
+    )
+    .map_err(|_| "script eval unread".to_string())?;
+    if output.status != 0 {
+        return Err("script eval status".into());
+    }
+    crate::publish::parse_quote_page_report(&output.stdout)
+}
+
 fn quote_native_opener(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
@@ -2310,6 +2354,23 @@ fn run_quote_attachment(
             "stage visibility · {view} · native click was not sent · Post was not clicked"
         ));
     }
+    let source = eval_quote_script_keep_open(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        &crate::publish::quote_source_script(target_id),
+        "qxSource",
+    );
+    let (screen, source_text, source_note) = match source {
+        Ok(report) if !report.source_screen.is_empty() && !report.source_text.is_empty() => (
+            report.source_screen.clone(),
+            report.source_text.clone(),
+            format!("source screen {} text yes", report.source_screen),
+        ),
+        Ok(_) => (String::new(), String::new(), "source missing".into()),
+        Err(_) => (String::new(), String::new(), "source unread".into()),
+    };
     let opener = match quote_native_opener(bin, runner, cli, surface.target.as_deref(), target_id) {
         Ok(note) => note,
         Err(note) => {
@@ -2343,7 +2404,7 @@ fn run_quote_attachment(
         Err(_) => "click unread".into(),
     };
     let quote_trusted = matches!(quote_note.as_str(), "click cdp" | "click ax");
-    let snap_js = crate::publish::quote_snap_script(target_id);
+    let snap_js = crate::publish::quote_snap_script_bound(target_id, &screen, &source_text);
     let mut after = browser_page_json(
         bin,
         runner,
@@ -2384,7 +2445,7 @@ fn run_quote_attachment(
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let line = format!(
-            "{} · {opener} · menu {menu_note} · quote {quote_note} · {shot} · {close_note} · {leftover}",
+            "{} · {source_note} · {opener} · menu {menu_note} · quote {quote_note} · {shot} · {close_note} · {leftover}",
             with_quote_view(crate::publish::quote_report_line(&after), &view)
         );
         return if ready {
@@ -2393,7 +2454,7 @@ fn run_quote_attachment(
             Err(line)
         };
     }
-    let post_script = crate::publish::quote_type_and_post_script(target_id, text);
+    let post_script = crate::publish::quote_type_and_post_script_bound(target_id, text, &screen, &source_text);
     let posted = browser_page_json(
         bin,
         runner,

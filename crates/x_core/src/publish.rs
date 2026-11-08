@@ -2039,15 +2039,28 @@ pub fn quote_menu_read_script(target_id: &str) -> String {
     )
 }
 
-/// Types the commentary and clicks Post once. Runs only after a snap has
-/// already shown a quoteTweet that links the target. Refuses otherwise.
 pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
+    quote_type_and_post_script_bound(target_id, commentary, "", "")
+}
+
+/// Types the commentary and clicks Post once. Runs only after a snap has
+/// already shown the source card for this status. Refuses otherwise.
+pub fn quote_type_and_post_script_bound(
+    target_id: &str,
+    commentary: &str,
+    screen: &str,
+    source_text: &str,
+) -> String {
     let id_js = js_ascii_string(target_id);
     let text_js = js_ascii_string(commentary);
+    let screen_js = js_ascii_string(screen);
+    let source_js = js_ascii_string(source_text);
     format!(
         r#"(async () => {{
   const TARGET = {id_js};
   const TEXT = {text_js};
+  const SCREEN = {screen_js};
+  const SOURCE = {source_js};
   window.__qxReport = null;
   const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
@@ -2062,7 +2075,41 @@ pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
       if (link.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]')) return false;
       return true;
     }});
-    if (!hits.length) return false;
+    if (!hits.length) {{
+      const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+      const tokenExact = (value) => {{
+        const text = String(value || "");
+        const at = text.indexOf(TARGET);
+        if (at < 0) return false;
+        const prev = at > 0 ? text.charAt(at - 1) : "";
+        const next = text.charAt(at + TARGET.length);
+        const digit = (ch) => ch >= "0" && ch <= "9";
+        return !digit(prev) && !digit(next);
+      }};
+      const card = Array.from(dialog.querySelectorAll('[data-testid="attachments"]')).find((node) => !node.closest('[data-testid="tweetTextarea_0"], [contenteditable="true"]'));
+      if (!card) return false;
+      const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
+      const textNode = card.querySelector('[data-testid="tweetText"]');
+      if (!avatar || !textNode) return false;
+      const cardText = norm(textNode.innerText || textNode.textContent);
+      const blob = norm(card.innerText || card.textContent).toLowerCase();
+      let attrExact = false;
+      let attrOther = false;
+      card.querySelectorAll("*").forEach((el) => {{
+        ["href", "aria-label", "title", "id", "datetime"].forEach((key) => {{
+          const value = el.getAttribute ? (el.getAttribute(key) || "") : "";
+          if (!value) return;
+          const sid = statusId(value);
+          if (sid === TARGET || tokenExact(value)) attrExact = true;
+          else if (sid) attrOther = true;
+        }});
+      }});
+      if (attrOther) return false;
+      const source = norm(SOURCE);
+      const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
+      const textOk = !!source && !!cardText && (cardText === source || (cardText.length >= 12 && source.indexOf(cardText) === 0));
+      return attrExact || (handleOk && textOk);
+    }}
     if (hits.some((link) => !!link.closest('[data-testid="quoteTweet"]'))) return true;
     let paramId = null;
     try {{ const raw = new URL(location.href).searchParams.get("url") || ""; const match = raw.match(/status\/(\d+)/); paramId = match ? match[1] : null; }} catch (e) {{ paramId = null; }}
@@ -2117,16 +2164,46 @@ pub fn quote_type_and_post_script(target_id: &str, commentary: &str) -> String {
     )
 }
 
-/// Read-only snapshot of the compose page. No clicks.
-/// A quote counts only when the dialog that contains the composer textarea
-/// also holds a quoteTweet or a non-editor source link for this status.
-/// Other visible links are described, including links inside the editor.
-/// A described link is not the card. Page links and pasted URLs are not
-/// an attachment.
-pub fn quote_snap_script(target_id: &str) -> String {
+/// Reads the clicked article's handle and tweet text. No clicks.
+pub fn quote_source_script(target_id: &str) -> String {
     let id_js = js_ascii_string(target_id);
     format!(
-        r#"( () => {{ const TERMY_QUOTE_SNAP = 1; const TARGET = {id_js};
+        r#"( () => {{ const TARGET = {id_js};
+  const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
+  const article = Array.from(document.querySelectorAll("article")).find((node) => Array.from(node.querySelectorAll("a[href]")).some((link) => statusId(link.href) === TARGET));
+  let screen = "";
+  if (article) {{
+    for (const link of article.querySelectorAll("a[href]")) {{
+      try {{
+        const parsed = new URL(link.href, location.origin);
+        const match = parsed.pathname.match(/^\/([A-Za-z0-9_]{{1,15}})\/status\/(\d+)\/?$/);
+        if (match && match[2] === TARGET && match[1] !== "i") {{ screen = match[1]; break; }}
+      }} catch (e) {{}}
+    }}
+  }}
+  const textNode = article ? (Array.from(article.querySelectorAll('[data-testid="tweetText"]')).find((node) => !node.closest('[data-testid="quoteTweet"]')) || article.querySelector('[data-testid="tweetText"]')) : null;
+  const text = textNode ? String(textNode.innerText || textNode.textContent || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim().slice(0, 500) : "";
+  const report = {{ stage: "source", source_screen: screen, source_text: text, card: false, clicked_post: false, composer_kind: "unknown", message: screen && text ? "source ready" : "source missing" }};
+  return JSON.stringify(report);
+}} )()"#
+    )
+}
+
+pub fn quote_snap_script(target_id: &str) -> String {
+    quote_snap_script_bound(target_id, "", "")
+}
+
+/// Read-only snapshot of the compose page. No clicks.
+/// A quote card is the composer attachment that matches the article that was
+/// quoted: same author handle and same tweet text, or an attribute in that
+/// attachment that carries this exact status id. An editor URL is not a card.
+/// A different author's card, or the same author with different text, is not.
+pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str) -> String {
+    let id_js = js_ascii_string(target_id);
+    let screen_js = js_ascii_string(screen);
+    let source_js = js_ascii_string(source_text);
+    format!(
+        r#"( () => {{ const TERMY_QUOTE_SNAP = 1; const TARGET = {id_js}; const SCREEN = {screen_js}; const SOURCE = {source_js};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
   const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
   const box = boxes.length ? boxes[boxes.length - 1] : null;
@@ -2254,6 +2331,44 @@ pub fn quote_snap_script(target_id: &str) -> String {
       attached = true;
       links.forEach((link) => hits.push(link));
     }}
+    const norm = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    const tokenExact = (value) => {{
+      const text = String(value || "");
+      const at = text.indexOf(TARGET);
+      if (at < 0) return false;
+      const prev = at > 0 ? text.charAt(at - 1) : "";
+      const next = text.charAt(at + TARGET.length);
+      const digit = (ch) => ch >= "0" && ch <= "9";
+      return !digit(prev) && !digit(next);
+    }};
+    const card = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).find((node) => !inEditor(node));
+    let bind = "none";
+    if (card) {{
+      const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
+      const textNode = card.querySelector('[data-testid="tweetText"]');
+      const cardText = norm(textNode && (textNode.innerText || textNode.textContent));
+      const blob = norm(card.innerText || card.textContent).toLowerCase();
+      let attrExact = false;
+      let attrOther = false;
+      card.querySelectorAll("*").forEach((el) => {{
+        ["href", "aria-label", "title", "id", "datetime"].forEach((key) => {{
+          const value = el.getAttribute ? (el.getAttribute(key) || "") : "";
+          if (!value) return;
+          const sid = statusId(value);
+          if (sid === TARGET || tokenExact(value)) attrExact = true;
+          else if (sid) attrOther = true;
+        }});
+      }});
+      const source = norm(SOURCE);
+      const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
+      const textOk = !!source && !!cardText && (cardText === source || (cardText.length >= 12 && source.indexOf(cardText) === 0));
+      if (hasBox && avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) {{
+        attached = true;
+        proofQuotes += 1;
+        bind = attrExact ? "id" : "article";
+      }} else if (attrOther) bind = "other-id";
+      else bind = "miss";
+    }}
     const editor = dlg.querySelector('[data-testid="tweetTextarea_0"]');
     const plain = editor ? String(editor.innerText || editor.textContent || "").replace(/\u00a0/g, " ") : "";
     const seen = [];
@@ -2269,7 +2384,7 @@ pub fn quote_snap_script(target_id: &str) -> String {
     }});
     const shown = ranked.slice(0, 3).map((node) => relTo(node, editor) + " " + linkBits(node));
     const inside = seen.filter((node) => relTo(node, editor) === "inside-editor").length;
-    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " editor " + textClass(plain) + " chars " + plain.trim().length + " near " + nearEditor(editor) + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
+    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " editor " + textClass(plain) + " chars " + plain.trim().length + " card-bind " + bind + " near " + nearEditor(editor) + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
   }});
   const ids = [];
   const composer = dialogs.find((dlg) => dlg.querySelector('[data-testid="tweetTextarea_0"]')) || null;
@@ -2312,6 +2427,10 @@ pub struct QuotePageReport {
     pub menu_shape: String,
     /// Sanitized composer-dialog attachment shape. Not proof by itself.
     pub attach: String,
+    /// Author handle and tweet text from the clicked status article.
+    /// The text is compared to the composer card and is not printed.
+    pub source_screen: String,
+    pub source_text: String,
     pub message: String,
 }
 
@@ -2470,6 +2589,8 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
         topo_after: text("topo_after"),
         menu_shape: text("menu_shape"),
         attach: text("attach"),
+        source_screen: text("source_screen"),
+        source_text: text("source_text"),
         message: text("message"),
     }
 }
@@ -4008,6 +4129,32 @@ mod tests {
         let reply = one("replylink");
         assert_eq!(reply["card"], false);
         assert_eq!(reply["status_ids"].as_array().unwrap().len(), 0);
+        assert_eq!(one("card")["card"], false);
+
+        let bound = quote_snap_script_bound(target, "cryptoXRPwhale", "IS OWNING 1,000 $XRP ENOUGH?");
+        let bound_path = dir.join("termy-quote-snap-bound.js");
+        std::fs::write(&bound_path, &bound).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(&bound_path)
+            .output()
+            .expect("node");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        let row = |name: &str| {
+            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+        };
+        let card = row("card");
+        assert_eq!(card["card"], true, "{}", card["attach"]);
+        assert_eq!(card["composer_kind"], "quote");
+        assert_eq!(card["quoted_status_id"], target);
+        assert!(card["attach"].as_str().unwrap().contains("card-bind article"));
+        assert!(!card["attach"].as_str().unwrap().contains("IS OWNING"));
+        assert_eq!(row("wrongtext")["card"], false);
+        assert_eq!(row("wronguser")["card"], false);
+        assert_eq!(row("pagecard")["card"], false);
+        assert_eq!(row("plain")["card"], false);
     }
 }
 
@@ -4117,6 +4264,41 @@ const rows = [
   ]),
   run("replylink", compose, [
     el("div", { role: "dialog" }, [box(), link(replyHref)])
+  ]),
+  run("card", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale IS OWNING 1,000 $XRP ENOUGH?" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, [])
+      ]),
+      el("div", { "data-testid": "tweetButton" }, [])
+    ])
+  ]),
+  run("wrongtext", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      box(),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale a different post" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText", innerText: "a different post" }, [])
+      ])
+    ])
+  ]),
+  run("wronguser", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      box(),
+      el("div", { "data-testid": "attachments", innerText: "@otheruser IS OWNING 1,000 $XRP ENOUGH?" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, [])
+      ])
+    ])
+  ]),
+  run("pagecard", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, [])]),
+    el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale IS OWNING 1,000 $XRP ENOUGH?" }, [
+      el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+      el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, [])
+    ])
   ])
 ];
 process.stdout.write(JSON.stringify(rows.map((row) => Object.assign({ name: row.name }, row.report))));
