@@ -1946,6 +1946,7 @@ fn open_visible_quote_page(
     cli: crate::publish::BrowserCli,
     session: &str,
     url: &str,
+    status_id: &str,
 ) -> Result<QuoteSurface, String> {
     let list_args = crate::publish::quote_browser_args(cli, session, &["tab", "list"], None, false);
     let listed = quote_run(bin, runner, &list_args, Duration::from_secs(20));
@@ -2045,15 +2046,80 @@ fn open_visible_quote_page(
         "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · visibility after open {after_open} · select {select_public} {select_note} · visibility after select {after_select}"
     );
     if after_select != "visible" {
+        let container = quote_container_note(bin, runner, status_id);
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
-            "stage visibility · {trace} · native click was not sent · Post was not clicked"
+            "stage visibility · {trace} · {container} · native click was not sent · Post was not clicked"
         ));
     }
     Ok(QuoteSurface {
         target,
         trace,
     })
+}
+
+fn chrome_call_args(method: &str, json_args: &str) -> Vec<String> {
+    vec![
+        "browser".into(),
+        "chrome".into(),
+        "call".into(),
+        method.into(),
+        json_args.into(),
+    ]
+}
+
+/// Read-only Chrome facts for the status tab. `windows.update` is not called:
+/// OpenCLI 2.0.2 rejects it for the owned group with managed_resource_conflict.
+fn quote_container_note(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    status_id: &str,
+) -> String {
+    let listed = quote_run(
+        bin,
+        runner,
+        &chrome_call_args("tabs.query", "[{}]"),
+        Duration::from_secs(20),
+    );
+    let Ok(listed) = listed else {
+        return "chrome windows unread · windows.update not called".into();
+    };
+    if listed.status != 0 {
+        return "chrome windows unread · windows.update not called".into();
+    }
+    let tabs = crate::publish::quote_status_tabs(&listed.stdout, status_id);
+    if tabs.len() != 1 {
+        return format!("chrome match {} · windows.update not called", tabs.len());
+    }
+    let tab = &tabs[0];
+    let group = if let Some(group_id) = tab.group_id {
+        match quote_run(
+            bin,
+            runner,
+            &chrome_call_args("tabGroups.get", &format!("[{group_id}]")),
+            Duration::from_secs(20),
+        ) {
+            Ok(output) if output.status == 0 => crate::publish::quote_group_name(&output.stdout),
+            _ => "unread",
+        }
+    } else {
+        "none"
+    };
+    let (state, focused) = match quote_run(
+        bin,
+        runner,
+        &chrome_call_args("windows.get", &format!("[{}]", tab.window_id)),
+        Duration::from_secs(20),
+    ) {
+        Ok(output) if output.status == 0 => crate::publish::quote_window_state(&output.stdout)
+            .map(|(state, focused)| (state.to_string(), if focused { "yes" } else { "no" }.to_string()))
+            .unwrap_or_else(|| ("unread".into(), "unread".into())),
+        _ => ("unread".into(), "unread".into()),
+    };
+    format!(
+        "chrome match 1 active {} group {group} window state {state} focused {focused} · windows.update not called",
+        if tab.active { "yes" } else { "no" }
+    )
 }
 
 fn read_quote_visibility(
@@ -2085,7 +2151,7 @@ fn run_quote_attachment(
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
     let page = format!("https://x.com/i/status/{target_id}");
-    let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page)?;
+    let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page, target_id)?;
     let script = crate::publish::quote_page_script(target_id, Some(text), true);
     let menu = browser_page_json(
         bin,
@@ -4931,6 +4997,21 @@ mod tests {
             &["browser", "eval", "document.visibilityState"],
             r#"{"ok":true,"data":"hidden"}"#,
         );
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "tabs.query"],
+            r#"{"ok":true,"data":[{"id":3,"windowId":5,"groupId":9,"active":true,"url":"https://x.com/cryptoXRPwhale/status/2118971448614334959"},{"id":4,"windowId":8,"groupId":-1,"active":true,"url":"https://example.com/unrelated"}]}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "tabGroups.get"],
+            r#"{"ok":true,"data":{"id":9,"title":"OpenCLI Browser","windowId":5}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "chrome", "call", "windows.get"],
+            r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false,"type":"normal"}}"#,
+        );
         runner.script("opencli", &["browser", "close"], "ok");
         let err = inspect_quote_attachment(
             "opencli",
@@ -4945,6 +5026,10 @@ mod tests {
         assert!(err.contains("A03BB6CCAE9402E75FCA7CB1AAED51FA"), "{err}");
         assert!(err.contains("visibility after open hidden"), "{err}");
         assert!(err.contains("visibility after select hidden"), "{err}");
+        assert!(err.contains("group OpenCLI Browser"), "{err}");
+        assert!(err.contains("window state minimized"), "{err}");
+        assert!(err.contains("focused no"), "{err}");
+        assert!(err.contains("windows.update not called"), "{err}");
         assert!(err.contains("ok selected absent"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
@@ -4959,6 +5044,7 @@ mod tests {
                 && args.iter().any(|arg| arg == "document.visibilityState")
         }));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update")));
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));

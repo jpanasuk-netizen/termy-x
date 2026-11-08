@@ -1032,6 +1032,85 @@ fn safe_ack_token(text: &str) -> String {
         .join(" ")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuoteStatusTab {
+    pub window_id: u64,
+    pub group_id: Option<u64>,
+    pub active: bool,
+}
+
+/// Tabs whose URL path is exactly this status. Other tabs are dropped.
+pub fn quote_status_tabs(stdout: &str, status_id: &str) -> Vec<QuoteStatusTab> {
+    let Some(value) = first_json_value(stdout) else {
+        return Vec::new();
+    };
+    let rows = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(rows) = rows else {
+        return Vec::new();
+    };
+    rows.iter().filter_map(|row| status_tab(row, status_id)).collect()
+}
+
+fn status_tab(row: &serde_json::Value, status_id: &str) -> Option<QuoteStatusTab> {
+    let url = row.get("url")?.as_str()?;
+    if !url_is_status(url, status_id) {
+        return None;
+    }
+    let window_id = row.get("windowId")?.as_u64()?;
+    let group_id = row.get("groupId").and_then(serde_json::Value::as_u64);
+    let group_id = group_id.filter(|id| *id > 0);
+    Some(QuoteStatusTab {
+        window_id,
+        group_id,
+        active: row.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false),
+    })
+}
+
+fn url_is_status(url: &str, status_id: &str) -> bool {
+    let marker = format!("/status/{status_id}");
+    let Some(at) = url.find(&marker) else {
+        return false;
+    };
+    let next = url[at + marker.len()..].chars().next();
+    next.is_none() || next == Some('?') || next == Some('#') || next == Some('/')
+}
+
+pub fn quote_window_state(stdout: &str) -> Option<(&'static str, bool)> {
+    let value = first_json_value(stdout)?;
+    let data = value.get("data").unwrap_or(&value);
+    let state = data.get("state")?.as_str()?;
+    let state = match state {
+        "minimized" => "minimized",
+        "normal" => "normal",
+        "maximized" => "maximized",
+        "fullscreen" => "fullscreen",
+        "locked-fullscreen" => "locked-fullscreen",
+        _ => return None,
+    };
+    let focused = data.get("focused").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Some((state, focused))
+}
+
+pub fn quote_group_name(stdout: &str) -> &'static str {
+    let Some(value) = first_json_value(stdout) else {
+        return "absent";
+    };
+    let title = value
+        .get("data")
+        .and_then(|data| data.get("title"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    match title {
+        "OpenCLI Browser" => "OpenCLI Browser",
+        "OpenCLI Adapter" => "OpenCLI Adapter",
+        "" => "absent",
+        _ => "other",
+    }
+}
+
 fn object_key_list(map: Option<&serde_json::Map<String, serde_json::Value>>) -> String {
     let Some(map) = map else {
         return "none".into();
@@ -2951,6 +3030,23 @@ mod tests {
         assert!(selected.ok);
         assert_eq!(selected.selected.as_deref(), Some(tab));
         assert_eq!(quote_select_ack("ok").note, "ok selected absent");
+        let tabs = quote_status_tabs(
+            r#"{"ok":true,"data":[{"id":3,"windowId":5,"groupId":9,"active":true,"url":"https://x.com/cryptoXRPwhale/status/2118971448614334959"},{"id":4,"windowId":8,"groupId":1,"active":true,"url":"https://example.com/other"}]}"#,
+            original,
+        );
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].window_id, 5);
+        assert_eq!(tabs[0].group_id, Some(9));
+        assert!(tabs[0].active);
+        assert_eq!(
+            quote_window_state(r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false}}"#),
+            Some(("minimized", false))
+        );
+        assert_eq!(
+            quote_group_name(r#"{"ok":true,"data":{"title":"OpenCLI Browser"}}"#),
+            "OpenCLI Browser"
+        );
+        assert_eq!(quote_group_name(r#"{"ok":true,"data":{"title":"Mail"}}"#), "other");
         assert!(inspect.contains(r"\/status\/"));
         assert!(inspect.contains(r"(\d+)"));
         assert!(!inspect.contains("/i/api/"));
