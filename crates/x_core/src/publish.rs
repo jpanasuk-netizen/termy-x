@@ -1879,7 +1879,78 @@ fn js_ascii_string(text: &str) -> String {
     out
 }
 
-/// OpenCLI 2.0 trusted click. `--name Quote` is the accessible name of the
+/// The status page. The Quote menu on this page is what attaches the source
+/// card. `compose/post?url=` put that URL into the editor as text.
+pub fn quote_status_url(status_id: &str) -> String {
+    let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    format!("https://x.com/i/status/{id}")
+}
+
+/// Trusted click on the target article's Repost control. `testid` is only
+/// `retweet` or `unretweet`. The confirm rows are not this selector.
+pub fn quote_opener_click_args(
+    cli: BrowserCli,
+    session: &str,
+    status_id: &str,
+    testid: &str,
+    tab: Option<&str>,
+) -> Vec<String> {
+    let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let testid = if testid == "unretweet" { "unretweet" } else { "retweet" };
+    let css = format!(r#"article:has(a[href*="/status/{id}"] time) [data-testid="{testid}"]"#);
+    let mut args = vec!["browser".to_string()];
+    if !cli.session_flag {
+        args.push(session.to_string());
+    }
+    args.push("click".into());
+    args.push(css);
+    if let Some(tab) = tab.filter(|value| is_browser_target_id(value)) {
+        args.push("--tab".into());
+        args.push(tab.to_string());
+    }
+    if cli.session_flag {
+        args.push("--session".into());
+        args.push(session.to_string());
+    }
+    if cli.window_flag {
+        args.push("--window".into());
+        args.push("foreground".into());
+    }
+    args
+}
+
+pub fn quote_click_note(stdout: &str) -> String {
+    let Some(value) = first_json_value(stdout) else {
+        return "click unread".into();
+    };
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
+        let code = value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error");
+        let safe: String = code
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+            .take(32)
+            .collect();
+        return format!("click error {}", if safe.is_empty() { "error" } else { &safe });
+    }
+    let data = value.get("data").unwrap_or(&value);
+    let method = match data.get("click_method").and_then(serde_json::Value::as_str) {
+        Some("cdp") => "cdp",
+        Some("ax") => "ax",
+        Some("js") => "js",
+        Some(_) => "other",
+        None => "absent",
+    };
+    format!("click {method}")
+}
+
+pub fn quote_click_trusted(stdout: &str) -> bool {
+    matches!(quote_click_note(stdout).as_str(), "click cdp" | "click ax")
+}
+
+/// Trusted click. `--name Quote` is the accessible name of the
 /// menu row. It is not `unretweetConfirm` and it is not Post.
 pub fn quote_native_click_args(cli: BrowserCli, session: &str, tab: Option<&str>) -> Vec<String> {
     let mut args = vec!["browser".to_string()];
@@ -1904,6 +1975,68 @@ pub fn quote_native_click_args(cli: BrowserCli, session: &str, tab: Option<&str>
         args.push("foreground".into());
     }
     args
+}
+
+/// Waits for the repost menu and records the Quote row. It does not click.
+pub fn quote_menu_read_script(target_id: &str) -> String {
+    let id_js = js_ascii_string(target_id);
+    format!(
+        r#"(async () => {{
+  const TARGET = {id_js};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const hrefShape = (el) => {{
+    const raw = el.getAttribute("href") || "";
+    if (!raw) return "none";
+    try {{
+      const parsed = new URL(raw, location.origin);
+      const keys = Array.from(parsed.searchParams.keys()).slice(0, 4);
+      return "path=" + parsed.pathname.slice(0, 80) + " keys=" + (keys.length ? keys.join(",") : "none");
+    }} catch (e) {{
+      return "unparsed";
+    }}
+  }};
+  let quoteItem = null;
+  let menu = null;
+  for (let i = 0; i < 20; i++) {{
+    menu = document.querySelector('[role="menu"], [data-testid="Dropdown"]');
+    const items = menu ? Array.from(menu.querySelectorAll('[role="menuitem"]')) : [];
+    quoteItem = items.find((el) => {{
+      const tid = el.getAttribute("data-testid") || "";
+      if (tid === "retweetConfirm" || tid === "unretweetConfirm" || tid === "reply") return false;
+      const label = (el.innerText || "").trim().split("\n")[0].trim();
+      return /^quote$/i.test(label);
+    }});
+    if (quoteItem) break;
+    await sleep(250);
+  }}
+  const menuShape = menu ? Array.from(menu.querySelectorAll('[role="menuitem"]')).slice(0, 4).map((el) => {{
+    const label = (el.innerText || "").trim().split("\n")[0].replace(/[^A-Za-z0-9 ]/g, "").trim().slice(0, 16) || "-";
+    const tid = el.getAttribute("data-testid") || "-";
+    return el.tagName + ":" + (el.getAttribute("role") || "-") + ":" + tid + ":" + label + ":" + hrefShape(el);
+  }}).join(" | ") : "none";
+  const href = quoteItem ? (quoteItem.getAttribute("href") || "") : "";
+  const tid = quoteItem ? (quoteItem.getAttribute("data-testid") || "") : "";
+  const refused = tid === "retweetConfirm" || tid === "unretweetConfirm" || href.indexOf("in_reply_to") >= 0;
+  const report = {{
+    stage: "menu",
+    path: location.pathname,
+    composer: false,
+    composer_kind: "unknown",
+    card: false,
+    quote_testids: 0,
+    clicked_post: false,
+    clicked_repost_confirm: refused,
+    selected_label: quoteItem ? (quoteItem.innerText || "").trim().split("\n")[0].trim().slice(0, 24) : "",
+    selected_testid: tid,
+    selected_href_kind: quoteItem ? hrefShape(quoteItem) : "none",
+    selected_scope: menu ? "menu" : "none",
+    menu_shape: menuShape,
+    message: !quoteItem ? "Quote menu item did not appear. Post was not clicked." : (refused ? "Refused the repost confirm. Post was not clicked." : "Quote row recorded. Post was not clicked.")
+  }};
+  window.__qxReport = report;
+  return JSON.stringify(report);
+}})()"#
+    )
 }
 
 /// Types the commentary and clicks Post once. Runs only after a snap has
@@ -3507,6 +3640,26 @@ mod tests {
         assert!(snap.contains("inside-editor"));
         assert!(snap.contains("rolelinks"));
         assert!(snap.contains("url-exact"));
+        let menu = crate::publish::quote_menu_read_script(original);
+        assert!(!menu.contains(".click("));
+        assert!(menu.contains("Quote row recorded"));
+        assert!(menu.contains("retweetConfirm"));
+        let opener = crate::publish::quote_opener_click_args(
+            browser_cli_from_help(""),
+            "termyx-quote",
+            original,
+            "retweet",
+            None,
+        );
+        assert!(opener.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]")));
+        assert!(opener.iter().any(|arg| arg.contains("/status/2118971448614334959")));
+        assert!(!opener.iter().any(|arg| arg.contains("Confirm")));
+        assert_eq!(
+            crate::publish::quote_click_note(r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#),
+            "click cdp"
+        );
+        assert!(!crate::publish::quote_click_trusted(r#"{"ok":true,"data":{"click_method":"js"}}"#));
+        assert!(crate::publish::quote_click_trusted(r#"{"ok":true,"data":{"click_method":"ax"}}"#));
         assert!(snap.contains("A visible link is not the card"));
         assert!(snap.contains("ancestors"));
         assert!(snap.contains("hasBox && qHits.length"));

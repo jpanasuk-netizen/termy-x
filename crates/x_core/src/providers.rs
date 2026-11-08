@@ -2248,6 +2248,27 @@ fn quote_container_note(
     )
 }
 
+fn quote_native_opener(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    cli: crate::publish::BrowserCli,
+    tab: Option<&str>,
+    status_id: &str,
+) -> Result<String, String> {
+    let mut notes = Vec::new();
+    for testid in ["retweet", "unretweet"] {
+        let args = crate::publish::quote_opener_click_args(cli, QUOTE_SESSION, status_id, testid, tab);
+        match quote_run(bin, runner, &args, Duration::from_secs(20)) {
+            Ok(output) if crate::publish::quote_click_trusted(&output.stdout) => {
+                return Ok(format!("opener {testid} {}", crate::publish::quote_click_note(&output.stdout)));
+            }
+            Ok(output) => notes.push(format!("opener {testid} {}", crate::publish::quote_click_note(&output.stdout))),
+            Err(_) => notes.push(format!("opener {testid} click unread")),
+        }
+    }
+    Err(notes.join(" · "))
+}
+
 fn read_quote_visibility(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
@@ -2272,7 +2293,7 @@ fn run_quote_attachment(
     inspect: bool,
 ) -> Result<crate::publish::QuotePageReport, String> {
     let cli = browser_cli_for(bin, runner)?;
-    let page = crate::publish::quote_composer_url(target_id);
+    let page = crate::publish::quote_status_url(target_id);
     let surface = open_visible_quote_page(bin, runner, cli, QUOTE_SESSION, &page, target_id)?;
     let click_visibility = read_quote_visibility(
         bin,
@@ -2289,6 +2310,39 @@ fn run_quote_attachment(
             "stage visibility · {view} · native click was not sent · Post was not clicked"
         ));
     }
+    let opener = match quote_native_opener(bin, runner, cli, surface.target.as_deref(), target_id) {
+        Ok(note) => note,
+        Err(note) => {
+            let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+            let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
+            let leftover = quote_owned_leftover(bin, runner);
+            return Err(format!(
+                "stage menu · {view} · {note} · {shot} · {close_note} · {leftover} · Post was not clicked"
+            ));
+        }
+    };
+    let menu_js = crate::publish::quote_menu_read_script(target_id);
+    let menu_note = match browser_page_json(
+        bin,
+        runner,
+        cli,
+        QUOTE_SESSION,
+        None,
+        &menu_js,
+        "qx",
+        true,
+        false,
+    ) {
+        Ok(report) => report.message,
+        Err(error) => error,
+    };
+    let quote_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
+    let quote_click = quote_run(bin, runner, &quote_args, Duration::from_secs(20));
+    let quote_note = match &quote_click {
+        Ok(output) => crate::publish::quote_click_note(&output.stdout),
+        Err(_) => "click unread".into(),
+    };
+    let quote_trusted = matches!(quote_note.as_str(), "click cdp" | "click ax");
     let snap_js = crate::publish::quote_snap_script(target_id);
     let mut after = browser_page_json(
         bin,
@@ -2302,7 +2356,7 @@ fn run_quote_attachment(
         false,
     )?;
     if !crate::publish::quote_inspect_ready(&after) {
-        for _ in 0..7 {
+        for _ in 0..16 {
             std::thread::sleep(Duration::from_millis(250));
             let again = crate::publish::browser_command(
                 cli,
@@ -2324,15 +2378,16 @@ fn run_quote_attachment(
             }
         }
     }
-    if inspect || !crate::publish::quote_inspect_ready(&after) {
+    let ready = crate::publish::quote_inspect_ready(&after) && quote_trusted;
+    if inspect || !ready {
         let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let line = format!(
-            "{} · {shot} · {close_note} · {leftover}",
+            "{} · {opener} · menu {menu_note} · quote {quote_note} · {shot} · {close_note} · {leftover}",
             with_quote_view(crate::publish::quote_report_line(&after), &view)
         );
-        return if crate::publish::quote_inspect_ready(&after) {
+        return if ready {
             Ok(after)
         } else {
             Err(line)
@@ -4811,7 +4866,11 @@ mod tests {
             r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_menu);
-        runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "click"],
+            r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#,
+        );
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"], quote_snap);
         runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxPost))"], quote_page);
         runner.script("opencli", &["browser", "termyx-quote-read", "open"], "ok");
@@ -4885,8 +4944,10 @@ mod tests {
         assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
         assert_eq!(calls[1].1[3], "harness reply");
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("2118971448614334959"))
+            args.iter().any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
+                && args.iter().any(|arg| arg == "open")
         }));
+        assert!(calls.iter().any(|(_, args)| args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| {
             args.get(1).map(String::as_str) == Some("post")
@@ -5004,7 +5065,11 @@ mod tests {
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
             menu,
         );
-        runner.script("opencli", &["browser", "termyx-quote", "click"], "ok");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "click"],
+            r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#,
+        );
         runner.script(
             "opencli",
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
@@ -5023,7 +5088,8 @@ mod tests {
         assert!(err.contains("No quote attachment"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("compose/post") && arg.contains("https://x.com/i/status/20"))
+            args.iter().any(|arg| arg.contains("https://x.com/i/status/20") && arg.contains("/status/20"))
+                && args.iter().any(|arg| arg == "open")
         }));
         assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
@@ -5031,9 +5097,13 @@ mod tests {
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
-        assert!(!calls.iter().any(|(_, args)| {
+        assert!(calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")
         }));
+        assert!(calls.iter().any(|(_, args)| {
+            args.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]"))
+        }));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("retweetConfirm") || arg.contains("unretweetConfirm"))));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("qxPost"))));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("post")));
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
@@ -5072,6 +5142,11 @@ mod tests {
             "opencli",
             &["browser", "termyx-quote", "eval", vis.as_str()],
             r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":false,\"t\":true,\"m\":false,\"c\":true,\"host\":\"x.com\"}"}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "click"],
+            r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#,
         );
         runner.script(
             "opencli",
