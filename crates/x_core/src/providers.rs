@@ -2358,91 +2358,6 @@ fn read_quote_visibility(
     }
 }
 
-fn attach_quote_image(
-    bin: &str,
-    runner: &dyn crate::io::CommandRunner,
-    cli: crate::publish::BrowserCli,
-    surface: &QuoteSurface,
-    media: &[PathBuf],
-) -> Result<(), String> {
-    crate::publish::validate_media_paths(media)?;
-    if media.len() != 1 {
-        return Err("Quote can attach one image. Remove the extras. Nothing was posted. Post was not clicked.".into());
-    }
-    let path = &media[0];
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("image")
-        .to_string();
-    let upload_args = crate::publish::quote_upload_args(
-        cli,
-        QUOTE_SESSION,
-        surface.target.as_deref(),
-        &path.to_string_lossy(),
-    );
-    let started = std::time::Instant::now();
-    let uploaded = quote_run(bin, runner, &upload_args, Duration::from_secs(90));
-    let fail = |note: String| -> String {
-        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
-        let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
-        let leftover = quote_owned_leftover(bin, runner);
-        format!("stage upload · {note} · {shot} · {close_note} · {leftover} · Post was not clicked")
-    };
-    let stdout = match uploaded {
-        Ok(output) => format!("{}\n{}", output.stdout, output.stderr),
-        Err(error) => return Err(fail(error)),
-    };
-    if let Err(error) = crate::publish::quote_upload_read(&stdout, &file_name) {
-        let bridge = crate::publish::quote_upload_log_bridge(&error);
-        crate::publish::log_action(
-            "quote",
-            "upload",
-            &[
-                ("ack", "rejected"),
-                ("preview", "no"),
-                ("bridge", &bridge),
-                ("elapsed_ms", &started.elapsed().as_millis().to_string()),
-            ],
-        );
-        return Err(fail(error));
-    }
-    let probe = crate::publish::quote_browser_args(
-        cli,
-        QUOTE_SESSION,
-        &["eval", crate::publish::quote_media_preview_expr()],
-        surface.target.as_deref(),
-        true,
-    );
-    let mut preview = false;
-    for _ in 0..8 {
-        let Ok(output) = quote_run(bin, runner, &probe, Duration::from_secs(20)) else {
-            std::thread::sleep(Duration::from_millis(200));
-            continue;
-        };
-        if output.status == 0 && output.stdout.contains("media-preview yes") {
-            preview = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    crate::publish::log_action(
-        "quote",
-        "upload",
-        &[
-            ("ack", if preview { "preview" } else { "rejected" }),
-            ("preview", if preview { "yes" } else { "no" }),
-            ("elapsed_ms", &started.elapsed().as_millis().to_string()),
-        ],
-    );
-    if !preview {
-        return Err(fail(
-            "the image did not appear in the composer. Not marked attached. Post was not clicked.".into(),
-        ));
-    }
-    Ok(())
-}
-
 fn run_quote_attachment(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
@@ -2451,6 +2366,9 @@ fn run_quote_attachment(
     media: &[PathBuf],
     inspect: bool,
 ) -> Result<(crate::publish::QuotePageReport, u64), String> {
+    if !media.is_empty() {
+        return Err(crate::publish::quote_image_unsupported().into());
+    }
     let epoch = begin_quote_lease();
     crate::publish::log_action("quote", "start", &[("ack", "pending"), ("epoch", &epoch.to_string())]);
     match run_quote_attachment_epoch(bin, runner, target_id, text, media, inspect, epoch) {
@@ -2575,7 +2493,10 @@ fn run_quote_attachment_epoch(
         }
     }
     let ready = crate::publish::quote_inspect_ready(&after) && quote_trusted;
-    if !ready || (inspect && media.is_empty()) {
+    if !media.is_empty() {
+        return Err(crate::publish::quote_image_unsupported().into());
+    }
+    if !ready || inspect {
         let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
@@ -2589,41 +2510,15 @@ fn run_quote_attachment_epoch(
             Err(line)
         };
     }
-    if !media.is_empty() {
-        attach_quote_image(bin, runner, cli, &surface, media)?;
-        let again = browser_page_json(
-            bin,
-            runner,
-            cli,
-            QUOTE_SESSION,
-            None,
-            &crate::publish::quote_snap_script_bound(target_id, &screen, &source_text),
-            "qxSnap",
-            true,
-            false,
-        )?;
-        if !crate::publish::quote_inspect_ready(&again) {
-            let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
-            let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
-            let leftover = quote_owned_leftover(bin, runner);
-            return Err(format!(
-                "stage upload · the quote card changed after the image attach · not marked attached · {shot} · {close_note} · {leftover} · Post was not clicked"
-            ));
-        }
-    }
     if inspect {
         let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
-        let image = if media.is_empty() {
-            "image none".to_string()
-        } else {
-            "image preview yes".to_string()
-        };
+        let image = "image none".to_string();
         let _ = crate::publish::log_action(
             "quote",
             "inspect",
-            &[("ack", "card"), ("new_id", "none"), ("preview", if media.is_empty() { "none" } else { "yes" })],
+            &[("ack", "card"), ("new_id", "none"), ("preview", "none")],
         );
         return Ok(crate::publish::QuotePageReport {
             message: format!(
@@ -2725,11 +2620,8 @@ pub fn inspect_quote_attachment(
     target_id: &str,
     media: &[PathBuf],
 ) -> Result<String, String> {
-    if let Err(error) = crate::publish::validate_media_paths(media) {
-        return Err(format!("{error} Post was not clicked."));
-    }
-    if media.len() > 1 {
-        return Err("Quote can attach one image. Remove the extras. Post was not clicked.".into());
+    if !media.is_empty() {
+        return Err(crate::publish::quote_image_unsupported().into());
     }
     let (report, _) = run_quote_attachment(bin, runner, target_id, "", media, true)?;
     let line = crate::publish::quote_report_line(&report);
@@ -2990,13 +2882,8 @@ impl OpenCliPublisher {
             if text.is_empty() {
                 return Err("write your quote first — nothing was posted".into());
             }
-            if media.len() > 1 {
-                return Err(
-                    "Quote can attach one image. Remove the extras. Nothing was posted.".into(),
-                );
-            }
-            if let Err(error) = crate::publish::validate_media_paths(media) {
-                return Err(format!("{error} Nothing was posted."));
+            if !media.is_empty() {
+                return Err(crate::publish::quote_image_unsupported().into());
             }
             let target_id = crate::model::post_id_from_input(target_url);
             let _composer = composer_gate();
@@ -5327,6 +5214,25 @@ mod tests {
     }
 
     #[test]
+    fn quote_cleanup_cannot_close_while_the_composer_is_open() {
+        let held = composer_gate();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = entered.clone();
+        let worker = std::thread::spawn(move || {
+            let _gate = composer_gate();
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !entered.load(std::sync::atomic::Ordering::SeqCst),
+            "cleanup took the composer gate while a write still held it"
+        );
+        drop(held);
+        worker.join().expect("cleanup thread");
+        assert!(entered.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
     fn quote_open_failure_keeps_the_opencli_cause() {
         use crate::io::{CommandOutput, CommandRunner};
         struct Runner;
@@ -6790,159 +6696,28 @@ mod tests {
     }
 
     #[test]
-    fn quote_image_inspect_proves_preview_without_posting() {
-        use crate::io::{CommandOutput, CommandRunner};
-        struct Runner {
-            calls: Mutex<Vec<Vec<String>>>,
-            snaps: Mutex<u32>,
-            upload: String,
-            preview: String,
-            later_snap: String,
-            absent: bool,
-        }
-        impl CommandRunner for Runner {
-            fn exists(&self, _: &str) -> bool { true }
-            fn run(&self, _: &str, args: &[String]) -> Result<CommandOutput, String> {
-                self.calls.lock().expect("calls").push(args.to_vec());
-                let joined = args.join("\n");
-                let body = if joined.contains("--help") {
-                    "Usage: opencli browser open <url> --session <name>\n--window <mode>\n".into()
-                } else if args.iter().any(|arg| arg == "upload") {
-                    self.upload.clone()
-                } else if joined.contains("media-preview") {
-                    self.preview.clone()
-                } else if joined.contains("visibilityState") {
-                    r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#.into()
-                } else if args.iter().any(|arg| arg == "open") {
-                    r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#.into()
-                } else if args.iter().any(|arg| arg == "click") {
-                    r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#.into()
-                } else if joined.contains("eval(atob(window.__qxSnap))") {
-                    let n = {
-                        let mut snaps = self.snaps.lock().expect("snaps");
-                        *snaps += 1;
-                        *snaps
-                    };
-                    if self.absent && n > 1 {
-                        return Ok(CommandOutput { status: 1, stdout: String::new(), stderr: "snap stopped".into() });
-                    }
-                    if self.absent {
-                        r#"{"stage":"inspect","composer":false,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"message":"Quote card absent. Post was not clicked."}"#.into()
-                    } else {
-                    let uploaded = self.calls.lock().expect("calls").iter().any(|call| call.iter().any(|arg| arg == "upload"));
-                    if uploaded { self.later_snap.clone() } else {
-                        r#"{"stage":"inspect","composer":true,"composer_kind":"quote","card":true,"quote_testids":1,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"message":"Quote attachment is visible. Post was not clicked."}"#.into()
-                    }
-                    }
-                } else if joined.contains("eval(atob(window.__qxPost))") {
-                    r#"{"stage":"posted","composer":true,"composer_kind":"quote","card":true,"quote_testids":1,"clicked_post":true,"clicked_repost_confirm":false,"quoted_status_id":"2118971448614334959","new_status_id":"2119413665547821165","text_landed":true,"message":"Quote tweet posted successfully."}"#.into()
-                } else if joined.contains("eval(atob(window.__qx))") {
-                    r#"{"stage":"menu","selected_label":"Quote","selected_scope":"menu","clicked_post":false,"card":false,"quote_testids":0,"message":"Quote row recorded. Post was not clicked."}"#.into()
-                } else if joined.contains("location.href") {
-                    "https://x.com/i/status/2118971448614334959".into()
-                } else if joined.contains("tabGroups") {
-                    r#"{"ok":true,"data":[]}"#.into()
-                } else {
-                    "ok".into()
-                };
-                Ok(CommandOutput { status: 0, stdout: body, stderr: String::new() })
-            }
-        }
+    fn quote_image_is_refused_before_any_browser_command() {
+        use crate::publish::EngageAction;
+        let runner = Arc::new(ScriptedRunner::new());
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("marked-quote-probe.png");
-        std::fs::write(&image, b"\x89PNG\r\nprobe").unwrap();
-        let envelope = r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["marked-quote-probe.png"],"target":"fileInput","matches_n":1}}"#;
-        let ready = r#"{"stage":"inspect","composer":true,"composer_kind":"quote","card":true,"quote_testids":1,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"message":"Quote attachment is visible. Post was not clicked."}"#;
-        let runner = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: envelope.into(),
-            preview: r#"{"ok":true,"data":"media-preview yes"}"#.into(),
-            later_snap: ready.into(),
-            absent: false,
-        });
-        let line = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[image.clone()]).expect("inspect");
-        assert!(line.contains("image preview yes"), "{line}");
-        assert!(line.contains("Post was not clicked"), "{line}");
-        let calls = runner.calls.lock().unwrap().clone();
-        assert!(calls.iter().any(|args| args.iter().any(|arg| arg == "upload") && args.iter().any(|arg| arg == "--testid") && args.iter().any(|arg| arg == "fileInput") && args.windows(2).any(|pair| pair[0] == "--session" && pair[1] == "termyx-quote") && args.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")));
-        assert!(!calls.iter().any(|args| args.iter().any(|arg| arg.contains("qxPost"))));
-
-        let confirm_runner = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: envelope.into(),
-            preview: r#"{"ok":true,"data":"media-preview yes"}"#.into(),
-            later_snap: ready.into(),
-            absent: false,
-        });
-        let publisher = OpenCliPublisher::new(&quiet_config(), confirm_runner.clone());
-        let receipt = publisher
+        std::fs::write(&image, b"png").unwrap();
+        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
+        assert!(err.contains("cannot attach an image"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
+        assert!(runner.calls.lock().unwrap().is_empty(), "inspect must not open the browser");
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let err = publisher
             .engage(
-                crate::publish::EngageAction::Quote,
+                EngageAction::Quote,
                 "https://x.com/i/status/2118971448614334959",
                 Some("100 is enough"),
-                &[image.clone()],
+                &[image],
             )
-            .expect("confirmed quote");
-        assert!(receipt.contains("Quote tweet posted successfully."), "{receipt}");
-        let confirm_calls = confirm_runner.calls.lock().unwrap().clone();
-        let upload_at = confirm_calls.iter().position(|args| args.iter().any(|arg| arg == "upload")).expect("upload");
-        let post_at = confirm_calls.iter().position(|args| args.iter().any(|arg| arg.contains("qxPost"))).expect("post");
-        assert!(upload_at < post_at);
-        assert_eq!(confirm_calls.iter().filter(|args| args.iter().any(|arg| arg == "upload")).count(), 1);
-
-        let blocked = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: r#"{"ok":false,"error":{"code":"-32000","message":"Not allowed"}}"#.into(),
-            preview: "media-preview yes".into(),
-            later_snap: ready.into(),
-            absent: false,
-        });
-        let err = inspect_quote_attachment("opencli", blocked.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
-        assert!(err.contains("-32000"), "{err}");
-        assert!(err.contains("Not allowed"), "{err}");
-        assert!(err.contains("not retried"), "{err}");
-        assert!(err.contains("Post was not clicked"), "{err}");
-        assert_eq!(blocked.calls.lock().unwrap().iter().filter(|args| args.iter().any(|arg| arg == "upload")).count(), 1);
-
-        let no_preview = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: envelope.into(),
-            preview: r#"{"ok":true,"data":"media-preview no"}"#.into(),
-            later_snap: ready.into(),
-            absent: false,
-        });
-        let err = inspect_quote_attachment("opencli", no_preview.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
-        assert!(err.contains("did not appear"), "{err}");
-        assert!(!no_preview.calls.lock().unwrap().iter().any(|args| args.iter().any(|arg| arg.contains("qxPost"))));
-
-        let changed = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: envelope.into(),
-            preview: r#"{"ok":true,"data":"media-preview yes"}"#.into(),
-            later_snap: r#"{"stage":"composer","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"message":"Quote card was not proven. Post was not clicked."}"#.into(),
-            absent: false,
-        });
-        let err = inspect_quote_attachment("opencli", changed.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
-        assert!(err.contains("card changed"), "{err}");
-        assert!(!changed.calls.lock().unwrap().iter().any(|args| args.iter().any(|arg| arg.contains("qxPost"))));
-
-        let absent = Arc::new(Runner {
-            calls: Mutex::new(Vec::new()),
-            snaps: Mutex::new(0),
-            upload: envelope.into(),
-            preview: r#"{"ok":true,"data":"media-preview yes"}"#.into(),
-            later_snap: ready.into(),
-            absent: true,
-        });
-        let err = inspect_quote_attachment("opencli", absent.as_ref(), "2118971448614334959", &[image]).unwrap_err();
-        assert!(err.contains("card absent"), "{err}");
-        assert!(err.contains("Post was not clicked"), "{err}");
-        assert!(!absent.calls.lock().unwrap().iter().any(|args| args.iter().any(|arg| arg == "upload")));
+            .unwrap_err();
+        assert!(err.contains("cannot attach an image"), "{err}");
+        assert!(err.contains("Nothing was posted"), "{err}");
+        assert!(runner.calls.lock().unwrap().is_empty(), "quote must not open the browser");
     }
 
     #[test]
@@ -6965,8 +6740,9 @@ mod tests {
                 &images,
             )
             .unwrap_err();
-        assert!(err.contains("one image"), "{err}");
+        assert!(err.contains("cannot attach an image"), "{err}");
         assert!(err.contains("Nothing was posted"), "{err}");
+        assert!(err.contains("Post was not clicked"), "{err}");
         assert!(runner.calls.lock().unwrap().is_empty());
     }
 

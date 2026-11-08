@@ -56,22 +56,6 @@ Legacy check-only wrapper: `scripts/patch-opencli-media.ps1` (now calls the reap
 - Live keep post with image: https://x.com/Jasper_Black/status/2107570911679246724 (`has_media: true`)
 - Free OpenCLI path only — no X API credits used
 
-## Quote image (OpenCLI 2.0.2)
+## Quote image
 
-A quote image does not use `twitter post --images` and does not use the local Hermes `post.js` patch. After the native quote card is proven, Termy calls the documented command once:
-
-```text
-opencli browser upload --testid fileInput <file> --tab <returned-page-id> --session termyx-quote --window foreground
-```
-
-The envelope must say `uploaded: true` and name the file. Termy then reads the composer preview. Avatar and quoted-text emoji do not count. A bridge refusal stops. There is no second upload and Post is not clicked. The refusal keeps the CLI's own code and message (`not_file_input`, `Page.fileChooserOpened`, or `-32000` / `Not allowed`). A missing card, a card that changes after the upload, or a missing preview also leaves Post unclicked.
-
-OpenCLI 2.0.2 checks that the resolved target is `input[type=file]` before it asks the extension to attach. The extension then intercepts a file chooser and clicks that input. Chrome's `-32000 Not allowed` remains the refusal for `DOM.setFileInputFiles` under the extension debugger when that chooser path is not accepted. Neither case is retried from Termy.
-
-This command does not post:
-
-```text
-termy-xcli write quote --to 2118971448614334959 --inspect --media marked-quote-probe.png
-```
-
-Use one allowlisted jpg, png, gif, or webp that a worker generated for the probe. Do not pass `--confirm yes`.
+Quote images are not in this release. One Windows inspect of OpenCLI 2.0.2 `browser upload` returned `-32000 Not allowed` on a single attempt, then closed the session (0 groups, 0 tabs). Termy does not call upload again. The Q-tweet button and `write quote --media` stop with a plain unsupported message before the browser opens. A new post can still use `twitter post --images`. In-app image viewing and libVLC playback are unchanged. Text quotes stay on the native quote card.

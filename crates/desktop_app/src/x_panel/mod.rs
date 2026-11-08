@@ -605,7 +605,6 @@ enum EditorId {
 enum PickTarget {
     Compose,
     Reply,
-    Quote,
 }
 
 #[derive(Clone, PartialEq)]
@@ -5332,12 +5331,12 @@ impl XPanel {
         } else {
             target_post.url.clone()
         };
-        if let Err(error) = termy_x::publish::validate_media_paths(&self.quote_media) {
-            self.notice = Some(error);
+        if !self.quote_media.is_empty() {
+            self.notice = Some(termy_x::publish::quote_image_unsupported().to_string());
             cx.notify();
             return;
         }
-        let media = self.quote_media.clone();
+        let media: Vec<std::path::PathBuf> = Vec::new();
         self.quote_posting = true;
         termy_x::publish::log_action("quote", "start", &[("ack", "pending"), ("new_id", "none")]);
         self.notice = Some(termy_x::publish::quote_visible_window_note().to_string());
@@ -10089,7 +10088,7 @@ impl XPanel {
                         rgb(0x9ad7ff)
                     })
                     .child(format!(
-                        "{} / {} characters \u{b7} Post button sends \u{b7} quotes attach 1 image",
+                        "{} / {} characters \u{b7} Post button sends \u{b7} text only",
                         count.weighted, count.limit
                     )),
             );
@@ -10135,11 +10134,11 @@ impl XPanel {
                 .flex_wrap()
                 .child(x_button!(
                     "x-quote-attach",
-                    "Attach image",
+                    "Images not supported",
                     cx.listener(|this, _, _, cx| {
-                        this.pick_target = PickTarget::Quote;
-                        this.attach_images(cx);
+                        this.notice = Some(termy_x::publish::quote_image_unsupported().to_string());
                         cx.stop_propagation();
+                        cx.notify();
                     })
                 ))
                 .child(x_button!(
@@ -10803,7 +10802,6 @@ impl XPanel {
         let attached = match self.pick_target {
             PickTarget::Compose => self.media.len(),
             PickTarget::Reply => self.reply_media.len(),
-            PickTarget::Quote => self.quote_media.len(),
         };
         if attached >= 4 {
             self.notice = Some("Max 4 images — remove one first.".into());
@@ -10842,7 +10840,6 @@ impl XPanel {
         let target = match self.pick_target {
             PickTarget::Compose => &mut self.media,
             PickTarget::Reply => &mut self.reply_media,
-            PickTarget::Quote => &mut self.quote_media,
         };
         let mut added = 0usize;
         let mut rejected: Vec<String> = Vec::new();
@@ -11857,6 +11854,17 @@ mod edit_keys_tests {
         soft_wrap_ranges,
     };
     use termy_x::providers::TimelineFeed;
+
+    #[test]
+    fn quote_image_button_does_not_start_a_post() {
+        let note = termy_x::publish::quote_image_unsupported();
+        assert!(note.contains("cannot attach an image"));
+        assert!(note.contains("new post"));
+        assert!(note.contains("Nothing was posted"));
+        assert!(note.contains("Post was not clicked"));
+        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet));
+        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::Post));
+    }
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {

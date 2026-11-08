@@ -21,7 +21,7 @@ use crate::splash::{render_splash, splash_ansi};
     name = "termy-xcli",
     version,
     about = "Termy X - read and post without X API credits",
-    after_help = "The program file is termy-xcli.exe. Do not run a file named x.exe.\nExamples:\n  termy-xcli doctor\n  termy-xcli connect --check\n  termy-xcli write quote --to ID --inspect\n  termy-xcli write quote --to ID --inspect --media marked-quote-probe.png",
+    after_help = "The program file is termy-xcli.exe. Do not run a file named x.exe.\nExamples:\n  termy-xcli doctor\n  termy-xcli connect --check\n  termy-xcli write quote --to ID --inspect",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -245,10 +245,9 @@ enum WriteOp {
         /// Omit with --inspect. Required before a real quote.
         text: Option<String>,
         /// Open the quote composer and report the card. Does not click Post.
-        /// With --media, also attaches that one image and checks the preview.
         #[arg(long)]
         inspect: bool,
-        /// One jpg, png, gif, or webp. With --inspect, Post is not clicked.
+        /// Not supported for a quote. The command stops before the browser opens.
         #[arg(long)]
         media: Option<PathBuf>,
     },
@@ -394,8 +393,6 @@ fn print_help_guide() {
     println!("  termy-xcli write post \"text\"                  Dry-run. Does not start the GUI or post.");
     println!("  termy-xcli write reply --to ID \"text\"         Dry-run a reply");
     println!("  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post");
-    println!("  termy-xcli write quote --to ID --inspect --media marked-quote-probe.png");
-    println!("                                              Attach one image and check the preview. Does not click Post");
     println!("  termy-xcli write quote --to ID \"text\"         Dry-run a Q-tweet");
     println!("  termy-xcli write repost --to ID                Dry-run a repost");
     println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
@@ -1498,8 +1495,12 @@ fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -
             text,
         },
         WriteOp::Quote { to, text, inspect, media } => {
+            if media.is_some() {
+                eprintln!("{}", crate::publish::quote_image_unsupported());
+                return 1;
+            }
             if inspect {
-                return inspect_quote(&to, media, io);
+                return inspect_quote(&to, None, io);
             }
             GuiWrite::Quote {
                 target_id: to,

@@ -82,6 +82,13 @@ const WITHHELD_OUTCOMES: [WriteOutcome; 4] = [
     WriteOutcome::Unsupported,
 ];
 
+/// Quote images are out of this release. Chrome answered the one
+/// `browser upload` attempt with `-32000 Not allowed`. Say so before any
+/// browser command. A new post can still attach images.
+pub fn quote_image_unsupported() -> &'static str {
+    "Quote tweets cannot attach an image in this release. Send the words, or attach the image on a new post. Nothing was posted. Post was not clicked."
+}
+
 /// Success note after the provider confirms the write. Each action has
 /// its own text. A Q-tweet says Q-tweet, not the generic post note.
 pub fn success_note(action: UserWrite) -> &'static str {
@@ -587,19 +594,15 @@ fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
             if text.is_empty() {
                 return Err("Write the quote first. Nothing was sent.".into());
             }
-            if media.len() > 1 {
-                return Err(
-                    "Quote can attach one image. Remove the extras. Nothing was sent.".into(),
-                );
+            if !media.is_empty() {
+                return Err(quote_image_unsupported().into());
             }
-            validate_media_paths(media)
-                .map_err(|error| format!("{error} Nothing was sent."))?;
             let url = crate::model::post_url("", &target_id);
             Ok(PreparedWrite {
                 kind: PreparedKind::Quote {
                     url,
                     target_id,
-                    media: media.clone(),
+                    media: Vec::new(),
                 },
                 text: text.to_string(),
             })
@@ -4213,7 +4216,10 @@ mod tests {
             8,
         );
         match dry_image {
-            GuiWriteOutcome::DryRun { detail, .. } => assert!(detail.contains("image one"), "{detail}"),
+            GuiWriteOutcome::Rejected { message } => {
+                assert!(message.contains("cannot attach an image"), "{message}");
+                assert!(message.contains("Nothing was posted"), "{message}");
+            }
             other => panic!("{other:?}"),
         }
         assert_eq!(publisher.engage.lock().expect("engage").len(), before);
@@ -4225,7 +4231,7 @@ mod tests {
                 write: GuiWrite::Quote {
                     target_id: "2118971448614334959".into(),
                     text: "100 is enough".into(),
-                    media: vec![image.clone()],
+                    media: vec![image],
                 },
                 confirm: Some("yes".into()),
                 account: "jasper_black".into(),
@@ -4234,9 +4240,8 @@ mod tests {
             18,
             9,
         );
-        assert!(matches!(confirmed, GuiWriteOutcome::Sent { .. }), "{confirmed:?}");
-        let logged = publisher.engage.lock().expect("engage").clone();
-        assert_eq!(logged.last().map(|row| row.3.clone()), Some(vec![image]));
+        assert!(matches!(confirmed, GuiWriteOutcome::Rejected { .. }), "{confirmed:?}");
+        assert_eq!(publisher.engage.lock().expect("engage").len(), before);
     }
 
     #[test]
