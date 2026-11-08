@@ -169,12 +169,12 @@ pub fn quote_action_label() -> &'static str {
     "Q-tweet"
 }
 
-/// Posts, replies, and retweets pass OpenCLI `--window background`.
-/// That flag stops focus theft. The window can still exist; on Windows the
-/// automation window is minimized while the command runs. Visibility is
-/// never spoofed, and the window is not moved off-screen.
+/// Posts and replies pass OpenCLI `--window background`, which asks the
+/// bridge not to take focus. The page stays visible: minimizing it makes
+/// Chrome report the document hidden, and the paste and Post click are
+/// refused. The window is not moved off-screen and visibility is not spoofed.
 pub fn background_write_note() -> &'static str {
-    "Posting through your X session in the background. OpenCLI is asked not to take focus."
+    "Posting through your X session. The window stays visible so the post can be typed, and OpenCLI is asked not to take focus."
 }
 
 /// Native Quote clicks are refused when Chrome reports the page hidden or
@@ -3693,7 +3693,8 @@ mod tests {
                 assert!(!withheld.contains(success), "{action:?} {outcome:?}");
             }
         }
-        assert!(background_write_note().contains("background"));
+        assert!(background_write_note().contains("stays visible"));
+        assert!(background_write_note().contains("not to take focus"));
         assert!(!background_write_note().contains("no browser"));
         assert!(quote_visible_window_note().contains("visible"));
         assert!(quote_visible_window_note().contains("focused"));
