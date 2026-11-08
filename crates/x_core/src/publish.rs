@@ -1182,7 +1182,7 @@ fn known_visibility(text: &str) -> String {
 pub fn quote_visibility_expr(status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
     format!(
-        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:(location.pathname.indexOf(\"/status/{id}\")>=0||(location.search||\"\").indexOf(\"{id}\")>=0),host:location.host}})"
+        "JSON.stringify({{v:document.visibilityState,h:document.hidden===true,p:document.prerendering===true,f:document.hasFocus(),t:window.top===window,m:(location.pathname.indexOf(\"/status/{id}\")>=0||(location.search||\"\").indexOf(\"{id}\")>=0),c:(location.pathname===\"/compose/post\"||location.pathname.slice(-13)===\"/compose/post\"),host:location.host}})"
     )
 }
 
@@ -1268,12 +1268,25 @@ fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibi
     let focus = yes_no(fields.get("f"));
     let top = yes_no(fields.get("t"));
     let path = yes_no(fields.get("m"));
+    let compose = yes_no(fields.get("c"));
     let host = host_class(fields.get("host").and_then(serde_json::Value::as_str).unwrap_or(""));
-    let ready = token == "visible" && path == "yes" && top == "yes" && prerender != "yes";
+    let route = if path == "yes" {
+        "status"
+    } else if compose == "yes" {
+        "compose"
+    } else {
+        "no"
+    };
+    let ready = token == "visible"
+        && hidden_flag != "yes"
+        && top == "yes"
+        && host == "x.com"
+        && prerender != "yes"
+        && route != "no";
     QuoteVisibilityRead {
         token: token.to_string(),
         summary: format!(
-            "eval data {kind} visibility {token} hidden-flag {hidden_flag} prerender {prerender} focus {focus} top {top} path {path} host {host}"
+            "eval data {kind} visibility {token} hidden-flag {hidden_flag} prerender {prerender} focus {focus} top {top} path {path} route {route} host {host}"
         ),
         ready,
     }
@@ -3286,6 +3299,19 @@ mod tests {
         assert!(hidden_read.summary.contains("top yes"));
         assert!(quote_visibility_read(
             r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#
+        )
+        .ready);
+        let compose = quote_visibility_read(
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":false,\"t\":true,\"m\":false,\"c\":true,\"host\":\"x.com\"}"}"#,
+        );
+        assert!(compose.ready, "{}", compose.summary);
+        assert!(compose.summary.contains("route compose"));
+        assert!(!quote_visibility_read(
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":false,\"t\":true,\"m\":false,\"c\":false,\"host\":\"x.com\"}"}"#
+        )
+        .ready);
+        assert!(!quote_visibility_read(
+            r#"{"ok":true,"data":"{\"v\":\"hidden\",\"h\":true,\"p\":false,\"f\":false,\"t\":true,\"m\":false,\"c\":true,\"host\":\"x.com\"}"}"#
         )
         .ready);
         assert!(!quote_visibility_read(r#"{"ok":true,"data":"hidden"}"#).ready);

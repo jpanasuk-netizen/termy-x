@@ -1709,7 +1709,7 @@ fn close_quote_session(
     if let Ok(listed) = quote_run(bin, runner, &list_args, Duration::from_secs(15)) {
         if listed.status == 0 {
             let pages = crate::publish::quote_session_pages(&listed.stdout);
-            for page in pages.iter().rev().skip(1) {
+            for page in pages.iter().rev() {
                 let close_tab = crate::publish::quote_browser_args(
                     cli,
                     session,
@@ -1721,12 +1721,25 @@ fn close_quote_session(
             }
         }
     }
+    // Documented session release. OPENCLI_CLOSE_OWNED_TAB asks the extension
+    // to drop this session's tab instead of leaving a blank placeholder.
+    // It does not call windows.update or windows.remove.
+    let previous = std::env::var("OPENCLI_CLOSE_OWNED_TAB").ok();
+    unsafe {
+        std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", "1");
+    }
     let _ = quote_run(
         bin,
         runner,
         &crate::publish::browser_command(cli, session, "close", None),
         Duration::from_secs(15),
     );
+    unsafe {
+        match previous {
+            Some(value) => std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", value),
+            None => std::env::remove_var("OPENCLI_CLOSE_OWNED_TAB"),
+        }
+    }
 }
 
 fn browser_cli_for(
@@ -4948,6 +4961,48 @@ mod tests {
         assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
         assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
         let _ = calls;
+    }
+
+    #[test]
+    fn quote_compose_route_reaches_the_attachment_check() {
+        let missing = r#"{"stage":"composer","path":"/compose/post","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"attach":"dialog testids none target-links 0 chain none","message":"No quote attachment for 20. Post was not clicked."}"#;
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["browser", "--help"],
+            "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n",
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "open"],
+            r#"{"ok":true,"data":{"url":"https://x.com/compose/post","page":"B94452EA22F530887AF90E615F8D7031"}}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "tab", "select"],
+            r#"{"ok":true,"data":{"selected":"B94452EA22F530887AF90E615F8D7031"}}"#,
+        );
+        runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
+        runner.script("opencli", &["browser", "termyx-quote", "tab", "list"], r#"{"ok":true,"data":[]}"#);
+        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/compose/post");
+        let vis = crate::publish::quote_visibility_expr("20");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", vis.as_str()],
+            r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":false,\"t\":true,\"m\":false,\"c\":true,\"host\":\"x.com\"}"}"#,
+        );
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
+            missing,
+        );
+        let err = inspect_quote_attachment("opencli", runner.as_ref(), "20").unwrap_err();
+        assert!(err.contains("stage composer"), "{err}");
+        assert!(!err.starts_with("stage visibility"), "{err}");
+        assert!(err.contains("No quote attachment"), "{err}");
+        assert!(err.contains("route compose"), "{err}");
+        assert!(err.contains("target-links 0"), "{err}");
+        assert!(!err.contains("card yes"), "{err}");
     }
 
     #[test]
