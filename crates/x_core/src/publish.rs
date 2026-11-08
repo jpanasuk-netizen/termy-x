@@ -1872,7 +1872,12 @@ fn js_ascii_string(text: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             ch if (ch as u32) < 128 && ch >= ' ' => out.push(ch),
-            ch => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => {
+                let mut units = [0u16; 2];
+                for unit in ch.encode_utf16(&mut units) {
+                    out.push_str(&format!("\\u{unit:04x}"));
+                }
+            }
         }
     }
     out.push('"');
@@ -2061,6 +2066,7 @@ pub fn quote_type_and_post_script_bound(
   const TEXT = {text_js};
   const SCREEN = {screen_js};
   const SOURCE = {source_js};
+  VISIBLE_TEXT_PLACEHOLDER
   window.__qxReport = null;
   const finish = (obj) => {{ window.__qxReport = obj; return JSON.stringify(obj); }};
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
@@ -2091,7 +2097,7 @@ pub fn quote_type_and_post_script_bound(
       const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
       const textNode = card.querySelector('[data-testid="tweetText"]');
       if (!avatar || !textNode) return false;
-      const cardText = norm(textNode.innerText || textNode.textContent);
+      const cardText = visibleText(textNode);
       const blob = norm(card.innerText || card.textContent).toLowerCase();
       let attrExact = false;
       let attrOther = false;
@@ -2107,7 +2113,7 @@ pub fn quote_type_and_post_script_bound(
       if (attrOther) return false;
       const source = norm(SOURCE);
       const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
-      const textOk = !!source && !!cardText && (cardText === source || (cardText.length >= 12 && source.indexOf(cardText) === 0));
+      const textOk = !!source && !!cardText && cardText === source;
       return attrExact || (handleOk && textOk);
     }}
     if (hits.some((link) => !!link.closest('[data-testid="quoteTweet"]'))) return true;
@@ -2162,6 +2168,36 @@ pub fn quote_type_and_post_script_bound(
   return finish(unclear);
 }})()"#
     )
+    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
+}
+
+fn quote_visible_text_js() -> &'static str {
+    r#"const visibleText = (node) => {
+  if (!node) return "";
+  const chunks = [];
+  const walk = (n) => {
+    if (!n) return;
+    if (n.nodeType === 3) { chunks.push(n.nodeValue || ""); return; }
+    const tag = n.tagName || "";
+    if (!tag) { chunks.push(n.textContent || n.nodeValue || ""); return; }
+    if (n.getAttribute && n.getAttribute("aria-hidden") === "true") return;
+    if (tag === "IMG" || tag === "IMAGE") {
+      const alt = (n.getAttribute && (n.getAttribute("alt") || n.getAttribute("aria-label"))) || "";
+      if (alt) { chunks.push(alt); return; }
+      const src = (n.getAttribute && n.getAttribute("src")) || "";
+      const found = String(src).match(/\/emoji\/[^/]+\/([0-9a-f-]+)\.(?:svg|png)/i);
+      if (found) chunks.push(found[1].split("-").map((hex) => { const cp = parseInt(hex, 16); return cp ? String.fromCodePoint(cp) : ""; }).join(""));
+      return;
+    }
+    if (tag === "BR") { chunks.push("\n"); return; }
+    const kids = n.childNodes && n.childNodes.length ? n.childNodes : (n.children || []);
+    if (!kids.length) { chunks.push(n.innerText || n.textContent || ""); return; }
+    for (let i = 0; i < kids.length; i++) walk(kids[i]);
+  };
+  walk(node);
+  return chunks.join("").normalize("NFC").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+};
+"#
 }
 
 /// Reads the clicked article's handle and tweet text. No clicks.
@@ -2169,6 +2205,7 @@ pub fn quote_source_script(target_id: &str) -> String {
     let id_js = js_ascii_string(target_id);
     format!(
         r#"( () => {{ const TARGET = {id_js};
+  VISIBLE_TEXT_PLACEHOLDER
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
   const article = Array.from(document.querySelectorAll("article")).find((node) => Array.from(node.querySelectorAll("a[href]")).some((link) => statusId(link.href) === TARGET));
   let screen = "";
@@ -2182,11 +2219,12 @@ pub fn quote_source_script(target_id: &str) -> String {
     }}
   }}
   const textNode = article ? (Array.from(article.querySelectorAll('[data-testid="tweetText"]')).find((node) => !node.closest('[data-testid="quoteTweet"]')) || article.querySelector('[data-testid="tweetText"]')) : null;
-  const text = textNode ? String(textNode.innerText || textNode.textContent || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim().slice(0, 500) : "";
+  const text = textNode ? visibleText(textNode).slice(0, 500) : "";
   const report = {{ stage: "source", source_screen: screen, source_text: text, card: false, clicked_post: false, composer_kind: "unknown", message: screen && text ? "source ready" : "source missing" }};
   return JSON.stringify(report);
 }} )()"#
     )
+    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
 }
 
 pub fn quote_snap_script(target_id: &str) -> String {
@@ -2204,6 +2242,7 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
     let source_js = js_ascii_string(source_text);
     format!(
         r#"( () => {{ const TERMY_QUOTE_SNAP = 1; const TARGET = {id_js}; const SCREEN = {screen_js}; const SOURCE = {source_js};
+  VISIBLE_TEXT_PLACEHOLDER
   const statusId = (href) => {{ try {{ const path = new URL(href, location.origin).pathname; const match = path.match(/\/status\/(\d+)/); return match ? match[1] : null; }} catch (e) {{ return null; }} }};
   const boxes = Array.from(document.querySelectorAll('[data-testid="tweetTextarea_0"]'));
   const box = boxes.length ? boxes[boxes.length - 1] : null;
@@ -2346,7 +2385,7 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
     if (card) {{
       const avatar = card.querySelector('[data-testid="Tweet-User-Avatar"]');
       const textNode = card.querySelector('[data-testid="tweetText"]');
-      const cardText = norm(textNode && (textNode.innerText || textNode.textContent));
+      const cardText = visibleText(textNode);
       const blob = norm(card.innerText || card.textContent).toLowerCase();
       let attrExact = false;
       let attrOther = false;
@@ -2361,7 +2400,7 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
       }});
       const source = norm(SOURCE);
       const handleOk = !!SCREEN && blob.indexOf("@" + String(SCREEN).toLowerCase()) >= 0;
-      const textOk = !!source && !!cardText && (cardText === source || (cardText.length >= 12 && source.indexOf(cardText) === 0));
+      const textOk = !!source && !!cardText && cardText === source;
       if (hasBox && avatar && textNode && !attrOther && (attrExact || (handleOk && textOk))) {{
         attached = true;
         proofQuotes += 1;
@@ -2375,12 +2414,22 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
     const textIn = !!(card && dialogTextNode && card.contains(dialogTextNode));
     const avatarIn = !!(card && dialogAvatar && card.contains(dialogAvatar));
     const fold = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
-    const sourceNorm = fold(SOURCE);
-    const cardNorm = fold(dialogTextNode && (dialogTextNode.innerText || dialogTextNode.textContent));
+    const sourceNorm = visibleText(SOURCE) || fold(SOURCE);
+    const cardNorm = dialogTextNode ? visibleText(dialogTextNode) : "";
     const asciiFold = (value) => value.replace(/[^\u0000-\u007F]/g, "");
     const attachBlob = fold(card && (card.innerText || card.textContent)).toLowerCase();
     const dialogBlob = fold(dlg.innerText || dlg.textContent).toLowerCase();
     const needle = SCREEN ? ("@" + String(SCREEN).toLowerCase()) : "";
+    let diffAt = -1;
+    const limit = Math.min(sourceNorm.length, cardNorm.length);
+    for (let i = 0; i < limit; i++) {{ if (sourceNorm.charCodeAt(i) !== cardNorm.charCodeAt(i)) {{ diffAt = i; break; }} }}
+    if (diffAt < 0 && sourceNorm.length !== cardNorm.length) diffAt = limit;
+    const hexAt = (value, start) => {{
+      if (start < 0) return "none";
+      const parts = [];
+      for (let i = start; i < Math.min(value.length, start + 6); i++) parts.push(value.charCodeAt(i).toString(16).padStart(4, "0"));
+      return parts.join(",") || "none";
+    }};
     const compare = "attach-count " + attachNodes.length
       + " avatar-in " + (avatarIn ? "yes" : "no")
       + " text-in " + (textIn ? "yes" : "no")
@@ -2391,9 +2440,13 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
       + " text-equal " + (sourceNorm && cardNorm && sourceNorm === cardNorm ? "yes" : "no")
       + " text-prefix " + (sourceNorm && cardNorm && cardNorm.length >= 12 && (sourceNorm.indexOf(cardNorm) === 0 || cardNorm.indexOf(sourceNorm) === 0) ? "yes" : "no")
       + " ascii-equal " + (sourceNorm && cardNorm && asciiFold(sourceNorm) === asciiFold(cardNorm) ? "yes" : "no")
+      + " img " + (dialogTextNode && dialogTextNode.querySelectorAll ? dialogTextNode.querySelectorAll("img").length : 0)
       + " handle-attach " + (needle && attachBlob.indexOf(needle) >= 0 ? "yes" : "no")
       + " handle-dialog " + (needle && dialogBlob.indexOf(needle) >= 0 ? "yes" : "no")
-      + " text-chain " + (dialogTextNode ? chainOf(dialogTextNode) : "none");
+      + " text-chain " + (dialogTextNode ? chainOf(dialogTextNode) : "none")
+      + " diff-at " + diffAt
+      + " source-cp " + hexAt(sourceNorm, diffAt)
+      + " card-cp " + hexAt(cardNorm, diffAt);
     const editor = dlg.querySelector('[data-testid="tweetTextarea_0"]');
     const plain = editor ? String(editor.innerText || editor.textContent || "").replace(/\u00a0/g, " ") : "";
     const seen = [];
@@ -2425,6 +2478,7 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
   return JSON.stringify(report);
 }} )()"#
     )
+    .replace("VISIBLE_TEXT_PLACEHOLDER", quote_visible_text_js())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4197,6 +4251,30 @@ mod tests {
         assert!(card_attach.contains("text-in yes"), "{card_attach}");
         assert!(card_attach.contains("text-equal yes"), "{card_attach}");
         assert!(card_attach.contains("handle-attach yes"), "{card_attach}");
+
+        let emoji_source = "IS OWNING 1,000 $XRP ENOUGH? #XRP \u{1F525}\u{1F4B0}";
+        let emoji_snap = quote_snap_script_bound(target, "cryptoXRPwhale", emoji_source);
+        let emoji_path = dir.join("termy-quote-snap-emoji.js");
+        std::fs::write(&emoji_path, &emoji_snap).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(&emoji_path)
+            .output()
+            .expect("node");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        let row = |name: &str| {
+            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+        };
+        let emoji = row("emoji");
+        assert_eq!(emoji["card"], true, "{}", emoji["attach"]);
+        assert!(emoji["attach"].as_str().unwrap().contains("text-equal yes"), "{}", emoji["attach"]);
+        assert!(emoji["attach"].as_str().unwrap().contains("card-chars 38"), "{}", emoji["attach"]);
+        assert!(emoji["attach"].as_str().unwrap().contains("source-chars 38"), "{}", emoji["attach"]);
+        assert!(!emoji["attach"].as_str().unwrap().contains("IS OWNING"));
+        assert_eq!(row("wrongemoji")["card"], false, "{}", row("wrongemoji")["attach"]);
+        assert_eq!(row("wrongtext")["card"], false);
     }
 }
 
@@ -4353,6 +4431,32 @@ const rows = [
       el("div", { "data-testid": "Tweet-User-Avatar" }, []),
       el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, []),
       el("span", { innerText: "@cryptoXRPwhale" }, [])
+    ])
+  ]),
+  run("emoji", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText" }, [
+          el("span", { innerText: "IS OWNING 1,000 $XRP ENOUGH? #XRP " }, []),
+          el("img", { alt: "\uD83D\uDD25" }, []),
+          el("img", { alt: "\uD83D\uDCB0" }, [])
+        ])
+      ])
+    ])
+  ]),
+  run("wrongemoji", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText" }, [
+          el("span", { innerText: "IS OWNING 1,000 $XRP ENOUGH? #XRP " }, []),
+          el("img", { alt: "\uD83D\uDD25" }, []),
+          el("img", { alt: "\u274C" }, [])
+        ])
+      ])
     ])
   ])
 ];
