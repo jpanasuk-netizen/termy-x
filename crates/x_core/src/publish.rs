@@ -2175,12 +2175,41 @@ fn quote_visible_text_js() -> &'static str {
     r#"const visibleText = (node) => {
   if (!node) return "";
   const chunks = [];
+  const priceText = (value) => {
+    const t = String(value || "").replace(/\s+/g, "");
+    return /^\$\d{1,6}(\.\d{1,8})?$/.test(t) || /^[+-]?\d{1,4}(\.\d{1,4})?%$/.test(t);
+  };
+  const shallow = (n) => {
+    if (!n) return "";
+    if (n.nodeType === 3) return n.nodeValue || "";
+    const tag = n.tagName || "";
+    if (!tag) return n.textContent || n.nodeValue || "";
+    if (tag === "IMG" || tag === "IMAGE") return "";
+    const kids = n.childNodes && n.childNodes.length ? n.childNodes : (n.children || []);
+    if (!kids.length) return n.innerText || n.textContent || "";
+    let out = "";
+    for (let i = 0; i < kids.length; i++) out += shallow(kids[i]);
+    return out;
+  };
+  const cashtag = (n) => {
+    const href = n && n.getAttribute ? (n.getAttribute("href") || "") : "";
+    if (!href || !/cashtag|%24/i.test(href)) return "";
+    try {
+      const parsed = new URL(href, "https://x.com");
+      const q = parsed.searchParams.get("q") || "";
+      const match = q.match(/^\$([A-Za-z][A-Za-z0-9]{0,14})$/);
+      if (match) return "$" + match[1];
+    } catch (e) {}
+    return "";
+  };
   const walk = (n) => {
     if (!n) return;
     if (n.nodeType === 3) { chunks.push(n.nodeValue || ""); return; }
     const tag = n.tagName || "";
     if (!tag) { chunks.push(n.textContent || n.nodeValue || ""); return; }
     if (n.getAttribute && n.getAttribute("aria-hidden") === "true") return;
+    const symbol = cashtag(n);
+    if (symbol) { chunks.push(symbol); return; }
     if (tag === "IMG" || tag === "IMAGE") {
       const alt = (n.getAttribute && (n.getAttribute("alt") || n.getAttribute("aria-label"))) || "";
       if (alt) { chunks.push(alt); return; }
@@ -2192,7 +2221,17 @@ fn quote_visible_text_js() -> &'static str {
     if (tag === "BR") { chunks.push("\n"); return; }
     const kids = n.childNodes && n.childNodes.length ? n.childNodes : (n.children || []);
     if (!kids.length) { chunks.push(n.innerText || n.textContent || ""); return; }
-    for (let i = 0; i < kids.length; i++) walk(kids[i]);
+    for (let i = 0; i < kids.length; i++) {
+      const kid = kids[i];
+      const symbolKid = cashtag(kid);
+      if (symbolKid) {
+        chunks.push(symbolKid);
+        const next = kids[i + 1];
+        if (next && priceText(shallow(next))) i += 1;
+        continue;
+      }
+      walk(kid);
+    }
   };
   walk(node);
   return chunks.join("").normalize("NFC").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
@@ -4247,6 +4286,11 @@ mod tests {
         assert!(split_attach.contains("handle-attach no"), "{split_attach}");
         assert!(split_attach.contains("handle-dialog yes"), "{split_attach}");
         assert!(split_attach.contains("card-bind miss"), "{split_attach}");
+        let cashtag = row("cashtag");
+        assert_eq!(cashtag["card"], true, "{}", cashtag["attach"]);
+        assert!(cashtag["attach"].as_str().unwrap().contains("text-equal yes"), "{}", cashtag["attach"]);
+        assert!(!cashtag["attach"].as_str().unwrap().contains("$1.23"), "{}", cashtag["attach"]);
+        assert_eq!(row("cashtagwrong")["card"], false, "{}", row("cashtagwrong")["attach"]);
         let card_attach = card["attach"].as_str().unwrap();
         assert!(card_attach.contains("text-in yes"), "{card_attach}");
         assert!(card_attach.contains("text-equal yes"), "{card_attach}");
@@ -4275,6 +4319,21 @@ mod tests {
         assert!(!emoji["attach"].as_str().unwrap().contains("IS OWNING"));
         assert_eq!(row("wrongemoji")["card"], false, "{}", row("wrongemoji")["attach"]);
         assert_eq!(row("wrongtext")["card"], false);
+
+        let price_snap = quote_snap_script_bound(target, "cryptoXRPwhale", "$1.23 is enough");
+        let price_path = dir.join("termy-quote-snap-price.js");
+        std::fs::write(&price_path, &price_snap).unwrap();
+        let output = std::process::Command::new("node")
+            .arg(&harness_path)
+            .arg(&price_path)
+            .output()
+            .expect("node");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
+        let price = reports.as_array().unwrap().iter().find(|item| item["name"] == "authorprice").unwrap();
+        assert_eq!(price["card"], true, "{}", price["attach"]);
+        assert!(price["attach"].as_str().unwrap().contains("text-equal yes"), "{}", price["attach"]);
     }
 }
 
@@ -4456,6 +4515,47 @@ const rows = [
           el("img", { alt: "\uD83D\uDD25" }, []),
           el("img", { alt: "\u274C" }, [])
         ])
+      ])
+    ])
+  ]),
+  run("cashtag", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText" }, [
+          el("span", { innerText: "IS OWNING 1,000 " }, []),
+          el("a", { href: "/search?q=%24XRP&src=cashtag_click" }, [
+            el("span", { "aria-hidden": "true", innerText: "$" }, []),
+            el("span", { innerText: "XRP" }, [])
+          ]),
+          el("span", { innerText: "$1.23" }, []),
+          el("span", { innerText: " ENOUGH?" }, [])
+        ])
+      ])
+    ])
+  ]),
+  run("cashtagwrong", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText" }, [
+          el("span", { innerText: "IS OWNING 2,000 " }, []),
+          el("a", { href: "/search?q=%24XRP&src=cashtag_click" }, [
+            el("span", { innerText: "$XRP" }, [])
+          ]),
+          el("span", { innerText: " ENOUGH?" }, [])
+        ])
+      ])
+    ])
+  ]),
+  run("authorprice", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale" }, [
+        el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+        el("div", { "data-testid": "tweetText", innerText: "$1.23 is enough" }, [])
       ])
     ])
   ])
