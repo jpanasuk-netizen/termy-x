@@ -2369,6 +2369,31 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
       }} else if (attrOther) bind = "other-id";
       else bind = "miss";
     }}
+    const attachNodes = Array.from(dlg.querySelectorAll('[data-testid="attachments"]')).filter((node) => !inEditor(node));
+    const dialogTextNode = Array.from(dlg.querySelectorAll('[data-testid="tweetText"]')).find((node) => !inEditor(node)) || null;
+    const dialogAvatar = Array.from(dlg.querySelectorAll('[data-testid="Tweet-User-Avatar"]')).find((node) => !inEditor(node)) || null;
+    const textIn = !!(card && dialogTextNode && card.contains(dialogTextNode));
+    const avatarIn = !!(card && dialogAvatar && card.contains(dialogAvatar));
+    const fold = (value) => String(value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+    const sourceNorm = fold(SOURCE);
+    const cardNorm = fold(dialogTextNode && (dialogTextNode.innerText || dialogTextNode.textContent));
+    const asciiFold = (value) => value.replace(/[^\u0000-\u007F]/g, "");
+    const attachBlob = fold(card && (card.innerText || card.textContent)).toLowerCase();
+    const dialogBlob = fold(dlg.innerText || dlg.textContent).toLowerCase();
+    const needle = SCREEN ? ("@" + String(SCREEN).toLowerCase()) : "";
+    const compare = "attach-count " + attachNodes.length
+      + " avatar-in " + (avatarIn ? "yes" : "no")
+      + " text-in " + (textIn ? "yes" : "no")
+      + " dialog-avatar " + (dialogAvatar ? "yes" : "no")
+      + " dialog-text " + (dialogTextNode ? "yes" : "no")
+      + " source-chars " + sourceNorm.length
+      + " card-chars " + cardNorm.length
+      + " text-equal " + (sourceNorm && cardNorm && sourceNorm === cardNorm ? "yes" : "no")
+      + " text-prefix " + (sourceNorm && cardNorm && cardNorm.length >= 12 && (sourceNorm.indexOf(cardNorm) === 0 || cardNorm.indexOf(sourceNorm) === 0) ? "yes" : "no")
+      + " ascii-equal " + (sourceNorm && cardNorm && asciiFold(sourceNorm) === asciiFold(cardNorm) ? "yes" : "no")
+      + " handle-attach " + (needle && attachBlob.indexOf(needle) >= 0 ? "yes" : "no")
+      + " handle-dialog " + (needle && dialogBlob.indexOf(needle) >= 0 ? "yes" : "no")
+      + " text-chain " + (dialogTextNode ? chainOf(dialogTextNode) : "none");
     const editor = dlg.querySelector('[data-testid="tweetTextarea_0"]');
     const plain = editor ? String(editor.innerText || editor.textContent || "").replace(/\u00a0/g, " ") : "";
     const seen = [];
@@ -2384,7 +2409,7 @@ pub fn quote_snap_script_bound(target_id: &str, screen: &str, source_text: &str)
     }});
     const shown = ranked.slice(0, 3).map((node) => relTo(node, editor) + " " + linkBits(node));
     const inside = seen.filter((node) => relTo(node, editor) === "inside-editor").length;
-    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " editor " + textClass(plain) + " chars " + plain.trim().length + " card-bind " + bind + " near " + nearEditor(editor) + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
+    bits.push("d" + (index + 1) + " box " + (hasBox ? "yes" : "no") + " post " + (hasPost ? "yes" : "no") + " quotes " + qNodes.length + " target-links " + links.length + " anchors " + dlg.querySelectorAll("a").length + " rolelinks " + dlg.querySelectorAll('[role="link"]').length + " inside-editor " + inside + " editor " + textClass(plain) + " chars " + plain.trim().length + " card-bind " + bind + " " + compare + " near " + nearEditor(editor) + " testids " + (names.join(",") || "none") + (shown.length ? " links " + shown.join(" ;; ") : " links none"));
   }});
   const ids = [];
   const composer = dialogs.find((dlg) => dlg.querySelector('[data-testid="tweetTextarea_0"]')) || null;
@@ -3761,6 +3786,9 @@ mod tests {
         assert!(snap.contains("inside-editor"));
         assert!(snap.contains("rolelinks"));
         assert!(snap.contains("url-exact"));
+        assert!(snap.contains("text-equal"));
+        assert!(snap.contains("avatar-in"));
+        assert!(snap.contains("handle-attach"));
         let menu = crate::publish::quote_menu_read_script(original);
         assert!(!menu.contains(".click("));
         assert!(menu.contains("Quote row recorded"));
@@ -4155,6 +4183,20 @@ mod tests {
         assert_eq!(row("wronguser")["card"], false);
         assert_eq!(row("pagecard")["card"], false);
         assert_eq!(row("plain")["card"], false);
+        let split = row("split");
+        assert_eq!(split["card"], false, "{}", split["attach"]);
+        let split_attach = split["attach"].as_str().unwrap();
+        assert!(split_attach.contains("text-in no"), "{split_attach}");
+        assert!(split_attach.contains("avatar-in no"), "{split_attach}");
+        assert!(split_attach.contains("dialog-text yes"), "{split_attach}");
+        assert!(split_attach.contains("text-equal yes"), "{split_attach}");
+        assert!(split_attach.contains("handle-attach no"), "{split_attach}");
+        assert!(split_attach.contains("handle-dialog yes"), "{split_attach}");
+        assert!(split_attach.contains("card-bind miss"), "{split_attach}");
+        let card_attach = card["attach"].as_str().unwrap();
+        assert!(card_attach.contains("text-in yes"), "{card_attach}");
+        assert!(card_attach.contains("text-equal yes"), "{card_attach}");
+        assert!(card_attach.contains("handle-attach yes"), "{card_attach}");
     }
 }
 
@@ -4186,7 +4228,11 @@ function el(tag, attrs, kids) {
       if (a < 0 || b < 0) return 1;
       return a < b ? 4 : 2;
     },
-    get innerText() { return this.attrs.innerText || ""; }
+    get innerText() {
+      const own = this.attrs.innerText || "";
+      const kids = (this.children || []).map((kid) => (kid.innerText || "")).join(" ");
+      return [own, kids].filter(Boolean).join(" ");
+    }
   };
   for (const kid of kids || []) { kid.parentElement = node; node.children.push(kid); }
   return node;
@@ -4298,6 +4344,15 @@ const rows = [
     el("div", { "data-testid": "attachments", innerText: "@cryptoXRPwhale IS OWNING 1,000 $XRP ENOUGH?" }, [
       el("div", { "data-testid": "Tweet-User-Avatar" }, []),
       el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, [])
+    ])
+  ]),
+  run("split", "https://x.com/compose/post", [
+    el("div", { role: "dialog" }, [
+      el("div", { "data-testid": "tweetTextarea_0", innerText: "" }, []),
+      el("div", { "data-testid": "attachments", innerText: "" }, []),
+      el("div", { "data-testid": "Tweet-User-Avatar" }, []),
+      el("div", { "data-testid": "tweetText", innerText: "IS OWNING 1,000 $XRP ENOUGH?" }, []),
+      el("span", { innerText: "@cryptoXRPwhale" }, [])
     ])
   ])
 ];

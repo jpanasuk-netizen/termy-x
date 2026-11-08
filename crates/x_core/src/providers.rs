@@ -2366,7 +2366,7 @@ fn run_quote_attachment(
         Ok(report) if !report.source_screen.is_empty() && !report.source_text.is_empty() => (
             report.source_screen.clone(),
             report.source_text.clone(),
-            format!("source screen {} text yes", report.source_screen),
+            format!("source screen {} text yes chars {}", report.source_screen, report.source_text.chars().count()),
         ),
         Ok(_) => (String::new(), String::new(), "source missing".into()),
         Err(_) => (String::new(), String::new(), "source unread".into()),
