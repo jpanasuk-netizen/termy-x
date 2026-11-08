@@ -1225,6 +1225,75 @@ pub fn quote_composer_url(status_id: &str) -> String {
     format!("https://x.com/compose/post?url={encoded}")
 }
 
+/// Sanitized compose-query shape. Never returns the URL itself.
+/// `url-key` is whether a `url` parameter is present. `id-match` is whether
+/// that parameter's status id is this target.
+pub fn quote_landed_query(stdout: &str, status_id: &str) -> String {
+    let Some(value) = first_json_value(stdout) else {
+        return "landed unread".into();
+    };
+    let url = value
+        .pointer("/data/url")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("url").and_then(serde_json::Value::as_str));
+    match url {
+        Some(url) => quote_query_shape(url, status_id),
+        None => "landed url absent".into(),
+    }
+}
+
+pub fn quote_query_shape(url: &str, status_id: &str) -> String {
+    let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let Some(query) = url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or("")) else {
+        return "landed url-key no id-match no".into();
+    };
+    let mut url_key = false;
+    let mut id_match = false;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key != "url" {
+            continue;
+        }
+        url_key = true;
+        let decoded = percent_decode_lossy(value);
+        if !id.is_empty() && (decoded.contains(&format!("/status/{id}")) || value.contains(&id)) {
+            id_match = true;
+        }
+    }
+    format!(
+        "landed url-key {} id-match {}",
+        if url_key { "yes" } else { "no" },
+        if id_match { "yes" } else { "no" }
+    )
+}
+
+fn percent_decode_lossy(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2])) {
+                out.push((hi << 4) | lo);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Target ids from `browser tab list` for this session only.
 pub fn quote_session_pages(stdout: &str) -> Vec<String> {
     let Some(value) = first_json_value(stdout) else {
@@ -1873,7 +1942,15 @@ pub fn quote_snap_script(target_id: &str) -> String {
   let attached = false;
   let proofQuotes = 0;
   const hits = [];
-  const bits = ["textareas " + boxes.length + " in-dialog-textareas " + inDialogBoxes + " dialogs " + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length + " page-quotes " + pageQuotes + " ancestors " + (box ? chainOf(box) : "none")];
+  let urlKey = "no";
+  let idMatch = "no";
+  try {{
+    const raw = new URL(location.href).searchParams.get("url") || "";
+    if (raw) urlKey = "yes";
+    const match = String(raw).match(/status\/(\d+)/);
+    if (match && match[1] === TARGET) idMatch = "yes";
+  }} catch (e) {{}}
+  const bits = ["query url-key " + urlKey + " id-match " + idMatch + " textareas " + boxes.length + " in-dialog-textareas " + inDialogBoxes + " dialogs " + document.querySelectorAll('[role="dialog"], [aria-modal="true"]').length + " page-quotes " + pageQuotes + " ancestors " + (box ? chainOf(box) : "none")];
   dialogs.forEach((dlg, index) => {{
     const qNodes = Array.from(dlg.querySelectorAll('[data-testid="quoteTweet"]'));
     const qHits = qNodes.filter((node) => Array.from(node.querySelectorAll('a[href*="/status/"]')).some((link) => statusId(link.href) === TARGET));
@@ -3475,6 +3552,25 @@ mod tests {
     }
 
     #[test]
+    fn quote_landed_query_reports_the_url_parameter_without_the_address() {
+        let id = "2118971448614334959";
+        let compose = quote_composer_url(id);
+        let intact = format!(r#"{{"ok":true,"data":{{"url":"{compose}","page":"B94452EA22F530887AF90E615F8D7031"}}}}"#);
+        let line = quote_landed_query(&intact, id);
+        assert_eq!(line, "landed url-key yes id-match yes");
+        assert!(!line.contains("https://"), "{line}");
+        assert_eq!(
+            quote_query_shape("https://x.com/compose/post", id),
+            "landed url-key no id-match no"
+        );
+        assert_eq!(
+            quote_query_shape("https://x.com/compose/post?url=https%3A%2F%2Fx.com%2Fi%2Fstatus%2F111", id),
+            "landed url-key yes id-match no"
+        );
+        assert_eq!(quote_landed_query("not json", id), "landed unread");
+    }
+
+    #[test]
     fn quote_snap_dom_separates_composer_dialog_from_page_links() {
         let target = "2118971448614334959";
         let snap = quote_snap_script(target);
@@ -3507,6 +3603,8 @@ mod tests {
         assert_eq!(outside["status_ids"].as_array().unwrap().len(), 0);
         assert_eq!(outside["clicked_post"], false);
         let attach = outside["attach"].as_str().unwrap();
+        assert!(attach.contains("query url-key yes"), "{attach}");
+        assert!(attach.contains("id-match yes"), "{attach}");
         assert!(attach.contains("textareas 2"), "{attach}");
         assert!(attach.contains("in-dialog-textareas 0"), "{attach}");
         assert!(attach.contains("dialogs 2"), "{attach}");

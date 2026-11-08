@@ -1700,15 +1700,19 @@ fn close_quote_session(
     runner: &dyn crate::io::CommandRunner,
     cli: crate::publish::BrowserCli,
     session: &str,
-) {
-    // Session-scoped tabs only. Close extras before the session release so
-    // a failed inspect does not leave status tabs behind. The last owned
-    // tab becomes OpenCLI's blank placeholder; personal Chrome tabs are
-    // not in this session. Do not call windows.update or windows.remove.
+) -> String {
+    // Session-scoped tabs only. Extra pages are closed here. The last page
+    // stays so OpenCLI's close-owned-tab can ungroup and remove that lease
+    // tab. Closing it first leaves the OpenCLI Browser placeholder, which
+    // is the leftover group. Personal Chrome tabs are not in this session.
+    // Do not call windows.update, windows.remove, or tabs.remove.
     let list_args = crate::publish::quote_browser_args(cli, session, &["tab", "list"], None, false);
     if let Ok(listed) = quote_run(bin, runner, &list_args, Duration::from_secs(15)) {
         if listed.status == 0 {
-            let pages = crate::publish::quote_session_pages(&listed.stdout);
+            let mut pages = crate::publish::quote_session_pages(&listed.stdout);
+            if !pages.is_empty() {
+                pages.pop();
+            }
             for page in pages.iter().rev() {
                 let close_tab = crate::publish::quote_browser_args(
                     cli,
@@ -1728,7 +1732,7 @@ fn close_quote_session(
     unsafe {
         std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", "1");
     }
-    let _ = quote_run(
+    let closed = quote_run(
         bin,
         runner,
         &crate::publish::browser_command(cli, session, "close", None),
@@ -1739,6 +1743,11 @@ fn close_quote_session(
             Some(value) => std::env::set_var("OPENCLI_CLOSE_OWNED_TAB", value),
             None => std::env::remove_var("OPENCLI_CLOSE_OWNED_TAB"),
         }
+    }
+    match closed {
+        Ok(output) if output.status == 0 => "session close acknowledged".into(),
+        Ok(output) => format!("session close exit {}", output.status),
+        Err(_) => "session close unread".into(),
     }
 }
 
@@ -2079,8 +2088,9 @@ fn open_visible_quote_page(
         }
     }
     let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
+    let landed = crate::publish::quote_landed_query(&opened.stdout, status_id);
     let trace = format!(
-        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · visibility after open {} · select {select_public} {select_note} · visibility after select {}",
+        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {landed} · visibility after open {} · select {select_public} {select_note} · visibility after select {}",
         after_open.summary, after_select.summary
     );
     if !after_select.ready {
@@ -2289,10 +2299,10 @@ fn run_quote_attachment(
         }
     }
     if inspect || !crate::publish::quote_inspect_ready(&after) {
-        close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let line = format!(
-            "{} · {leftover}",
+            "{} · {close_note} · {leftover}",
             with_quote_view(crate::publish::quote_report_line(&after), &view)
         );
         return if crate::publish::quote_inspect_ready(&after) {
@@ -5024,7 +5034,11 @@ mod tests {
             r#"{"ok":true,"data":{"selected":"B94452EA22F530887AF90E615F8D7031"}}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
-        runner.script("opencli", &["browser", "termyx-quote", "tab", "list"], r#"{"ok":true,"data":[]}"#);
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "tab", "list"],
+            r#"{"ok":true,"data":[{"page":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},{"page":"B94452EA22F530887AF90E615F8D7031"}]}"#,
+        );
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/compose/post");
         let vis = crate::publish::quote_visibility_expr("20");
         runner.script(
@@ -5057,13 +5071,25 @@ mod tests {
         assert!(!err.contains("card yes"), "{err}");
         assert!(err.contains("owned group OpenCLI Browser groups 1 tabs 1"), "{err}");
         assert!(err.contains("session list is not chrome clean"), "{err}");
+        assert!(err.contains("session close acknowledged"), "{err}");
+        assert!(err.contains("landed url-key no"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         let encoded = b64_encode(crate::publish::quote_snap_script("20").as_bytes());
         assert!(calls.iter().any(|(_, args)| {
             args.iter().any(|arg| arg.starts_with("window.__qxSnap='") && encoded.starts_with(arg.trim_start_matches("window.__qxSnap='").trim_end_matches('\'')))
         }));
         assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxSnap))")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove" || arg == "tabs.remove")));
+        assert!(calls.iter().any(|(_, args)| {
+            args.windows(3).any(|triple| {
+                triple[0] == "tab" && triple[1] == "close" && triple[2] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            })
+        }));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.windows(3).any(|triple| {
+                triple[0] == "tab" && triple[1] == "close" && triple[2] == "B94452EA22F530887AF90E615F8D7031"
+            })
+        }));
     }
 
     #[test]

@@ -527,7 +527,6 @@ fn powershell_command(path: &Path, args: &[String]) -> Command {
     command
 }
 
-#[cfg(windows)]
 fn cmd_c_argument(path: &Path, args: &[String]) -> String {
     let mut inner = quote_cmd_token(&path.to_string_lossy());
     for arg in args {
@@ -537,7 +536,9 @@ fn cmd_c_argument(path: &Path, args: &[String]) -> String {
     format!("\"{inner} \"")
 }
 
-#[cfg(windows)]
+/// Quote one `cmd.exe /S /C` token. `cmd` expands `%NAME%` inside quotes, so
+/// a compose URL's `%3A%` and `%2F%` would be deleted before OpenCLI sees
+/// them. `%%` is the literal percent.
 fn quote_cmd_token(token: &str) -> String {
     if token.is_empty() {
         return "\"\"".to_string();
@@ -548,11 +549,18 @@ fn quote_cmd_token(token: &str) -> String {
             ' ' | '\t' | '"' | '&' | '|' | '<' | '>' | '^' | '%' | '!' | '(' | ')'
         )
     });
+    let mut escaped = String::new();
+    for ch in token.chars() {
+        if ch == '%' {
+            escaped.push('%');
+        }
+        escaped.push(ch);
+    }
     if !needs_quotes {
-        return token.to_string();
+        return escaped;
     }
     let mut quoted = String::from('"');
-    for ch in token.chars() {
+    for ch in escaped.chars() {
         if ch == '"' {
             quoted.push('"');
         }
@@ -1028,6 +1036,24 @@ mod tests {
             "Kalshi - Prediction Market - Google Chrome"
         ));
         assert!(!is_automation_title("Billing - Google Chrome"));
+    }
+
+    #[test]
+    fn cmd_quoting_keeps_percent_encoded_compose_urls() {
+        let url = crate::publish::quote_composer_url("2118971448614334959");
+        assert!(url.contains("%3A"));
+        assert!(url.contains("%2F"));
+        let quoted = super::quote_cmd_token(&url);
+        assert!(quoted.contains("%%3A%%"), "{quoted}");
+        assert!(quoted.contains("%%2F%%"), "{quoted}");
+        assert_eq!(quoted.matches("%%").count() > 4, true, "{quoted}");
+        let line = super::cmd_c_argument(std::path::Path::new("opencli.cmd"), &[
+            "browser".into(),
+            "open".into(),
+            url,
+        ]);
+        assert!(line.contains("%%3A%%"), "{line}");
+        assert!(line.contains("compose/post?url="), "{line}");
     }
 
     #[test]
