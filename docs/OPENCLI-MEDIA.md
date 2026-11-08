@@ -64,7 +64,9 @@ A quote image does not use `twitter post --images` and does not use the local He
 opencli browser upload --testid fileInput <file> --tab <returned-page-id> --session termyx-quote --window foreground
 ```
 
-The envelope must say `uploaded: true` and name the file. Termy then reads the composer preview. Avatar and quoted-text emoji do not count. `Not allowed`, `-32000`, `fileChooserOpened`, or `not_file_input` stops. There is no second upload and Post is not clicked. A missing card, a card that changes after the upload, or a missing preview also leaves Post unclicked.
+The envelope must say `uploaded: true` and name the file. Termy then reads the composer preview. Avatar and quoted-text emoji do not count. A bridge refusal stops. There is no second upload and Post is not clicked. The refusal keeps the CLI's own code and message (`not_file_input`, `Page.fileChooserOpened`, or `-32000` / `Not allowed`). A missing card, a card that changes after the upload, or a missing preview also leaves Post unclicked.
+
+OpenCLI 2.0.2 checks that the resolved target is `input[type=file]` before it asks the extension to attach. The extension then intercepts a file chooser and clicks that input. Chrome's `-32000 Not allowed` remains the refusal for `DOM.setFileInputFiles` under the extension debugger when that chooser path is not accepted. Neither case is retried from Termy.
 
 This command does not post:
 

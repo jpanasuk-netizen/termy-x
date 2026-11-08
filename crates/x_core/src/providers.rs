@@ -2394,10 +2394,16 @@ fn attach_quote_image(
         Err(error) => return Err(fail(error)),
     };
     if let Err(error) = crate::publish::quote_upload_read(&stdout, &file_name) {
+        let bridge = crate::publish::quote_upload_log_bridge(&error);
         crate::publish::log_action(
             "quote",
             "upload",
-            &[("ack", "rejected"), ("preview", "no"), ("elapsed_ms", &started.elapsed().as_millis().to_string())],
+            &[
+                ("ack", "rejected"),
+                ("preview", "no"),
+                ("bridge", &bridge),
+                ("elapsed_ms", &started.elapsed().as_millis().to_string()),
+            ],
         );
         return Err(fail(error));
     }
@@ -6895,6 +6901,8 @@ mod tests {
             absent: false,
         });
         let err = inspect_quote_attachment("opencli", blocked.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
+        assert!(err.contains("-32000"), "{err}");
+        assert!(err.contains("Not allowed"), "{err}");
         assert!(err.contains("not retried"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
         assert_eq!(blocked.calls.lock().unwrap().iter().filter(|args| args.iter().any(|arg| arg == "upload")).count(), 1);

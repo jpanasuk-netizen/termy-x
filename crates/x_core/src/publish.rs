@@ -1119,8 +1119,9 @@ pub fn quote_media_preview_expr() -> &'static str {
     "(() => { const dlg = Array.from(document.querySelectorAll('[role=\"dialog\"], [aria-modal=\"true\"]')).find((node) => node.querySelector('[data-testid=\"tweetTextarea_0\"]')); if (!dlg) return 'media-preview no'; const nodes = dlg.querySelectorAll('[data-testid=\"tweetPhoto\"], [data-testid=\"attachmentCell\"] img, [data-testid=\"attachments\"] img'); let preview = 0; nodes.forEach((img) => { if (img.closest && (img.closest('[data-testid=\"Tweet-User-Avatar\"]') || img.closest('[data-testid=\"tweetText\"]'))) return; preview += 1; }); return preview ? 'media-preview yes' : 'media-preview no'; })()"
 }
 
-/// `uploaded: true` plus the file name. `Not allowed` and file-chooser
-/// failures are blocked and must not be retried.
+/// `uploaded: true` plus the file name. A bridge refusal is not retried.
+/// The refusal keeps the CLI's own code and message so a selector miss,
+/// a file-chooser timeout, and Chrome `-32000` stay distinguishable.
 pub fn quote_upload_read(stdout: &str, file_name: &str) -> Result<(), String> {
     let flat = format!("{stdout}");
     let lower = flat.to_ascii_lowercase();
@@ -1129,9 +1130,10 @@ pub fn quote_upload_read(stdout: &str, file_name: &str) -> Result<(), String> {
         || lower.contains("filechooser")
         || lower.contains("not_file_input")
     {
-        return Err(
-            "image upload blocked: the bridge rejected the file input. Upload was not retried. Post was not clicked.".into(),
-        );
+        let detail = quote_upload_bridge_detail(&flat);
+        return Err(format!(
+            "image upload blocked: {detail}. Upload was not retried. Post was not clicked."
+        ));
     }
     let Some(value) = first_json_value(&flat) else {
         return Err("image upload returned no envelope. Not marked attached. Post was not clicked.".into());
@@ -1171,6 +1173,49 @@ pub fn quote_upload_read(stdout: &str, file_name: &str) -> Result<(), String> {
     } else {
         Err("image upload envelope did not name the file. Not marked attached. Post was not clicked.".into())
     }
+}
+
+/// Code and message from the upload command, with secrets and filesystem
+/// paths removed. This is the text the next failure must show.
+fn quote_upload_bridge_detail(text: &str) -> String {
+    let raw = opencli_error_cause(text)
+        .or_else(|| first_safe_line(text))
+        .unwrap_or_else(|| "no bridge text".into());
+    let mut out = String::new();
+    for token in raw.split_whitespace() {
+        let piece = if line_has_secret(token) {
+            "redacted"
+        } else if token.contains('\\')
+            || token.contains(":/")
+            || (token.starts_with('/') && token.matches('/').count() >= 2)
+        {
+            "<path>"
+        } else {
+            token
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(piece);
+        if out.chars().count() >= 140 {
+            break;
+        }
+    }
+    if out.is_empty() {
+        "no bridge text".into()
+    } else {
+        out
+    }
+}
+
+/// Short bridge clause for the action log. The user-facing error keeps the
+/// full sanitized sentence; this is the same clause without the close notes.
+pub fn quote_upload_log_bridge(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    let start = lower.find("image upload blocked:").unwrap_or(0);
+    let slice = &error[start..];
+    let end = slice.find(". Upload was not retried").unwrap_or(slice.len());
+    slice[..end].to_string()
 }
 
 pub fn is_browser_target_id(value: &str) -> bool {
@@ -1853,7 +1898,12 @@ fn opencli_error_cause(text: &str) -> Option<String> {
     }
     let value: serde_json::Value = serde_json::from_str(&text[start..=end]).ok()?;
     let error = value.get("error")?;
-    let code = error.get("code").and_then(serde_json::Value::as_str).unwrap_or("");
+    let code_owned = match error.get("code") {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Number(number)) => number.to_string(),
+        _ => String::new(),
+    };
+    let code = code_owned.as_str();
     let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
     let hint = error.get("hint").and_then(serde_json::Value::as_str).unwrap_or("");
     if code.is_empty() && message.is_empty() {
@@ -3335,6 +3385,14 @@ pub fn quote_post_text(user_text: &str, target_url: &str) -> String {
 /// `providers::log_raw_provider_error`). The result never contains
 /// JSON, `ok:false`, `command_exec`, or exit codes.
 pub fn humanize_error(raw: &str) -> String {
+    if let Some(start) = raw.to_ascii_lowercase().find("image upload blocked:") {
+        let slice = &raw[start..];
+        let end = slice
+            .find("Post was not clicked.")
+            .map(|pos| pos + "Post was not clicked.".len())
+            .unwrap_or(slice.len());
+        return ensure_sentence(slice[..end].trim());
+    }
     let extracted = extract_error_message(raw);
     let msg = extracted.as_deref().unwrap_or(raw).trim();
     let collapsed = msg.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -4246,11 +4304,39 @@ mod tests {
             r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["marked-quote-probe.png"],"target":"fileInput","matches_n":1}}"#,
             "marked-quote-probe.png",
         ).is_ok());
-        let blocked = quote_upload_read(r#"{"ok":false,"error":{"message":"Not allowed"}}"#, "marked-quote-probe.png").unwrap_err();
+        let blocked = quote_upload_read(r#"{"ok":false,"error":{"code":-32000,"message":"Not allowed"}}"#, "marked-quote-probe.png").unwrap_err();
+        assert!(blocked.contains("-32000"), "{blocked}");
+        assert!(blocked.contains("Not allowed"), "{blocked}");
         assert!(blocked.contains("not retried"), "{blocked}");
         assert!(blocked.contains("Post was not clicked"), "{blocked}");
-        let chooser = quote_upload_read("Page.fileChooserOpened timed out", "marked-quote-probe.png").unwrap_err();
-        assert!(chooser.contains("not retried"), "{chooser}");
+        let chooser = quote_upload_read("Page.fileChooserOpened not received within 5s — the input may not have opened a file chooser", "marked-quote-probe.png").unwrap_err();
+        assert!(chooser.contains("fileChooserOpened"), "{chooser}");
+        assert!(!chooser.contains("Not allowed"), "{chooser}");
+        assert!(!chooser.contains("-32000"), "{chooser}");
+        let selector = quote_upload_read(
+            r#"{"ok":false,"error":{"code":"not_file_input","message":"Target \"fileInput\" is not an input[type=file]."}}"#,
+            "marked-quote-probe.png",
+        ).unwrap_err();
+        assert!(selector.contains("not_file_input"), "{selector}");
+        assert!(selector.contains("not an input[type=file]"), "{selector}");
+        assert_ne!(blocked, chooser);
+        assert_ne!(blocked, selector);
+        assert_ne!(chooser, selector);
+        let secret = quote_upload_read(
+            r#"{"ok":false,"error":{"code":"-32000","message":"Not allowed","hint":"cookie=abc ct0=secret"}}"#,
+            "marked-quote-probe.png",
+        ).unwrap_err();
+        assert!(secret.contains("-32000"), "{secret}");
+        assert!(secret.contains("Not allowed"), "{secret}");
+        assert!(!secret.to_ascii_lowercase().contains("cookie"), "{secret}");
+        assert!(!secret.contains("ct0"), "{secret}");
+        let shown = humanize_error(&format!(
+            "stage upload · {blocked} · screenshot saved C:\\Users\\probe\\quote-inspect.png · session close acknowledged"
+        ));
+        assert!(shown.contains("Not allowed"), "{shown}");
+        assert!(shown.contains("-32000"), "{shown}");
+        assert!(!shown.contains("couldn't do that"), "{shown}");
+        assert!(!shown.contains("quote-inspect"), "{shown}");
         let unnamed = quote_upload_read(
             r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["other.png"],"target":"fileInput","matches_n":1}}"#,
             "marked-quote-probe.png",
