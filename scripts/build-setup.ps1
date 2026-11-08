@@ -131,6 +131,10 @@ if (-not $Version) {
     $Version = Get-CargoPackageVersion -CargoTomlPath $cargoToml
 }
 
+# Release builds pass the tag (v1.2.3). The output file keeps it so the asset
+# name matches the tag; the version Windows shows has no "v".
+$appVersion = $Version -replace '^v', ''
+
 if (-not $Target) {
     $Target = Get-DefaultTarget
 }
@@ -143,12 +147,21 @@ if (-not $Arch) {
     $Arch = Arch-FromTarget -TargetTriple $Target
 }
 
+if ($Arch -eq "arm64") {
+    throw @"
+Refusing to package an arm64 Setup with the official VLC 3.0.24 win64 runtime.
+That zip is AMD64 (PE machine 0x8664). VideoLAN also publishes vlc-3.0.24-winarm64.zip (sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5).
+Termy embeds only AMD64 libVLC, so this script does not stage the win64 DLLs onto an arm64 build and does not stage the winarm64 archive either. No Setup.exe is produced for arm64.
+"@
+}
+
 $exePath = Join-Path $repoRoot "target\$Target\release\termy.exe"
 $cliExePath = Join-Path $repoRoot "target\$Target\release\termy-cli.exe"
+$xCliExePath = Join-Path $repoRoot "target\$Target\release\termy-xcli.exe"
 
 if (-not $NoBuild) {
-    Write-Host "Building termy.exe and termy-cli.exe for target '$Target'..."
-    & cargo build --release --target $Target -p termy -p termy_cli
+    Write-Host "Building termy.exe, termy-cli.exe, and termy-xcli.exe for target '$Target'..."
+    & cargo build --release --target $Target -p termy -p termy_cli -p termy_x_cli
     if ($LASTEXITCODE -ne 0) {
         throw "cargo build failed with exit code $LASTEXITCODE"
     }
@@ -160,17 +173,70 @@ if (-not (Test-Path $exePath)) {
 if (-not (Test-Path $cliExePath)) {
     throw "Expected CLI binary not found at $cliExePath"
 }
+if (-not (Test-Path $xCliExePath)) {
+    throw "Expected X CLI binary not found at $xCliExePath"
+}
+if (Test-Path (Join-Path $repoRoot "target\$Target\release\x.exe")) {
+    throw "Refusing to package x.exe. The X command is termy-xcli.exe."
+}
+
+# The WinUI tab strip needs termy.manifest in termy.exe and the WinUI 2
+# runtime the desktop crate's build script stages beside it.
+$releaseDir = Split-Path -Parent $exePath
+foreach ($winuiFile in @("Microsoft.UI.Xaml.dll", "resources.pri", "termy.manifest")) {
+    if (-not (Test-Path (Join-Path $releaseDir $winuiFile))) {
+        throw "Expected $winuiFile beside termy.exe; rebuild termy for target '$Target'"
+    }
+}
+& (Join-Path $PSScriptRoot "windows\embed-manifest.ps1") -ExePath $exePath
+
+# Video playback loads libVLC from <exe>\vlc. The installer must not ship
+# without that folder. Staging copies an official 3.0.24 tree; it does not
+# modify a VLC install and does not download unless the caller passes a zip.
+$vlcDest = Join-Path $releaseDir "vlc"
+$stage = Join-Path $PSScriptRoot "windows\stage-libvlc.ps1"
+if ($env:TERMY_VLC_ZIP) {
+    & $stage -Zip $env:TERMY_VLC_ZIP -Dest $vlcDest -SourceTar $env:TERMY_VLC_SOURCE_TAR
+} elseif ($env:TERMY_VLC_SOURCE) {
+    & $stage -SourceDir $env:TERMY_VLC_SOURCE -Dest $vlcDest -SourceTar $env:TERMY_VLC_SOURCE_TAR
+} else {
+    $python = $null
+    foreach ($name in @("python", "python3", "py")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) { $python = $command.Source; break }
+    }
+    $checker = Join-Path $PSScriptRoot "windows\stage-libvlc.py"
+    if ($python -and (Test-Path $vlcDest)) {
+        & $python $checker --check --dest $vlcDest
+        if ($LASTEXITCODE -ne 0) {
+            throw "The vlc folder beside termy.exe is incomplete. Stage official VLC 3.0.24 with scripts/windows/stage-libvlc.ps1 -Zip <vlc-3.0.24-win64.zip> -Dest $vlcDest"
+        }
+    } else {
+        throw "Windows video playback needs the official VLC 3.0.24 win64 runtime beside termy.exe. It is not bundled in git. Download https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip (sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323) and rerun with TERMY_VLC_ZIP set to that file, or set TERMY_VLC_SOURCE to an extracted 3.0.24 tree. A copy of C:\Program Files\VideoLAN\VLC is only accepted when libvlc.dll contains 3.0.24. The script copies files; it does not change that install."
+    }
+}
 
 $isccPath = Resolve-IsccPath
 Write-Host "Using ISCC at $isccPath"
-Write-Host "Packaging Termy $Version ($Arch)..."
+Write-Host "Packaging Termy $appVersion ($Arch)..."
+
+# Optional: release CI drops the ConPTY NuGet binaries beside termy.exe.
+foreach ($conptyFile in @("conpty.dll", "OpenConsole.exe")) {
+    if (Test-Path (Join-Path $releaseDir $conptyFile)) {
+        Write-Host "Bundling $conptyFile"
+    } else {
+        Write-Host "No $conptyFile beside termy.exe; the installer relies on the system ConPTY"
+    }
+}
 
 & $isccPath `
-    "/DMyAppVersion=$Version" `
+    "/DMyAppVersion=$appVersion" `
+    "/DMyOutputVersion=$Version" `
     "/DMyArch=$Arch" `
     "/DMyTarget=$Target" `
     "/DMyExeName=termy.exe" `
     "/DMyCliExeName=termy-cli.exe" `
+    "/DMyXCliExeName=termy-xcli.exe" `
     $issPath
 
 if ($LASTEXITCODE -ne 0) {

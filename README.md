@@ -30,6 +30,24 @@ Termy is a fast, native terminal for macOS, Linux, and Windows. It combines GPU-
 - Optional tmux control-mode sessions
 - Native platform integration with a reusable headless runtime and FFI
 
+## Source
+
+The public repository is [github.com/jpanasuk-netizen/termy-x](https://github.com/jpanasuk-netizen/termy-x).
+Anyone can clone it, download the source archive, and fork it.
+
+```sh
+git clone https://github.com/jpanasuk-netizen/termy-x.git
+```
+
+The source license is the MIT license in [`LICENSE`](./LICENSE), copyright 2026 Lasse Vestergaard.
+That copyright and license are unchanged.
+
+A Windows x64 package may also contain the official VLC 3.0.24 win64 runtime.
+VLC, FFmpeg, x264, and those plugins are not MIT. Their notices are shipped
+with the runtime (`COPYING.txt`, `COPYING`, `COPYING.LIB`) and described in
+[release packaging](docs/architecture/release-packaging.md). Windows ARM64
+Setup is not offered.
+
 ## Install
 
 Download the latest build from **[termy.sh/download](https://termy.sh/download)** or browse every artifact on **[GitHub Releases](https://github.com/lassejlv/termy/releases)**.

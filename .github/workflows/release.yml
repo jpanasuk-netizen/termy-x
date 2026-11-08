@@ -3,6 +3,14 @@ name: Release
 on:
   release:
     types: [published]
+  # Builds artifacts for the selected ref and does not publish a release,
+  # move a tag, or upload to an existing release.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version label used only in artifact file names
+        required: true
+        default: ci
 
 permissions:
   contents: read
@@ -12,8 +20,12 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  VERSION: ${{ github.event.release.tag_name }}
+  VERSION: ${{ github.event.release.tag_name || inputs.version }}
   INNOSETUP_VERSION: 6.7.1
+  # Microsoft.Windows.Console.ConPTY NuGet package bundled with the Windows
+  # installer. Update both together; the hash is of the .nupkg file.
+  CONPTY_VERSION: 1.25.260930003
+  CONPTY_SHA512: 2eea8c93daf9a13cde4677b7e483a551d490ec3923a2b3886dc9ce0c667cd4cbe65294ebff5541433ddf01d08d0b091fb91d0c96eabe1fbad2dc77acfc0d5f3b
   APPIMAGETOOL_VERSION: 1.9.1
   APPIMAGETOOL_X86_64_SHA256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
 
@@ -35,7 +47,7 @@ jobs:
             target: x86_64-apple-darwin
             runner: macos-26
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
       APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
       TERMY_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       TERMY_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
@@ -43,7 +55,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Decide whether this DMG is signed
+        id: signing
+        env:
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          TERMY_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          TERMY_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          mode="$(./scripts/macos-release-mode.sh)"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          if [[ "$mode" == "unsigned" ]]; then
+            echo "No Apple signing credentials. The DMG will be unsigned and is not notarized."
+          fi
+
       - name: Import Developer ID and notarization credentials
+        if: steps.signing.outputs.mode == 'signed'
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -63,7 +92,27 @@ jobs:
         run: cargo install cargo-bundle --locked
 
       - name: Build, sign, and notarize DMG
+        if: steps.signing.outputs.mode == 'signed'
         run: ./scripts/build-dmg-signed.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --no-layout
+
+      - name: Build unsigned DMG
+        if: steps.signing.outputs.mode == 'unsigned'
+        run: |
+          echo "Building an unsigned DMG. It is not notarized and is not named as a signed release."
+          ./scripts/build-dmg.sh --version "$VERSION" --arch "${{ matrix.arch }}" --target "${{ matrix.target }}" --no-layout
+
+      - name: Sign DMG for Sparkle
+        if: steps.signing.outputs.mode == 'signed'
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+        run: |
+          sparkle_dir="$(./scripts/fetch-sparkle.sh)"
+          python3 scripts/sparkle-appcast.py sign \
+            --sign-update "$sparkle_dir/bin/sign_update" \
+            --dmg "dist/Termy-$VERSION-macos-${{ matrix.arch }}-signed.dmg" \
+            --info-plist "target/${{ matrix.target }}/release/bundle/osx/Termy.app/Contents/Info.plist" \
+            --arch "${{ matrix.arch }}" \
+            --out "dist/sparkle-${{ matrix.arch }}.json"
 
       - name: Remove signing credentials
         if: always()
@@ -73,19 +122,38 @@ jobs:
             rm -rf "$TERMY_SIGNING_DIR"
           fi
 
-      - name: Upload DMG artifact
+      - name: Upload signed DMG artifact
+        if: steps.signing.outputs.mode == 'signed'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: termy-dmg-${{ matrix.arch }}
-          path: dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}-signed.dmg
+          path: |
+            dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}-signed.dmg
+            dist/sparkle-${{ matrix.arch }}.json
+          if-no-files-found: error
+
+      - name: Upload unsigned DMG artifact
+        if: steps.signing.outputs.mode == 'unsigned'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: termy-dmg-${{ matrix.arch }}-unsigned
+          path: dist/Termy-${{ env.VERSION }}-macos-${{ matrix.arch }}.dmg
           if-no-files-found: error
 
   build-windows-setup:
-    name: Build Windows x64 Setup
+    name: Build Windows ${{ matrix.arch }} Setup
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+    env:
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -94,23 +162,69 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Record the supported Windows matrix
+        shell: pwsh
+        run: |
+          @"
+          ## Windows matrix
+          Windows x64 Setup is the supported Windows package. It includes termy.exe, termy-cli.exe, and termy-xcli.exe. It does not include x.exe.
+          Windows ARM64 Setup is not offered. Termy embeds only AMD64 libVLC (PE machine 0x8664). vlc-3.0.24-win64.zip is not staged for arm64. VideoLAN publishes vlc-3.0.24-winarm64.zip (sha256 f096226211f67f8e06e50cd0d6a948d842db128ff22a676dc1ca1cc6114baba5); that archive is not staged either. No arm64 Setup artifact is uploaded.
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8
 
       - name: Install Inno Setup
         run: choco install innosetup --version="$env:INNOSETUP_VERSION" --no-progress -y
 
+      - name: Build termy.exe, termy-cli.exe, and termy-xcli.exe
+        shell: pwsh
+        run: cargo build --release --target ${{ matrix.target }} -p termy -p termy_cli -p termy_x_cli
+
+      # Microsoft's out-of-band ConPTY (conpty.dll + OpenConsole.exe), newer
+      # than the one in older Windows builds. Termy loads it from beside
+      # termy.exe when present; termy.iss packs whatever is there.
+      - name: Stage official VLC 3.0.24 win64
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "vlc-3.0.24-win64.zip"
+          $url = "https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLowerInvariant()
+          $expect = "fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323"
+          if ($hash -ne $expect) { throw "VLC zip sha256 $hash != $expect" }
+          "TERMY_VLC_ZIP=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Bundle ConPTY
+        shell: pwsh
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP "conpty.zip"
+          $url = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$env:CONPTY_VERSION/microsoft.windows.console.conpty.$env:CONPTY_VERSION.nupkg"
+          Invoke-WebRequest -Uri $url -OutFile $package
+          $hash = (Get-FileHash -Algorithm SHA512 -Path $package).Hash
+          if ($hash -ne $env:CONPTY_SHA512) {
+            throw "ConPTY package hash mismatch: expected $env:CONPTY_SHA512, got $hash"
+          }
+          $extracted = Join-Path $env:RUNNER_TEMP "conpty"
+          [System.IO.Compression.ZipFile]::ExtractToDirectory($package, $extracted, $true)
+          $release = "target\${{ matrix.target }}\release"
+          Copy-Item (Join-Path $extracted "runtimes\win-${{ matrix.arch }}\native\conpty.dll") $release
+          Copy-Item (Join-Path $extracted "build\native\runtimes\${{ matrix.arch }}\OpenConsole.exe") $release
+
       - name: Build Setup.exe
         shell: pwsh
-        run: .\scripts\build-setup.ps1 -Version "${env:VERSION}" -Arch x64 -Target x86_64-pc-windows-msvc
+        run: .\scripts\build-setup.ps1 -Version "${env:VERSION}" -Arch ${{ matrix.arch }} -Target ${{ matrix.target }} -NoBuild
 
       - name: Upload Setup artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: termy-setup-x64
-          path: target/dist/Termy-${{ env.VERSION }}-windows-x64-Setup.exe
+          name: termy-setup-${{ matrix.arch }}
+          path: target/dist/Termy-${{ env.VERSION }}-windows-${{ matrix.arch }}-Setup.exe
           if-no-files-found: error
 
   build-linux:
@@ -126,7 +240,7 @@ jobs:
           - arch: x86_64
             target: x86_64-unknown-linux-gnu
     env:
-      VERSION: ${{ github.event.release.tag_name }}
+      VERSION: ${{ github.event.release.tag_name || inputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -212,6 +326,7 @@ jobs:
 
   attach-and-finalize-release:
     name: Attach release artifacts
+    if: github.event_name == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs:
@@ -222,11 +337,31 @@ jobs:
       contents: write
       actions: write
     steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          sparse-checkout: scripts
+
       - name: Download all artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Generate Sparkle appcasts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          notes_args=()
+          if [[ -n "${RELEASE_BODY//[[:space:]]/}" ]]; then
+            gh api markdown -f text="$RELEASE_BODY" -f mode=gfm -f context="$GITHUB_REPOSITORY" > "$RUNNER_TEMP/release-notes.html"
+            notes_args=(--notes-html "$RUNNER_TEMP/release-notes.html")
+          fi
+          python3 scripts/sparkle-appcast.py feed \
+            --repo "$GITHUB_REPOSITORY" --tag "$TAG" "${notes_args[@]}" \
+            --out-dir dist dist/sparkle-*.json
 
       - name: Generate SHA256 checksums
         shell: bash
@@ -249,5 +384,6 @@ jobs:
             dist/*.deb
             dist/*.rpm
             dist/checksums.txt
+            dist/appcast-*.xml
           fail_on_unmatched_files: true
           overwrite_files: true
