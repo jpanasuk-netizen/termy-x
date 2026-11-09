@@ -2700,6 +2700,18 @@ impl Publisher for OpenCliPublisher {
             // `opencli twitter reply --help` on 1.8.8) — say so plainly
             // instead of silently dropping the extra images.
             if index == 0 && !media.is_empty() {
+                let kinds = media
+                    .iter()
+                    .filter_map(|path| path.extension().and_then(|ext| ext.to_str()))
+                    .map(|ext| ext.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let count = media.len().to_string();
+                crate::publish::log_action(
+                    kind,
+                    "media",
+                    &[("ack", "pending"), ("count", &count), ("kinds", &kinds)],
+                );
                 if reply_to.is_some() {
                     if media.len() > 1 {
                         return Err(
@@ -2721,12 +2733,17 @@ impl Publisher for OpenCliPublisher {
             }
             let args = opencli_json(&args);
             let call_started = Instant::now();
+            let budget = if media.is_empty() {
+                POST_TIMEOUT
+            } else {
+                POST_MEDIA_TIMEOUT
+            };
             // `run_timeout` minimizes the automation window. Chrome then
             // reports the composer hidden and refuses the paste and Post
             // click, so the tweet never lands. `--window background` stays
             // on the command: it asks the bridge not to take focus. The
             // page itself stays visible. Do not move the window off-screen.
-            let output = match self.runner.run_keeping_window(&self.bin, &args, POST_TIMEOUT) {
+            let output = match self.runner.run_keeping_window(&self.bin, &args, budget) {
                 Ok(output) => {
                     write_perf_line(&format!(
                         "write post part={index} cli_ms={} status={}",
@@ -2740,8 +2757,23 @@ impl Publisher for OpenCliPublisher {
                         "write post part={index} cli_ms={} runner-error",
                         call_started.elapsed().as_millis()
                     ));
+                    if reply_to.is_none() {
+                        if let Some(id) = self.confirmed_post_on_timeline(part) {
+                            crate::publish::log_action(
+                                kind,
+                                "reconcile",
+                                &[("ack", "confirmed"), ("new_id", &id)],
+                            );
+                            let note = if media.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" with {} image(s)", media.len())
+                            };
+                            return Ok(format!("Posted {id}{note}"));
+                        }
+                    }
                     crate::publish::log_action(kind, "timeout", &[("ack", "pending")]);
-                    return Err(write_timeout_error(error, "posting", POST_TIMEOUT));
+                    return Err(write_timeout_error(error, "posting", budget));
                 }
             };
             last = check_opencli_output(&output, "opencli post/reply")?;
@@ -2767,6 +2799,17 @@ impl Publisher for OpenCliPublisher {
                 Ok(format!("{receipt}{media_note}"))
             }
             Err(error) => {
+                if reply_to.is_none() {
+                    if let Some(id) = self.confirmed_post_on_timeline(parts.last().map(String::as_str).unwrap_or("")) {
+                        write_perf_line("write post proof=reconciled");
+                        crate::publish::log_action(
+                            kind,
+                            "reconcile",
+                            &[("ack", "confirmed"), ("new_id", &id)],
+                        );
+                        return Ok(format!("Posted {id}{media_note}"));
+                    }
+                }
                 write_perf_line("write post proof=rejected");
                 crate::publish::log_action(kind, "ack", &[("ack", "rejected"), ("new_id", "none")]);
                 Err(error)
@@ -2794,6 +2837,7 @@ impl Publisher for OpenCliPublisher {
         }
         let verb = if follow { "follow" } else { "unfollow" };
         let what = if follow { "following" } else { "unfollowing" };
+        crate::publish::log_action(verb, "start", &[("ack", "pending"), ("new_id", "none")]);
         let args = opencli_json(&["twitter".into(), verb.into(), handle.into()]);
         let call_started = Instant::now();
         let output = match self.runner.run_timeout(&self.bin, &args, ENGAGE_TIMEOUT) {
@@ -2820,10 +2864,17 @@ impl Publisher for OpenCliPublisher {
             crate::publish::OpenCliWrite::Unfollow
         };
         if let Err(error) = crate::publish::prove_opencli_write(kind, &stdout, Some(handle)) {
+            if follow && self.confirmed_following(handle) {
+                write_perf_line(&format!("write {verb} proof=reconciled"));
+                crate::publish::log_action(verb, "reconcile", &[("ack", "confirmed"), ("new_id", "none")]);
+                return Ok(format!("Followed @{handle}"));
+            }
             write_perf_line(&format!("write {verb} proof=rejected"));
+            crate::publish::log_action(verb, "ack", &[("ack", "rejected"), ("new_id", "none")]);
             return Err(error);
         }
         write_perf_line(&format!("write {verb} proof=confirmed"));
+        crate::publish::log_action(verb, "ack", &[("ack", "confirmed"), ("new_id", "none")]);
         Ok(if follow {
             format!("Followed @{handle}")
         } else {
@@ -2844,6 +2895,8 @@ impl Publisher for OpenCliPublisher {
 /// check-before-retry answer; engage gets 90s for the same reason
 /// (goto + up-to-10s button poll + verify). Timing out never retries.
 const POST_TIMEOUT: Duration = Duration::from_secs(150);
+/// Image upload waits inside OpenCLI (up to 30s) before the sent-toast poll.
+const POST_MEDIA_TIMEOUT: Duration = Duration::from_secs(180);
 const ENGAGE_TIMEOUT: Duration = Duration::from_secs(90);
 
 fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
@@ -2858,6 +2911,43 @@ fn write_timeout_error(error: String, what: &str, budget: Duration) -> String {
 }
 
 impl OpenCliPublisher {
+    fn read_timeline(&self) -> Option<String> {
+        let args = opencli_json(&[
+            "twitter".into(),
+            "timeline".into(),
+            "--limit".into(),
+            "8".into(),
+        ]);
+        let output = self
+            .runner
+            .run_keeping_window(&self.bin, &args, Duration::from_secs(20))
+            .ok()?;
+        (output.status == 0).then_some(output.stdout)
+    }
+
+    fn confirmed_post_on_timeline(&self, text: &str) -> Option<String> {
+        let stdout = self.read_timeline()?;
+        crate::publish::own_post_id_matching(&stdout, text)
+    }
+
+    fn timeline_shows_flag(&self, id: &str, flag: &str, expected: bool) -> bool {
+        let Some(stdout) = self.read_timeline() else {
+            return false;
+        };
+        crate::publish::live_flag_equals(&stdout, id, flag, expected)
+    }
+
+    fn confirmed_following(&self, handle: &str) -> bool {
+        let args = opencli_json(&["twitter".into(), "user".into(), handle.into()]);
+        let Ok(output) = self
+            .runner
+            .run_keeping_window(&self.bin, &args, Duration::from_secs(20))
+        else {
+            return false;
+        };
+        output.status == 0 && crate::publish::live_following(&output.stdout, handle)
+    }
+
     /// `opencli twitter like|unlike|retweet|unretweet <url>` through
     /// the same silent-background shim as posts/replies. A quote does
     /// not call `twitter quote` or `twitter post`. Those commands open
@@ -2963,6 +3053,30 @@ impl OpenCliPublisher {
                 "engage {} proof=rejected",
                 action.opencli_verb()
             ));
+            if matches!(action, EngageAction::Retweet | EngageAction::Like | EngageAction::Unlike) {
+                let flag = match action {
+                    EngageAction::Retweet => "retweeted",
+                    _ => "favorited",
+                };
+                let target_id = crate::model::post_id_from_input(target_url);
+                let expected = !matches!(action, EngageAction::Unlike);
+                if self.timeline_shows_flag(&target_id, flag, expected) {
+                    write_perf_line(&format!("engage {} proof=reconciled", action.opencli_verb()));
+                    crate::publish::log_action(
+                        action.opencli_verb(),
+                        "reconcile",
+                        &[("ack", "confirmed"), ("new_id", &target_id)],
+                    );
+                    return Ok(format!(
+                        "[{{\"status\":\"success\",\"message\":\"{}\",\"id\":\"{target_id}\"}}]",
+                        match action {
+                            EngageAction::Retweet => "Tweet successfully retweeted.",
+                            EngageAction::Unlike => "Tweet successfully unliked.",
+                            _ => "Tweet successfully liked.",
+                        }
+                    ));
+                }
+            }
             crate::publish::log_action(action.opencli_verb(), "ack", &[("ack", "rejected"), ("new_id", "none")]);
             return Err(error);
         }
@@ -5202,7 +5316,15 @@ mod tests {
             db.confirmed("Jasper_Black", ToggleKind::Repost, "2118971448614334959"),
             Some(true)
         );
-        assert_eq!(bad.calls.lock().unwrap().len(), 2);
+        let calls = bad.calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 4, "{calls:?}");
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, args)| args.get(1).map(String::as_str) == Some("timeline"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -6574,6 +6696,107 @@ mod tests {
             assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
         }
         assert!(!args.iter().any(|a| a == "--images"), "{args:?}");
+    }
+
+    #[test]
+    fn image_post_sends_images_and_keeps_a_failed_receipt_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("marked-post.png");
+        let jpg = dir.path().join("marked-post.jpg");
+        std::fs::write(&png, b"png").unwrap();
+        std::fs::write(&jpg, b"jpg").unwrap();
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "post"],
+            r#"[{"status":"success","message":"still uploading","unconfirmed":true}]"#,
+        );
+        runner.script(
+            "opencli",
+            &["twitter", "timeline"],
+            r#"[{"id":"2119439234763472909","full_text":"photo hello"}]"#,
+        );
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let outcome = crate::publish::confirm_and_publish_with_media(
+            "photo hello",
+            None,
+            crate::publish::ConfirmDecision::Yes,
+            false,
+            &publisher,
+            280,
+            &[png.clone(), jpg.clone()],
+        );
+        match outcome {
+            crate::publish::GateOutcome::Sent { receipt, .. } => {
+                assert!(receipt.contains("2119439234763472909"), "{receipt}");
+                assert!(receipt.contains("2 image"), "{receipt}");
+            }
+            other => panic!("{other:?}"),
+        }
+        let calls = runner.calls.lock().unwrap().clone();
+        let post = calls.iter().find(|(_, args)| args.get(1).map(String::as_str) == Some("post")).expect("post");
+        let images = post.1.windows(2).find(|pair| pair[0] == "--images").expect("images");
+        assert!(images[1].contains("marked-post.png"), "{images:?}");
+        assert!(images[1].contains("marked-post.jpg"), "{images:?}");
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "upload" || arg == "x.exe")));
+
+        let bad = dir.path().join("note.txt");
+        std::fs::write(&bad, b"nope").unwrap();
+        let err = publisher.publish(&["photo hello".into()], None, &[bad]).unwrap_err();
+        assert!(err.contains("webp") || err.contains("jpg"), "{err}");
+    }
+
+    #[test]
+    fn retweet_and_like_reconcile_from_a_timeline_read_only() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "retweet"],
+            r#"[{"status":"success","message":"clicked","unconfirmed":true}]"#,
+        );
+        runner.script(
+            "opencli",
+            &["twitter", "timeline"],
+            r#"[{"id":"2118971448614334959","retweeted":true}]"#,
+        );
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let receipt = publisher
+            .engage(
+                crate::publish::EngageAction::Retweet,
+                "https://x.com/i/status/2118971448614334959",
+                None,
+                &[],
+            )
+            .expect("reconciled retweet");
+        assert!(receipt.contains("retweeted"), "{receipt}");
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline")));
+        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "x.exe")));
+    }
+
+    #[test]
+    fn follow_logs_and_reconciles_without_marking_a_miss_as_followed() {
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli",
+            &["twitter", "follow"],
+            r#"[{"status":"success","message":"clicked","unconfirmed":true}]"#,
+        );
+        runner.script(
+            "opencli",
+            &["twitter", "user"],
+            r#"{"screen_name":"moosaswrld","following":false}"#,
+        );
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let err = publisher.set_follow("moosaswrld", true).unwrap_err();
+        assert!(err.contains("not confirmed") || err.contains("Not marked"), "{err}");
+        runner.script(
+            "opencli",
+            &["twitter", "user"],
+            r#"{"screen_name":"moosaswrld","following":true}"#,
+        );
+        let ok = publisher.set_follow("moosaswrld", true).expect("reconciled");
+        assert!(ok.contains("Followed @moosaswrld"), "{ok}");
     }
 
     #[test]

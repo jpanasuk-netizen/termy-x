@@ -634,6 +634,121 @@ pub fn prove_new_post(stdout: &str) -> Result<String, String> {
     Ok(posted_receipt(stdout))
 }
 
+/// Id of a live post whose text is exactly `text`. Used only after a
+/// write receipt was not confirmed. A missing match is not a success.
+pub fn own_post_id_matching(stdout: &str, text: &str) -> Option<String> {
+    let wanted = text.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    find_post_id(&value, wanted)
+}
+
+fn json_id(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(text) = map.get("id_str").and_then(serde_json::Value::as_str) {
+        if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()) {
+            return Some(text.to_string());
+        }
+    }
+    match map.get("id") {
+        Some(serde_json::Value::String(text))
+            if !text.is_empty() && text.chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            Some(text.clone())
+        }
+        Some(serde_json::Value::Number(number)) => number.as_u64().map(|id| id.to_string()),
+        _ => None,
+    }
+}
+
+fn find_post_id(value: &serde_json::Value, wanted: &str) -> Option<String> {
+    match value {
+        serde_json::Value::Array(rows) => rows.iter().find_map(|row| find_post_id(row, wanted)),
+        serde_json::Value::Object(map) => {
+            let body = map
+                .get("full_text")
+                .or_else(|| map.get("text"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim);
+            if body == Some(wanted) {
+                if let Some(id) = json_id(map) {
+                    return Some(id);
+                }
+            }
+            map.values().find_map(|child| find_post_id(child, wanted))
+        }
+        _ => None,
+    }
+}
+
+/// True when a read-only payload shows `flag` for this status id.
+/// `favorited` and `liked` both count as a like. This is not a write.
+pub fn live_flag_for_id(stdout: &str, id: &str, flag: &str) -> bool {
+    live_flag_equals(stdout, id, flag, true)
+}
+
+pub fn live_flag_equals(stdout: &str, id: &str, flag: &str, expected: bool) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return false;
+    };
+    flag_on_id(&value, id, flag, expected)
+}
+
+fn flag_on_id(value: &serde_json::Value, id: &str, flag: &str, expected: bool) -> bool {
+    match value {
+        serde_json::Value::Array(rows) => rows.iter().any(|row| flag_on_id(row, id, flag, expected)),
+        serde_json::Value::Object(map) => {
+            let same = json_id(map).as_deref() == Some(id);
+            let flags = if flag == "favorited" {
+                ["favorited", "liked"]
+            } else {
+                [flag, flag]
+            };
+            let matched = flags.iter().any(|name| {
+                map.get(*name).and_then(serde_json::Value::as_bool) == Some(expected)
+            });
+            if same && matched {
+                return true;
+            }
+            map.values().any(|child| flag_on_id(child, id, flag, expected))
+        }
+        _ => false,
+    }
+}
+
+/// A profile read shows this handle as followed. Not a follow command.
+pub fn live_following(stdout: &str, handle: &str) -> bool {
+    let wanted = crate::model::strip_handle(handle);
+    if wanted.is_empty() {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        return false;
+    };
+    profile_following(&value, wanted)
+}
+
+fn profile_following(value: &serde_json::Value, handle: &str) -> bool {
+    match value {
+        serde_json::Value::Array(rows) => rows.iter().any(|row| profile_following(row, handle)),
+        serde_json::Value::Object(map) => {
+            let name = map
+                .get("screen_name")
+                .or_else(|| map.get("username"))
+                .or_else(|| map.get("handle"))
+                .and_then(serde_json::Value::as_str)
+                .map(crate::model::strip_handle);
+            let following = map.get("following").and_then(serde_json::Value::as_bool) == Some(true);
+            if following && name.is_some_and(|name| name.eq_ignore_ascii_case(handle)) {
+                return true;
+            }
+            map.values().any(|child| profile_following(child, handle))
+        }
+        _ => false,
+    }
+}
+
 pub fn prove_reply(stdout: &str) -> Result<String, String> {
     prove_opencli_write(OpenCliWrite::Reply, stdout, None)?;
     Ok("Reply sent".into())

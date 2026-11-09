@@ -11568,7 +11568,7 @@ impl XPanel {
                         // Stay on confirm so the user can retry or explicitly
                         // choose 'Open in browser'. Nothing auto-opens.
                         panel.notice = Some(format!(
-                            "Could not post: {} Nothing was posted.",
+                            "Could not post: {} Nothing was posted. The draft is still here.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
