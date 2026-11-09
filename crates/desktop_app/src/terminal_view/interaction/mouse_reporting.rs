@@ -225,7 +225,12 @@ impl TerminalView {
         }
     }
 
-    fn send_owned_mouse_packet_to_pane(&self, pane_id: &str, packet: Vec<u8>) -> bool {
+    fn send_owned_mouse_packet_to_pane(
+        &self,
+        pane_id: &str,
+        packet: Vec<u8>,
+        event_kind: TerminalMouseEventKind,
+    ) -> bool {
         if packet.is_empty() {
             return false;
         }
@@ -236,7 +241,15 @@ impl TerminalView {
                 let Some(terminal) = self.pane_terminal_by_id(pane_id) else {
                     return false;
                 };
-                terminal.write_input_owned(packet);
+                // Motion yields to keys when the program stops reading.
+                if matches!(
+                    event_kind,
+                    TerminalMouseEventKind::Move | TerminalMouseEventKind::Drag(_)
+                ) {
+                    terminal.write_mouse_motion(packet);
+                } else {
+                    terminal.write_input_owned(packet);
+                }
                 true
             }
         }
@@ -282,7 +295,7 @@ impl TerminalView {
         modifiers: gpui_kit::Modifiers,
     ) -> MouseForwardOutcome {
         let send_result = Self::encode_mouse_packet(mode, event_kind, cell, modifiers)
-            .map(|packet| self.send_owned_mouse_packet_to_pane(pane_id, packet));
+            .map(|packet| self.send_owned_mouse_packet_to_pane(pane_id, packet, event_kind));
         mouse_forward_outcome(mode, send_result)
     }
 

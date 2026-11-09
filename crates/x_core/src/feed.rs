@@ -1,4 +1,5 @@
 use crate::model::{Post, StatusLine};
+use crate::sort::{LIST_SORT_KEY, ResultSort, cmp_posts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RankMode {
@@ -90,21 +91,29 @@ impl Feed {
             self.notice = format!("searching {topic}");
             return FeedEffect::Search {
                 topic: topic.to_string(),
-                recent: self.mode == RankMode::Upcoming,
+                recent: self.sort() == ResultSort::Newest,
             };
         }
         match key {
             "j" | "down" => self.move_cursor(1),
             "k" | "up" => self.move_cursor(-1),
-            "h" | "hot" => {
+            "h" | "hot" | "popular" => {
                 self.mode = RankMode::Hot;
                 self.rank();
-                self.notice = "hot: engagement, then newer".into();
+                self.notice = "popular: likes, then engagement".into();
             }
-            "u" | "upcoming" => {
+            "u" | "upcoming" | "newest" => {
                 self.mode = RankMode::Upcoming;
                 self.rank();
-                self.notice = "upcoming: newer, then engagement".into();
+                self.notice = "newest: created_at descending".into();
+            }
+            key if key.eq_ignore_ascii_case(LIST_SORT_KEY) => {
+                self.mode = match self.mode {
+                    RankMode::Hot => RankMode::Upcoming,
+                    RankMode::Upcoming => RankMode::Hot,
+                };
+                self.rank();
+                self.notice = format!("{}: {}", self.sort().as_str(), self.sort().label());
             }
             "r" => {
                 if self.posts.is_empty() {
@@ -177,10 +186,7 @@ impl Feed {
 
     pub fn render(&self) -> String {
         let mut out = String::new();
-        let mode = match self.mode {
-            RankMode::Hot => "hot",
-            RankMode::Upcoming => "upcoming",
-        };
+        let mode = self.sort().as_str();
         let subject = self.topic.as_deref().unwrap_or("home timeline");
         out.push_str(&format!(
             "{status} | {mode} | {subject} | {quota}\n",
@@ -220,24 +226,22 @@ impl Feed {
             out.push_str(&format!("{}\n", self.notice));
         }
         out.push_str(
-            "keys: j/k move | h hot | u upcoming | /subject search | r reply | p preview | y post | esc cancel | q quit\n",
+            "keys: j/k move | s popular/newest | h popular | u newest | /subject search | r reply | p preview | y post | esc cancel | q quit\n",
         );
         out
     }
 
+    fn sort(&self) -> ResultSort {
+        match self.mode {
+            RankMode::Hot => ResultSort::Popular,
+            RankMode::Upcoming => ResultSort::Newest,
+        }
+    }
+
     fn rank(&mut self) {
-        let mode = self.mode;
-        self.posts.sort_by(|left, right| match mode {
-            RankMode::Hot => right
-                .engagement()
-                .cmp(&left.engagement())
-                .then(recency_key(right).cmp(recency_key(left)))
-                .then(left.id.cmp(&right.id)),
-            RankMode::Upcoming => recency_key(right)
-                .cmp(recency_key(left))
-                .then(right.engagement().cmp(&left.engagement()))
-                .then(left.id.cmp(&right.id)),
-        });
+        let sort = self.sort();
+        self.posts
+            .sort_by(|left, right| cmp_posts(left, right, sort));
         if self.cursor >= self.posts.len() {
             self.cursor = self.posts.len().saturating_sub(1);
         }
@@ -309,10 +313,6 @@ fn remaining_quota(blob: &str) -> Option<u64> {
         }
     }
     None
-}
-
-fn recency_key(post: &Post) -> &str {
-    post.created_at.as_deref().unwrap_or("")
 }
 
 fn one_line(text: &str) -> String {
@@ -462,12 +462,7 @@ mod tests {
             text: format!("tweet {id}"),
             created_at: Some(created.into()),
             likes,
-            reposts: 0,
-            replies: 0,
-            bookmarks: 0,
-            views: 0,
-            media: Vec::new(),
-            retweeted: None,
+            ..Post::default()
         }
     }
 
@@ -500,6 +495,26 @@ mod tests {
         let feed = Feed::new(posts, &status("search"), RankMode::Upcoming, None);
         assert_eq!(feed.posts[0].id, "new-small");
         assert_eq!(feed.posts[1].id, "old-big");
+    }
+
+    #[test]
+    fn s_toggles_popular_and_newest() {
+        let mut feed = Feed::new(
+            vec![
+                post("old-big", 50, "2026-10-01T00:00:00Z"),
+                post("new-small", 1, "2026-10-08T00:00:00Z"),
+            ],
+            &status("search"),
+            RankMode::Hot,
+            None,
+        );
+        assert_eq!(feed.posts[0].id, "old-big");
+        assert_eq!(feed.apply("s"), FeedEffect::Stay);
+        assert_eq!(feed.posts[0].id, "new-small");
+        assert!(feed.render().contains("newest"));
+        assert_eq!(feed.apply("s"), FeedEffect::Stay);
+        assert_eq!(feed.posts[0].id, "old-big");
+        assert!(feed.render().contains("popular"));
     }
 
     #[test]

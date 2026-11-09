@@ -1,0 +1,5 @@
+module CTermy [system] {
+    header "shim.h"
+    link "termy_core"
+    export *
+}

@@ -16,14 +16,6 @@ struct PreviewArgs {
     splash: bool,
     mock: bool,
     compose: bool,
-    posted: bool,
-    posted_card: bool,
-    entities: bool,
-    trends: bool,
-    search: bool,
-    lookupdemo: bool,
-    research: bool,
-    researchdemo: bool,
     width: f32,
     height: f32,
 }
@@ -33,14 +25,6 @@ fn preview_args() -> PreviewArgs {
         splash: false,
         mock: false,
         compose: false,
-        posted: false,
-        posted_card: false,
-        entities: false,
-        trends: false,
-        search: false,
-        lookupdemo: false,
-        research: false,
-        researchdemo: false,
         bench_tabs: false,
         width: std::env::var("TERMY_X_PREVIEW_WIDTH")
             .ok()
@@ -57,14 +41,6 @@ fn preview_args() -> PreviewArgs {
             "--splash" | "splash" => args.splash = true,
             "--mock" | "mock" => args.mock = true,
             "--compose" | "compose" => args.compose = true,
-            "--posted" | "posted" => args.posted = true,
-            "--posted-card" | "posted-card" => args.posted_card = true,
-            "--entities" | "entities" => args.entities = true,
-            "--trends" | "trends" => args.trends = true,
-            "--search" | "search" => args.search = true,
-            "--lookupdemo" | "lookupdemo" => args.lookupdemo = true,
-            "--researchdemo" | "researchdemo" => args.researchdemo = true,
-            "--research" | "research" => args.research = true,
             "--bench-tabs" | "bench-tabs" => args.bench_tabs = true,
             "--width" => {
                 if let Some(value) = raw.next().and_then(|text| text.parse().ok()) {
@@ -97,28 +73,10 @@ fn preview_args() -> PreviewArgs {
 fn main() {
     let args = preview_args();
     // `--splash` is the empty full-strength bird. `--mock` and the default stay on fixtures.
-    let scene = if args.splash {
-        "splash"
-    } else if args.posted {
-        "posted"
-    } else if args.posted_card {
-        "posted-card"
-    } else if args.entities {
-        "entities"
-    } else if args.trends {
-        "trends"
-    } else if args.search {
-        "search"
-    } else if args.lookupdemo {
-        "lookupdemo"
-    } else if args.research {
-        "research"
-    } else if args.researchdemo {
-        "researchdemo"
-    } else if args.compose {
-        "compose"
-    } else {
-        "mock"
+    let scene = match (args.splash, args.compose, args.mock) {
+        (true, _, _) => "splash",
+        (_, true, _) => "compose",
+        _ => "mock",
     };
     let width = args.width;
     let height = args.height;

@@ -10,9 +10,9 @@ This crate owns the standalone `x` executable shipped beside Termy. Command beha
 
 ```sh
 cargo test -p termy_x
-cargo run -p termy_x_cli --bin x -- doctor
-cargo run -p termy_x_cli --bin x -- splash
-cargo run -p termy_x_cli --bin x -- post --dry-run "hello world"
+cargo run -p termy_x_cli --bin termy-xcli -- doctor
+cargo run -p termy_x_cli --bin termy-xcli -- splash
+cargo run -p termy_x_cli --bin termy-xcli -- post --dry-run "hello world"
 ```
 
 ## Forbidden Dependencies

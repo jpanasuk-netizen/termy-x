@@ -12,6 +12,13 @@ impl TerminalMouseMode {
     pub const fn can_report_drag(self) -> bool {
         self.report_drag || self.report_motion
     }
+
+    /// X10 compatibility mode (`?9`): presses only, without modifiers. It's
+    /// the one enabled mode with no reporting flag, which keeps the
+    /// serialized shape unchanged.
+    pub const fn presses_only(self) -> bool {
+        self.enabled && !self.report_click && !self.can_report_drag()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,8 +166,8 @@ fn event_allowed(mode: TerminalMouseMode, event: TerminalMouseEventKind) -> bool
     match event {
         TerminalMouseEventKind::Move => mode.report_motion,
         TerminalMouseEventKind::Drag(_) => mode.can_report_drag(),
+        TerminalMouseEventKind::Release(_) => !mode.presses_only(),
         TerminalMouseEventKind::Press(_)
-        | TerminalMouseEventKind::Release(_)
         | TerminalMouseEventKind::WheelUp
         | TerminalMouseEventKind::WheelDown
         | TerminalMouseEventKind::WheelLeft
@@ -177,6 +184,11 @@ pub fn encode_mouse_report(
     if !event_allowed(mode, event) {
         return None;
     }
+    let modifiers = if mode.presses_only() {
+        TerminalMouseModifiers::default()
+    } else {
+        modifiers
+    };
 
     if mode.sgr_encoding {
         Some(sgr_mouse_report(event, position, modifiers))
@@ -251,6 +263,47 @@ mod tests {
         .expect("packet");
         // 33 + (4 + 8) = 45
         assert_eq!(bytes, b"\x1b[<45;1;1M");
+    }
+
+    #[test]
+    fn x10_mode_reports_presses_without_modifiers_and_no_releases() {
+        let x10 = TerminalMouseMode {
+            enabled: true,
+            ..TerminalMouseMode::default()
+        };
+        assert!(x10.presses_only());
+        let position = TerminalMousePosition { col: 5, row: 8 };
+        let shift = TerminalMouseModifiers {
+            shift: true,
+            ..TerminalMouseModifiers::default()
+        };
+        assert_eq!(
+            encode_mouse_report(
+                x10,
+                TerminalMouseEventKind::Press(TerminalMouseButton::Left),
+                position,
+                shift,
+            ),
+            Some(vec![0x1b, b'[', b'M', 32, 38, 41])
+        );
+        assert_eq!(
+            encode_mouse_report(
+                x10,
+                TerminalMouseEventKind::Release(TerminalMouseButton::Left),
+                position,
+                shift,
+            ),
+            None
+        );
+        // Button-event tracking without click reporting (tmux `?1002`) still
+        // reports releases.
+        assert!(
+            !TerminalMouseMode {
+                report_drag: true,
+                ..x10
+            }
+            .presses_only()
+        );
     }
 
     #[test]

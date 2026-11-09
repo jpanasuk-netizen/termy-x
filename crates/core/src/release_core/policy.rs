@@ -118,60 +118,62 @@ fn is_checksum_manifest_name(name: &str) -> bool {
     )
 }
 
-fn find_macos_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&'a ReleaseAsset> {
-    let dmg_suffix = format!("{arch}.dmg");
-    assets
+/// Names release assets use for each architecture [`current_arch`] reports.
+const ARCH_ALIASES: [(&str, &[&str]); 2] = [
+    ("arm64", &["arm64", "aarch64"]),
+    ("x86_64", &["x86_64", "x64", "amd64"]),
+];
+
+fn arch_aliases(arch: &str) -> &[&str] {
+    ARCH_ALIASES
         .iter()
-        .find(|asset| asset.name.contains(arch) && asset.name.ends_with(".dmg"))
-        .or_else(|| {
-            assets
-                .iter()
-                .find(|asset| asset.name.ends_with(&dmg_suffix))
-        })
-        .or_else(|| assets.iter().find(|asset| asset.name.ends_with(".dmg")))
+        .find(|(name, _)| *name == arch)
+        .map_or(&[], |(_, aliases)| aliases)
+}
+
+fn names_arch(name: &str, arch: &str) -> bool {
+    name.contains(arch) || arch_aliases(arch).iter().any(|alias| name.contains(alias))
+}
+
+/// Fallbacks may take an asset that names no architecture (or a universal
+/// one), never one built for another architecture.
+fn names_other_arch(name: &str, arch: &str) -> bool {
+    ARCH_ALIASES
+        .iter()
+        .filter(|(other, _)| *other != arch)
+        .any(|(other, _)| names_arch(name, other))
+}
+
+fn find_macos_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&'a ReleaseAsset> {
+    let dmgs = || assets.iter().filter(|asset| asset.name.ends_with(".dmg"));
+    dmgs()
+        .find(|asset| names_arch(&asset.name, arch))
+        .or_else(|| dmgs().find(|asset| !names_other_arch(&asset.name, arch)))
 }
 
 fn find_windows_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&'a ReleaseAsset> {
-    let win_arch = match arch {
-        "x86_64" => "x64",
-        "arm64" => "arm64",
-        _ => arch,
+    let with_extension = |extension: &'static str| {
+        assets
+            .iter()
+            .filter(move |asset| asset.name.ends_with(extension))
     };
 
-    assets
-        .iter()
-        .find(|asset| {
-            (asset.name.contains(arch) || asset.name.contains(win_arch))
-                && asset.name.ends_with(".msi")
-        })
-        .or_else(|| assets.iter().find(|asset| asset.name.ends_with(".msi")))
-        .or_else(|| {
-            assets.iter().find(|asset| {
-                (asset.name.contains(arch) || asset.name.contains(win_arch))
-                    && asset.name.ends_with(".exe")
-            })
-        })
-        .or_else(|| assets.iter().find(|asset| asset.name.ends_with(".exe")))
+    with_extension(".msi")
+        .find(|asset| names_arch(&asset.name, arch))
+        .or_else(|| with_extension(".exe").find(|asset| names_arch(&asset.name, arch)))
+        .or_else(|| with_extension(".msi").find(|asset| !names_other_arch(&asset.name, arch)))
+        .or_else(|| with_extension(".exe").find(|asset| !names_other_arch(&asset.name, arch)))
 }
 
 fn find_linux_asset<'a>(assets: &'a [ReleaseAsset], arch: &str) -> Option<&'a ReleaseAsset> {
-    let linux_arch = match arch {
-        "arm64" => "aarch64",
-        _ => arch,
+    let tarballs = || {
+        assets
+            .iter()
+            .filter(|asset| asset.name.contains("linux") && asset.name.ends_with(".tar.gz"))
     };
-
-    assets
-        .iter()
-        .find(|asset| {
-            asset.name.contains("linux")
-                && (asset.name.contains(arch) || asset.name.contains(linux_arch))
-                && asset.name.ends_with(".tar.gz")
-        })
-        .or_else(|| {
-            assets
-                .iter()
-                .find(|asset| asset.name.contains("linux") && asset.name.ends_with(".tar.gz"))
-        })
+    tarballs()
+        .find(|asset| names_arch(&asset.name, arch))
+        .or_else(|| tarballs().find(|asset| !names_other_arch(&asset.name, arch)))
 }
 
 #[cfg(test)]
@@ -237,6 +239,75 @@ mod tests {
             "Termy-v1.0.0-linux-aarch64.tar.gz"
         );
         assert!(select_platform_asset(&assets, PlatformKind::Other, "x86_64").is_none());
+    }
+
+    #[test]
+    fn fallbacks_never_pick_another_architecture() {
+        let other_arch_only = [
+            ("Termy-v1.0.0-macos-x86_64.dmg", PlatformKind::MacOs),
+            ("Termy-v1.0.0-windows-x64-Setup.exe", PlatformKind::Windows),
+            ("Termy-v1.0.0-windows-x64.msi", PlatformKind::Windows),
+            ("Termy-v1.0.0-linux-x86_64.tar.gz", PlatformKind::Linux),
+            ("termy-1.0.0-amd64.linux.tar.gz", PlatformKind::Linux),
+        ];
+        for (name, platform) in other_arch_only {
+            assert!(
+                select_platform_asset(&[asset(name)], platform, "arm64").is_none(),
+                "{name}"
+            );
+        }
+        assert!(
+            select_platform_asset(
+                &[asset("Termy-v1.0.0-linux-aarch64.tar.gz")],
+                PlatformKind::Linux,
+                "x86_64"
+            )
+            .is_none()
+        );
+
+        // Architecture-neutral assets remain a fallback.
+        for (name, platform) in [
+            ("Termy-v1.0.0-macos-universal.dmg", PlatformKind::MacOs),
+            ("Termy-v1.0.0-windows-Setup.exe", PlatformKind::Windows),
+            ("Termy-v1.0.0-linux.tar.gz", PlatformKind::Linux),
+        ] {
+            let assets = [asset("Termy-v1.0.0-other-x86_64.bin"), asset(name)];
+            assert_eq!(
+                select_platform_asset(&assets, platform, "arm64").map(|asset| asset.name.as_str()),
+                Some(name)
+            );
+        }
+        // The current architecture's installer wins over a neutral one.
+        let assets = [
+            asset("Termy-v1.0.0-windows.msi"),
+            asset("Termy-v1.0.0-windows-arm64-Setup.exe"),
+        ];
+        assert_eq!(
+            select_platform_asset(&assets, PlatformKind::Windows, "arm64")
+                .expect("Windows asset")
+                .name,
+            "Termy-v1.0.0-windows-arm64-Setup.exe"
+        );
+    }
+
+    #[test]
+    fn selects_windows_setup_for_each_architecture() {
+        // The names the release workflow uploads for each Windows matrix entry.
+        let assets = vec![
+            asset("checksums.txt"),
+            asset("Termy-v1.0.0-windows-x64-Setup.exe"),
+            asset("Termy-v1.0.0-windows-arm64-Setup.exe"),
+        ];
+
+        for (arch, expected_name) in [
+            ("x86_64", "Termy-v1.0.0-windows-x64-Setup.exe"),
+            ("arm64", "Termy-v1.0.0-windows-arm64-Setup.exe"),
+        ] {
+            let selected = select_platform_asset(&assets, PlatformKind::Windows, arch)
+                .expect("Windows Setup asset");
+            assert_eq!(selected.name, expected_name);
+            assert_eq!(extension_for_asset_name(&selected.name), "exe");
+        }
     }
 
     #[test]

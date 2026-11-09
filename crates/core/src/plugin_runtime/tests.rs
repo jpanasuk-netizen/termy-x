@@ -317,6 +317,30 @@ export default definePlugin({
     assert!(error.contains("cancelled"), "error: {error}");
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_bun_lookup_skips_shell_shims_and_prefers_the_packaged_exe() {
+    let temp = TempDir::new().expect("temp dir");
+    let dir = temp.path();
+    fs::write(dir.join("bun"), "#!/bin/sh").expect("write sh shim");
+    assert_eq!(bun_candidate_in_dir(dir), None);
+
+    fs::write(dir.join("bun.cmd"), "@echo off").expect("write cmd shim");
+    assert_eq!(bun_candidate_in_dir(dir), Some(dir.join("bun.cmd")));
+
+    let packaged = dir.join(r"node_modules\bun\bin");
+    fs::create_dir_all(&packaged).expect("create package dir");
+    fs::write(packaged.join("bun.exe"), "").expect("write packaged exe");
+    assert_eq!(
+        bun_candidate_in_dir(dir),
+        Some(dir.join(r"node_modules\bun\bin\bun.exe"))
+    );
+
+    fs::write(dir.join("bun.exe"), "").expect("write exe");
+    assert_eq!(bun_candidate_in_dir(dir), Some(dir.join("bun.exe")));
+    assert!(!is_executable_file(&dir.join("bun")));
+}
+
 #[cfg(unix)]
 #[test]
 fn plugin_host_environment_restores_gui_missing_path_entries() {
@@ -987,6 +1011,72 @@ fn discovery_is_sorted_and_fingerprints_contents() {
 }
 
 #[test]
+fn plugin_file_digests_are_cached_for_settled_files() {
+    let temp = TempDir::new().expect("temp dir");
+    let path = temp.path().join("plugin.ts");
+    let cached = || {
+        plugin_file_digests()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .keys()
+            .filter(|key| key.0 == path)
+            .count()
+    };
+    let digest = |contents: &str, modified: Option<std::time::SystemTime>| {
+        fs::write(&path, contents).expect("write plugin file");
+        if let Some(modified) = modified {
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("set modification time");
+        }
+        let entries = plugin_tree_entries(temp.path()).expect("plugin tree");
+        assert_eq!(entries.len(), 1);
+        plugin_file_digest(&entries[0]).expect("digest")
+    };
+
+    // Just written: its time may not have settled, so it isn't cached.
+    let fresh = digest("export const value = 1;", None);
+    assert_eq!(
+        fresh,
+        <[u8; 32]>::from(Sha256::digest(b"export const value = 1;"))
+    );
+    assert_eq!(cached(), 0);
+
+    let settled = std::time::SystemTime::now() - Duration::from_secs(3600);
+    assert_eq!(digest("export const value = 1;", Some(settled)), fresh);
+    assert_eq!(cached(), 1);
+    assert_eq!(digest_of_listed_file(temp.path()), fresh);
+
+    // Same path, length and restored modification time: the status-change
+    // time still tells the edit apart.
+    #[cfg(unix)]
+    assert_eq!(
+        digest("export const value = 2;", Some(settled)),
+        <[u8; 32]>::from(Sha256::digest(b"export const value = 2;"))
+    );
+}
+
+fn digest_of_listed_file(root: &Path) -> [u8; 32] {
+    let entries = plugin_tree_entries(root).expect("plugin tree");
+    plugin_file_digest(&entries[0]).expect("digest")
+}
+
+#[test]
+fn plugin_tree_size_limit_is_checked_before_reading() {
+    let temp = TempDir::new().expect("temp dir");
+    // Sparse, so the test doesn't write 16 MiB.
+    fs::File::create(temp.path().join("huge.ts"))
+        .and_then(|file| file.set_len(MAX_PLUGIN_SOURCE_BYTES + 1))
+        .expect("create sparse plugin file");
+    let error = plugin_tree_entries(temp.path())
+        .err()
+        .expect("oversized tree must be rejected");
+    assert!(error.contains("16 MiB"), "unexpected error: {error}");
+}
+
+#[test]
 fn discovery_requires_a_manifest_and_ignores_loose_typescript() {
     let temp = TempDir::new().expect("temp dir");
     let plugins = temp.path().join("plugins");
@@ -1467,6 +1557,26 @@ fn protocol_handshake_is_bounded_and_requires_authentication() {
         secret
     ));
     assert!(!valid_protocol_handshake(&valid, valid.len(), "wrong"));
+    assert!(!valid_protocol_handshake(
+        &valid,
+        valid.len(),
+        "0123456789abcdeF"
+    ));
+    assert!(!valid_protocol_handshake(
+        &valid,
+        valid.len(),
+        "0123456789abcde"
+    ));
+}
+
+#[test]
+fn secrets_match_compares_every_byte() {
+    assert!(secrets_match(b"abc", b"abc"));
+    assert!(secrets_match(b"", b""));
+    assert!(!secrets_match(b"abd", b"abc"));
+    assert!(!secrets_match(b"xbc", b"abc"));
+    assert!(!secrets_match(b"ab", b"abc"));
+    assert!(!secrets_match(b"abcd", b"abc"));
 }
 
 #[test]

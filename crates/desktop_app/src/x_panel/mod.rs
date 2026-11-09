@@ -2,9 +2,14 @@
 //! `background_opacity` behind lists and at full strength on the empty splash.
 
 pub mod art;
+mod desk;
+mod editor_surface;
+mod list_sort;
 mod media_fit;
 mod player;
+mod preview;
 mod scroll_math;
+mod thread_view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,6 +25,7 @@ use gpui_kit::{
     rgb, rgba,
 };
 
+/// Secondary control: neutral chrome. Active = selected, not neon.
 macro_rules! x_button {
     ($id:expr, $label:expr, $handler:expr) => {
         x_button!($id, $label, false, $handler)
@@ -28,24 +34,87 @@ macro_rules! x_button {
         let active = $active;
         div()
             .id($id)
-            .px(px(10.0))
-            .py(px(6.0))
+            .px(px(7.0))
+            .py(px(4.0))
             .rounded(px(8.0))
             .border_1()
             .border_color(if active {
-                rgb(0xff4fa3)
+                rgb(0x0a84ff)
             } else {
-                tint(0x7af6ff, 55)
+                rgb(0x3a3a3c)
             })
-            .bg(if active { rgb(0x2a0f3a) } else { rgb(0x1636c9) })
-            .text_size(px(12.0))
-            .text_color(if active { rgb(0xffd0ea) } else { rgb(0xf8fbff) })
+            .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
+            .text_size(px(11.0))
+            .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
             .cursor_pointer()
             .hover(|style| {
                 style
-                    .bg(rgb(0x1f4fff))
-                    .border_color(rgb(0x7af6ff))
-                    .text_color(rgb(0xe9fdff))
+                    .bg(rgb(0x3a3a3c))
+                    .border_color(rgb(0x636366))
+                    .text_color(rgb(0xffffff))
+            })
+            .child($label)
+            .on_mouse_down(MouseButton::Left, $handler)
+    }};
+}
+
+/// Compact tweet-row control. Padding stays tall enough to tap.
+macro_rules! x_action {
+    ($id:expr, $label:expr, $handler:expr) => {
+        x_action!($id, $label, false, $handler)
+    };
+    ($id:expr, $label:expr, $active:expr, $handler:expr) => {{
+        let active = $active;
+        div()
+            .id($id)
+            .px(px(6.0))
+            .py(px(6.0))
+            .min_h(px(32.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if active {
+                rgb(0x0a84ff)
+            } else {
+                rgb(0x3a3a3c)
+            })
+            .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
+            .text_size(px(12.0))
+            .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x3a3a3c))
+                    .border_color(rgb(0x636366))
+                    .text_color(rgb(0xffffff))
+            })
+            .child($label)
+            .on_mouse_down(MouseButton::Left, $handler)
+    }};
+}
+
+/// Primary CTA — one accent (system blue). Use sparingly.
+macro_rules! x_cta {
+    ($id:expr, $label:expr, $handler:expr) => {{
+        div()
+            .id($id)
+            .px(px(10.0))
+            .py(px(5.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(rgb(0x0a84ff))
+            .bg(rgb(0x0a84ff))
+            .text_size(px(11.0))
+            .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+            .text_color(rgb(0xffffff))
+            .cursor_pointer()
+            .hover(|style| {
+                style
+                    .bg(rgb(0x409cff))
+                    .border_color(rgb(0x409cff))
             })
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
@@ -58,16 +127,26 @@ use termy_x::model::{
     filter_trends, group_trends, profile_sections, sort_trends, trend_rank,
 };
 use termy_x::providers::{MockProvider, TimelineFeed, XProvider};
+use termy_x::publish::Publisher;
 use termy_x::text::{entity_spans, split_thread_limited, weighted_len_limited};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XSection {
     Timeline,
     Search,
+    Mentions,
+    Inbox,
     Trends,
     Lookup,
     Compose,
     Research,
+    Help,
+    Feeds,
+    Stats,
+    Followers,
+    Queue,
+    Analyze,
+    ReplyGuy,
 }
 
 impl XSection {
@@ -75,20 +154,72 @@ impl XSection {
         match self {
             Self::Timeline => "Timeline",
             Self::Search => "Search",
+            Self::Mentions => "Mentions",
+            Self::Inbox => "Inbox",
             Self::Trends => "Trends",
             Self::Lookup => "Lookup",
             Self::Compose => "Compose",
             Self::Research => "Research",
+            Self::Help => "Help",
+            Self::Feeds => "Feeds",
+            Self::Stats => "Stats",
+            Self::Followers => "Followers",
+            Self::Queue => "Queue",
+            Self::Analyze => "Analyze",
+            Self::ReplyGuy => "Reply Guy",
         }
+    }
+
+    fn all() -> [XSection; 15] {
+        [
+            Self::Timeline,
+            Self::Search,
+            Self::Mentions,
+            Self::Inbox,
+            Self::Trends,
+            Self::Lookup,
+            Self::Compose,
+            Self::Research,
+            Self::Feeds,
+            Self::Stats,
+            Self::Followers,
+            Self::Queue,
+            Self::Analyze,
+            Self::ReplyGuy,
+            Self::Help,
+        ]
+    }
+
+    fn is_desk(self) -> bool {
+        matches!(
+            self,
+            Self::Inbox
+                | Self::Mentions
+                | Self::Feeds
+                | Self::Stats
+                | Self::Followers
+                | Self::Queue
+                | Self::Analyze
+                | Self::ReplyGuy
+        )
     }
 
     pub fn from_command(name: &str) -> Self {
         match name {
             "search" => Self::Search,
+            "mentions" => Self::Mentions,
+            "inbox" => Self::Inbox,
             "trends" => Self::Trends,
             "lookup" => Self::Lookup,
             "compose" => Self::Compose,
             "research" => Self::Research,
+            "help" => Self::Help,
+            "feeds" => Self::Feeds,
+            "stats" | "analytics" => Self::Stats,
+            "followers" => Self::Followers,
+            "queue" => Self::Queue,
+            "analyze" => Self::Analyze,
+            "replyguy" | "reply-guy" => Self::ReplyGuy,
             _ => Self::Timeline,
         }
     }
@@ -116,9 +247,17 @@ enum InputTarget {
     Search,
     Reply,
     Quote,
+    NewTweet,
     Trends,
     Research,
     Lookup,
+    FeedQuery,
+    FeedFilter,
+    QueueText,
+    QueueReplyTo,
+    Analyze,
+    RgTopic,
+    RgKey,
 }
 
 /// Width of the panel when docked beside the terminal (as opposed to
@@ -155,9 +294,14 @@ fn edit_keys_owned(
         InputTarget::Reply => reply_open,
         // Quote shares the reply's gate: caller passes reply||quote open.
         InputTarget::Quote => reply_open,
+        InputTarget::NewTweet => reply_open,
         InputTarget::Trends => section == XSection::Trends,
         InputTarget::Research => section == XSection::Research,
         InputTarget::Lookup => section == XSection::Lookup,
+        InputTarget::FeedQuery | InputTarget::FeedFilter => section == XSection::Feeds,
+        InputTarget::QueueText | InputTarget::QueueReplyTo => section == XSection::Queue,
+        InputTarget::Analyze => section == XSection::Analyze,
+        InputTarget::RgTopic | InputTarget::RgKey => section == XSection::ReplyGuy,
     }
 }
 
@@ -191,17 +335,184 @@ pub struct CardTextSelection {
 /// selection instead of a click.
 pub const CARD_DRAG_PX: f32 = 6.0;
 
-/// Follow button label from the payload's real following flag plus
-/// an in-flight target. `None` flag = payload silent: show Follow and
-/// let only a verified action change the state (never fake Following).
-pub fn follow_button_label(viewer_following: Option<bool>, pending: Option<bool>) -> &'static str {
+/// What a Follow click is allowed to do. A write happens only after
+/// [`FollowStep::Confirm`] is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowStep {
+    ConnectFirst,
+    OwnAccount,
+    Confirm { handle: String, follow: bool },
+}
+
+/// What a Follow click does. Every variant is visible. None of them send
+/// a write except after [`FollowClick::Confirm`] is accepted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FollowClick {
+    /// A follow write is already in flight. The button stays on Following….
+    InFlight,
+    ConnectFirst,
+    OwnAccount,
+    Confirm { handle: String, follow: bool },
+}
+
+pub fn follow_click(
+    in_flight: bool,
+    connected: bool,
+    own_account: bool,
+    currently_following: bool,
+    handle: &str,
+) -> FollowClick {
+    if !termy_x::action_state::follow_write_allowed(in_flight) {
+        return FollowClick::InFlight;
+    }
+    match follow_step(connected, own_account, currently_following, handle) {
+        FollowStep::ConnectFirst => FollowClick::ConnectFirst,
+        FollowStep::OwnAccount => FollowClick::OwnAccount,
+        FollowStep::Confirm { handle, follow } => FollowClick::Confirm { handle, follow },
+    }
+}
+
+/// Text for the always-visible status line. Never empty.
+pub fn follow_click_status(click: &FollowClick) -> String {
+    match click {
+        FollowClick::InFlight => "Follow is already in progress.".into(),
+        FollowClick::ConnectFirst => {
+            "Connect X before following anyone. Nothing was changed.".into()
+        }
+        FollowClick::OwnAccount => "That's your account. Nothing was changed.".into(),
+        FollowClick::Confirm { handle, follow } => format!(
+            "{} Press Confirm or Cancel on that card. Nothing is sent until you do.",
+            follow_confirm_prompt(handle, *follow)
+        ),
+    }
+}
+
+/// The sentence on the card. The Follow button itself does not become this.
+pub fn follow_confirm_prompt(handle: &str, follow: bool) -> String {
+    let verb = if follow { "follow" } else { "unfollow" };
+    let handle = handle.trim().trim_start_matches('@');
+    format!("Do you want to {verb} @{handle}")
+}
+
+/// The confirm buttons belong on the card that was clicked, not at the
+/// top of the scrolled list where a long feed hides them.
+pub fn follow_confirm_on_card(ask_handle: Option<&str>, card_handle: &str) -> bool {
+    ask_handle.is_some_and(|ask| {
+        termy_x::model::strip_handle(ask)
+            .eq_ignore_ascii_case(termy_x::model::strip_handle(card_handle))
+    })
+}
+
+pub fn follow_step(
+    connected: bool,
+    own_account: bool,
+    currently_following: bool,
+    handle: &str,
+) -> FollowStep {
+    let handle = handle.trim().trim_start_matches('@').to_string();
+    if handle.is_empty() || own_account {
+        return FollowStep::OwnAccount;
+    }
+    if !connected {
+        return FollowStep::ConnectFirst;
+    }
+    FollowStep::Confirm {
+        handle,
+        follow: !currently_following,
+    }
+}
+
+/// Gap between rolling follow dots. Long enough that the redraw is not a spin.
+pub const FOLLOW_DOT_MS: u64 = 400;
+
+/// Dots run from the first click through the confirm panel and the request.
+/// They stop when neither is active, or when a newer animation replaced this one.
+pub fn follow_dots_keep_going(seq_matches: bool, awaiting_confirm: bool, pending: bool) -> bool {
+    seq_matches && (awaiting_confirm || pending)
+}
+
+/// Neutral dots while the confirm panel is up. This is not a sent request.
+pub fn follow_wait_label(frame: u32) -> &'static str {
+    match frame % 3 {
+        0 => ".",
+        1 => "..",
+        _ => "...",
+    }
+}
+
+/// One frame of the rolling dots. Frame 3 matches frame 0.
+pub fn follow_pending_label(following: bool, frame: u32) -> &'static str {
+    match (following, frame % 3) {
+        (true, 0) => "Following.",
+        (true, 1) => "Following..",
+        (true, _) => "Following...",
+        (false, 0) => "Unfollowing.",
+        (false, 1) => "Unfollowing..",
+        (false, _) => "Unfollowing...",
+    }
+}
+
+/// Action on the button. Someone you follow gets Unfollow. Followed is
+/// the success note, not this label. While the confirm panel is open the
+/// button is only rolling dots. After Confirm those dots become Following
+/// or Unfollowing without starting again at the first dot.
+pub fn follow_button_label(
+    viewer_following: Option<bool>,
+    pending: Option<bool>,
+    awaiting_confirm: bool,
+    frame: u32,
+) -> &'static str {
     match pending {
-        Some(true) => "Following\u{2026}",
-        Some(false) => "Unfollowing\u{2026}",
+        Some(target) => follow_pending_label(target, frame),
+        None if awaiting_confirm => follow_wait_label(frame),
         None => match viewer_following {
-            Some(true) => "Following \u{b7} Unfollow",
+            Some(true) => "Unfollow",
             _ => "Follow",
         },
+    }
+}
+
+/// Beside the dots while Confirm and Cancel are showing. Not a sent request.
+pub fn follow_awaiting_note(awaiting_confirm: bool, pending: bool) -> Option<&'static str> {
+    if awaiting_confirm && !pending {
+        Some("Awaiting confirmation")
+    } else {
+        None
+    }
+}
+
+/// Small note beside a remembered follow. It does not replace Unfollow.
+pub fn follow_saved_mark(following: bool, saved: bool, pending: bool) -> Option<&'static str> {
+    if following && saved && !pending {
+        Some("saved")
+    } else {
+        None
+    }
+}
+
+fn merge_pending_ids(confirmed: &[String], current: &[String], pending: &[String]) -> Vec<String> {
+    let mut ids = confirmed.to_vec();
+    for id in pending {
+        let held = current.iter().any(|item| item == id);
+        if held && !ids.iter().any(|item| item == id) {
+            ids.push(id.clone());
+        }
+        if !held {
+            ids.retain(|item| item != id);
+        }
+    }
+    ids
+}
+
+pub fn like_button_label(liked: bool, pending: bool, saved: bool) -> &'static str {
+    if pending {
+        "\u{2026}"
+    } else if liked && saved {
+        "Liked \u{b7} saved"
+    } else if liked {
+        "Liked"
+    } else {
+        "Like"
     }
 }
 
@@ -245,22 +556,48 @@ enum EnterAction {
 
 fn enter_action(field: TextField) -> EnterAction {
     match field {
-        TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
-            EnterAction::RunSearch
-        }
-        TextField::Reply | TextField::Quote => EnterAction::Newline,
+        TextField::Search
+        | TextField::Trends
+        | TextField::Research
+        | TextField::Lookup
+        | TextField::FeedQuery
+        | TextField::FeedFilter
+        | TextField::QueueText
+        | TextField::QueueReplyTo
+        | TextField::Analyze
+        | TextField::RgTopic
+        | TextField::RgKey => EnterAction::RunSearch,
+        TextField::Reply | TextField::Quote | TextField::NewTweet => EnterAction::Newline,
     }
 }
 
-/// The two simple end-caret text fields (Search query, inline reply).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Panel text fields. Reply and Quote are multiline; the rest are one row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum TextField {
     Search,
     Reply,
     Quote,
+    NewTweet,
     Trends,
     Research,
     Lookup,
+    FeedQuery,
+    FeedFilter,
+    QueueText,
+    QueueReplyTo,
+    Analyze,
+    RgTopic,
+    RgKey,
+}
+
+/// Compose, or one of the shared draft fields. The masked key box is not
+/// a caret editor: its glyphs are not the secret.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum EditorId {
+    Compose,
+    Field(TextField),
+    /// Developer-key box. Masked; the caret edits the real string.
+    Bearer,
 }
 
 /// Which post a pending image-picker result belongs to.
@@ -268,7 +605,6 @@ enum TextField {
 enum PickTarget {
     Compose,
     Reply,
-    Quote,
 }
 
 #[derive(Clone, PartialEq)]
@@ -324,7 +660,12 @@ pub struct XPanel {
     player_pending: bool,
     player_paused: bool,
     player_muted: bool,
+    /// mpv's own volume, 0–100. Zero is silent. Not the OS mixer.
+    player_volume: u8,
     player_error: Option<String>,
+    /// Bumped on open and on dismiss. A late player callback from an
+    /// older video must not close or reopen the one on screen.
+    player_gen: u64,
     #[cfg(target_os = "windows")]
     host_hwnd: isize,
     /// Last window viewport width (logical px), for seek-bar hit math.
@@ -370,9 +711,8 @@ pub struct XPanel {
     /// Per-feed: the loaded list's depth is backed by `feed_cursor`, so
     /// Load more can continue strictly older instead of re-fetching.
     feed_cursor_ok: [bool; 2],
-    /// Tweets this session liked / retweeted from the panel (payloads
-    /// carry no favorited/retweeted flag, so state starts unknown and
-    /// only reflects clicks made here; counts move locally with them).
+    /// Confirmed likes / reposts for the signed-in account. Hydrated
+    /// from the action file and from live flags on loaded posts.
     liked_ids: Vec<String>,
     retweeted_ids: Vec<String>,
     /// Bare-repost resolution cache: repost id -> embedded original
@@ -386,8 +726,25 @@ pub struct XPanel {
     engage_pending: Vec<String>,
     /// (handle, target state) while a follow/unfollow write is in flight.
     follow_pending: Option<(String, bool)>,
-    /// Session-verified follow states (set only on write success).
+    /// Waiting for Confirm before any follow write. Nothing is sent until
+    /// the person confirms.
+    follow_ask: Option<(String, bool)>,
+    /// Confirmed follow states for the signed-in account.
     follow_overrides: std::collections::HashMap<String, bool>,
+    /// Generation of the follow write currently in flight.
+    follow_seq: u64,
+    /// Which rolling-dot frame the Follow button is on.
+    follow_dots: u32,
+    /// Generation of the dot animation, from the first click until it ends.
+    follow_anim_seq: u64,
+    /// Per-tweet generation for an in-flight like or repost.
+    engage_seq: std::collections::HashMap<String, u64>,
+    action_db: termy_x::action_state::ActionDb,
+    action_seq: u64,
+    sync_generation: u64,
+    sync_snapshot_ms: u64,
+    action_persist: bool,
+    sync_line: String,
     /// Inline quote composer state (quote = retweet with your own words).
     quote_post_id: Option<String>,
     quote_author: String,
@@ -397,6 +754,7 @@ pub struct XPanel {
     /// Internal scroll for the three text editors (fixed-height boxes;
     /// long drafts scroll inside instead of overflowing the card).
     reply_scroll: ScrollHandle,
+    new_tweet_scroll: ScrollHandle,
     quote_scroll: ScrollHandle,
     compose_scroll: ScrollHandle,
     /// "Posted" burst playing in the editor a post just succeeded
@@ -416,7 +774,14 @@ pub struct XPanel {
     /// Poster URLs waiting for background decode (drained in batches).
     media_queue: std::collections::VecDeque<String>,
     media_draining: bool,
+    frame_queue: std::collections::VecDeque<String>,
+    frames_inflight: u8,
+    /// Poster URL → video URL, used once if the still image fails.
+    preview_fallback: HashMap<String, String>,
     search_posts: Vec<Post>,
+    mentions_posts: Vec<Post>,
+    inbox_posts: Vec<Post>,
+    list_sort: termy_x::sort::ResultSort,
     trends: Vec<Trend>,
     research: Vec<ResearchHit>,
     profile: Option<Profile>,
@@ -431,7 +796,7 @@ pub struct XPanel {
     picking: bool,
     /// Per-section single-flight guard: one OpenCLI/browser-session call at a time,
     /// so rapid clicks cannot spawn a storm of Chrome/OpenCLI processes.
-    fetching: [bool; 5],
+    fetching: [bool; 7],
     /// Last explicit browser open, for debounce (never reopen in a burst).
     last_browser_open: Option<Instant>,
     variants: Vec<Draft>,
@@ -451,12 +816,13 @@ pub struct XPanel {
     checking_conn: bool,
     bearer_mode: bool,
     bearer_input: String,
+    bearer_caret: termy_x::draft_edit::DraftCaret,
     queued_section: Option<XSection>,
     /// Per-section last successful fetch. Tab switches reuse data younger than 30s.
     fetched_at: SectionTimes,
     /// Monotonic id so a slow OpenCLI reply cannot overwrite a newer tab's data.
     fetch_seq: u64,
-    inflight: [u64; 5],
+    inflight: [u64; 7],
     loading: bool,
     /// Focus the panel on next render (Compose needs keys; terminal steals focus).
     pending_focus: bool,
@@ -468,6 +834,14 @@ pub struct XPanel {
     caret: usize,
     /// Selection anchor; range is between anchor and caret when set.
     sel_anchor: Option<usize>,
+    /// Grapheme column remembered across Up/Down in the compose box.
+    compose_preferred: Option<usize>,
+    /// Caret + selection for reply, quote, and the shared single-line fields.
+    field_carets: HashMap<TextField, termy_x::draft_edit::DraftCaret>,
+    /// Last shaped layout, keyed by editor, used to map a click to a byte.
+    editor_paint: HashMap<EditorId, editor_surface::EditorPaint>,
+    /// Field currently extending a selection by mouse drag.
+    text_drag: Option<EditorId>,
     /// Tweet text selected by dragging across a card (see
     /// [`CardTextSelection`]), plus the in-progress drag start
     /// `(post_id, text, x, y)` and whether the card currently owns
@@ -497,32 +871,73 @@ pub struct XPanel {
     reply_post_id: Option<String>,
     reply_author: String,
     reply_text: String,
+    new_tweet_open: bool,
+    new_tweet_text: String,
+    new_tweet_posting: bool,
     reply_media: Vec<PathBuf>,
     reply_posting: bool,
     replied_ids: Vec<String>,
     input_target: InputTarget,
     pick_target: PickTarget,
+    /// Thread overlay (click a tweet). Not a tab: Back/Esc restore the
+    /// list that was showing, including its scroll offset.
+    thread: Option<thread_view::ThreadView>,
+    thread_return_scroll: Option<f32>,
+    thread_seq: u64,
+    thread_leaving: bool,
+    /// Set while the confirm dialog is a reply (thread Reply). Compose
+    /// Publish leaves this None. post_now_async passes it as reply_to.
+    confirm_reply_to: Option<String>,
+    confirm_reply_author: String,
+    /// Per-run like-all / follow-all cap (clamped 25..=50).
+    bulk_cap: usize,
+    /// In-memory likes/follows for mock preview. Never talks to X.
+    mock_writes: termy_x::bulk::MockWriteLog,
+    bulk: Option<thread_view::BulkUi>,
+    bulk_seq: u64,
+    confirm_queue_id: Option<String>,
+    desk: desk::DeskState,
 }
 
 const FRESH_FOR: Duration = Duration::from_secs(30);
-/// Deep timeline: one OpenCLI call per feed returns this many unique
-/// tweets (verified live; no pagination flag exists or is needed).
-const TIMELINE_LIMIT: usize = 160;
-/// Posts fetched up front per feed (Jeremy's depth ask: land at 420
-/// real posts, then Load more pages older from there).
-const TIMELINE_INITIAL: usize = 420;
-/// Load more grows the OpenCLI limit by one batch (+160) at a time.
-/// The real end is data-driven (a fetch that returns no new tweets);
-/// this is only a high perf safety ceiling.
+/// Unique posts For you / Following ask for on open and on each Load more.
+/// The provider may answer in smaller pages; the fetch walks those until
+/// this many unique posts, or until the cursor stops.
+const TIMELINE_PAGE: usize = termy_x::providers::HOME_UI_PAGE;
+/// Search, mentions, inbox, and profile tweets. One request at the
+/// provider max that is still within 100. A short answer is shown as-is.
+const LIST_PAGE: usize = 100;
+/// Posts fetched up front per feed.
+const TIMELINE_INITIAL: usize = TIMELINE_PAGE;
+/// Safety ceiling on how many posts a feed will keep. Load more stops
+/// here even if the provider still has a cursor.
 const TIMELINE_MAX: usize = 1600;
 
-/// Next Load-more limit for a feed loaded to `current`, or None at cap.
-#[allow(dead_code)]
+/// Keep a forward cursor. The same cursor twice means the provider did
+/// not advance, so the feed stops instead of calling it again.
+fn store_feed_cursor(
+    slot: &mut Option<String>,
+    exhausted: &mut bool,
+    cursor_ok: &mut bool,
+    next_cursor: Option<String>,
+) {
+    let repeated = next_cursor.is_some() && next_cursor == *slot;
+    *cursor_ok = true;
+    if repeated || next_cursor.is_none() {
+        *exhausted = true;
+        *slot = None;
+    } else {
+        *exhausted = false;
+        *slot = next_cursor;
+    }
+}
+
+/// Another page is allowed while the loaded list is under the ceiling.
 fn next_timeline_limit(current: usize) -> Option<usize> {
     if current >= TIMELINE_MAX {
         None
     } else {
-        Some((current + TIMELINE_LIMIT).min(TIMELINE_MAX))
+        Some(TIMELINE_PAGE)
     }
 }
 
@@ -551,12 +966,15 @@ struct SectionTimes {
     timeline: Option<Instant>,
     timeline_following: Option<Instant>,
     search: Option<Instant>,
+    mentions: Option<Instant>,
+    inbox: Option<Instant>,
     trends: Option<Instant>,
     lookup: Option<Instant>,
     research: Option<Instant>,
 }
 
 #[derive(Clone)]
+#[allow(clippy::large_enum_variant)]
 enum FetchPayload {
     Timeline {
         posts: Vec<Post>,
@@ -576,6 +994,14 @@ enum FetchPayload {
         failed: bool,
     },
     Search {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Mentions {
+        posts: Vec<Post>,
+        status: String,
+    },
+    Inbox {
         posts: Vec<Post>,
         status: String,
     },
@@ -605,7 +1031,16 @@ fn section_slot(section: XSection) -> Option<usize> {
         XSection::Trends => Some(2),
         XSection::Lookup => Some(3),
         XSection::Research => Some(4),
-        XSection::Compose => None,
+        XSection::Mentions => Some(5),
+        XSection::Inbox => Some(6),
+        XSection::Compose
+        | XSection::Help
+        | XSection::Feeds
+        | XSection::Stats
+        | XSection::Followers
+        | XSection::Queue
+        | XSection::Analyze
+        | XSection::ReplyGuy => None,
     }
 }
 
@@ -637,6 +1072,20 @@ impl XPanel {
             termy_x::connect::load_connected_handle(&config)
         };
         let char_limit = config.char_limit_or_fallback();
+        let (action_db, action_persist, action_note) = if fill_window {
+            (termy_x::action_state::ActionDb::default(), false, None)
+        } else {
+            match termy_x::action_state::ActionDb::load(&config.action_state_path()) {
+                Ok(db) => (db, true, None),
+                Err(error) => (
+                    termy_x::action_state::ActionDb::default(),
+                    false,
+                    Some(format!(
+                        "Could not read saved likes and follows ({error}). Nothing was marked successful."
+                    )),
+                ),
+            }
+        };
         let mut panel = Self {
             focus: cx.focus_handle(),
             char_limit,
@@ -646,7 +1095,9 @@ impl XPanel {
             player_pending: false,
             player_paused: false,
             player_muted: false,
+            player_volume: 100,
             player_error: None,
+            player_gen: 0,
             #[cfg(target_os = "windows")]
             host_hwnd: 0,
             viewport_w: 0.0,
@@ -678,13 +1129,25 @@ impl XPanel {
             repost_resolving: false,
             engage_pending: Vec::new(),
             follow_pending: None,
+            follow_ask: None,
             follow_overrides: std::collections::HashMap::new(),
+            follow_seq: 0,
+            follow_dots: 0,
+            follow_anim_seq: 0,
+            engage_seq: std::collections::HashMap::new(),
+            action_db,
+            action_seq: 0,
+            sync_generation: 0,
+            sync_snapshot_ms: 0,
+            action_persist,
+            sync_line: String::new(),
             quote_post_id: None,
             quote_author: String::new(),
             quote_text: String::new(),
             quote_media: Vec::new(),
             quote_posting: false,
             reply_scroll: ScrollHandle::new(),
+            new_tweet_scroll: ScrollHandle::new(),
             quote_scroll: ScrollHandle::new(),
             compose_scroll: ScrollHandle::new(),
             post_burst: None,
@@ -696,7 +1159,13 @@ impl XPanel {
             mention_timer: false,
             media_queue: std::collections::VecDeque::new(),
             media_draining: false,
+            frame_queue: std::collections::VecDeque::new(),
+            frames_inflight: 0,
+            preview_fallback: HashMap::new(),
             search_posts: Vec::new(),
+            mentions_posts: Vec::new(),
+            inbox_posts: Vec::new(),
+            list_sort: config.list_sort,
             trends: Vec::new(),
             research: Vec::new(),
             profile: None,
@@ -709,7 +1178,7 @@ impl XPanel {
             media: Vec::new(),
             posting: false,
             picking: false,
-            fetching: [false; 5],
+            fetching: [false; 7],
             last_browser_open: None,
             compose: if fill_window {
                 "Termy X counts this URL as 23: https://termy.sh".into()
@@ -733,16 +1202,21 @@ impl XPanel {
             checking_conn: false,
             bearer_mode: false,
             bearer_input: String::new(),
+            bearer_caret: termy_x::draft_edit::DraftCaret::collapsed(0),
             queued_section: None,
             fetched_at: SectionTimes::default(),
             fetch_seq: 0,
-            inflight: [0; 5],
+            inflight: [0; 7],
             loading: false,
             pending_focus: false,
             suggesting: false,
             compose_focused: false,
             caret: 0,
             sel_anchor: None,
+            compose_preferred: None,
+            field_carets: HashMap::new(),
+            editor_paint: HashMap::new(),
+            text_drag: None,
             card_text_selection: None,
             card_drag_start: None,
             card_copy_focus: false,
@@ -759,15 +1233,34 @@ impl XPanel {
             reply_post_id: None,
             reply_author: String::new(),
             reply_text: String::new(),
+            new_tweet_open: false,
+            new_tweet_text: String::new(),
+            new_tweet_posting: false,
             reply_media: Vec::new(),
             reply_posting: false,
             replied_ids: Vec::new(),
             input_target: InputTarget::Compose,
             pick_target: PickTarget::Compose,
+            thread: None,
+            thread_return_scroll: None,
+            thread_seq: 0,
+            thread_leaving: false,
+            confirm_reply_to: None,
+            confirm_reply_author: String::new(),
+            bulk_cap: termy_x::clamp_bulk_cap(config.bulk_cap),
+            mock_writes: termy_x::bulk::MockWriteLog::default(),
+            bulk: None,
+            bulk_seq: 0,
+            confirm_queue_id: None,
+            desk: desk::DeskState::load(&config),
         };
+        if let Some(note) = action_note {
+            panel.notice = Some(note);
+        }
         if fill_window {
             // Preview path fills via load_scene / open_section.
         } else {
+            panel.hydrate_actions();
             panel.prewarm_art(cx);
             // Who is connected comes first: real tabs must never sit
             // silently empty (or on fixtures) with no profile behind them.
@@ -790,9 +1283,13 @@ impl XPanel {
     /// never wipes a Compose draft, gives instant status feedback.
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
         let section = self.section;
-        if section == XSection::Compose {
+        if section == XSection::Compose || section == XSection::Help {
             self.notice = Some("Compose draft kept \u{b7} refresh does nothing here.".into());
             cx.notify();
+            return;
+        }
+        if section.is_desk() {
+            self.refresh_desk(section, cx);
             return;
         }
         if self.fetching.iter().any(|f| *f) {
@@ -815,10 +1312,19 @@ impl XPanel {
                 TimelineFeed::Following => self.fetched_at.timeline_following = None,
             },
             XSection::Search => self.fetched_at.search = None,
+            XSection::Mentions => self.fetched_at.mentions = None,
+            XSection::Inbox => self.fetched_at.inbox = None,
             XSection::Trends => self.fetched_at.trends = None,
             XSection::Lookup => self.fetched_at.lookup = None,
             XSection::Research => self.fetched_at.research = None,
-            XSection::Compose => {}
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze
+            | XSection::ReplyGuy => {}
         }
         self.last_refresh = Some(local_hms());
         self.pending_top = true;
@@ -850,6 +1356,9 @@ impl XPanel {
     pub fn open_section(&mut self, section: XSection, cx: &mut Context<Self>) {
         let started = Instant::now();
         self.close_viewer();
+        if self.thread.is_some() {
+            self.abandon_thread();
+        }
         self.section = section;
         self.confirm = false;
         self.splash = false;
@@ -872,6 +1381,24 @@ impl XPanel {
                 self.input_target = InputTarget::Lookup;
                 self.pending_focus = true;
             }
+            XSection::Feeds => {
+                self.input_target = InputTarget::FeedQuery;
+                self.pending_focus = true;
+            }
+            XSection::Queue => {
+                self.input_target = InputTarget::QueueText;
+                self.pending_focus = true;
+            }
+            XSection::Analyze => {
+                self.input_target = InputTarget::Analyze;
+                self.pending_focus = true;
+            }
+            XSection::ReplyGuy => {
+                self.input_target = InputTarget::RgTopic;
+                self.pending_focus = true;
+                self.rg_refresh_keys();
+                self.rg_start_agents(cx);
+            }
             _ => {}
         }
 
@@ -892,6 +1419,9 @@ impl XPanel {
                     .search(&self.query, false, 10)
                     .map(|served| served.value)
                     .unwrap_or_default();
+            }
+            if section.is_desk() {
+                self.refresh_desk(section, cx);
             }
             log_switch(section, started, "local");
             return;
@@ -946,6 +1476,17 @@ impl XPanel {
             return;
         }
 
+        if section.is_desk() {
+            self.loading = false;
+            self.status = format!(
+                "{} \u{b7} local + OpenCLI reads \u{b7} nothing posts until Confirm",
+                section.label()
+            );
+            self.refresh_desk(section, cx);
+            log_switch(section, started, "desk");
+            return;
+        }
+
         if self.is_fresh(section) {
             self.loading = false;
             self.status = format!("{} Â· cached (<30s) Â· no X API credits", section.label());
@@ -977,6 +1518,44 @@ impl XPanel {
                 self.focus_compose_editor();
             }
             "search" => self.open_section(XSection::Search, cx),
+            "search-popular" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Popular;
+                self.open_section(XSection::Search, cx);
+                self.searched_query = "swift".into();
+                self.search_input = "swift".into();
+                self.search_posts = MockProvider
+                    .search("swift", false, 8)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.input_target = InputTarget::Compose;
+                self.status = "search \u{b7} Popular".into();
+            }
+            "search-newest" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Newest;
+                self.open_section(XSection::Search, cx);
+                self.searched_query = "swift".into();
+                self.search_input = "swift".into();
+                self.search_posts = MockProvider
+                    .search("swift", true, 8)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.input_target = InputTarget::Compose;
+                self.status = "search \u{b7} Newest".into();
+            }
+            "mentions" => {
+                self.load_mock_dashboard();
+                self.list_sort = termy_x::sort::ResultSort::Popular;
+                self.open_section(XSection::Mentions, cx);
+                let posts = MockProvider
+                    .mentions("termy", 10)
+                    .map(|served| served.value)
+                    .unwrap_or_default();
+                self.mentions_posts = posts.clone();
+                self.desk.mentions_posts = posts;
+                self.status = "mentions \u{b7} Popular".into();
+            }
             "compose" => self.open_section(XSection::Compose, cx),
             // Dev-preview only: show the Posted burst state without
             // posting anything (the preview binary never publishes).
@@ -990,10 +1569,11 @@ impl XPanel {
                     seq: 1,
                     started: Instant::now(),
                     card_id: None,
+                    follow_handle: None,
                     label: "\u{2713} Posted",
                 });
                 self.notice =
-                    Some("Posted in-app \u{2014} no browser opened. 1 part(s) posted".into());
+                    Some("Preview of the Posted note. Nothing was posted.".into());
             }
             "confirm" => {
                 self.open_section(XSection::Compose, cx);
@@ -1003,6 +1583,8 @@ impl XPanel {
                 self.section = XSection::Timeline;
                 self.posts.clear();
                 self.search_posts.clear();
+                self.mentions_posts.clear();
+                self.inbox_posts.clear();
                 self.trends.clear();
                 self.research.clear();
                 self.profile = None;
@@ -1022,6 +1604,7 @@ impl XPanel {
                         seq: 1,
                         started: Instant::now(),
                         card_id: Some(id),
+                        follow_handle: None,
                         label: "\u{2713} Liked",
                     });
                 }
@@ -1038,6 +1621,13 @@ impl XPanel {
                 self.lookup = "someone".into();
                 self.open_section(XSection::Lookup, cx);
             }
+            // Dev-preview only: Lookup stats card (profile totals + tweet window).
+            "stats" => {
+                self.load_mock_dashboard();
+                self.profile = MockProvider.lookup("termy").ok().map(|served| served.value);
+                self.lookup = "termy".into();
+                self.open_section(XSection::Lookup, cx);
+            }
             "trends" => {
                 self.load_mock_dashboard();
                 self.open_section(XSection::Trends, cx);
@@ -1050,6 +1640,63 @@ impl XPanel {
                 self.research_input = "gpui".into();
                 self.researched_query = "gpui".into();
                 self.open_section(XSection::Research, cx);
+            }
+            "thread" => self.show_mock_thread(termy_x::sort::ResultSort::Popular),
+            "thread-newest" => self.show_mock_thread(termy_x::sort::ResultSort::Newest),
+            "thread-reply" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                if let Some(thread) = &self.thread {
+                    let id = thread.root.id.clone();
+                    let author = thread.root.author_handle.clone();
+                    self.open_reply_parts(&id, &author);
+                    self.reply_text = "Mock reply. Nothing posts until Confirm.".into();
+                    self.arm_reply_confirm();
+                }
+            }
+            "thread-bulk" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                self.arm_bulk(termy_x::bulk::BulkKind::LikeReplies, cx);
+            }
+            "thread-progress" => {
+                self.show_mock_thread(termy_x::sort::ResultSort::Popular);
+                let replies = self.thread_replies_for_bulk();
+                let plan = termy_x::bulk::plan_bulk(
+                    termy_x::bulk::BulkKind::LikeReplies,
+                    &replies,
+                    self.own_handle(),
+                    self.bulk_cap,
+                );
+                let total = plan.action_count().max(1);
+                self.status = format!("bulk \u{b7} 1/{total}");
+                self.bulk = Some(thread_view::BulkUi::Running {
+                    plan,
+                    done: 1,
+                    stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                });
+            }
+            "inbox" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Inbox, cx);
+            }
+            "feeds" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Feeds, cx);
+            }
+            "analytics" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Stats, cx);
+            }
+            "followers" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Followers, cx);
+            }
+            "queue" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Queue, cx);
+            }
+            "analyze" => {
+                self.load_mock_dashboard();
+                self.open_section(XSection::Analyze, cx);
             }
             _ => self.open_section(XSection::Timeline, cx),
         }
@@ -1078,6 +1725,24 @@ impl XPanel {
                 .search(&self.query, false, 4)
                 .map(|served| served.value)
                 .unwrap_or_default();
+        }
+        if self.mentions_posts.is_empty() {
+            self.mentions_posts = MockProvider
+                .mentions("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.inbox_posts.is_empty() {
+            self.inbox_posts = MockProvider
+                .inbox_replies("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.desk.mentions_posts.is_empty() {
+            self.desk.mentions_posts = self.mentions_posts.clone();
+        }
+        if self.desk.inbox_posts.is_empty() {
+            self.desk.inbox_posts = self.inbox_posts.clone();
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
@@ -1116,6 +1781,24 @@ impl XPanel {
                 .search(&self.query, false, 4)
                 .map(|served| served.value)
                 .unwrap_or_default();
+        }
+        if self.mentions_posts.is_empty() {
+            self.mentions_posts = MockProvider
+                .mentions("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.inbox_posts.is_empty() {
+            self.inbox_posts = MockProvider
+                .inbox_replies("termy", 10)
+                .map(|served| served.value)
+                .unwrap_or_default();
+        }
+        if self.desk.mentions_posts.is_empty() {
+            self.desk.mentions_posts = self.mentions_posts.clone();
+        }
+        if self.desk.inbox_posts.is_empty() {
+            self.desk.inbox_posts = self.inbox_posts.clone();
         }
         if self.trends.is_empty() {
             self.trends = MockProvider
@@ -1166,15 +1849,15 @@ impl XPanel {
             cx.notify();
             return;
         }
-        // Cursor-backed list: fetch just the next older batch from the
-        // stored bottom cursor. Legacy-backed list (cursor path was
-        // unavailable at load): establish the chain by walking from the
-        // top past everything already loaded, once.
-        let next = if self.feed_cursor_ok[idx] {
-            TIMELINE_LIMIT
-        } else {
-            (self.feed_depth[idx] + TIMELINE_LIMIT).min(TIMELINE_MAX)
-        };
+        if !self.feed_cursor_ok[idx] || self.feed_cursor[idx].is_none() {
+            self.status = format!(
+                "no next-page cursor \u{b7} {} shown \u{b7} this provider cannot continue",
+                self.feed_posts().len()
+            );
+            cx.notify();
+            return;
+        }
+        let next = TIMELINE_PAGE;
         self.next_fetch = Some((true, next));
         self.append_inflight = true;
         self.loading = true;
@@ -1191,6 +1874,12 @@ impl XPanel {
                 "No more older tweets \u{b7} {} shown \u{b7} \u{21bb} refreshes to the newest {}",
                 self.feed_posts().len(),
                 TIMELINE_INITIAL
+            ));
+        }
+        if !self.feed_cursor_ok[idx] || self.feed_cursor[idx].is_none() {
+            return hint(format!(
+                "No next-page cursor \u{b7} {} shown \u{b7} this provider cannot continue",
+                self.feed_posts().len()
             ));
         }
         if self.feed_posts().len() >= TIMELINE_MAX {
@@ -1254,6 +1943,9 @@ impl XPanel {
         if feed == self.timeline_feed {
             return;
         }
+        if self.thread.is_some() {
+            self.abandon_thread();
+        }
         let old = Self::feed_index(self.timeline_feed);
         self.feed_offset[old] = self.list_scroll.offset().y.into();
         self.timeline_feed = feed;
@@ -1281,10 +1973,19 @@ impl XPanel {
                 TimelineFeed::Following => self.fetched_at.timeline_following,
             },
             XSection::Search => self.fetched_at.search,
+            XSection::Mentions => self.fetched_at.mentions,
+            XSection::Inbox => self.fetched_at.inbox,
             XSection::Trends => self.fetched_at.trends,
             XSection::Lookup => self.fetched_at.lookup,
             XSection::Research => self.fetched_at.research,
-            XSection::Compose => return true,
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze
+            | XSection::ReplyGuy => return true,
         };
         matches!(
             at,
@@ -1296,10 +1997,20 @@ impl XPanel {
         match section {
             XSection::Timeline => !self.feed_posts().is_empty(),
             XSection::Search => !self.search_posts.is_empty(),
+            XSection::Mentions => !self.desk.mentions_posts.is_empty(),
+            XSection::Inbox => !self.desk.inbox_posts.is_empty(),
             XSection::Trends => !self.trends.is_empty(),
             XSection::Lookup => self.profile.is_some(),
             XSection::Research => !self.research.is_empty(),
-            XSection::Compose => true,
+            XSection::Compose | XSection::Help => true,
+            XSection::Feeds => {
+                !self.desk.feed_posts.is_empty() || !self.desk.feed_store.feeds.is_empty()
+            }
+            XSection::Stats => self.desk.stats.is_some(),
+            XSection::Followers => self.desk.follower_diff.is_some(),
+            XSection::Queue => !self.desk.queue.is_empty(),
+            XSection::Analyze => self.desk.analyze.is_some(),
+            XSection::ReplyGuy => !self.desk.rg_hits.is_empty(),
         }
     }
 
@@ -1308,10 +2019,19 @@ impl XPanel {
         for section in [
             XSection::Timeline,
             XSection::Search,
+            XSection::Mentions,
+            XSection::Inbox,
             XSection::Trends,
             XSection::Lookup,
             XSection::Compose,
             XSection::Research,
+            XSection::Help,
+            XSection::Feeds,
+            XSection::Stats,
+            XSection::Followers,
+            XSection::Queue,
+            XSection::Analyze,
+            XSection::ReplyGuy,
             XSection::Timeline,
         ] {
             self.open_section(section, cx);
@@ -1372,11 +2092,17 @@ impl XPanel {
         }
         self.fetching[slot] = true;
         self.fetch_seq = self.fetch_seq.wrapping_add(1);
+        self.sync_snapshot_ms = termy_x::action_state::now_ms();
         let seq = self.fetch_seq;
         self.inflight[slot] = seq;
 
         let query = self.query.clone();
         let lookup = self.lookup.clone();
+        let handle = match &self.connection {
+            ConnState::Connected { handle, .. } => handle.clone(),
+            _ => self.lookup.clone(),
+        };
+        let newest = self.list_sort == termy_x::sort::ResultSort::Newest;
         let live = self.live;
         let feed = self.timeline_feed;
         let (append, limit) = self
@@ -1399,6 +2125,8 @@ impl XPanel {
                         section,
                         query,
                         lookup,
+                        handle,
+                        newest,
                         live,
                         feed,
                         append,
@@ -1448,8 +2176,10 @@ impl XPanel {
                     // keep every loaded tweet, keep the cursor, and say
                     // so. Never swap in fixture posts, never mark the
                     // feed exhausted for a transient error.
+                    self.absorb_posts(&[], Some(status.as_str()));
                     self.status = status;
                 } else if append {
+                    self.absorb_posts(&posts, None);
                     // Load more: existing order untouched, only unseen
                     // ids extend the list downward. Scroll is not moved.
                     let (total, added) = match feed {
@@ -1474,11 +2204,12 @@ impl XPanel {
                         }
                     };
                     if cursor_ok {
-                        self.feed_cursor[idx] = next_cursor.clone();
-                        self.feed_cursor_ok[idx] = true;
-                        if next_cursor.is_none() {
-                            self.feed_exhausted[idx] = true;
-                        }
+                        store_feed_cursor(
+                            &mut self.feed_cursor[idx],
+                            &mut self.feed_exhausted[idx],
+                            &mut self.feed_cursor_ok[idx],
+                            next_cursor,
+                        );
                     } else if added == 0 {
                         self.feed_exhausted[idx] = true;
                     }
@@ -1493,6 +2224,7 @@ impl XPanel {
                         TimelineFeed::Following => self.fetched_at.timeline_following = Some(now),
                     }
                 } else {
+                    self.absorb_posts(&posts, None);
                     let landed = posts.len();
                     match feed {
                         TimelineFeed::ForYou => {
@@ -1506,17 +2238,33 @@ impl XPanel {
                     }
                     self.feed_depth[idx] = landed;
                     if cursor_ok {
-                        self.feed_cursor[idx] = next_cursor.clone();
-                        self.feed_cursor_ok[idx] = true;
-                        self.feed_exhausted[idx] = next_cursor.is_none();
+                        store_feed_cursor(
+                            &mut self.feed_cursor[idx],
+                            &mut self.feed_exhausted[idx],
+                            &mut self.feed_cursor_ok[idx],
+                            next_cursor,
+                        );
                     }
                     self.status = status;
                 }
             }
             FetchPayload::Search { posts, status } => {
+                self.absorb_posts(&posts, None);
                 self.search_posts = posts;
                 self.status = status;
                 self.fetched_at.search = Some(now);
+            }
+            FetchPayload::Mentions { posts, status } => {
+                self.absorb_posts(&posts, None);
+                self.mentions_posts = posts;
+                self.status = status;
+                self.fetched_at.mentions = Some(now);
+            }
+            FetchPayload::Inbox { posts, status } => {
+                self.absorb_posts(&posts, None);
+                self.inbox_posts = posts;
+                self.status = status;
+                self.fetched_at.inbox = Some(now);
             }
             FetchPayload::Trends {
                 trends,
@@ -1537,9 +2285,15 @@ impl XPanel {
             } => {
                 self.lookup_error = failed.then_some(status.clone());
                 if !failed {
+                    if let Some(profile) = &profile {
+                        let mut loaded = profile.posts.clone();
+                        loaded.extend(profile.pinned.iter().cloned());
+                        self.absorb_posts(&loaded, None);
+                    }
                     self.profile = profile;
                     self.fetched_at.lookup = Some(now);
                 } else {
+                    self.absorb_posts(&[], Some(status.as_str()));
                     self.profile = None;
                 }
                 self.status = status;
@@ -1577,20 +2331,27 @@ impl XPanel {
         if self.repost_resolving {
             return;
         }
-        let mut wanted: Vec<String> = Vec::new();
-        let scan = |posts: &[Post], wanted: &mut Vec<String>| {
+        let mut wanted: Vec<(String, String)> = Vec::new();
+        let scan = |posts: &[Post], wanted: &mut Vec<(String, String)>| {
             for post in posts {
-                if post.bare_repost_handle().is_some()
-                    && !self.repost_cache.contains_key(&post.id)
-                    && !wanted.contains(&post.id)
+                let needs = post.retweeted.is_none()
+                    && post.unavailable_original_url.is_none()
+                    && (post.bare_repost_handle().is_some() || post.referenced_status_id.is_some());
+                if needs && !self.repost_cache.contains_key(&post.id) && !wanted.iter().any(|(id, _)| id == &post.id)
                 {
-                    wanted.push(post.id.clone());
+                    let fetch = post
+                        .original_fetch_id()
+                        .unwrap_or(post.id.as_str())
+                        .to_string();
+                    wanted.push((post.id.clone(), fetch));
                 }
             }
         };
         scan(&self.posts, &mut wanted);
         scan(&self.following_posts, &mut wanted);
         scan(&self.search_posts, &mut wanted);
+        scan(&self.mentions_posts, &mut wanted);
+        scan(&self.inbox_posts, &mut wanted);
         if let Some(profile) = &self.profile {
             scan(&profile.posts, &mut wanted);
             scan(&profile.pinned, &mut wanted);
@@ -1607,11 +2368,10 @@ impl XPanel {
                     let service = XPanel::service_free();
                     wanted
                         .iter()
-                        .map(|id| {
-                            let original = service
-                                .post_by_id(id)
-                                .ok()
-                                .and_then(|served| served.value.retweeted.map(|inner| *inner));
+                        .map(|(id, fetch_id)| {
+                            let original = service.post_by_id(fetch_id).ok().and_then(|served| {
+                                termy_x::model::Post::adopt_fetched_original(id, served.value)
+                            });
                             (id.clone(), original)
                         })
                         .collect::<Vec<(String, Option<Post>)>>()
@@ -1625,13 +2385,26 @@ impl XPanel {
                         patch_repost_original(&mut panel.posts, &id, &original);
                         patch_repost_original(&mut panel.following_posts, &id, &original);
                         patch_repost_original(&mut panel.search_posts, &id, &original);
+                        patch_repost_original(&mut panel.mentions_posts, &id, &original);
+                        patch_repost_original(&mut panel.inbox_posts, &id, &original);
                         if let Some(profile) = &mut panel.profile {
                             patch_repost_original(&mut profile.posts, &id, &original);
                             patch_repost_original(&mut profile.pinned, &id, &original);
                         }
+                    } else {
+                        patch_repost_unavailable(&mut panel.posts, &id);
+                        patch_repost_unavailable(&mut panel.following_posts, &id);
+                        patch_repost_unavailable(&mut panel.search_posts, &id);
+                        patch_repost_unavailable(&mut panel.mentions_posts, &id);
+                        patch_repost_unavailable(&mut panel.inbox_posts, &id);
+                        if let Some(profile) = &mut panel.profile {
+                            patch_repost_unavailable(&mut profile.posts, &id);
+                            patch_repost_unavailable(&mut profile.pinned, &id);
+                        }
                     }
                 }
                 panel.resolve_bare_reposts(cx);
+                panel.prefetch_media(cx);
                 cx.notify();
             });
         })
@@ -1678,7 +2451,21 @@ impl XPanel {
                         // Clear any stale "Disconnected\u{2026}" notice from a
                         // previous disconnect_x: it is false once reconnected.
                         panel.notice = None;
-                        panel.connection = ConnState::Connected { handle, via };
+                        let previous = match &panel.connection {
+                            ConnState::Connected { handle: old, .. } => Some(old.clone()),
+                            _ => None,
+                        };
+                        panel.connection = ConnState::Connected {
+                            handle: handle.clone(),
+                            via,
+                        };
+                        if previous.as_deref() != Some(handle.as_str()) {
+                            panel.fetch_seq = panel.fetch_seq.wrapping_add(1);
+                            for slot in &mut panel.inflight {
+                                *slot = panel.fetch_seq;
+                            }
+                        }
+                        panel.bind_account(&handle);
                         let next = panel.queued_section.take().unwrap_or(panel.section);
                         let next = if next == XSection::Compose {
                             XSection::Timeline
@@ -1705,6 +2492,8 @@ impl XPanel {
         let _ = termy_x::connect::disconnect(&config);
         self.posts.clear();
         self.search_posts.clear();
+        self.mentions_posts.clear();
+        self.inbox_posts.clear();
         self.trends.clear();
         self.research.clear();
         self.profile = None;
@@ -1849,7 +2638,7 @@ impl XPanel {
                         )),
                 );
                 if self.bearer_mode {
-                    let masked = "\u{2022}".repeat(self.bearer_input.chars().count().min(24));
+                    let count = self.bearer_input.chars().count();
                     col = col.child(focus_glow(
                         "glow-bearer",
                         true,
@@ -1858,16 +2647,32 @@ impl XPanel {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x7af6ff))
-                            .child(format!("Your key: {masked}"))
-                            .child(caret_element("caret-bearer"))
-                            .child(format!(
-                                " ({} characters) \u{2014} Ctrl+V pastes, Enter saves, Esc cancels",
-                                self.bearer_input.chars().count()
-                            ))
-                            .into_any_element()),
-                    );
+                            .gap(px(8.0))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .child(self.editor_canvas(
+                                        EditorId::Bearer,
+                                        true,
+                                        "Paste your developer key",
+                                        editor_surface::FIELD_FONT,
+                                        editor_surface::FIELD_LINE,
+                                        true,
+                                        cx,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(format!("({count} chars) · Enter saves · Esc cancels")),
+                            )
+                            .into_any_element(),
+                    ));
                     col = col.child(
                         div()
                             .flex()
@@ -1954,9 +2759,13 @@ impl XPanel {
             self.confirm = false;
             return;
         }
-        self.intent_urls = termy_x::publish::intent_urls(&parts, None);
+        self.intent_urls = termy_x::publish::intent_urls(&parts, self.confirm_reply_to.as_deref());
         self.intent_index = 0;
-        if self.media.is_empty() {
+        if self.confirm_reply_to.is_some() {
+            self.notice = Some(
+                "Confirm this reply. Nothing posts until Post now. Dry run never sends.".into(),
+            );
+        } else if self.media.is_empty() {
             self.notice = Some("Confirm exact text before anything posts.".into());
         } else {
             let names: Vec<String> = self
@@ -1979,6 +2788,609 @@ impl XPanel {
         self.compose_focused = false;
         self.ui_focus = UiFocus::ConfirmNext;
         self.pending_focus = true;
+    }
+
+    /// Thread Reply: open the existing confirm dialog with reply_to set.
+    /// Never posts. Preview/mock still cannot send.
+    fn arm_reply_confirm(&mut self) {
+        let Some(target_id) = self.reply_post_id.clone() else {
+            return;
+        };
+        let text = self.reply_text.trim();
+        if text.is_empty() {
+            self.notice = Some(
+                "Type a reply first \u{2014} confirm shows the exact text before anything posts."
+                    .into(),
+            );
+            return;
+        }
+        let parts = split_thread_limited(&self.reply_text, self.char_limit);
+        let parts = if parts.is_empty() {
+            vec![text.to_string()]
+        } else {
+            parts
+        };
+        self.confirm_reply_to = Some(target_id);
+        self.confirm_reply_author = self.reply_author.clone();
+        self.intent_urls = termy_x::publish::intent_urls(&parts, self.confirm_reply_to.as_deref());
+        self.intent_index = 0;
+        self.notice = Some(format!(
+            "Reply to @{} \u{2014} nothing posts until you confirm.",
+            self.reply_author
+        ));
+        self.confirm = true;
+        self.compose_focused = false;
+        self.ui_focus = UiFocus::ConfirmNext;
+        self.pending_focus = true;
+    }
+
+    fn me_handle(&self) -> Option<String> {
+        match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.clone()),
+            _ => {
+                if !self.live {
+                    Some("termy".into())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn live_config(&self) -> XConfig {
+        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+    }
+
+    fn arm_confirm_reply(&mut self, text: &str, reply_to: &str, queue_id: Option<String>) {
+        self.compose = text.to_string();
+        self.caret = self.compose.len();
+        self.sel_anchor = None;
+        self.confirm_reply_to = Some(reply_to.to_string());
+        self.confirm_queue_id = queue_id;
+        self.arm_confirm();
+    }
+
+    fn refresh_desk(&mut self, section: XSection, cx: &mut Context<Self>) {
+        match section {
+            XSection::Inbox => self.load_inbox(cx),
+            XSection::Mentions => self.load_mentions(cx),
+            XSection::Feeds => {
+                self.status = "feeds \u{b7} add a topic, then Run \u{b7} nothing posts".into();
+                cx.notify();
+            }
+            XSection::Stats => {
+                self.status = "stats \u{b7} Load reads your tweets \u{b7} never posts".into();
+                cx.notify();
+            }
+            XSection::Followers => {
+                self.desk.follower_diff = termy_x::followers::diff_latest(&self.desk.follower_log);
+                self.status = "followers \u{b7} snapshot only when you click Snapshot".into();
+                cx.notify();
+            }
+            XSection::Queue => {
+                self.status = "queue \u{b7} Send opens Confirm \u{b7} nothing auto-posts".into();
+                cx.notify();
+            }
+            XSection::Analyze => {
+                self.status = "analyze \u{b7} type a handle and press Enter".into();
+                cx.notify();
+            }
+            XSection::ReplyGuy => {
+                self.status =
+                    "reply guy \u{b7} Treg finds posts, Grok drafts \u{b7} Reply opens Confirm"
+                        .into();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn load_inbox(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.inbox_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading inbox for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().inbox_posts(&me, LIST_PAGE)
+                    } else {
+                        MockProvider
+                            .search(&termy_x::inbox::to_me_query(&me), true, 8)
+                            .map(|s| termy_x::model::Served {
+                                value: s.value,
+                                status: s.status,
+                            })
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        panel.desk.inbox_posts = served.value;
+                        panel.desk.inbox_error = None;
+                        panel.status = format!(
+                            "inbox \u{b7} {} item(s) \u{b7} {}",
+                            panel.desk.inbox_posts.len(),
+                            served.status.render()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.inbox_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("inbox \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_mentions(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.mentions_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading mentions of @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().mentions_posts(&me, LIST_PAGE)
+                    } else {
+                        MockProvider.search(&format!("@{me}"), true, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        panel.desk.mentions_posts = served.value;
+                        panel.desk.mentions_error = None;
+                        panel.status = format!(
+                            "mentions \u{b7} {} \u{b7} {}",
+                            panel.desk.mentions_posts.len(),
+                            panel.list_sort.label()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.mentions_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "mentions \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn inbox_mark(&mut self, id: &str, done: bool, cx: &mut Context<Self>) {
+        let state = if done {
+            termy_x::inbox::InboxState::Done
+        } else {
+            termy_x::inbox::InboxState::Waiting
+        };
+        termy_x::inbox::mark(&mut self.desk.inbox_store, id, state);
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_inbox(&config) {
+            self.notice = Some(error);
+        } else {
+            self.status = format!("inbox {id} \u{b7} {}", state.as_str());
+        }
+        cx.notify();
+    }
+
+    fn inbox_ai_draft(&mut self, post: &Post, cx: &mut Context<Self>) {
+        if self.desk.loading {
+            self.notice = Some("Already drafting \u{2014} wait for it.".into());
+            cx.notify();
+            return;
+        }
+        let idea = termy_x::inbox::draft_idea(post);
+        let reply_to = post.id.clone();
+        self.desk.loading = true;
+        self.desk.drafts_for = Some(reply_to.clone());
+        self.notice = Some("Drafting a reply \u{2014} nothing will be posted.".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let config =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let http = termy_x::io::UreqHttp::default();
+                    termy_x::ai::draft_variants(
+                        &config,
+                        &http,
+                        &idea,
+                        termy_x::model::Tone::Reply,
+                        3,
+                    )
+                    .map(|mut drafts| {
+                        for draft in &mut drafts {
+                            draft.reply_to = Some(reply_to.clone());
+                        }
+                        let _ =
+                            termy_x::drafts::upsert_drafts(&config.drafts_path(), drafts.clone());
+                        drafts
+                    })
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                match result {
+                    Ok(drafts) => {
+                        panel.variants = drafts.clone();
+                        if let Some(first) = drafts.first() {
+                            panel.compose = first.text.clone();
+                            panel.caret = panel.compose.len();
+                        }
+                        panel.notice =
+                            Some("Draft ready. Reply opens Confirm. Nothing was posted.".into());
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "AI draft failed ({error}). Templates still work from Compose."
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn add_feed_from_fields(&mut self, cx: &mut Context<Self>) {
+        let query = self.desk.feed_query.trim().to_string();
+        if query.is_empty() {
+            self.notice = Some("Type a topic first, then Add.".into());
+            cx.notify();
+            return;
+        }
+        let (lang, age, words, accounts) =
+            termy_x::feeds::parse_filter_line(&self.desk.feed_filter);
+        let feed = termy_x::feeds::add_feed(
+            &mut self.desk.feed_store,
+            termy_x::feeds::EngageFeed {
+                id: String::new(),
+                query,
+                lang,
+                max_age_hours: age,
+                muted_words: words,
+                muted_accounts: accounts,
+            },
+        );
+        self.desk.feed_selected = Some(feed.id.clone());
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_feeds(&config) {
+            self.notice = Some(error);
+        } else {
+            self.notice = Some(format!("Saved feed {} \u{b7} {}", feed.id, feed.query));
+            self.desk.feed_query.clear();
+        }
+        cx.notify();
+    }
+
+    fn run_selected_feed(&mut self, cx: &mut Context<Self>) {
+        let Some(feed) = self.desk.selected_feed().cloned() else {
+            self.notice = Some("Add or select a feed first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            self.status = "already loading \u{2014} one X session call at a time".into();
+            cx.notify();
+            return;
+        }
+        let query = termy_x::feeds::search_query(&feed);
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("searching {query}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().search(&query, true, LIST_PAGE)
+                    } else {
+                        MockProvider.search(&query, true, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        let now = termy_x::time::unix_now();
+                        if let Some(feed) = panel.desk.selected_feed().cloned() {
+                            panel.desk.feed_posts =
+                                termy_x::feeds::filter_posts(&served.value, &feed, now);
+                        } else {
+                            panel.desk.feed_posts = served.value;
+                        }
+                        panel.desk.feed_error = None;
+                        panel.status = format!(
+                            "feed \u{b7} {} shown after filters",
+                            panel.desk.feed_posts.len()
+                        );
+                    }
+                    Err(error) => {
+                        panel.desk.feed_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("feed \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_stats(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.stats_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            return;
+        }
+        let days = self.desk.stats_days;
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("loading stats for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().tweets(&me, 80)
+                    } else {
+                        MockProvider.tweets(&me, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        let now = termy_x::time::unix_now();
+                        panel.desk.stats = Some(termy_x::analytics_stats::compare_periods(
+                            &served.value,
+                            now,
+                            days,
+                        ));
+                        panel.desk.stats_heat =
+                            Some(termy_x::analytics_stats::heatmap(&served.value));
+                        panel.desk.stats_top =
+                            termy_x::analytics_stats::top_posts(&served.value, 5);
+                        panel.desk.stats_error = None;
+                        panel.status = format!("stats \u{b7} {} tweets", served.value.len());
+                    }
+                    Err(error) => {
+                        panel.desk.stats_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status =
+                            format!("stats \u{b7} {}", termy_x::publish::humanize_error(&error));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn snapshot_followers(&mut self, cx: &mut Context<Self>) {
+        let Some(me) = self.me_handle() else {
+            self.desk.follower_error = Some("Connect my X first.".into());
+            cx.notify();
+            return;
+        };
+        if self.desk.loading {
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("snapshotting followers for @{me}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        let me_fetch = me.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        XPanel::service_free().followers(&me_fetch, 200)
+                    } else {
+                        MockProvider.followers(&me_fetch, 8)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok(served) => {
+                        termy_x::followers::append_snapshot(
+                            &mut panel.desk.follower_log,
+                            termy_x::followers::make_snapshot(&me, served.value, None),
+                        );
+                        let config =
+                            termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                        if let Err(error) = panel.desk.persist_followers(&config) {
+                            panel.desk.follower_error = Some(error);
+                        } else {
+                            panel.desk.follower_error = None;
+                        }
+                        panel.desk.follower_diff =
+                            termy_x::followers::diff_latest(&panel.desk.follower_log);
+                        panel.status = "followers \u{b7} snapshot saved".into();
+                    }
+                    Err(error) => {
+                        panel.desk.follower_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "followers \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn queue_add_from_fields(&mut self, cx: &mut Context<Self>) {
+        let item =
+            termy_x::queue::make_item(&self.desk.queue_text, &self.desk.queue_reply_to, "", None);
+        if let Err(error) = termy_x::queue::enqueue(&mut self.desk.queue, item) {
+            self.notice = Some(error);
+            cx.notify();
+            return;
+        }
+        let config = self.live_config();
+        if let Err(error) = self.desk.persist_queue(&config) {
+            self.notice = Some(error);
+        } else {
+            self.desk.queue_text.clear();
+            self.notice = Some("Queued. Send opens Confirm \u{2014} nothing posted.".into());
+        }
+        cx.notify();
+    }
+
+    fn queue_from_post(&mut self, post: &Post, cx: &mut Context<Self>) {
+        let text = if self.compose.trim().is_empty() {
+            String::new()
+        } else {
+            self.compose.trim().to_string()
+        };
+        if text.is_empty() {
+            self.notice =
+                Some("Write a draft first (AI draft or type in Compose), then Queue.".into());
+            cx.notify();
+            return;
+        }
+        let item = termy_x::queue::make_item(
+            &text,
+            &post.id,
+            &post.author_handle,
+            Some(post.card_text().to_string()),
+        );
+        if let Err(error) = termy_x::queue::enqueue(&mut self.desk.queue, item) {
+            self.notice = Some(error);
+        } else {
+            let config = self.live_config();
+            let _ = self.desk.persist_queue(&config);
+            self.notice = Some("Queued. Open Queue and click Send to confirm.".into());
+        }
+        cx.notify();
+    }
+
+    fn run_analyze(&mut self, cx: &mut Context<Self>) {
+        let handle = termy_x::model::strip_handle(&self.desk.analyze_handle).to_string();
+        if handle.is_empty() {
+            self.notice = Some("Type a handle first.".into());
+            cx.notify();
+            return;
+        }
+        if self.desk.loading {
+            return;
+        }
+        self.desk.loading = true;
+        self.loading = true;
+        self.status = format!("analyzing @{handle}\u{2026}");
+        cx.notify();
+        let live = self.live;
+        let handle_fetch = handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    if live {
+                        let service = XPanel::service_free();
+                        let profile = service.lookup(&handle_fetch).ok().map(|s| s.value);
+                        let posts = match service.tweets(&handle_fetch, LIST_PAGE) {
+                            Ok(served) if !served.value.is_empty() => served.value,
+                            _ => profile
+                                .as_ref()
+                                .map(|p| p.posts.clone())
+                                .unwrap_or_default(),
+                        };
+                        Ok::<_, String>((profile, posts))
+                    } else {
+                        let profile = MockProvider.lookup(&handle_fetch).ok().map(|s| s.value);
+                        let posts = MockProvider
+                            .tweets(&handle_fetch, 8)
+                            .map(|s| s.value)
+                            .unwrap_or_default();
+                        Ok::<_, String>((profile, posts))
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.desk.loading = false;
+                panel.loading = false;
+                match result {
+                    Ok((profile, posts)) => {
+                        panel.desk.analyze = Some(termy_x::analytics_stats::account_report(
+                            &handle,
+                            profile.as_ref(),
+                            &posts,
+                            termy_x::time::unix_now(),
+                            14,
+                        ));
+                        panel.desk.analyze_error = None;
+                        panel.status = format!("analyze \u{b7} @{handle} \u{b7} 14 days");
+                    }
+                    Err(error) => {
+                        panel.desk.analyze_error = Some(termy_x::publish::humanize_error(&error));
+                        panel.status = format!(
+                            "analyze \u{b7} {}",
+                            termy_x::publish::humanize_error(&error)
+                        );
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn accept_variant(&mut self, index: usize) {
@@ -2008,32 +3420,55 @@ impl XPanel {
         }
     }
 
+    fn on_bearer_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        let word = mods.control || mods.platform;
+        if key == "escape" {
+            self.bearer_mode = false;
+            self.bearer_input.clear();
+            self.bearer_caret = termy_x::draft_edit::DraftCaret::collapsed(0);
+            self.notice = Some("Key entry cancelled. Nothing was saved.".into());
+        } else if key == "enter" {
+            self.save_bearer(cx);
+        } else if let Some(motion) = editor_surface::navigation_motion(key, word) {
+            self.editor_motion(EditorId::Bearer, motion, mods.shift);
+        } else if word && key.eq_ignore_ascii_case("a") {
+            self.editor_select_all(EditorId::Bearer);
+        } else if word && key.eq_ignore_ascii_case("c") {
+            if let Some(selected) = self.editor_selection_text(EditorId::Bearer) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+        } else if word && key.eq_ignore_ascii_case("x") {
+            if let Some(selected) = self.editor_cut(EditorId::Bearer) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+        } else if word && key.eq_ignore_ascii_case("v") {
+            if let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                self.editor_insert(EditorId::Bearer, clip.trim());
+            }
+        } else if key == "backspace" {
+            self.editor_backspace(EditorId::Bearer, word);
+        } else if key == "delete" {
+            self.editor_delete_forward(EditorId::Bearer);
+        } else if !(mods.control || mods.alt || mods.platform || mods.function)
+            && let Some(ch) = event.keystroke.key_char.as_deref()
+            && !ch.is_empty()
+        {
+            self.editor_insert(EditorId::Bearer, ch);
+        }
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
         if self.bearer_mode {
-            if key == "escape" {
-                self.bearer_mode = false;
-                self.bearer_input.clear();
-                self.notice = Some("Key entry cancelled. Nothing was saved.".into());
-            } else if key == "enter" {
-                self.save_bearer(cx);
-            } else if key == "backspace" {
-                self.bearer_input.pop();
-            } else if (mods.control || mods.platform) && key.eq_ignore_ascii_case("v") {
-                if let Some(item) = cx.read_from_clipboard()
-                    && let Some(clip) = item.text()
-                {
-                    self.bearer_input.push_str(clip.trim());
-                }
-            } else if !(mods.control || mods.alt || mods.platform || mods.function)
-                && let Some(ch) = event.keystroke.key_char.as_deref()
-            {
-                self.bearer_input.push_str(ch);
-            }
-            cx.stop_propagation();
-            cx.notify();
+            self.on_bearer_key(event, cx);
             return;
         }
 
@@ -2044,6 +3479,7 @@ impl XPanel {
                 return;
             }
             if self.viewer.is_some() {
+                player::note_player_phase("esc");
                 self.close_viewer();
                 self.notice = Some("Viewer closed \u{b7} nothing was posted.".into());
                 cx.stop_propagation();
@@ -2056,17 +3492,39 @@ impl XPanel {
                 cx.notify();
                 return;
             }
+            if matches!(self.bulk, Some(thread_view::BulkUi::Confirm(_))) {
+                self.bulk = None;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            if let Some(thread_view::BulkUi::Running { stop, .. }) = &self.bulk {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.status = "bulk \u{b7} stopping\u{2026}".into();
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
+            if self.confirm {
+                self.confirm = false;
+                self.confirm_reply_to = None;
+                self.confirm_reply_author.clear();
+                self.focus_compose_editor();
+                self.pending_focus = true;
+                cx.notify();
+                cx.stop_propagation();
+                return;
+            }
             if self.reply_post_id.is_some() {
                 self.close_reply();
                 cx.stop_propagation();
                 cx.notify();
                 return;
             }
-            if self.confirm {
-                self.confirm = false;
-                self.focus_compose_editor();
-                self.pending_focus = true;
-                cx.notify();
+            if self.thread.is_some() {
+                self.dismiss_thread(cx);
+                cx.stop_propagation();
+                return;
             }
             // Never leak Esc into the terminal while the X panel has the key stream.
             cx.stop_propagation();
@@ -2107,6 +3565,7 @@ impl XPanel {
             .viewer
             .as_ref()
             .is_some_and(|v| v.kind != MediaKind::Photo)
+            && !player::launches_external_vlc()
         {
             match key {
                 "space" => {
@@ -2156,12 +3615,59 @@ impl XPanel {
             self.on_text_input_key(event, TextField::Lookup, cx);
             return;
         }
+        if self.input_target == InputTarget::FeedQuery && self.section == XSection::Feeds {
+            self.on_text_input_key(event, TextField::FeedQuery, cx);
+            return;
+        }
+        if self.input_target == InputTarget::FeedFilter && self.section == XSection::Feeds {
+            self.on_text_input_key(event, TextField::FeedFilter, cx);
+            return;
+        }
+        if self.input_target == InputTarget::QueueText && self.section == XSection::Queue {
+            self.on_text_input_key(event, TextField::QueueText, cx);
+            return;
+        }
+        if self.input_target == InputTarget::QueueReplyTo && self.section == XSection::Queue {
+            self.on_text_input_key(event, TextField::QueueReplyTo, cx);
+            return;
+        }
+        if self.input_target == InputTarget::Analyze && self.section == XSection::Analyze {
+            self.on_text_input_key(event, TextField::Analyze, cx);
+            return;
+        }
+        if self.section == XSection::ReplyGuy && self.input_target == InputTarget::RgTopic {
+            self.on_text_input_key(event, TextField::RgTopic, cx);
+            return;
+        }
+        if self.section == XSection::ReplyGuy && self.input_target == InputTarget::RgKey {
+            self.on_text_input_key(event, TextField::RgKey, cx);
+            let mods = &event.keystroke.modifiers;
+            let pasted =
+                (mods.control || mods.platform) && event.keystroke.key.eq_ignore_ascii_case("v");
+            if pasted && !self.desk.rg_key_input.trim().is_empty() {
+                self.rg_save_key(cx);
+            }
+            return;
+        }
+        if self.input_target == InputTarget::NewTweet && self.new_tweet_open && self.section == XSection::Timeline {
+            self.on_text_input_key(event, TextField::NewTweet, cx);
+            return;
+        }
         if self.input_target == InputTarget::Reply && self.reply_post_id.is_some() {
             self.on_text_input_key(event, TextField::Reply, cx);
             return;
         }
         if self.input_target == InputTarget::Quote && self.quote_post_id.is_some() {
             self.on_text_input_key(event, TextField::Quote, cx);
+            return;
+        }
+
+        if key.eq_ignore_ascii_case(termy_x::LIST_SORT_KEY)
+            && !mods.modified()
+            && self.shows_list_sort()
+        {
+            self.toggle_list_sort(cx);
+            cx.stop_propagation();
             return;
         }
 
@@ -2230,18 +3736,15 @@ impl XPanel {
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("a") {
-            self.sel_anchor = Some(0);
-            self.caret = self.compose.len();
+            self.editor_select_all(EditorId::Compose);
             self.mark_edit_chord();
             cx.stop_propagation();
             cx.notify();
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("c") {
-            if let Some((a, b)) = self.selection_range() {
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                    self.compose[a..b].to_string(),
-                ));
+            if let Some(selected) = self.editor_selection_text(EditorId::Compose) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -2249,13 +3752,8 @@ impl XPanel {
             return;
         }
         if (mods.control || mods.platform) && key.eq_ignore_ascii_case("x") {
-            if let Some((a, b)) = self.selection_range() {
-                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
-                    self.compose[a..b].to_string(),
-                ));
-                self.compose.replace_range(a..b, "");
-                self.caret = a;
-                self.clear_selection();
+            if let Some(selected) = self.editor_cut(EditorId::Compose) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
             }
             self.mark_edit_chord();
             cx.stop_propagation();
@@ -2263,26 +3761,12 @@ impl XPanel {
             return;
         }
 
-        if key == "left" {
-            self.move_caret(CaretMove::Left, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "right" {
-            self.move_caret(CaretMove::Right, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "up" || key == "home" {
-            self.move_caret(CaretMove::LineStart, mods.shift);
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-        if key == "down" || key == "end" {
-            self.move_caret(CaretMove::LineEnd, mods.shift);
+        if let Some(motion) = editor_surface::navigation_motion(key, mods.control || mods.platform)
+        {
+            // Up/Down walk visual lines (including soft wraps). Home/End
+            // stay on the current visual line. Ctrl+Home/End cover the draft.
+            // Swallowed so the terminal behind the panel never sees arrows.
+            self.editor_motion(EditorId::Compose, motion, mods.shift);
             cx.stop_propagation();
             cx.notify();
             return;
@@ -2296,9 +3780,9 @@ impl XPanel {
             return;
         }
         if key == "backspace" {
-            self.backspace();
+            self.editor_backspace(EditorId::Compose, mods.control || mods.platform);
         } else if key == "delete" {
-            self.delete_forward();
+            self.editor_delete_forward(EditorId::Compose);
         } else if key == "space" {
             self.insert_text(" ");
         } else if key == "enter" {
@@ -2323,12 +3807,14 @@ impl XPanel {
         self.card_copy_focus = false;
         self.card_text_selection = None;
         self.card_drag_start = None;
+        self.input_target = InputTarget::Compose;
         self.compose_focused = true;
         self.ui_focus = UiFocus::Compose;
         if self.compose.is_empty() {
             // Empty draft: caret at left (index 0), never a phantom selection.
             self.caret = 0;
             self.sel_anchor = None;
+            self.compose_preferred = None;
         } else {
             self.caret = self.caret.min(self.compose.len());
         }
@@ -2368,7 +3854,7 @@ impl XPanel {
             self.bearer_mode,
             self.input_target,
             self.section,
-            self.reply_post_id.is_some() || self.quote_post_id.is_some(),
+            self.reply_post_id.is_some() || self.quote_post_id.is_some() || self.new_tweet_open,
             self.compose_focused,
             self.ui_focus == UiFocus::Compose,
         )
@@ -2384,39 +3870,28 @@ impl XPanel {
         }
         let clean = text.trim_end_matches(['\r', '\n']);
         if self.bearer_mode {
-            self.bearer_input.push_str(clean.trim());
-        } else {
-            match self.input_target {
-                InputTarget::Compose => {
-                    self.focus_compose_editor();
-                    self.insert_text(clean);
-                }
-                InputTarget::Search => self.search_input.push_str(clean),
-                InputTarget::Reply => self.reply_text.push_str(clean),
-                InputTarget::Quote => self.quote_text.push_str(clean),
-                InputTarget::Trends => self.trends_filter.push_str(clean),
-                InputTarget::Research => self.research_input.push_str(clean),
-                InputTarget::Lookup => self.lookup.push_str(clean),
+            self.editor_insert(EditorId::Bearer, clean.trim());
+        } else if let Some(id) = self.active_editor() {
+            if id == EditorId::Compose {
+                self.focus_compose_editor();
             }
-        }
-        match self.input_target {
-            InputTarget::Reply => self.scroll_small_editor_to_end(TextField::Reply),
-            InputTarget::Quote => self.scroll_small_editor_to_end(TextField::Quote),
-            _ => {}
+            self.editor_insert(id, clean);
+            if id == EditorId::Field(TextField::RgKey) && !self.desk.rg_key_input.trim().is_empty()
+            {
+                self.rg_save_key_now();
+            }
         }
         self.mark_edit_chord();
     }
 
-    /// Text a Copy action should take, if the active field has a
-    /// selection. Search/reply fields are end-caret only (no selection),
-    /// so they return None; the action is still swallowed by the caller
-    /// so the terminal selection is never copied over the clipboard.
+    /// Text a Copy action should take. A focused card selection beats the
+    /// draft selection. The masked key field never copies (the bullets are
+    /// not the secret). An empty selection returns None; the caller still
+    /// swallows the chord so the terminal selection is not copied.
     pub fn active_copy_text(&self) -> Option<String> {
-        let editor = if self.input_target == InputTarget::Compose {
-            self.compose_selection_text()
-        } else {
-            None
-        };
+        let editor = self
+            .active_editor()
+            .and_then(|id| self.editor_selection_text(id));
         copy_text_for_focus(
             self.card_copy_focus,
             self.card_text_selection.as_ref(),
@@ -2424,12 +3899,16 @@ impl XPanel {
         )
     }
 
-    /// SelectAll for the active field. Search/reply fields have no
-    /// selection model, so this just marks the chord (the caller swallows
-    /// the action, keeping it out of the terminal).
+    /// SelectAll for the active field. Single-line fields (Reply Guy topic
+    /// included) and the multiline writers select the whole draft. The
+    /// masked key field keeps its select-all highlight.
     pub fn select_all_active(&mut self) {
-        if self.input_target == InputTarget::Compose && !self.bearer_mode {
-            self.select_all_compose();
+        if let Some(id) = self.active_editor() {
+            if self.chord_already_applied() {
+                return;
+            }
+            self.editor_select_all(id);
+            self.mark_edit_chord();
         } else if !self.chord_already_applied() {
             self.mark_edit_chord();
         }
@@ -2448,16 +3927,14 @@ impl XPanel {
     }
 
     pub fn compose_selection_text(&self) -> Option<String> {
-        let (a, b) = self.selection_range()?;
-        Some(self.compose[a..b].to_string())
+        self.editor_selection_text(EditorId::Compose)
     }
 
     pub fn select_all_compose(&mut self) {
         if self.chord_already_applied() {
             return;
         }
-        self.sel_anchor = Some(0);
-        self.caret = self.compose.len();
+        self.editor_select_all(EditorId::Compose);
         self.mark_edit_chord();
     }
 
@@ -2470,92 +3947,136 @@ impl XPanel {
             .is_some_and(|t| t.elapsed() < Duration::from_millis(80))
     }
 
-    /// Shared keyboard handling for the Search query and inline reply
-    /// fields: plain text appends at the end, Backspace deletes, Ctrl+V
-    /// pastes. Enter runs a search; in a reply Enter adds a line and
-    /// never sends (only the Post button does). Everything is swallowed so the terminal behind
-    /// the panel never sees these keys.
-    fn on_text_input_key(
+    /// Shared keyboard handling for the Search query, inline reply, quote,
+    /// and the other single-line fields. The masked key box keeps the
+    /// older end-caret path (`on_text_input_key` below). Every other field
+    /// has a real caret. Enter still runs a search in a filter box and
+    /// inserts a newline in a reply or quote — it never posts.
+    fn on_draft_field_key(
         &mut self,
         event: &KeyDownEvent,
         field: TextField,
         cx: &mut Context<Self>,
     ) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
+        let id = EditorId::Field(field);
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+        let word = mods.control || mods.platform;
+        if key == "escape"
+            && field == TextField::Trends
+            && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
+        {
+            self.trends_filter.clear();
+            self.trends_bucket = None;
+            self.field_carets.remove(&TextField::Trends);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if key == "enter" {
             match enter_action(field) {
                 EnterAction::RunSearch => match field {
                     TextField::Trends => self.enter_trends_filter(cx),
                     TextField::Research => self.run_research(cx),
                     TextField::Lookup => self.run_lookup(cx),
+                    TextField::FeedQuery | TextField::FeedFilter => self.add_feed_from_fields(cx),
+                    TextField::Analyze => self.run_analyze(cx),
+                    TextField::RgTopic => self.rg_fetch(cx),
+                    TextField::RgKey => self.rg_save_key(cx),
+                    TextField::QueueText | TextField::QueueReplyTo => {
+                        self.queue_add_from_fields(cx);
+                    }
                     _ => self.run_search(cx),
                 },
-                EnterAction::Newline => match field {
-                    TextField::Reply => self.reply_text.push('\n'),
-                    _ => self.quote_text.push('\n'),
-                },
-            }
-            if field != TextField::Search {
-                self.scroll_small_editor_to_end(field);
+                EnterAction::Newline => {
+                    self.editor_insert(id, "\n");
+                }
             }
             cx.stop_propagation();
             cx.notify();
             return;
         }
-        if key == "escape"
-            && field == TextField::Trends
-            && (!self.trends_filter.is_empty() || self.trends_bucket.is_some())
-        {
-            // Esc clears the filter/chip and restores the full list.
-            self.trends_filter.clear();
-            self.trends_bucket = None;
+        if let Some(motion) = editor_surface::navigation_motion(key, word) {
+            self.editor_motion(id, motion, mods.shift);
             cx.stop_propagation();
             cx.notify();
             return;
         }
-        // Read chord/clipboard state before borrowing the target string.
-        let is_paste = (mods.control || mods.platform) && key.eq_ignore_ascii_case("v");
-        let already_applied = is_paste && self.chord_already_applied();
-        let clip_text = if is_paste && !already_applied {
-            cx.read_from_clipboard()
-                .and_then(|item| item.text())
-                .map(|clip| clip.trim_end_matches(['\r', '\n']).to_string())
-        } else {
-            None
-        };
-        let mut pasted = false;
-        let target = match field {
-            TextField::Search => &mut self.search_input,
-            TextField::Reply => &mut self.reply_text,
-            TextField::Quote => &mut self.quote_text,
-            TextField::Trends => &mut self.trends_filter,
-            TextField::Research => &mut self.research_input,
-            TextField::Lookup => &mut self.lookup,
-        };
-        if key == "backspace" {
-            target.pop();
-        } else if is_paste {
-            // If TerminalView's Paste action already inserted this chord
-            // (it routes here via `paste_active_text`), do not insert twice.
-            if let Some(text) = &clip_text {
-                target.push_str(text);
-                pasted = true;
-            }
-        } else if !(mods.control || mods.alt || mods.platform || mods.function)
-            && let Some(ch) = event.keystroke.key_char.as_deref()
-        {
-            target.push_str(ch);
-        } else {
-            return;
-        }
-        if pasted {
+        if word && key.eq_ignore_ascii_case("a") {
+            self.editor_select_all(id);
             self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
-        if field != TextField::Search {
-            self.scroll_small_editor_to_end(field);
+        if word && key.eq_ignore_ascii_case("c") {
+            if let Some(selected) = self.editor_selection_text(id) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
         }
+        if word && key.eq_ignore_ascii_case("x") {
+            if let Some(selected) = self.editor_cut(id) {
+                cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(selected));
+            }
+            self.mark_edit_chord();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if word && key.eq_ignore_ascii_case("v") {
+            if !self.chord_already_applied()
+                && let Some(item) = cx.read_from_clipboard()
+                && let Some(clip) = item.text()
+            {
+                let clean = clip.trim_end_matches(['\r', '\n']);
+                self.editor_insert(id, clean);
+                self.mark_edit_chord();
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "backspace" {
+            self.editor_backspace(id, word);
+            self.note_reply_first_key(field);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if key == "delete" {
+            self.editor_delete_forward(id);
+            self.note_reply_first_key(field);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if !(mods.control || mods.alt || mods.platform || mods.function) {
+            if let Some(ch) = event
+                .keystroke
+                .key_char
+                .as_deref()
+                .filter(|ch| !ch.is_empty())
+            {
+                self.editor_insert(id, ch);
+                self.note_reply_first_key(field);
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+            if key.chars().count() == 1 {
+                self.editor_insert(id, key);
+                self.note_reply_first_key(field);
+                cx.stop_propagation();
+                cx.notify();
+            }
+        }
+    }
+
+    fn note_reply_first_key(&mut self, field: TextField) {
         if field == TextField::Reply && !self.reply_key_logged {
             self.reply_key_logged = true;
             if let Some(opened) = self.reply_opened_at {
@@ -2565,12 +4086,18 @@ impl XPanel {
                 ));
             }
         }
-        cx.stop_propagation();
-        cx.notify();
     }
 
-    /// Run the typed query through the active provider (OpenCLI silent
-    /// background session). Empty query = a plain hint, never a fetch.
+    /// Every panel field, including the masked key, edits through the caret.
+    fn on_text_input_key(
+        &mut self,
+        event: &KeyDownEvent,
+        field: TextField,
+        cx: &mut Context<Self>,
+    ) {
+        self.on_draft_field_key(event, field, cx);
+    }
+
     fn run_search(&mut self, cx: &mut Context<Self>) {
         let query = self.search_input.trim().to_string();
         if query.is_empty() {
@@ -2771,7 +4298,12 @@ impl XPanel {
         )
     }
 
-    fn begin_post_burst(&mut self, target: BurstTarget, cx: &mut Context<Self>) {
+    fn begin_post_burst(
+        &mut self,
+        target: BurstTarget,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) {
         self.burst_seq += 1;
         let seq = self.burst_seq;
         self.post_burst = Some(PostBurst {
@@ -2779,7 +4311,8 @@ impl XPanel {
             seq,
             started: Instant::now(),
             card_id: None,
-            label: "\u{2713} Posted",
+            follow_handle: None,
+            label,
         });
         cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -2788,6 +4321,32 @@ impl XPanel {
             let _ = this.update(cx, |panel, cx| {
                 if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
                     panel.finish_post_burst(target);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Same card toast as Like, keyed by the author's handle.
+    fn begin_author_burst(&mut self, handle: &str, label: &'static str, cx: &mut Context<Self>) {
+        self.burst_seq += 1;
+        let seq = self.burst_seq;
+        self.post_burst = Some(PostBurst {
+            target: BurstTarget::Card,
+            seq,
+            started: Instant::now(),
+            card_id: None,
+            follow_handle: Some(handle.trim_start_matches('@').to_string()),
+            label,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(BURST_MS + 80))
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if panel.post_burst.as_ref().is_some_and(|b| b.seq == seq) {
+                    panel.finish_post_burst(BurstTarget::Card);
                     cx.notify();
                 }
             });
@@ -2806,6 +4365,7 @@ impl XPanel {
             seq,
             started: Instant::now(),
             card_id: Some(post_id.to_string()),
+            follow_handle: None,
             label,
         });
         cx.spawn(async move |this, cx| {
@@ -2855,6 +4415,37 @@ impl XPanel {
                     cx.notify();
                 }
             });
+        })
+        .detach();
+    }
+
+    /// Roll the follow dots until this write ends, a newer one replaces it,
+    /// or the panel is gone. The timer is the only wake-up; it does not spin.
+    fn spawn_follow_dots(&self, cx: &mut Context<Self>, seq: u64) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(FOLLOW_DOT_MS))
+                    .await;
+                let keep_going = cx.update(|cx| {
+                    this.update(cx, |panel, cx| {
+                        let keep = follow_dots_keep_going(
+                            panel.follow_anim_seq == seq,
+                            panel.follow_ask.is_some(),
+                            panel.follow_pending.is_some(),
+                        );
+                        if keep {
+                            panel.follow_dots = panel.follow_dots.wrapping_add(1);
+                            cx.notify();
+                        }
+                        keep
+                    })
+                    .unwrap_or(false)
+                });
+                if !keep_going {
+                    break;
+                }
+            }
         })
         .detach();
     }
@@ -2938,7 +4529,15 @@ impl XPanel {
         let burst = self.burst_for(BurstTarget::Card)?;
         // Engage bursts are keyed by the tweet acted on; on a repost
         // card that's the embedded original, not the repost wrapper.
-        if burst.card_id.as_deref() != Some(post.id.as_str())
+        if let Some(handle) = burst.follow_handle.as_deref() {
+            let needle = handle.trim_start_matches('@');
+            let author = post.engage_target().author_handle.as_str();
+            if !author.eq_ignore_ascii_case(needle)
+                && !post.author_handle.eq_ignore_ascii_case(needle)
+            {
+                return None;
+            }
+        } else if burst.card_id.as_deref() != Some(post.id.as_str())
             && burst.card_id.as_deref() != Some(post.engage_target().id.as_str())
         {
             return None;
@@ -2970,24 +4569,6 @@ impl XPanel {
             480.0
         };
         (((panel_w - 70.0) / 6.8) as usize).clamp(24, 240)
-    }
-
-    /// Keep the end caret of a reply/quote draft visible: scroll the
-    /// fixed-height editor so the last visual line is in view.
-    fn scroll_small_editor_to_end(&mut self, field: TextField) {
-        let (text, handle) = match field {
-            TextField::Reply => (self.reply_text.clone(), &self.reply_scroll),
-            TextField::Quote => (self.quote_text.clone(), &self.quote_scroll),
-            TextField::Search | TextField::Trends | TextField::Research | TextField::Lookup => {
-                return;
-            }
-        };
-        let lines = soft_wrap_ranges(&text, self.editor_max_chars()).len();
-        let overflow = lines as f32 * 19.0 - 44.0;
-        handle.set_offset(point(
-            px(0.0),
-            px(if overflow > 0.0 { -overflow } else { 0.0 }),
-        ));
     }
 
     /// Keep the Compose caret's visual line inside the scroll view.
@@ -3031,63 +4612,348 @@ impl XPanel {
     /// engage in the background. Failure reverts the flip and says why;
     /// counts move locally with the flip, never via a re-fetch, so the
     /// scroll position cannot jump.
+    fn action_account(&self) -> String {
+        if !self.live {
+            return "preview".to_string();
+        }
+        match &self.connection {
+            ConnState::Connected { handle, .. } => termy_x::action_state::account_key(handle),
+            _ => "signed-out".to_string(),
+        }
+    }
+
+    fn persist_actions(&self) {
+        if !self.action_persist || !self.live {
+            return;
+        }
+        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let _ = self.action_db.save(&config.action_state_path());
+    }
+
+    fn next_action_seq(&mut self) -> u64 {
+        self.action_seq = self.action_seq.wrapping_add(1);
+        self.action_seq
+    }
+
+    fn remember_receipt(&mut self, kind: termy_x::action_state::ReceiptKind, tweet_id: &str, text: &str) {
+        let seq = self.next_action_seq();
+        self.action_db.record_receipt(
+            &self.action_account(),
+            kind,
+            tweet_id,
+            text,
+            seq,
+            termy_x::action_state::now_ms(),
+        );
+        self.persist_actions();
+    }
+
+    fn hydrate_actions(&mut self) {
+        let account = self.action_account();
+        let pending = self.engage_pending.clone();
+        let likes = self
+            .action_db
+            .true_ids(&account, termy_x::action_state::ToggleKind::Like);
+        let reposts = self
+            .action_db
+            .true_ids(&account, termy_x::action_state::ToggleKind::Repost);
+        self.liked_ids = merge_pending_ids(&likes, &self.liked_ids, &pending);
+        self.retweeted_ids = merge_pending_ids(&reposts, &self.retweeted_ids, &pending);
+        if self.follow_pending.is_none() {
+            self.follow_overrides = self.action_db.follow_map(&account);
+        }
+        self.replied_ids = self
+            .action_db
+            .receipt_ids(&account, termy_x::action_state::ReceiptKind::Reply);
+    }
+
+    fn bind_account(&mut self, handle: &str) {
+        self.sync_generation = self.action_db.begin_sync(handle);
+        self.sync_snapshot_ms = termy_x::action_state::now_ms();
+        self.hydrate_actions();
+        self.sync_line = self.action_db.cached_summary(handle);
+    }
+
+    fn absorb_posts(&mut self, posts: &[termy_x::model::Post], failed: Option<&str>) {
+        if !self.live {
+            return;
+        }
+        let account = self.action_account();
+        if account == "signed-out" {
+            return;
+        }
+        let generation = self.sync_generation;
+        if generation == 0 {
+            self.sync_generation = self.action_db.begin_sync(&account);
+        }
+        let generation = self.sync_generation;
+        let now = termy_x::action_state::now_ms();
+        let snapshot = if self.sync_snapshot_ms == 0 {
+            now
+        } else {
+            self.sync_snapshot_ms
+        };
+        let finish = self.action_db.apply_sync_page(
+            &account,
+            generation,
+            posts,
+            failed,
+            snapshot,
+            now,
+        );
+        if let termy_x::action_state::SyncFinish::Report(report) = finish {
+            self.sync_line = report.summary;
+            self.hydrate_actions();
+            self.persist_actions();
+        }
+    }
+
+    fn shown_follow(&self, handle: &str, payload: Option<bool>) -> (Option<bool>, bool) {
+        let account = self.action_account();
+        let remembered = self.action_db.confirmed(
+            &account,
+            termy_x::action_state::ToggleKind::Follow,
+            handle,
+        );
+        let value = termy_x::action_state::remembered_or_payload(remembered, payload);
+        let saved = remembered.is_some()
+            && self.action_db.is_saved(
+                &account,
+                termy_x::action_state::ToggleKind::Follow,
+                handle,
+            );
+        (value, saved)
+    }
+
+    fn shown_liked(&self, id: &str, in_memory: bool) -> (bool, bool) {
+        let account = self.action_account();
+        let saved = in_memory
+            && self
+                .action_db
+                .is_saved(&account, termy_x::action_state::ToggleKind::Like, id);
+        (in_memory, saved)
+    }
+
+    fn following_now(&self, handle: &str) -> bool {
+        let payload = self.payload_follow(handle).or_else(|| {
+            self.profile
+                .as_ref()
+                .filter(|profile| {
+                    termy_x::model::strip_handle(&profile.handle)
+                        .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+                })
+                .and_then(|profile| profile.viewer_following)
+        });
+        self.shown_follow(handle, payload).0.unwrap_or(false)
+    }
+
+    fn payload_follow(&self, handle: &str) -> Option<bool> {
+        let mut found = None;
+        self.walk_posts(|post| {
+            if termy_x::model::strip_handle(&post.author_handle)
+                .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+                && post.viewer_follows_author == Some(true)
+            {
+                found = Some(true);
+            } else if found.is_none()
+                && termy_x::model::strip_handle(&post.author_handle)
+                    .eq_ignore_ascii_case(termy_x::model::strip_handle(handle))
+            {
+                found = post.viewer_follows_author;
+            }
+        });
+        found
+    }
+
+    fn walk_posts(&self, mut visit: impl FnMut(&Post)) {
+        let mut one = |post: &Post| {
+            visit(post);
+            if let Some(inner) = &post.retweeted {
+                visit(inner);
+            }
+            if let Some(inner) = &post.quoted {
+                visit(inner);
+            }
+        };
+        for post in self
+            .posts
+            .iter()
+            .chain(self.following_posts.iter())
+            .chain(self.search_posts.iter())
+            .chain(self.mentions_posts.iter())
+            .chain(self.inbox_posts.iter())
+        {
+            one(post);
+        }
+        if let Some(profile) = &self.profile {
+            for post in profile.posts.iter().chain(profile.pinned.iter()) {
+                one(post);
+            }
+        }
+        if let Some(thread) = &self.thread {
+            one(&thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &thread.load {
+                for post in replies {
+                    one(post);
+                }
+            }
+        }
+    }
+
+    /// Ask before any follow write. Not connected and your own account
+    /// never reach the publisher.
+    fn request_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
+        let own = match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+            _ => None,
+        };
+        let connected = !self.live || matches!(self.connection, ConnState::Connected { .. });
+        let click = follow_click(
+            self.follow_pending.is_some(),
+            connected,
+            is_own_profile(handle, own),
+            self.following_now(handle),
+            handle,
+        );
+        let status = follow_click_status(&click);
+        perf_log(&format!(
+            "follow click {}",
+            match &click {
+                FollowClick::InFlight => "in-flight",
+                FollowClick::ConnectFirst => "connect-first",
+                FollowClick::OwnAccount => "own-account",
+                FollowClick::Confirm { follow, .. } => {
+                    if *follow {
+                        "confirm-follow"
+                    } else {
+                        "confirm-unfollow"
+                    }
+                }
+            }
+        ));
+        self.status = status.clone();
+        match click {
+            FollowClick::InFlight => {}
+            FollowClick::ConnectFirst | FollowClick::OwnAccount => {
+                self.notice = Some(status);
+                self.follow_ask = None;
+            }
+            FollowClick::Confirm { handle, follow } => {
+                self.notice = None;
+                let already =
+                    self.follow_ask.is_some() || self.follow_pending.is_some();
+                self.follow_ask = Some((handle, follow));
+                if !already {
+                    self.follow_anim_seq = self.follow_anim_seq.wrapping_add(1);
+                    self.follow_dots = 0;
+                    self.spawn_follow_dots(cx, self.follow_anim_seq);
+                }
+            }
+        }
+        cx.notify();
+    }
+
     /// Follow/unfollow the profile on screen. State shown is the
     /// payload's real flag or a session-verified override — never a
     /// guess; on failure nothing flips and the error is humanized.
-    fn toggle_follow(&mut self, handle: &str, cx: &mut Context<Self>) {
-        if self.follow_pending.is_some() {
+    fn toggle_follow(&mut self, handle: &str, target: bool, cx: &mut Context<Self>) {
+        if !termy_x::action_state::follow_write_allowed(self.follow_pending.is_some()) {
             return;
         }
-        if !self.live {
-            self.notice = Some("Preview/mock never follows anyone.".into());
+        let handle = termy_x::model::strip_handle(handle).to_string();
+        if handle.is_empty() {
+            self.notice = Some("No account to follow. Nothing was changed.".into());
             cx.notify();
             return;
         }
-        let current = self
-            .follow_overrides
-            .get(handle)
-            .copied()
-            .or_else(|| {
-                self.profile
-                    .as_ref()
-                    .filter(|p| p.handle.eq_ignore_ascii_case(handle))
-                    .and_then(|p| p.viewer_following)
-            })
-            .unwrap_or(false);
-        let target = !current;
-        let handle = handle.to_string();
+        let seq = self.next_action_seq();
+        let now = termy_x::action_state::now_ms();
+        self.action_db.begin_toggle(
+            &self.action_account(),
+            termy_x::action_state::ToggleKind::Follow,
+            &handle,
+            target,
+            seq,
+            now,
+        );
+        self.follow_seq = seq;
         self.follow_pending = Some((handle.clone(), target));
         cx.notify();
         let handle_for_call = handle.clone();
+        let live = self.live;
+        let mock = self.mock_writes.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let service = XPanel::service_free();
-                    let publishers = service.publishers;
-                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
-                    else {
-                        return Err(
-                            "No in-app posting path found. Connect X first, then try again."
-                                .to_string(),
-                        );
-                    };
-                    publisher.set_follow(&handle_for_call, target)
+                    if live {
+                        let service = XPanel::service_free();
+                        let publishers = service.publishers;
+                        let Some(publisher) =
+                            termy_x::publish::first_that_follows(publishers.as_slice())
+                        else {
+                            return Err(
+                                "No follow path. OpenCLI can follow and unfollow; this posting path cannot. Nothing was changed."
+                                    .to_string(),
+                            );
+                        };
+                        publisher.set_follow(&handle_for_call, target)
+                    } else {
+                        mock.set_follow(&handle_for_call, target)
+                    }
                 })
                 .await;
             let _ = this.update(cx, |panel, cx| {
+                if panel.follow_seq != seq {
+                    return;
+                }
                 panel.follow_pending = None;
+                let account = panel.action_account();
+                let now = termy_x::action_state::now_ms();
                 match result {
                     Ok(message) => {
-                        panel.follow_overrides.insert(handle.clone(), target);
-                        if let Some(profile) = &mut panel.profile
-                            && profile.handle.eq_ignore_ascii_case(&handle)
-                        {
-                            profile.viewer_following = Some(target);
+                        let applied = panel.action_db.finish_toggle(
+                            &account,
+                            termy_x::action_state::ToggleKind::Follow,
+                            &handle,
+                            seq,
+                            true,
+                            None,
+                            now,
+                        );
+                        if applied == termy_x::action_state::FinishResult::Applied {
+                            if live {
+                                panel.action_db.note_opencli_contract(
+                                    &account,
+                                    termy_x::action_state::ToggleKind::Follow,
+                                    &handle,
+                                );
+                            }
+                            panel.follow_overrides.insert(
+                                termy_x::action_state::account_key(&handle),
+                                target,
+                            );
+                            panel.apply_follow_to_thread(&handle, target);
+                            panel.persist_actions();
+                            let _ = message;
+                            panel.status = termy_x::publish::follow_burst_label(target).to_string();
+                            panel.begin_author_burst(
+                                &handle,
+                                termy_x::publish::follow_burst_label(target),
+                                cx,
+                            );
                         }
-                        panel.status = message;
                     }
                     Err(error) => {
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            termy_x::action_state::ToggleKind::Follow,
+                            &handle,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
                         panel.notice = Some(format!(
                             "That did not go through: {} Nothing changed on X.",
                             termy_x::publish::humanize_error(&error)
@@ -3111,10 +4977,7 @@ impl XPanel {
         use termy_x::publish::EngageAction;
         let id = id.to_string();
         if self.engage_pending.iter().any(|p| p == &id) {
-            return;
-        }
-        if !self.live {
-            self.notice = Some("Preview/mock never likes or retweets.".into());
+            self.status = "That action is already in progress. Nothing was retried.".into();
             cx.notify();
             return;
         }
@@ -3123,58 +4986,152 @@ impl XPanel {
         let engage_started = Instant::now();
         let is_like = matches!(action, EngageAction::Like | EngageAction::Unlike);
         let now_active = matches!(action, EngageAction::Like | EngageAction::Retweet);
+        let seq = self.next_action_seq();
+        let kind = if is_like {
+            termy_x::action_state::ToggleKind::Like
+        } else {
+            termy_x::action_state::ToggleKind::Repost
+        };
+        self.action_db.begin_toggle(
+            &self.action_account(),
+            kind,
+            &id,
+            now_active,
+            seq,
+            termy_x::action_state::now_ms(),
+        );
+        self.engage_seq.insert(id.clone(), seq);
         self.set_engage_state(&id, is_like, now_active);
         self.engage_pending.push(id.clone());
+        let action_kind = match action {
+            EngageAction::Like => "like",
+            EngageAction::Unlike => "unlike",
+            EngageAction::Retweet => "retweet",
+            EngageAction::Unretweet => "unretweet",
+            EngageAction::Quote => "quote",
+        };
+        termy_x::publish::log_action(action_kind, "start", &[("ack", "pending"), ("new_id", "none")]);
         cx.notify();
+        let live = self.live;
+        let mock = self.mock_writes.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let probe_started = Instant::now();
-                    let service = XPanel::service_free();
-                    let publishers = service.publishers;
-                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
-                    else {
-                        return Err(
-                            "No in-app posting path found. Connect X first, then try again."
-                                .to_string(),
-                        );
-                    };
-                    perf_log(&format!(
-                        "engage probe_ms={}",
-                        probe_started.elapsed().as_millis()
-                    ));
-                    publisher.engage(action, &url, None, &[])
+                    if live {
+                        let service = XPanel::service_free();
+                        let publishers = service.publishers;
+                        let Some(publisher) =
+                            termy_x::publish::first_available(publishers.as_slice())
+                        else {
+                            return Err(
+                                "No in-app posting path found. Connect X first, then try again."
+                                    .to_string(),
+                            );
+                        };
+                        perf_log(&format!(
+                            "engage probe_ms={}",
+                            probe_started.elapsed().as_millis()
+                        ));
+                        publisher.engage(action, &url, None, &[])
+                    } else {
+                        mock.engage(action, &url, None, &[])
+                    }
                 })
                 .await;
             perf_log(&format!(
                 "engage {action:?} confirmed_ms={}",
                 engage_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action(action_kind, "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
+                if panel.engage_seq.get(&id).copied() != Some(seq) {
+                    return;
+                }
+                panel.engage_seq.remove(&id);
                 panel.engage_pending.retain(|p| p != &id);
+                let account = panel.action_account();
+                let now = termy_x::action_state::now_ms();
+                let kind = if is_like {
+                    termy_x::action_state::ToggleKind::Like
+                } else {
+                    termy_x::action_state::ToggleKind::Repost
+                };
+                let proven = match &result {
+                    Ok(receipt)
+                        if matches!(
+                            action,
+                            termy_x::publish::EngageAction::Retweet
+                                | termy_x::publish::EngageAction::Unretweet
+                        ) =>
+                    {
+                        let expected = match &panel.connection {
+                            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+                            _ => None,
+                        };
+                        termy_x::publish::prove_engage(action, receipt, expected).err()
+                    }
+                    _ => None,
+                };
+                let result = if let Some(error) = proven {
+                    Err(error)
+                } else {
+                    result
+                };
                 match result {
                     Ok(_) => {
-                        panel.status = format!(
-                            "{} @{}",
-                            match action {
-                                termy_x::publish::EngageAction::Like => "liked",
-                                termy_x::publish::EngageAction::Unlike => "unliked",
-                                termy_x::publish::EngageAction::Retweet => "retweeted",
-                                termy_x::publish::EngageAction::Unretweet => "retweet removed from",
-                                termy_x::publish::EngageAction::Quote => "quoted",
-                            },
-                            author
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            kind,
+                            &id,
+                            seq,
+                            true,
+                            None,
+                            now,
                         );
-                        // Verified success only: Like and Retweet get
-                        // the card burst. Removals (unlike/unretweet)
-                        // just flip state — taking away is not a post.
+                        if live {
+                            panel.action_db.note_opencli_contract(&account, kind, &id);
+                        }
+                        panel.persist_actions();
+                        panel.status = match action {
+                            termy_x::publish::EngageAction::Like => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Like)
+                            }
+                            termy_x::publish::EngageAction::Unlike => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Unlike)
+                            }
+                            termy_x::publish::EngageAction::Retweet => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Retweet)
+                            }
+                            termy_x::publish::EngageAction::Unretweet => termy_x::publish::success_note(
+                                termy_x::publish::UserWrite::Unretweet,
+                            ),
+                            termy_x::publish::EngageAction::Quote => termy_x::publish::success_note(
+                                termy_x::publish::UserWrite::QTweet,
+                            ),
+                        }
+                        .to_string();
+                        let _ = author;
+                        // Verified success only. Like, unlike, retweet, and
+                        // unretweet each have their own card note.
                         if let Some(label) = termy_x::publish::engage_burst_label(action) {
                             panel.begin_card_burst(&id, label, cx);
                         }
                     }
                     Err(error) => {
-                        // Revert the optimistic flip.
+                        let _ = panel.action_db.finish_toggle(
+                            &account,
+                            kind,
+                            &id,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
+                        // Revert the optimistic flip. The saved value stays.
                         panel.set_engage_state(&id, is_like, !now_active);
                         panel.notice = Some(format!(
                             "That did not go through: {} Nothing changed on X.",
@@ -3184,6 +5141,11 @@ impl XPanel {
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                action_kind,
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
@@ -3205,18 +5167,86 @@ impl XPanel {
             return;
         }
         let delta: i64 = if active { 1 } else { -1 };
+        let apply = |post: &mut Post| {
+            if post.id == id {
+                if is_like {
+                    post.likes = (post.likes as i64 + delta).max(0) as u64;
+                    post.viewer_liked = Some(active);
+                } else {
+                    post.reposts = (post.reposts as i64 + delta).max(0) as u64;
+                }
+            }
+        };
         for list in [
             &mut self.posts,
             &mut self.following_posts,
             &mut self.search_posts,
+            &mut self.mentions_posts,
+            &mut self.inbox_posts,
+            &mut self.desk.inbox_posts,
+            &mut self.desk.mentions_posts,
+            &mut self.desk.feed_posts,
+            &mut self.desk.stats_top,
         ] {
             for post in list.iter_mut() {
-                if post.id == id {
-                    if is_like {
-                        post.likes = (post.likes as i64 + delta).max(0) as u64;
-                    } else {
-                        post.reposts = (post.reposts as i64 + delta).max(0) as u64;
-                    }
+                apply(post);
+            }
+        }
+        if let Some(thread) = self.thread.as_mut() {
+            apply(&mut thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &mut thread.load {
+                for post in replies {
+                    apply(post);
+                }
+            }
+        }
+    }
+
+    fn apply_follow_to_thread(&mut self, handle: &str, following: bool) {
+        let needle = termy_x::model::strip_handle(handle).to_ascii_lowercase();
+        let apply = |post: &mut Post| {
+            if termy_x::model::strip_handle(&post.author_handle).eq_ignore_ascii_case(&needle) {
+                post.viewer_follows_author = Some(following);
+            }
+            if let Some(inner) = post.retweeted.as_mut()
+                && termy_x::model::strip_handle(&inner.author_handle).eq_ignore_ascii_case(&needle)
+            {
+                inner.viewer_follows_author = Some(following);
+            }
+            if let Some(inner) = post.quoted.as_mut()
+                && termy_x::model::strip_handle(&inner.author_handle).eq_ignore_ascii_case(&needle)
+            {
+                inner.viewer_follows_author = Some(following);
+            }
+        };
+        for list in [
+            &mut self.posts,
+            &mut self.following_posts,
+            &mut self.search_posts,
+            &mut self.mentions_posts,
+            &mut self.inbox_posts,
+            &mut self.desk.inbox_posts,
+            &mut self.desk.mentions_posts,
+            &mut self.desk.feed_posts,
+            &mut self.desk.stats_top,
+        ] {
+            for post in list.iter_mut() {
+                apply(post);
+            }
+        }
+        if let Some(profile) = &mut self.profile {
+            if termy_x::model::strip_handle(&profile.handle).eq_ignore_ascii_case(&needle) {
+                profile.viewer_following = Some(following);
+            }
+            for post in profile.posts.iter_mut().chain(profile.pinned.iter_mut()) {
+                apply(post);
+            }
+        }
+        if let Some(thread) = self.thread.as_mut() {
+            apply(&mut thread.root);
+            if let thread_view::ThreadLoad::Ready { replies } = &mut thread.load {
+                for post in replies {
+                    apply(post);
                 }
             }
         }
@@ -3254,8 +5284,8 @@ impl XPanel {
         self.status = "quote closed \u{b7} nothing was posted".into();
     }
 
-    /// Post the quote (retweet with your own words) via OpenCLI
-    /// `twitter quote <url> <text>` in the silent background session.
+    /// Post the quote via OpenCLI `twitter quote <url> <text>`.
+    /// A normal post is not a fallback. Failure leaves the draft.
     fn submit_quote(&mut self, cx: &mut Context<Self>) {
         if self.quote_posting {
             self.notice = Some("Already sending that quote \u{2014} wait for it.".into());
@@ -3284,6 +5314,8 @@ impl XPanel {
             .iter()
             .chain(self.following_posts.iter())
             .chain(self.search_posts.iter())
+            .chain(self.mentions_posts.iter())
+            .chain(self.inbox_posts.iter())
             .find(|post| post.id == target_id);
         let Some(target_post) = target_post else {
             self.notice =
@@ -3299,17 +5331,15 @@ impl XPanel {
         } else {
             target_post.url.clone()
         };
-        if let Err(error) = termy_x::publish::validate_media_paths(&self.quote_media) {
-            self.notice = Some(error);
+        if !self.quote_media.is_empty() {
+            self.notice = Some(termy_x::publish::quote_image_unsupported().to_string());
             cx.notify();
             return;
         }
-        let media = self.quote_media.clone();
-        let author = self.quote_author.clone();
+        let media: Vec<std::path::PathBuf> = Vec::new();
         self.quote_posting = true;
-        self.notice = Some(format!(
-            "Quoting @{author} in-app, silently in the background\u{2026} no browser will open."
-        ));
+        termy_x::publish::log_action("quote", "start", &[("ack", "pending"), ("new_id", "none")]);
+        self.notice = Some(termy_x::publish::quote_visible_window_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -3344,7 +5374,10 @@ impl XPanel {
                 "submit quote confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("quote", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.quote_posting = false;
                 match result {
                     Ok(_) => {
@@ -3353,22 +5386,44 @@ impl XPanel {
                         }
                         panel.quote_text.clear();
                         panel.quote_media.clear();
-                        panel.notice = Some(format!(
-                            "Quoted @{author} \u{b7} posted in-app, no browser opened."
-                        ));
-                        panel.status = format!("quoted @{author}");
-                        panel.begin_post_burst(BurstTarget::Quote, cx);
+                        panel.notice = Some(
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
+                                .to_string(),
+                        );
+                        panel.status = termy_x::publish::success_note(
+                            termy_x::publish::UserWrite::QTweet,
+                        )
+                        .to_string();
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::QTweet,
+                            &target_id,
+                            &termy_x::publish::quote_saved_receipt(&target_id),
+                        );
+                        panel.begin_post_burst(
+                            BurstTarget::Quote,
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet),
+                            cx,
+                        );
                         panel.close_box_after_burst(BurstTarget::Quote, target_id.clone(), cx);
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not quote: {} Nothing was posted; no browser opened.",
+                            "{} {} The draft is still here. Nothing was retried.",
+                            termy_x::publish::withheld_note(
+                                termy_x::publish::UserWrite::QTweet,
+                                termy_x::publish::WriteOutcome::Failed
+                            ),
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                "quote",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
@@ -3414,9 +5469,8 @@ impl XPanel {
         let author = self.reply_author.clone();
         let target_id_for_update = target_id.clone();
         self.reply_posting = true;
-        self.notice = Some(format!(
-            "Replying to @{author} in-app, silently in the background\u{2026} no browser will open."
-        ));
+        termy_x::publish::log_action("reply", "start", &[("ack", "pending"), ("new_id", "none")]);
+        self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -3465,7 +5519,10 @@ impl XPanel {
                 "submit reply confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("reply", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.reply_posting = false;
                 match result {
                     Ok(_receipt) => {
@@ -3474,11 +5531,21 @@ impl XPanel {
                         }
                         panel.reply_text.clear();
                         panel.reply_media.clear();
-                        panel.notice = Some(format!(
-                            "Replied to @{author} \u{b7} posted in-app, no browser opened."
-                        ));
+                        panel.notice = Some(
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::Reply)
+                                .to_string(),
+                        );
                         panel.status = format!("replied to @{author}");
-                        panel.begin_post_burst(BurstTarget::Reply, cx);
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::Reply,
+                            &target_id_for_update,
+                            "Reply sent",
+                        );
+                        panel.begin_post_burst(
+                            BurstTarget::Reply,
+                            termy_x::publish::reply_sent_label(),
+                            cx,
+                        );
                         panel.close_box_after_burst(
                             BurstTarget::Reply,
                             target_id_for_update.clone(),
@@ -3487,97 +5554,24 @@ impl XPanel {
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
-                            "Could not reply: {} Nothing was posted; no browser opened.",
+                            "Could not reply: {} Nothing was posted.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
                 }
                 cx.notify();
             });
+            termy_x::publish::log_action(
+                "reply",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
         })
         .detach();
     }
 
-    fn selection_range(&self) -> Option<(usize, usize)> {
-        let anchor = self.sel_anchor?;
-        let a = anchor.min(self.caret);
-        let b = anchor.max(self.caret);
-        if a == b { None } else { Some((a, b)) }
-    }
-
-    fn clear_selection(&mut self) {
-        self.sel_anchor = None;
-    }
-
     fn insert_text(&mut self, text: &str) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, text);
-            self.caret = a + text.len();
-        } else {
-            let at = self.caret.min(self.compose.len());
-            self.compose.insert_str(at, text);
-            self.caret = at + text.len();
-        }
-        self.clear_selection();
-        self.follow_compose_caret();
-    }
-
-    fn backspace(&mut self) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, "");
-            self.caret = a;
-            self.clear_selection();
-            self.follow_compose_caret();
-            return;
-        }
-        if self.caret == 0 {
-            return;
-        }
-        let prev = prev_boundary(&self.compose, self.caret);
-        self.compose.replace_range(prev..self.caret, "");
-        self.caret = prev;
-        self.follow_compose_caret();
-    }
-
-    fn delete_forward(&mut self) {
-        self.mention_dirty_at = Some(std::time::Instant::now());
-        if let Some((a, b)) = self.selection_range() {
-            self.compose.replace_range(a..b, "");
-            self.caret = a;
-            self.clear_selection();
-            return;
-        }
-        if self.caret >= self.compose.len() {
-            return;
-        }
-        let next = next_boundary(&self.compose, self.caret);
-        self.compose.replace_range(self.caret..next, "");
-        self.follow_compose_caret();
-    }
-
-    fn move_caret(&mut self, motion: CaretMove, extend: bool) {
-        if extend && self.sel_anchor.is_none() {
-            self.sel_anchor = Some(self.caret);
-        } else if !extend {
-            self.clear_selection();
-        }
-        match motion {
-            CaretMove::Left => self.caret = prev_boundary(&self.compose, self.caret),
-            CaretMove::Right => self.caret = next_boundary(&self.compose, self.caret),
-            CaretMove::LineStart => {
-                let head = self.compose[..self.caret].rfind('\n').map_or(0, |i| i + 1);
-                self.caret = head;
-            }
-            CaretMove::LineEnd => {
-                let tail = self.compose[self.caret..]
-                    .find('\n')
-                    .map_or(self.compose.len(), |i| self.caret + i);
-                self.caret = tail;
-            }
-        }
-        self.follow_compose_caret();
+        self.editor_insert(EditorId::Compose, text);
     }
 
     fn cycle_ui_focus(&mut self, reverse: bool) {
@@ -3613,35 +5607,6 @@ impl XPanel {
     }
 }
 
-#[derive(Clone, Copy)]
-enum CaretMove {
-    Left,
-    Right,
-    LineStart,
-    LineEnd,
-}
-
-fn prev_boundary(text: &str, offset: usize) -> usize {
-    if offset == 0 {
-        return 0;
-    }
-    let offset = offset.min(text.len());
-    text[..offset]
-        .char_indices()
-        .next_back()
-        .map_or(0, |(i, _)| i)
-}
-
-fn next_boundary(text: &str, offset: usize) -> usize {
-    if offset >= text.len() {
-        return text.len();
-    }
-    text[offset..]
-        .chars()
-        .next()
-        .map_or(text.len(), |c| offset + c.len_utf8())
-}
-
 fn live_status(status: &termy_x::StatusLine) -> String {
     if status.provider == termy_x::ProviderId::Mock {
         format!(
@@ -3659,14 +5624,27 @@ fn patch_repost_original(posts: &mut [Post], repost_id: &str, original: &Post) {
     for post in posts.iter_mut() {
         if post.id == repost_id && post.retweeted.is_none() {
             post.retweeted = Some(Box::new(original.clone()));
+            post.unavailable_original_url = None;
         }
     }
 }
 
+fn patch_repost_unavailable(posts: &mut [Post], repost_id: &str) {
+    for post in posts.iter_mut() {
+        if post.id == repost_id && post.retweeted.is_none() && post.unavailable_original_url.is_none()
+        {
+            post.unavailable_original_url = post.original_link();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn fetch_section(
     section: XSection,
     query: String,
     lookup: String,
+    handle: String,
+    newest: bool,
     live: bool,
     feed: TimelineFeed,
     append: bool,
@@ -3681,7 +5659,7 @@ fn fetch_section(
                 // top, Load more continues strictly older from the
                 // stored bottom cursor \u{2014} never a bigger re-fetch.
                 match service.timeline_page(feed, cursor.as_deref(), limit) {
-                    Ok(served) => {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
                         return FetchPayload::Timeline {
                             posts: served.value.posts,
                             status: live_status(&served.status),
@@ -3691,6 +5669,18 @@ fn fetch_section(
                             next_cursor: served.value.next_cursor,
                             cursor_ok: true,
                             failed: false,
+                        };
+                    }
+                    Ok(_) => {
+                        return FetchPayload::Timeline {
+                            posts: Vec::new(),
+                            status: "could not load timeline \u{2014} fixture posts are not used in the normal app. Connect X and try again.".into(),
+                            feed,
+                            append,
+                            requested: limit,
+                            next_cursor: None,
+                            cursor_ok: false,
+                            failed: true,
                         };
                     }
                     Err(error) => {
@@ -3710,10 +5700,15 @@ fn fetch_section(
                         }
                         // Fresh load: legacy one-shot fetch still works
                         // when the cursor session cannot start.
-                        if let Ok(served) = service.timeline_feed(feed, limit) {
+                        if let Ok(served) = service.timeline_feed(feed, limit.min(TIMELINE_PAGE))
+                            && served.status.provider != termy_x::ProviderId::Mock
+                        {
                             return FetchPayload::Timeline {
                                 posts: served.value,
-                                status: live_status(&served.status),
+                                status: format!(
+                                    "{} \u{b7} no next-page cursor from this path",
+                                    live_status(&served.status)
+                                ),
                                 feed,
                                 append,
                                 requested: limit,
@@ -3722,16 +5717,95 @@ fn fetch_section(
                                 failed: false,
                             };
                         }
+                        return FetchPayload::Timeline {
+                            posts: Vec::new(),
+                            status: format!(
+                                "could not load {} \u{2014} {error}",
+                                feed.label()
+                            ),
+                            feed,
+                            append,
+                            requested: limit,
+                            next_cursor: None,
+                            cursor_ok: false,
+                            failed: true,
+                        };
                     }
                 }
             }
             XSection::Search => {
-                if let Ok(served) = service.search(&query, false, 15) {
-                    return FetchPayload::Search {
-                        posts: served.value,
-                        status: live_status(&served.status),
-                    };
-                }
+                return match service.search(&query, newest, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Search {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Search {
+                        posts: Vec::new(),
+                        status: "could not search \u{2014} fixture posts are not used in the normal app."
+                            .into(),
+                    },
+                    Err(error) => FetchPayload::Search {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not search \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
+            }
+            XSection::Mentions => {
+                let who = if handle.trim().is_empty() {
+                    lookup.as_str()
+                } else {
+                    handle.as_str()
+                };
+                return match service.mentions(who, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Mentions {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Mentions {
+                        posts: Vec::new(),
+                        status: "could not load mentions \u{2014} fixture posts are not used in the normal app.".into(),
+                    },
+                    Err(error) => FetchPayload::Mentions {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not load mentions \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
+            }
+            XSection::Inbox => {
+                let who = if handle.trim().is_empty() {
+                    lookup.as_str()
+                } else {
+                    handle.as_str()
+                };
+                return match service.inbox_replies(who, LIST_PAGE) {
+                    Ok(served) if served.status.provider != termy_x::ProviderId::Mock => {
+                        FetchPayload::Inbox {
+                            posts: served.value,
+                            status: live_status(&served.status),
+                        }
+                    }
+                    Ok(_) => FetchPayload::Inbox {
+                        posts: Vec::new(),
+                        status: "could not load inbox \u{2014} fixture posts are not used in the normal app.".into(),
+                    },
+                    Err(error) => FetchPayload::Inbox {
+                        posts: Vec::new(),
+                        status: format!(
+                            "could not load inbox \u{2014} {}",
+                            termy_x::publish::humanize_error(&error)
+                        ),
+                    },
+                };
             }
             XSection::Trends => {
                 match service.trends(Some("worldwide"), 50) {
@@ -3792,31 +5866,90 @@ fn fetch_section(
                     ),
                 };
             }
-            XSection::Compose => {}
+            XSection::Compose
+            | XSection::Help
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze
+            | XSection::ReplyGuy => {
+                return FetchPayload::Timeline {
+                    posts: Vec::new(),
+                    status: "could not load \u{2014} this tab does not use fixture posts".into(),
+                    feed,
+                    append,
+                    requested: limit,
+                    next_cursor: None,
+                    cursor_ok: false,
+                    failed: true,
+                };
+            }
         }
     }
 
+    // Preview / tests only. The normal app returned above.
     match section {
-        XSection::Timeline => FetchPayload::Timeline {
-            posts: MockProvider
-                .timeline_feed(feed, limit)
+        XSection::Timeline => {
+            let page = MockProvider
+                .timeline_page(feed, cursor.as_deref(), limit)
                 .map(|served| served.value)
-                .unwrap_or_default(),
-            feed,
-            status: "mock Â· fixture data Â· no X API credits".into(),
-            append,
-            requested: limit,
-            next_cursor: None,
-            cursor_ok: false,
-            failed: false,
-        },
+                .unwrap_or(termy_x::providers::TimelinePage {
+                    posts: Vec::new(),
+                    next_cursor: None,
+                });
+            let more = page.next_cursor.is_some();
+            FetchPayload::Timeline {
+                posts: page.posts,
+                feed,
+                status: if more {
+                    "mock \u{b7} fixture page \u{b7} Load more continues \u{b7} no X API credits"
+                        .into()
+                } else {
+                    "mock \u{b7} fixture page \u{b7} end of fixture \u{b7} no X API credits".into()
+                },
+                append,
+                requested: limit,
+                next_cursor: page.next_cursor,
+                cursor_ok: true,
+                failed: false,
+            }
+        }
         XSection::Search => FetchPayload::Search {
             posts: MockProvider
-                .search(&query, false, 15)
+                .search(&query, newest, LIST_PAGE)
                 .map(|served| served.value)
                 .unwrap_or_default(),
             status: format!("mock Â· search â€œ{query}â€ Â· no X API credits"),
         },
+        XSection::Mentions => {
+            let who = if handle.trim().is_empty() {
+                "termy"
+            } else {
+                handle.as_str()
+            };
+            FetchPayload::Mentions {
+                posts: MockProvider
+                    .mentions(who, LIST_PAGE)
+                    .map(|served| served.value)
+                    .unwrap_or_default(),
+                status: "mock Â· mentions Â· no X API credits".into(),
+            }
+        }
+        XSection::Inbox => {
+            let who = if handle.trim().is_empty() {
+                "termy"
+            } else {
+                handle.as_str()
+            };
+            FetchPayload::Inbox {
+                posts: MockProvider
+                    .inbox_replies(who, LIST_PAGE)
+                    .map(|served| served.value)
+                    .unwrap_or_default(),
+                status: "mock Â· inbox Â· no X API credits".into(),
+            }
+        }
         XSection::Trends => FetchPayload::Trends {
             trends: MockProvider
                 .trends(Some("worldwide"), 50)
@@ -3846,7 +5979,14 @@ fn fetch_section(
             }],
             status: "research Â· fixture Â· no X API credits".into(),
         },
-        XSection::Compose => FetchPayload::Timeline {
+        XSection::Compose
+        | XSection::Help
+        | XSection::Feeds
+        | XSection::Stats
+        | XSection::Followers
+        | XSection::Queue
+        | XSection::Analyze
+        | XSection::ReplyGuy => FetchPayload::Timeline {
             posts: Vec::new(),
             status: "compose".into(),
             feed,
@@ -3854,7 +5994,7 @@ fn fetch_section(
             cursor_ok: false,
             failed: false,
             append: false,
-            requested: TIMELINE_LIMIT,
+            requested: TIMELINE_PAGE,
         },
     }
 }
@@ -3869,6 +6009,11 @@ impl Drop for XPanel {
 impl Render for XPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_spawn_mention_check(cx);
+        // Reply Guy restored at launch: read saved keys once so a stored
+        // Treg key shows as saved instead of prompting again.
+        if self.section == XSection::ReplyGuy && !self.desk.rg.checked {
+            self.rg_refresh_keys();
+        }
         self.sync_video_player(window, cx);
         if self.pending_focus {
             self.focus.focus(window, cx);
@@ -3878,10 +6023,16 @@ impl Render for XPanel {
         let char_limit = self.char_limit;
         // Off the Compose tab the thread math is never displayed; skip it
         // so Timeline/Search keystrokes and blink frames stay cheap.
+        let confirm_text = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty()
+        {
+            self.reply_text.as_str()
+        } else {
+            self.compose.as_str()
+        };
         let (count, parts) =
             if self.section == XSection::Compose || self.confirm || self.fill_window {
-                let count = weighted_len_limited(&self.compose, char_limit);
-                let parts = split_thread_limited(&self.compose, char_limit);
+                let count = weighted_len_limited(confirm_text, char_limit);
+                let parts = split_thread_limited(confirm_text, char_limit);
                 (count, parts)
             } else {
                 (weighted_len_limited("", char_limit), Vec::new())
@@ -3928,10 +6079,13 @@ impl Render for XPanel {
                     .child(self.connection_bar(cx))
                     .child(self.status_line())
                     .children(
-                        (columns == 1 && self.section == XSection::Timeline)
-                            .then(|| self.feed_switch(cx)),
+                        (columns == 1
+                            && self.section == XSection::Timeline
+                            && self.thread.is_none())
+                        .then(|| self.feed_switch(cx)),
                     )
-                    .child(if columns == 1 {
+                    .children(self.shows_list_sort().then(|| self.list_sort_bar(cx)))
+                    .child(if columns == 1 || self.thread.is_some() {
                         div()
                             .relative()
                             .flex_1()
@@ -4044,6 +6198,7 @@ impl Render for XPanel {
             .children(self.confirm.then(|| {
                 self.confirm_dialog(count.weighted, count.limit, &parts, dialog_width, cx)
             }))
+            .children(self.bulk_overlay(dialog_width, cx))
             .children(self.viewer_overlay(cx));
         let elapsed = render_started.elapsed();
         if elapsed.as_millis() > 12
@@ -4066,26 +6221,8 @@ impl Render for XPanel {
 /// Local copy of the release-notes loader: x_panel lives in the lib crate,
 /// which cannot reach the binary crate's `ui` module.
 fn fetch_image_rgba(url: &str) -> Result<image::RgbaImage, String> {
-    if !url.starts_with("https://") && !url.starts_with("http://") {
-        return Err("only http(s) images".into());
-    }
-    use std::io::Read;
-    let response = ureq::get(url)
-        .set("User-Agent", "TermyX/1.0")
-        .call()
-        .map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(5_000_001)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 5_000_000 {
-        return Err("image too large".into());
-    }
-    image::load_from_memory(&bytes)
-        .map(|d| d.to_rgba8())
-        .map_err(|e| e.to_string())
+    let bytes = preview::fetch_bounded(url, 5_000_000)?;
+    preview::decode_still(&bytes)
 }
 
 /// Global cursor Y in list-relative logical coordinates, read straight
@@ -4160,6 +6297,7 @@ fn local_hms() -> String {
             ms: 0,
         };
         unsafe { GetLocalTime(&mut st) };
+        #[allow(clippy::needless_return)]
         return format!("{:02}:{:02}:{:02}", st.hour, st.minute, st.second);
     }
     #[cfg(not(target_os = "windows"))]
@@ -4187,24 +6325,6 @@ fn breath_animation(cycle_ms: u64) -> Animation {
         .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
 }
 
-/// Breathing text caret shared by every panel editor. Always rendered
-/// (fixed cell, zero layout shift); only its opacity breathes.
-fn caret_element(id: &'static str) -> gpui_kit::AnyElement {
-    // A real 2px bar (same look as the Compose caret), not a "|" glyph:
-    // the glyph was thin enough to miss at editor font sizes, which read
-    // as "no cursor" in the small fields.
-    div()
-        .w(px(2.0))
-        .h(px(14.0))
-        .rounded(px(1.0))
-        .bg(rgb(0x7af6ff))
-        .flex_none()
-        .with_animation(id, breath_animation(2_300), |el, v| {
-            el.opacity(0.12 + 0.88 * v)
-        })
-        .into_any_element()
-}
-
 /// Compact post-count formatting for trend volumes ("182K posts").
 fn fmt_volume(volume: u64) -> String {
     let (scaled, suffix) = if volume >= 1_000_000 {
@@ -4219,39 +6339,6 @@ fn fmt_volume(volume: u64) -> String {
         text.truncate(text.len() - 2);
     }
     format!("{text}{suffix}")
-}
-
-/// Split `text[a..b]` at entity edges into chunk divs: @mentions,
-/// #hashtags, and $cashtags in X blue, the rest in the default color.
-/// Shared by every editor surface (Compose rows, small editors, and the
-/// single-line fields) so token rendering is identical everywhere.
-fn entity_chunk_divs(
-    text: &str,
-    a: usize,
-    b: usize,
-    entities: &[(usize, usize, termy_x::text::EntityKind)],
-) -> Vec<gpui_kit::AnyElement> {
-    let mut cuts: Vec<usize> = vec![a, b];
-    for (es, ee, _) in entities {
-        for edge in [*es, *ee] {
-            if edge > a && edge < b {
-                cuts.push(edge);
-            }
-        }
-    }
-    cuts.sort_unstable();
-    cuts.dedup();
-    cuts.windows(2)
-        .map(|w| {
-            let (cs, ce) = (w[0], w[1]);
-            let in_entity = entities.iter().any(|(es, ee, _)| cs >= *es && ce <= *ee);
-            let mut chunk = div().child(text[cs..ce].to_string());
-            if in_entity {
-                chunk = chunk.text_color(rgb(ENTITY_BLUE));
-            }
-            chunk.into_any_element()
-        })
-        .collect()
 }
 
 /// Red<->blue glow colour at breath phase `v` (0 = warm red, 1 = blue).
@@ -4358,13 +6445,13 @@ struct PostBurst {
     started: Instant,
     /// For BurstTarget::Card: the tweet whose card shows the burst.
     card_id: Option<String>,
+    /// When set, every card by this author shows the toast (follow).
+    follow_handle: Option<String>,
     /// Full burst text ("\u{2713} Posted" / "\u{2713} Liked").
     label: &'static str,
 }
 
 const BURST_MS: u64 = 1_150;
-/// X brand blue for @mentions / #hashtags / $cashtags in editors.
-const ENTITY_BLUE: u32 = 0x1d9bf0;
 
 /// Burst look at animation progress `v` (0..1): (font px, opacity).
 /// First ~55%: "Posted" grows small -> big at full opacity. Rest:
@@ -4431,17 +6518,7 @@ fn soft_wrap_ranges(text: &str, max_chars: usize) -> Vec<(usize, usize)> {
 
 /// Which visual line (0-based) a byte caret lands on, given the wrap.
 fn caret_visual_line(text: &str, caret: usize, max_chars: usize) -> usize {
-    let ranges = soft_wrap_ranges(text, max_chars);
-    for (idx, &(_start, end)) in ranges.iter().enumerate() {
-        if caret <= end {
-            return idx;
-        }
-        // Caret on a skipped wrap-space: it belongs to the next line.
-        if caret > end && ranges.get(idx + 1).is_some_and(|&(ns, _)| caret < ns) {
-            return idx + 1;
-        }
-    }
-    ranges.len().saturating_sub(1)
+    termy_x::draft_edit::line_index(&soft_wrap_ranges(text, max_chars), caret)
 }
 
 /// The centered "Posted" burst element (one scoped animated element).
@@ -4478,7 +6555,7 @@ fn perf_log(line: &str) {
 
 impl XPanel {
     fn column_count(&self, window: &Window) -> usize {
-        if self.splash || !self.fill_window {
+        if self.splash || !self.fill_window || self.section.is_desk() {
             return 1;
         }
         let width: f32 = window.viewport_size().width.into();
@@ -4546,9 +6623,9 @@ impl XPanel {
             .child(
                 div().flex().flex_col().child(
                     div()
-                        .text_size(px(18.0))
+                        .text_size(px(15.0))
                         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                        .text_color(rgb(0x7af6ff))
+                        .text_color(rgb(0xf5f5f7))
                         .child("Termy X"),
                 ),
             )
@@ -4556,34 +6633,28 @@ impl XPanel {
                 let art_focus = self.ui_focus == UiFocus::Art;
                 div()
                     .id("x-art-toggle")
-                    .px(px(10.0))
+                    .px(px(8.0))
                     .py(px(4.0))
                     .rounded(px(999.0))
                     .border_1()
-                    .border_color(if art_focus {
-                        rgb(0xff4fa3)
-                    } else if self.background_art {
-                        rgb(0x7af6ff)
+                    .border_color(if art_focus || self.background_art {
+                        rgb(0x0a84ff)
                     } else {
-                        tint(0x7af6ff, 40)
+                        rgb(0x3a3a3c)
                     })
                     .bg(if art_focus {
-                        rgb(0x2a0f3a)
+                        rgb(0x1a2a44)
                     } else {
-                        tint(0x102033, 180)
+                        rgb(0x2c2c2e)
                     })
-                    .text_size(px(12.0))
-                    .text_color(if art_focus {
-                        rgb(0xffd0ea)
-                    } else {
-                        rgb(0xe7eefc)
-                    })
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xe5e5ea))
                     .cursor_pointer()
                     .hover(|style| {
                         style
-                            .bg(rgb(0x1a3050))
-                            .border_color(rgb(0x7af6ff))
-                            .text_color(rgb(0x7af6ff))
+                            .bg(rgb(0x3a3a3c))
+                            .border_color(rgb(0x636366))
+                            .text_color(rgb(0xffffff))
                     })
                     .child(if self.background_art {
                         "Art on"
@@ -4608,28 +6679,28 @@ impl XPanel {
             let refreshing = self.loading;
             div()
                 .id("x-refresh")
-                .px(px(9.0))
-                .py(px(5.0))
+                .px(px(7.0))
+                .py(px(4.0))
                 .rounded(px(8.0))
-                .text_size(px(13.0))
+                .text_size(px(11.0))
                 .cursor_pointer()
                 .border_1()
                 .border_color(if refreshing {
-                    rgb(0xff4fa3)
+                    rgb(0x64d2ff)
                 } else {
-                    tint(0x7af6ff, 45)
+                    rgb(0x3a3a3c)
                 })
                 .bg(if refreshing {
-                    rgb(0x2a0f3a)
+                    rgb(0x0f2a3a)
                 } else {
-                    tint(0x101826, 170)
+                    rgb(0x2c2c2e)
                 })
                 .text_color(if refreshing {
-                    rgb(0xffd0ea)
+                    rgb(0x64d2ff)
                 } else {
-                    rgb(0x7af6ff)
+                    rgb(0xe5e5ea)
                 })
-                .hover(|style| style.bg(rgb(0x1a3050)).border_color(rgb(0x7af6ff)))
+                .hover(|style| style.bg(rgb(0x3a3a3c)).border_color(rgb(0x636366)))
                 .child(if refreshing {
                     "\u{21bb}\u{2026}"
                 } else {
@@ -4646,56 +6717,45 @@ impl XPanel {
         };
         div()
             .flex()
-            .gap(px(6.0))
+            .gap(px(3.0))
             .flex_wrap()
-            .children(
-                [
-                    XSection::Timeline,
-                    XSection::Search,
-                    XSection::Trends,
-                    XSection::Lookup,
-                    XSection::Compose,
-                    XSection::Research,
-                ]
-                .into_iter()
-                .map(move |section| {
-                    let active = section == current;
-                    div()
-                        .id(SharedString::from(format!("x-tab-{}", section.label())))
-                        .px(px(10.0))
-                        .py(px(5.0))
-                        .rounded(px(8.0))
-                        .text_size(px(12.0))
-                        .cursor_pointer()
-                        .border_1()
-                        .border_color(if active {
-                            rgb(0x7af6ff)
-                        } else {
-                            tint(0x7af6ff, 25)
-                        })
-                        .bg(if active {
-                            rgb(0x122a55)
-                        } else {
-                            tint(0x101826, 170)
-                        })
-                        .text_color(if active { rgb(0x7af6ff) } else { rgb(0xb7c3dc) })
-                        .hover(|style| {
-                            style
-                                .bg(rgb(0x1a3050))
-                                .border_color(rgb(0xff4fa3))
-                                .text_color(rgb(0xffd0ea))
-                        })
-                        .child(section.label())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                                this.open_section(section, cx);
-                                cx.stop_propagation();
-                                cx.notify();
-                            }),
-                        )
-                }),
-            )
+            .children(XSection::all().into_iter().map(move |section| {
+                let active = section == current;
+                div()
+                    .id(SharedString::from(format!("x-tab-{}", section.label())))
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(8.0))
+                    .text_size(px(11.0))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if active {
+                        rgb(0x0a84ff)
+                    } else {
+                        rgb(0x2c2c2e)
+                    })
+                    .bg(if active {
+                        rgb(0x1a2a44)
+                    } else {
+                        rgb(0x1c1c1e)
+                    })
+                    .text_color(if active { rgb(0xffffff) } else { rgb(0x8e8e93) })
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0x2c2c2e))
+                            .border_color(rgb(0x3a3a3c))
+                            .text_color(rgb(0xf5f5f7))
+                    })
+                    .child(section.label())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                            this.open_section(section, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            }))
             .child(refresh_btn)
     }
 
@@ -4715,9 +6775,9 @@ impl XPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
+            .gap(px(4.0))
             .text_size(px(11.0))
-            .text_color(rgb(0x93a4c3));
+            .text_color(rgb(0x8e8e93));
         if self.loading {
             row = row.child(breathing_bird());
         }
@@ -4997,7 +7057,16 @@ impl XPanel {
         }
         let sorted = sort_trends(&self.trends);
         let filtering = !self.trends_filter.trim().is_empty();
-        let visible = filter_trends(&self.trends, &self.trends_filter);
+        let ranked = filter_trends(&self.trends, &self.trends_filter);
+        let visible = match self.list_sort {
+            termy_x::sort::ResultSort::Newest => self
+                .trends
+                .iter()
+                .filter(|trend| ranked.iter().any(|hit| hit.query == trend.query))
+                .cloned()
+                .collect::<Vec<_>>(),
+            termy_x::sort::ResultSort::Popular => ranked,
+        };
         if filtering {
             rows.push(
                 div()
@@ -5029,7 +7098,8 @@ impl XPanel {
             );
         } else {
             rows.push(hint(format!(
-                "{total} unique trends \u{b7} Top 20 first, then grouped by the category X reports \u{b7} X no longer publishes trend post counts"
+                "{total} unique trends \u{b7} {} \u{b7} Top 20 first, then grouped by the category X reports \u{b7} trends have no post time, so Newest keeps X's order",
+                self.list_sort.label()
             )));
         }
         if visible.is_empty() {
@@ -5103,6 +7173,592 @@ impl XPanel {
         rows
     }
 
+    fn desk_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        match self.section {
+            XSection::Inbox => self.inbox_rows(cx),
+            XSection::Mentions => self.mentions_rows(cx),
+            XSection::Feeds => self.feeds_rows(cx),
+            XSection::Stats => self.stats_rows(cx),
+            XSection::Followers => self.followers_rows(cx),
+            XSection::Queue => self.queue_rows(cx),
+            XSection::Analyze => self.analyze_rows(cx),
+            XSection::ReplyGuy => self.reply_guy_rows(cx),
+            _ => Vec::new(),
+        }
+    }
+
+    fn inbox_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Replies and mentions that still need a response. Waiting/Done is local. Reply opens Confirm. Nothing auto-posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(6.0))
+                .flex_wrap()
+                .child(x_button!(
+                    "x-inbox-load",
+                    if self.desk.loading {
+                        "Loading\u{2026}"
+                    } else {
+                        "Load inbox"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.load_inbox(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-waiting",
+                    "Waiting",
+                    self.desk.inbox_filter == desk::InboxFilter::Waiting,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::Waiting;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-done",
+                    "Done",
+                    self.desk.inbox_filter == desk::InboxFilter::Done,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::Done;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-inbox-all",
+                    "All",
+                    self.desk.inbox_filter == desk::InboxFilter::All,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.inbox_filter = desk::InboxFilter::All;
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.inbox_error {
+            rows.push(hint(error.clone()));
+        }
+        let mut items = self.desk.visible_inbox();
+        items
+            .sort_by(|(left, _), (right, _)| termy_x::sort::cmp_posts(left, right, self.list_sort));
+        if items.is_empty() && !self.desk.loading {
+            rows.push(empty_state(
+                "Inbox is empty",
+                "Load inbox to pull notifications and to:you search. Empty is not an error.",
+            ));
+        }
+        for (post, state) in items {
+            rows.push(self.tweet_card(&post, cx));
+            let id = post.id.clone();
+            let id_done = id.clone();
+            let post_ai = post.clone();
+            let post_reply = post.clone();
+            let post_q = post.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .flex_wrap()
+                    .child(hint(format!("state \u{b7} {}", state.as_str())))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-mark-{id_done}")),
+                        if state == termy_x::inbox::InboxState::Done {
+                            "Waiting"
+                        } else {
+                            "Done"
+                        },
+                        cx.listener(move |this, _, _, cx| {
+                            this.inbox_mark(&id, state != termy_x::inbox::InboxState::Done, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-ai-{}", post_ai.id)),
+                        "AI draft",
+                        cx.listener(move |this, _, _, cx| {
+                            this.inbox_ai_draft(&post_ai, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-reply-{}", post_reply.id)),
+                        "Reply",
+                        cx.listener(move |this, _, _, cx| {
+                            let text = this.compose.clone();
+                            this.arm_confirm_reply(&text, &post_reply.id, None);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-inbox-queue-{}", post_q.id)),
+                        "Queue",
+                        cx.listener(move |this, _, _, cx| {
+                            this.queue_from_post(&post_q, cx);
+                            cx.stop_propagation();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn mentions_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(format!(
+            "Posts that mention you. Sort: {} (key {}).",
+            self.list_sort.label(),
+            termy_x::LIST_SORT_KEY
+        )));
+        rows.push(
+            x_button!(
+                "x-mentions-load",
+                if self.desk.loading {
+                    "Loading\u{2026}"
+                } else {
+                    "Load mentions"
+                },
+                cx.listener(|this, _, _, cx| {
+                    this.load_mentions(cx);
+                    cx.stop_propagation();
+                })
+            )
+            .into_any_element(),
+        );
+        if let Some(error) = &self.desk.mentions_error {
+            rows.push(hint(error.clone()));
+        }
+        if self.desk.mentions_posts.is_empty() && !self.desk.loading {
+            rows.push(empty_state(
+                "No mentions yet",
+                "Load mentions runs search @you. Empty is not an error.",
+            ));
+        }
+        for post in self.sorted_posts(&self.desk.mentions_posts) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn feeds_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Keyword feeds with local filters (language, max age, muted words/accounts). Filters persist. Nothing posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::FeedQuery, cx))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::FeedFilter, cx))
+                .child(x_button!(
+                    "x-feed-add",
+                    "Add",
+                    cx.listener(|this, _, _, cx| {
+                        this.add_feed_from_fields(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .child(x_button!(
+                    "x-feed-run",
+                    if self.desk.loading {
+                        "Running\u{2026}"
+                    } else {
+                        "Run"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.run_selected_feed(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if self.desk.feed_store.feeds.is_empty() {
+            rows.push(empty_state(
+                "No feeds yet",
+                "Type a topic, optional lang:en age:24 mute:spam @acct, then Add.",
+            ));
+        }
+        for feed in &self.desk.feed_store.feeds {
+            let id = feed.id.clone();
+            let id_sel = id.clone();
+            let id_rm = id.clone();
+            let selected = self.desk.feed_selected.as_deref() == Some(id.as_str());
+            rows.push(
+                div()
+                    .flex()
+                    .gap(px(6.0))
+                    .flex_wrap()
+                    .items_center()
+                    .child(x_button!(
+                        SharedString::from(format!("x-feed-sel-{id_sel}")),
+                        format!("{} \u{b7} {}", feed.query, feed.id),
+                        selected,
+                        cx.listener(move |this, _, _, cx| {
+                            this.desk.feed_selected = Some(id_sel.clone());
+                            cx.notify();
+                        })
+                    ))
+                    .child(x_button!(
+                        SharedString::from(format!("x-feed-rm-{id_rm}")),
+                        "Remove",
+                        cx.listener(move |this, _, _, cx| {
+                            termy_x::feeds::remove_feed(&mut this.desk.feed_store, &id_rm);
+                            let config = this.live_config();
+                            let _ = this.desk.persist_feeds(&config);
+                            cx.notify();
+                        })
+                    ))
+                    .into_any_element(),
+            );
+        }
+        if let Some(error) = &self.desk.feed_error {
+            rows.push(hint(error.clone()));
+        }
+        for post in self.sorted_posts(&self.desk.feed_posts) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn stats_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Per-day posts/likes/replies/reposts/views vs the prior window. Best-hour heatmap. Top posts. Read-only.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(6.0))
+                .child(x_button!(
+                    "x-stats-7",
+                    "7 days",
+                    self.desk.stats_days == 7,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 7;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-14",
+                    "14 days",
+                    self.desk.stats_days == 14,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 14;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-30",
+                    "30 days",
+                    self.desk.stats_days == 30,
+                    cx.listener(|this, _, _, cx| {
+                        this.desk.stats_days = 30;
+                        cx.notify();
+                    })
+                ))
+                .child(x_button!(
+                    "x-stats-load",
+                    if self.desk.loading {
+                        "Loading\u{2026}"
+                    } else {
+                        "Load stats"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.load_stats(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.stats_error {
+            rows.push(hint(error.clone()));
+        }
+        if let Some(cmp) = &self.desk.stats {
+            rows.push(card(
+                format!("Last {}d vs prior {}d", cmp.days, cmp.days),
+                format!(
+                    "posts {} ({:+.1}%)\nlikes {} ({:+.1}%)\nreplies {} ({:+.1}%)\nreposts {} ({:+.1}%)\nviews {} ({:+.1}%)",
+                    cmp.current.posts,
+                    cmp.delta_pct.posts,
+                    cmp.current.likes,
+                    cmp.delta_pct.likes,
+                    cmp.current.replies,
+                    cmp.delta_pct.replies,
+                    cmp.current.reposts,
+                    cmp.delta_pct.reposts,
+                    cmp.current.views,
+                    cmp.delta_pct.views
+                ),
+            ));
+            for day in &cmp.current.days {
+                if day.posts == 0 {
+                    continue;
+                }
+                rows.push(hint(format!(
+                    "{} \u{b7} {} posts \u{b7} {} likes \u{b7} {} replies \u{b7} {} reposts \u{b7} {} views",
+                    day.day, day.posts, day.likes, day.replies, day.reposts, day.views
+                )));
+            }
+        }
+        if let Some(heat) = &self.desk.stats_heat {
+            if let Some(best) = &heat.best {
+                rows.push(hint(format!(
+                    "best hour \u{b7} {} \u{b7} engagement {}",
+                    best.label(),
+                    best.engagement
+                )));
+            }
+            rows.push(self.heatmap_grid(heat));
+        }
+        if self.desk.stats_top.is_empty() && self.desk.stats.is_none() && !self.desk.loading {
+            rows.push(empty_state(
+                "No stats yet",
+                "Load stats reads your tweets via OpenCLI. Empty is not an error.",
+            ));
+        }
+        for post in self.sorted_posts(&self.desk.stats_top) {
+            rows.push(self.tweet_card(post, cx));
+        }
+        rows
+    }
+
+    fn heatmap_grid(&self, heat: &termy_x::analytics_stats::Heatmap) -> gpui_kit::AnyElement {
+        let max = heat
+            .cells
+            .iter()
+            .flatten()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        const DAYS: [&str; 7] = ["S", "M", "T", "W", "T", "F", "S"];
+        let mut col = div().flex().flex_col().gap(px(2.0));
+        for (wd, row) in heat.cells.iter().enumerate() {
+            let mut line = div().flex().gap(px(2.0)).items_center().child(
+                div()
+                    .w(px(12.0))
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(DAYS[wd]),
+            );
+            for value in row {
+                let t = (*value as f32 / max as f32).clamp(0.0, 1.0);
+                let alpha = (40.0 + t * 200.0) as u8;
+                line = line.child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(10.0))
+                        .rounded(px(2.0))
+                        .bg(tint(0x7af6ff, alpha)),
+                );
+            }
+            col = col.child(line);
+        }
+        col.into_any_element()
+    }
+
+    fn followers_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Snapshot writes a local JSON copy. Diff is latest vs previous. Never follows or unfollows.".into(),
+        ));
+        rows.push(
+            x_button!(
+                "x-followers-snap",
+                if self.desk.loading {
+                    "Snapshot\u{2026}"
+                } else {
+                    "Snapshot"
+                },
+                cx.listener(|this, _, _, cx| {
+                    this.snapshot_followers(cx);
+                    cx.stop_propagation();
+                })
+            )
+            .into_any_element(),
+        );
+        if let Some(error) = &self.desk.follower_error {
+            rows.push(hint(error.clone()));
+        }
+        match &self.desk.follower_diff {
+            None => rows.push(empty_state(
+                "No snapshot yet",
+                "Click Snapshot. A snapshot is never taken automatically.",
+            )),
+            Some(diff) => {
+                rows.push(card(
+                    format!(
+                        "@{} \u{b7} {} now \u{b7} {} before",
+                        diff.handle, diff.latest_count, diff.previous_count
+                    ),
+                    format!(
+                        "taken {} \u{b7} previous {}",
+                        diff.latest_at,
+                        diff.previous_at.as_deref().unwrap_or("none")
+                    ),
+                ));
+                rows.push(hint(format!("new ({})", diff.new.len())));
+                for row in &diff.new {
+                    rows.push(hint(format!("+ @{} {}", row.handle, row.name)));
+                }
+                rows.push(hint(format!("unfollowed ({})", diff.gone.len())));
+                for row in &diff.gone {
+                    rows.push(hint(format!("- @{} {}", row.handle, row.name)));
+                }
+            }
+        }
+        rows
+    }
+
+    fn queue_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Drafted replies wait here. Send opens Confirm. Remove drops the item. Nothing auto-posts.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::QueueReplyTo, cx))
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::QueueText, cx))
+                .child(x_button!(
+                    "x-queue-add",
+                    "Add",
+                    cx.listener(|this, _, _, cx| {
+                        this.queue_add_from_fields(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if self.desk.queue.is_empty() {
+            rows.push(empty_state(
+                "Queue is empty",
+                "Add a reply id + text, or Queue from Inbox after an AI draft.",
+            ));
+        }
+        for item in &self.desk.queue {
+            let id_send = item.id.clone();
+            let id_rm = item.id.clone();
+            let send_item = item.clone();
+            rows.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(card(
+                        format!(
+                            "{} \u{b7} reply to {} @{}",
+                            item.id, item.reply_to, item.author
+                        ),
+                        item.text.clone(),
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                SharedString::from(format!("x-queue-send-{id_send}")),
+                                "Send",
+                                cx.listener(move |this, _, _, cx| {
+                                    this.arm_confirm_reply(
+                                        &send_item.text,
+                                        &send_item.reply_to,
+                                        Some(send_item.id.clone()),
+                                    );
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                SharedString::from(format!("x-queue-rm-{id_rm}")),
+                                "Remove",
+                                cx.listener(move |this, _, _, cx| {
+                                    termy_x::queue::remove_item(&mut this.desk.queue, &id_rm);
+                                    let config = this.live_config();
+                                    let _ = this.desk.persist_queue(&config);
+                                    cx.notify();
+                                })
+                            )),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn analyze_rows(&self, cx: &mut Context<Self>) -> Vec<gpui_kit::AnyElement> {
+        let mut rows = Vec::new();
+        rows.push(hint(
+            "Enter any handle for a 14-day read: posts/day, avg engagement, best hours, top posts, reply ratio.".into(),
+        ));
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(self.single_line_field(TextField::Analyze, cx))
+                .child(x_button!(
+                    "x-analyze-run",
+                    if self.desk.loading {
+                        "Reading\u{2026}"
+                    } else {
+                        "Analyze"
+                    },
+                    cx.listener(|this, _, _, cx| {
+                        this.run_analyze(cx);
+                        cx.stop_propagation();
+                    })
+                ))
+                .into_any_element(),
+        );
+        if let Some(error) = &self.desk.analyze_error {
+            rows.push(hint(error.clone()));
+        }
+        if let Some(report) = &self.desk.analyze {
+            rows.push(card(
+                format!("@{} \u{b7} {}d", report.handle, report.days),
+                format!(
+                    "{} posts ({:.2}/day)\navg engagement {:.1}\nreply ratio {:.0}%",
+                    report.posts,
+                    report.posts_per_day,
+                    report.avg_engagement,
+                    report.reply_ratio * 100.0
+                ),
+            ));
+            if !report.best_hours.is_empty() {
+                let hours: Vec<String> = report.best_hours.iter().map(|h| h.label()).collect();
+                rows.push(hint(format!("best hours \u{b7} {}", hours.join(", "))));
+            }
+            rows.push(self.heatmap_grid(&report.heatmap));
+            for post in self.sorted_posts(&report.top_posts) {
+                rows.push(self.tweet_card(post, cx));
+            }
+        } else if !self.desk.loading {
+            rows.push(empty_state(
+                "No report yet",
+                "Type a handle and press Enter. Empty tweets are shown as an empty report, not a crash.",
+            ));
+        }
+        rows
+    }
+
     fn body(
         &self,
         weighted: usize,
@@ -5114,9 +7770,17 @@ impl XPanel {
         if let Some(notice) = &self.notice {
             rows.push(hint(notice.clone()));
         }
+        if !self.sync_line.is_empty() {
+            rows.push(hint(self.sync_line.clone()));
+        }
+        if self.thread.is_some() {
+            rows.extend(self.thread_rows(cx));
+            return rows;
+        }
         if self.live
             && matches!(self.connection, ConnState::NotConnected { .. })
             && self.section != XSection::Compose
+            && self.section != XSection::Help
         {
             rows.push(card(
                 "Not connected yet".into(),
@@ -5126,6 +7790,7 @@ impl XPanel {
         }
         match self.section {
             XSection::Timeline => {
+                rows.push(self.new_tweet_bar(cx));
                 if !self.feed_posts().is_empty() {
                     rows.push(hint(format!(
                         "{} \u{b7} {} shown",
@@ -5139,16 +7804,24 @@ impl XPanel {
                             "Loading timeline...",
                             "Using your free OpenCLI session. Nothing burns X API credits.",
                         ));
+                    } else if self.status.contains("could not")
+                        || self.status.contains("Not connected")
+                        || self.status.contains("no provider")
+                    {
+                        rows.push(empty_state(
+                            "Timeline did not load",
+                            self.status.clone(),
+                        ));
                     } else {
                         rows.push(empty_state(
                             "Timeline is quiet",
-                            "OpenCLI / twitter-cli / fixtures fill this lane. Press Timeline to retry.",
+                            "Press refresh after Connect my X. Nothing here is sample data.",
                         ));
                     }
                 } else if self.loading {
                     rows.push(hint("Refreshing timeline...".into()));
                 }
-                for post in self.feed_posts() {
+                for post in self.sorted_posts(self.feed_posts()) {
                     rows.push(self.tweet_card(post, cx));
                 }
                 if !self.feed_posts().is_empty() {
@@ -5168,26 +7841,39 @@ impl XPanel {
                         self.searched_query
                     )));
                 } else if self.search_posts.is_empty() {
-                    rows.push(empty_state(
-                        "No results",
+                    let detail = if self.status.contains("could not") {
+                        self.status.clone()
+                    } else {
                         format!(
                             "Nothing matched \u{201c}{}\u{201d}. Try a different word, a #tag, or from:someone.",
                             self.searched_query
-                        ),
-                    ));
+                        )
+                    };
+                    rows.push(empty_state("No results", detail));
                 } else {
                     rows.push(hint(format!(
-                        "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} click a tweet to reply in place",
+                        "Results for \u{201c}{}\u{201d} \u{b7} {} shown \u{b7} {} \u{b7} click a tweet to open the thread",
                         self.searched_query,
-                        self.search_posts.len()
+                        self.search_posts.len(),
+                        self.list_sort.label()
                     )));
-                    for post in &self.search_posts {
+                    for post in self.sorted_posts(&self.search_posts) {
                         rows.push(self.tweet_card(post, cx));
                     }
                 }
             }
             XSection::Trends => {
                 rows.extend(self.trends_rows(cx));
+            }
+            XSection::Inbox
+            | XSection::Mentions
+            | XSection::Feeds
+            | XSection::Stats
+            | XSection::Followers
+            | XSection::Queue
+            | XSection::Analyze
+            | XSection::ReplyGuy => {
+                rows.extend(self.desk_rows(cx));
             }
             XSection::Lookup => {
                 let me_handle = match &self.connection {
@@ -5238,27 +7924,24 @@ impl XPanel {
                         }
                     }
                     if !sections.top.is_empty() {
-                        rows.push(section_label(&if sections.top_ranked {
-                            format!(
-                                "Top {} \u{b7} ranked by engagement (likes + 3\u{d7} reposts + 2\u{d7} replies + 5\u{d7} bookmarks)",
-                                sections.top.len()
-                            )
-                        } else {
-                            format!(
-                                "Top {} \u{b7} latest \u{b7} no engagement counts in the returned posts, so no ranking is claimed",
-                                sections.top.len()
-                            )
-                        }));
-                        for post in &sections.top {
+                        let top = self.sorted_posts(&sections.top);
+                        rows.push(section_label(&format!(
+                            "{} \u{b7} {} shown",
+                            self.list_sort.label(),
+                            top.len()
+                        )));
+                        for post in top {
                             rows.push(self.tweet_card_scoped(post, "top", cx));
                         }
                     }
                     if !sections.all.is_empty() {
+                        let all = self.sorted_posts(&sections.all);
                         rows.push(section_label(&format!(
-                            "All tweets \u{b7} {} returned \u{b7} up to 120 deep",
-                            sections.all.len()
+                            "All tweets \u{b7} {} returned \u{b7} {}",
+                            all.len(),
+                            self.list_sort.label()
                         )));
-                        for post in &sections.all {
+                        for post in all {
                             rows.push(self.tweet_card_scoped(post, "all", cx));
                         }
                     }
@@ -5359,6 +8042,31 @@ impl XPanel {
             XSection::Compose => {
                 rows.push(self.compose_block(weighted, limit, parts, cx));
             }
+            XSection::Help => {
+                rows.push(card(
+                    "Keys".into(),
+                    format!(
+                        "{key}  Popular / Newest sort (every list, including nested replies and desk lists)\nEsc  Back / close overlay / cancel confirm\nTab  Cycle compose controls\nEnter  Run Search / Lookup / Research / desk fields\nCtrl+Shift+X  Open / close this panel",
+                        key = termy_x::LIST_SORT_KEY
+                    ),
+                ));
+                rows.push(card(
+                    "Sort".into(),
+                    "Popular = likes, then engagement. Newest = created_at descending. The last choice is stored in x.toml as list_sort and restored on launch.".into(),
+                ));
+                rows.push(card(
+                    "Writes".into(),
+                    "Nothing posts, likes, or follows until you Confirm. Preview/mock never writes. Inbox Reply and Queue Send open the same confirm screen.".into(),
+                ));
+                rows.push(card(
+                    "Desk".into(),
+                    "Inbox has Waiting/Done, AI draft, Reply (confirm), and Queue. Feeds filter by language, age, and mute. Followers snapshot is click-only. Analyze is a 14-day read of any handle.".into(),
+                ));
+                rows.push(card(
+                    "Stats".into(),
+                    "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. The Stats tab compares per-day engagement vs the prior window with a best-hour heatmap. Follower count is the profile payload, never len() of a capped followers page.".into(),
+                ));
+            }
         }
         rows
     }
@@ -5402,41 +8110,116 @@ impl XPanel {
     /// the render loop. The drain loop starts a few at a time on the
     /// background executor; scrolling and typing never wait on it.
     fn prefetch_media(&mut self, cx: &mut Context<Self>) {
-        let mut urls: Vec<String> = Vec::new();
-        let collect = |posts: &[Post], urls: &mut Vec<String>| {
-            for post in posts {
-                for media in &post.media {
-                    if let Some(poster) = &media.poster
-                        && !poster.is_empty()
-                    {
-                        urls.push(poster.clone());
-                    }
-                }
-            }
-        };
-        collect(&self.posts, &mut urls);
-        collect(&self.following_posts, &mut urls);
-        collect(&self.search_posts, &mut urls);
-        if let Some(profile) = &self.profile {
-            collect(&profile.posts, &mut urls);
-            collect(&profile.pinned, &mut urls);
-            for image in [&profile.avatar_url, &profile.banner_url]
-                .into_iter()
-                .flatten()
-            {
-                if !image.is_empty() {
-                    urls.push(image.clone());
-                }
-            }
+        let mut plans = Vec::new();
+        let mut avatars = Vec::new();
+        for posts in [
+            &self.posts,
+            &self.following_posts,
+            &self.search_posts,
+            &self.mentions_posts,
+            &self.inbox_posts,
+        ] {
+            plans.extend(posts.iter().flat_map(preview::preview_jobs));
         }
-        urls.sort();
-        urls.dedup();
-        for url in urls {
-            if !self.media_cache.contains_key(&url) && !self.media_queue.contains(&url) {
-                self.media_queue.push_back(url);
-            }
+        if let Some(profile) = &self.profile {
+            plans.extend(profile.posts.iter().flat_map(preview::preview_jobs));
+            plans.extend(profile.pinned.iter().flat_map(preview::preview_jobs));
+            avatars.extend(
+                [&profile.avatar_url, &profile.banner_url]
+                    .into_iter()
+                    .flatten()
+                    .filter(|image| !image.is_empty())
+                    .cloned(),
+            );
+        }
+        for plan in plans {
+            self.enqueue_post_plan(plan);
+        }
+        for image in avatars {
+            self.enqueue_still(image);
         }
         self.drain_media_queue(cx);
+        self.drain_frame_queue(cx);
+    }
+
+    fn enqueue_post_plan(&mut self, plan: preview::PreviewPlan) {
+        match plan {
+            preview::PreviewPlan::Still { url, video } => {
+                if let Some(video) = video {
+                    self.preview_fallback.entry(url.clone()).or_insert(video);
+                }
+                self.enqueue_still(url);
+            }
+            preview::PreviewPlan::Frame { video } => self.enqueue_frame(video),
+            preview::PreviewPlan::Unavailable => {}
+        }
+    }
+
+    fn enqueue_still(&mut self, url: String) {
+        if self.media_cache.contains_key(&url) || self.media_queue.contains(&url) {
+            return;
+        }
+        self.media_cache.insert(url.clone(), MediaState::Loading);
+        self.media_queue.push_back(url);
+    }
+
+    fn enqueue_frame(&mut self, video: String) {
+        let key = preview::frame_cache_key(&video);
+        if self.media_cache.contains_key(&key) || self.frame_queue.iter().any(|queued| queued == &video) {
+            return;
+        }
+        self.media_cache.insert(key, MediaState::Loading);
+        self.frame_queue.push_back(video);
+    }
+
+    fn drain_frame_queue(&mut self, cx: &mut Context<Self>) {
+        if self.frames_inflight > 0 {
+            return;
+        }
+        while let Some(video) = self.frame_queue.pop_front() {
+            let key = preview::frame_cache_key(&video);
+            if matches!(
+                self.media_cache.get(&key),
+                Some(MediaState::Ready(_) | MediaState::Failed)
+            ) {
+                continue;
+            }
+            self.frames_inflight = 1;
+            self.spawn_frame(video, cx);
+            return;
+        }
+    }
+
+    fn spawn_frame(&mut self, video: String, cx: &mut Context<Self>) {
+        let key = preview::frame_cache_key(&video);
+        self.media_cache.insert(key.clone(), MediaState::Loading);
+        let started = key.clone();
+        cx.spawn(async move |this, cx| {
+            let image = cx
+                .background_executor()
+                .spawn(async move { preview::derive_frame(&video) })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.frames_inflight = panel.frames_inflight.saturating_sub(1);
+                if panel.media_cache.contains_key(&started) {
+                    let state = match image {
+                        Ok(buffer) => {
+                            let (width, height) = (buffer.width(), buffer.height());
+                            MediaState::Ready(CachedImage {
+                                image: Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+                                width,
+                                height,
+                            })
+                        }
+                        Err(_) => MediaState::Failed,
+                    };
+                    panel.media_cache.insert(started, state);
+                }
+                panel.drain_frame_queue(cx);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn drain_media_queue(&mut self, cx: &mut Context<Self>) {
@@ -5453,7 +8236,10 @@ impl XPanel {
                             let Some(url) = panel.media_queue.pop_front() else {
                                 break;
                             };
-                            if panel.media_cache.contains_key(&url) {
+                            if matches!(
+                                panel.media_cache.get(&url),
+                                Some(MediaState::Ready(_) | MediaState::Failed)
+                            ) {
                                 continue;
                             }
                             panel.spawn_media_fetch(url, cx);
@@ -5477,7 +8263,10 @@ impl XPanel {
     }
 
     fn spawn_media_fetch(&mut self, url: String, cx: &mut Context<Self>) {
-        if self.media_cache.contains_key(&url) {
+        if matches!(
+            self.media_cache.get(&url),
+            Some(MediaState::Ready(_) | MediaState::Failed)
+        ) {
             return;
         }
         self.media_cache.insert(url.clone(), MediaState::Loading);
@@ -5499,7 +8288,14 @@ impl XPanel {
                     }
                     Err(_) => MediaState::Failed,
                 };
+                let failed = matches!(state, MediaState::Failed);
                 panel.media_cache.insert(url.clone(), state);
+                if let Some(video) = panel.preview_fallback.remove(&url) {
+                    if failed {
+                        panel.enqueue_frame(video);
+                        panel.drain_frame_queue(cx);
+                    }
+                }
                 cx.notify();
             });
         })
@@ -5518,25 +8314,70 @@ impl XPanel {
         media.aspect()
     }
 
+    fn open_still(&mut self, url: String, poster: Option<String>, post_id: &str, notice: &str, cx: &mut Context<Self>) {
+        self.viewer = Some(Viewer {
+            kind: MediaKind::Photo,
+            url: url.clone(),
+            poster,
+            post_id: post_id.to_string(),
+        });
+        self.player_pending = false;
+        self.spawn_media_fetch(url, cx);
+        self.notice = Some(notice.to_string());
+    }
+
     fn open_viewer(&mut self, media: &MediaItem, post_id: &str, cx: &mut Context<Self>) {
         self.autoscroll = None;
         self.stop_video_player();
-        self.viewer = Some(Viewer {
-            kind: media.kind,
-            url: media.url.clone(),
-            poster: media.poster.clone(),
-            post_id: post_id.to_string(),
-        });
         self.player_error = None;
         self.player_paused = false;
         self.player_muted = false;
-        if media.kind == MediaKind::Photo {
-            let url = media.url.clone();
-            self.spawn_media_fetch(url, cx);
-            self.notice = Some("Photo opened in Termy — Esc or ✕ to close.".into());
-        } else {
-            self.player_pending = true;
-            self.notice = Some("Playing video inside Termy — Esc or ✕ to stop.".into());
+        match player::dispatch_media(media.kind, &media.url) {
+            player::MediaDispatch::StillImage => {
+                self.open_still(
+                    media.url.clone(),
+                    media.poster.clone(),
+                    post_id,
+                    "Photo opened in Termy — Esc or \u{2715} to close.",
+                    cx,
+                );
+            }
+            player::MediaDispatch::Vlc => {
+                self.viewer = Some(Viewer {
+                    kind: media.kind,
+                    url: media.url.clone(),
+                    poster: media.poster.clone(),
+                    post_id: post_id.to_string(),
+                });
+                self.player_pending = true;
+                self.player_gen = player::begin_playback(&mut self.player_gen).0;
+                self.notice = Some(player::VLC_OPEN_NOTICE.to_string());
+            }
+            player::MediaDispatch::Unplayable => {
+                if let Some(poster) = media
+                    .poster
+                    .clone()
+                    .filter(|poster| player::is_still_image_url(poster))
+                {
+                    self.open_still(
+                        poster,
+                        media.poster.clone(),
+                        post_id,
+                        "No playable video or audio was attached. Showing the image in Termy.",
+                        cx,
+                    );
+                } else {
+                    self.viewer = Some(Viewer {
+                        kind: media.kind,
+                        url: media.url.clone(),
+                        poster: media.poster.clone(),
+                        post_id: post_id.to_string(),
+                    });
+                    self.player_pending = false;
+                    self.player_error = Some(player::NO_PLAYABLE_MEDIA.to_string());
+                    self.notice = Some(player::NO_PLAYABLE_MEDIA.to_string());
+                }
+            }
         }
         self.pending_focus = true;
     }
@@ -5554,12 +8395,16 @@ impl XPanel {
     /// and the "Playing video \u{2014} Esc or \u{2715} to stop" notice is
     /// cleared with it so the status can never stick after playback ends.
     fn close_viewer(&mut self) {
+        let _ = player::dismiss_playback(&mut self.player_gen);
         self.stop_video_player();
         self.viewer = None;
         self.player_error = None;
         if matches!(
             self.notice.as_deref(),
-            Some(n) if n.starts_with("Playing video") || n.starts_with("Photo opened")
+            Some(n) if n.starts_with("Playing video")
+                || n.starts_with("Playing in VLC")
+                || n.starts_with("Photo opened")
+                || n.starts_with("No playable")
         ) {
             self.notice = None;
         }
@@ -5687,15 +8532,7 @@ impl XPanel {
                     .text_color(rgb(0xe7eefc))
                     .child(profile.bio.clone())
             }))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x9ad7ff))
-                    .child(format!(
-                        "{} followers \u{b7} {} following",
-                        profile.followers, profile.following
-                    )),
-            );
+            .children(profile_stats_rows(profile));
         // Follow/Unfollow (hidden on your own profile). Label follows
         // the payload flag / verified session state; while a write is
         // in flight the label shows progress and clicks are ignored.
@@ -5704,29 +8541,70 @@ impl XPanel {
             _ => None,
         };
         if !is_own_profile(&profile.handle, own_handle) {
-            let viewer = self
-                .follow_overrides
-                .get(&profile.handle)
-                .copied()
-                .or(profile.viewer_following);
+            let (viewer, saved) = self.shown_follow(&profile.handle, profile.viewer_following);
             let pending = self
                 .follow_pending
                 .as_ref()
-                .filter(|(h, _)| h.eq_ignore_ascii_case(&profile.handle))
-                .map(|(_, target)| *target);
-            let label = follow_button_label(viewer, pending);
-            let click_handle = profile.handle.clone();
-            card_el = card_el.child(div().flex().child(x_button!(
-                "x-follow-toggle",
-                label,
-                viewer == Some(true),
-                cx.listener(move |this, _, _, cx| {
-                    this.toggle_follow(&click_handle, cx);
-                    cx.stop_propagation();
+                .filter(|(h, _)| {
+                    termy_x::model::strip_handle(h)
+                        .eq_ignore_ascii_case(termy_x::model::strip_handle(&profile.handle))
                 })
-            )));
+                .map(|(_, target)| *target);
+            let asking = follow_confirm_on_card(
+                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+                &profile.handle,
+            );
+            let label = follow_button_label(viewer, pending, asking, self.follow_dots);
+            let click_handle = profile.handle.clone();
+            card_el = card_el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(x_button!(
+                                "x-follow-toggle",
+                                label,
+                                viewer == Some(true),
+                                cx.listener(move |this, _, _, cx| {
+                                    this.request_follow(&click_handle, cx);
+                                    cx.stop_propagation();
+                                })
+                            ))
+                            .children(follow_awaiting_note(asking, pending.is_some()).map(|note| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(note)
+                            }))
+                            .children((!asking).then(|| follow_saved_mark(
+                                viewer == Some(true),
+                                saved,
+                                pending.is_some(),
+                            )).flatten().map(|mark| {
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0x8e8e93))
+                                    .child(mark)
+                            })),
+                    )
+                    .children(self.follow_confirm_strip(&profile.handle, "profile", cx)),
+            );
         }
         card_el.into_any_element()
+    }
+
+    fn preview_lookup(&self, key: &str) -> preview::CacheLookup {
+        match self.media_cache.get(key) {
+            Some(MediaState::Loading) => preview::CacheLookup::Loading,
+            Some(MediaState::Ready(_)) => preview::CacheLookup::Ready,
+            Some(MediaState::Failed) => preview::CacheLookup::Failed,
+            None => preview::CacheLookup::Missing,
+        }
     }
 
     #[allow(dead_code)]
@@ -5742,7 +8620,6 @@ impl XPanel {
     ) -> Option<gpui_kit::AnyElement> {
         let media = post.media.first()?;
         let kind = media.kind;
-        let poster = media.poster.clone().unwrap_or_default();
         let viewer_media = media.clone();
         let post_id = post.id.clone();
         let aspect = self.media_aspect(media);
@@ -5754,8 +8631,8 @@ impl XPanel {
         let (fit_w, fit_h) = media_fit::contain_size(424.0, box_h, aspect);
         let extra = post.media.len().saturating_sub(1);
         let badge = match kind {
-            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play in Termy",
-            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play in Termy",
+            MediaKind::Video => "\u{25b6} VIDEO \u{b7} tap to play",
+            MediaKind::Gif => "\u{25b6} GIF \u{b7} tap to play",
             MediaKind::Photo => "\u{1f50d} tap to view",
         };
         let mut area = div()
@@ -5771,42 +8648,27 @@ impl XPanel {
             .border_1()
             .border_color(tint(0x7af6ff, 55))
             .cursor_pointer();
-        match self.media_cache.get(&poster) {
-            Some(MediaState::Ready(cached)) => {
-                let source: ImageSource = ImageSource::Render(cached.image.clone());
-                area = area.child(
-                    img(source)
-                        .w(px(fit_w))
-                        .h(px(fit_h))
-                        .object_fit(ObjectFit::Contain),
-                );
-            }
-            Some(MediaState::Failed) => {
-                area = area.child(
-                    div()
-                        .p(px(10.0))
-                        .text_size(px(12.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo {
-                            "Photo (could not load preview)"
-                        } else {
-                            "Video (could not load preview)"
-                        }),
-                );
-            }
-            _ => {
-                area = area.child(
-                    div()
-                        .p(px(10.0))
-                        .text_size(px(12.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(if kind == MediaKind::Photo {
-                            "Loading photo\u{2026}"
-                        } else {
-                            "Loading video preview\u{2026}"
-                        }),
-                );
-            }
+        let plan = preview::preview_plan(media);
+        let view = preview::preview_view(&plan, |key| self.preview_lookup(key));
+        if view == preview::PreviewView::Image
+            && let Some(key) = preview::ready_key(&plan, |key| self.preview_lookup(key))
+            && let Some(MediaState::Ready(cached)) = self.media_cache.get(&key)
+        {
+            let source: ImageSource = ImageSource::Render(cached.image.clone());
+            area = area.child(
+                img(source)
+                    .w(px(fit_w))
+                    .h(px(fit_h))
+                    .object_fit(ObjectFit::Contain),
+            );
+        } else if view != preview::PreviewView::Image {
+            area = area.child(
+                div()
+                    .p(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(preview::preview_caption(kind, view)),
+            );
         }
         {
             let label = if extra > 0 {
@@ -5853,6 +8715,7 @@ impl XPanel {
         allow(unused_variables)
     )]
     fn sync_video_player(&mut self, window: &Window, cx: &mut Context<Self>) {
+        player::reap_video_hosts();
         let Some(viewer) = self.viewer.clone() else {
             return;
         };
@@ -5865,30 +8728,46 @@ impl XPanel {
             if let Ok(handle) = HasWindowHandle::window_handle(window)
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
-                self.host_hwnd = win32.hwnd.get() as isize;
+                self.host_hwnd = win32.hwnd.get();
             }
         }
         let viewport = window.viewport_size();
         let vw: f32 = viewport.width.into();
         self.viewport_w = vw;
         let vh: f32 = viewport.height.into();
-        let panel_w = if self.fill_window {
-            vw
+        let rect = if player::launches_external_vlc() {
+            Some((0.0_f32, 0.0, 0.0, 0.0))
         } else {
-            480.0_f32.min(vw)
+            player::embed_rect(vw, vh, self.fill_window)
         };
-        let rect: player::Rect = (vw - panel_w, 56.0, panel_w, (vh - 160.0).max(80.0));
+        let Some(rect) = rect else {
+            return;
+        };
         let scale = window.scale_factor();
         if let Some(player) = &mut self.video_player {
-            player.reposition(scale, rect);
+            if !player::launches_external_vlc() {
+                player.reposition(scale, rect);
+            }
         } else if self.player_pending {
-            self.player_pending = false;
             if !self.live {
+                self.player_pending = false;
                 self.player_error = Some("Preview does not play video.".into());
                 return;
             }
             #[cfg(target_os = "windows")]
-            match player::VideoPlayer::start(self.host_hwnd, scale, rect, &viewer.url) {
+            if !player::launches_external_vlc() && self.host_hwnd == 0 {
+                return;
+            }
+            self.player_pending = false;
+            let play_gen = player::PlayGen(self.player_gen);
+            #[cfg(target_os = "windows")]
+            match player::VideoPlayer::start(
+                self.host_hwnd,
+                scale,
+                rect,
+                &viewer.url,
+                self.player_volume,
+            ) {
                 Ok(player) => {
                     self.video_player = Some(player);
                     self.player_error = None;
@@ -5901,6 +8780,9 @@ impl XPanel {
                                 .await;
                             let alive = this
                                 .update(cx, |panel, cx| {
+                                    if !player::callback_is_current(panel.player_gen, play_gen) {
+                                        return false;
+                                    }
                                     let open = panel
                                         .viewer
                                         .as_ref()
@@ -5917,12 +8799,23 @@ impl XPanel {
                                         .video_player
                                         .as_ref()
                                         .map_or((0.0, 0.0), |pl| pl.progress());
+                                    if let Some(err) = panel
+                                        .video_player
+                                        .as_mut()
+                                        .and_then(|pl| pl.take_failure())
+                                    {
+                                        panel.player_error = Some(err.to_string());
+                                        panel.stop_video_player();
+                                        cx.notify();
+                                        return false;
+                                    }
                                     let player_gone = panel
                                         .video_player
                                         .as_mut()
                                         .is_some_and(|pl| !pl.is_alive());
                                     let at_eof = dur > 0.0 && pos >= dur - 0.25;
                                     if player_gone || at_eof {
+                                        player::note_player_phase("eof");
                                         panel.close_viewer();
                                         panel.notice =
                                             Some("Video ended \u{b7} back to the timeline.".into());
@@ -5941,11 +8834,11 @@ impl XPanel {
                     .detach();
                 }
                 Err(e) => {
-                    self.player_error = Some(format!("In-app player unavailable: {e}"));
+                    self.player_error = Some(e);
                 }
             }
             #[cfg(target_os = "linux")]
-            match player::VideoPlayer::start(0, scale, rect, &viewer.url) {
+            match player::VideoPlayer::start(0, scale, rect, &viewer.url, self.player_volume) {
                 Ok(player) => {
                     self.video_player = Some(player);
                     // Honest UI note, shown over the viewer area: the
@@ -5964,6 +8857,9 @@ impl XPanel {
                                 .await;
                             let alive = this
                                 .update(cx, |panel, cx| {
+                                    if !player::callback_is_current(panel.player_gen, play_gen) {
+                                        return false;
+                                    }
                                     let open = panel
                                         .viewer
                                         .as_ref()
@@ -5974,6 +8870,7 @@ impl XPanel {
                                     }
                                     if panel.video_player.as_mut().is_some_and(|pl| !pl.is_alive())
                                     {
+                                        player::note_player_phase("eof");
                                         panel.close_viewer();
                                         panel.notice =
                                             Some("Video ended \u{b7} back to the timeline.".into());
@@ -6005,6 +8902,28 @@ impl XPanel {
 
     /// Seek-bar click/drag at window-x `x`: fraction from the bar's known
     /// geometry (panel is the rightmost 480px, bar inset 12px each side).
+    fn set_player_volume(&mut self, percent: u8) {
+        let percent = percent.min(100);
+        self.player_volume = percent;
+        self.player_muted = percent == 0;
+        if let Some(player) = &mut self.video_player {
+            player.set_volume(percent);
+        }
+    }
+
+    fn volume_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
+        let panel_w = if self.fill_window {
+            self.viewport_w
+        } else {
+            480.0_f32.min(self.viewport_w)
+        };
+        let bar_x = self.viewport_w - panel_w + 12.0;
+        let bar_w = (panel_w - 24.0).max(1.0);
+        self.set_player_volume(player::volume_percent(x, bar_x, bar_w));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn seek_bar_click(&mut self, x: f32, cx: &mut Context<Self>) {
         let panel_w = if self.fill_window {
             self.viewport_w
@@ -6032,8 +8951,8 @@ impl XPanel {
         let is_video = viewer.kind != MediaKind::Photo;
         let title = match viewer.kind {
             MediaKind::Photo => "Photo \u{b7} in Termy",
-            MediaKind::Video => "Video \u{b7} playing in Termy",
-            MediaKind::Gif => "GIF \u{b7} playing in Termy (muted)",
+            MediaKind::Video => "Video \u{b7} in Termy",
+            MediaKind::Gif => "GIF \u{b7} in Termy",
         };
         // Middle: photo image (contain, whole) or the native video host area.
         let middle: gpui_kit::AnyElement = if is_video {
@@ -6050,9 +8969,13 @@ impl XPanel {
                         .bg(tint(0x2a0f1a, 235))
                         .text_size(px(12.0))
                         .text_color(rgb(0xffd0ea))
-                        .child(format!(
-                            "{error} The poster is shown instead \u{2014} no browser was opened."
-                        )),
+                        .child(if player::launches_external_vlc() {
+                            error.clone()
+                        } else {
+                            format!(
+                                "{error} The poster is shown instead \u{2014} no browser was opened."
+                            )
+                        }),
                 );
             } else if self.video_player.is_none() {
                 area = area.child(
@@ -6060,7 +8983,11 @@ impl XPanel {
                         .p(px(12.0))
                         .text_size(px(12.0))
                         .text_color(rgb(0x93a4c3))
-                        .child("Starting in-app player\u{2026}"),
+                        .child(if player::launches_external_vlc() {
+                            "Opening VLC\u{2026}"
+                        } else {
+                            "Starting in-app player\u{2026}"
+                        }),
                 );
             }
             area.into_any_element()
@@ -6117,7 +9044,14 @@ impl XPanel {
             .justify_center()
             .gap(px(6.0))
             .px(px(12.0));
-        if is_video {
+        if is_video && player::launches_external_vlc() {
+            controls = controls.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(player::VLC_CONTROLS_NOTE),
+            );
+        } else if is_video {
             let (pos, dur) = self
                 .video_player
                 .as_ref()
@@ -6196,6 +9130,58 @@ impl XPanel {
                         }),
                     ),
             );
+            let vol = f32::from(self.player_volume) / 100.0;
+            controls = controls.child(
+                div()
+                    .id("x-viewer-volume")
+                    .relative()
+                    .w_full()
+                    .h(px(22.0))
+                    .flex_none()
+                    .rounded(px(999.0))
+                    .bg(tint(0x1a2a4a, 255))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tint(0x243656, 255)))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h_full()
+                            .w(px(bar_w * vol))
+                            .rounded(px(999.0))
+                            .bg(rgb(0xffd0ea)),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(3.0))
+                            .left(px(10.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xe9fdff))
+                            .child(format!("Volume {}%", self.player_volume)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if event.pressed_button == Some(MouseButton::Left) {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            let x: f32 = event.position.x.into();
+                            this.volume_bar_click(x, cx);
+                        }),
+                    ),
+            );
             controls = controls.child(
                 div()
                     .flex()
@@ -6243,9 +9229,10 @@ impl XPanel {
                         "x-viewer-mute",
                         if self.player_muted { "Unmute" } else { "Mute" },
                         cx.listener(|this, _, _, cx| {
-                            this.player_muted = !this.player_muted;
-                            if let Some(pl) = &mut this.video_player {
-                                pl.set_muted(this.player_muted);
+                            if this.player_volume == 0 {
+                                this.set_player_volume(100);
+                            } else {
+                                this.set_player_volume(0);
                             }
                             cx.stop_propagation();
                             cx.notify();
@@ -6255,7 +9242,11 @@ impl XPanel {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(0x93a4c3))
-                            .child("Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close"),
+                            .child(if cfg!(windows) {
+                                "Drag to scrub \u{b7} Space pause \u{b7} Esc close. VLC's engine draws in this panel; these buttons are Termy's."
+                            } else {
+                                "Drag the bar to scrub \u{b7} Space pause \u{b7} Esc close"
+                            }),
                     ),
             );
         } else {
@@ -6288,11 +9279,47 @@ impl XPanel {
                         "x-viewer-close",
                         "\u{2715} Close",
                         cx.listener(|this, _, _, cx| {
+                            player::note_player_phase("close");
                             this.close_viewer();
                             cx.stop_propagation();
                             cx.notify();
                         })
                     )),
+            )
+            .child(
+                div()
+                    .id("x-viewer-corner-close")
+                    .absolute()
+                    .top(px(60.0))
+                    .right(px(12.0))
+                    .w(px(36.0))
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0xff4fa3))
+                    .bg(rgb(0x2a0f1a))
+                    .text_size(px(16.0))
+                    .text_color(rgb(0xffd0ea))
+                    .cursor_pointer()
+                    .hover(|style| {
+                        style
+                            .bg(rgb(0xff4fa3))
+                            .border_color(rgb(0xffd0ea))
+                            .text_color(rgb(0x1a0a10))
+                    })
+                    .child("\u{2715}")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            player::note_player_phase("close");
+                            this.close_viewer();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
             )
             .child(div().flex_1().min_h(px(0.0)).child(middle))
             .child(controls)
@@ -6308,8 +9335,8 @@ impl XPanel {
         Some(el.into_any_element())
     }
 
-    /// One tweet in Timeline / Search / Trends. Clicking it expands an
-    /// inline reply box right underneath; a sent reply marks it Replied.
+    /// One tweet in Timeline / Search / Lookup. Clicking the card opens
+    /// the thread overlay; Like / Retweet / Quote / Reply keep working.
     /// Thin draggable scrollbar overlaid on the list's right edge.
     /// Geometry comes from the shared scroll handle, so wheel scrolling,
     /// middle-click autoscroll and this thumb never disagree. Track
@@ -6465,7 +9492,7 @@ impl XPanel {
             if let Ok(handle) = HasWindowHandle::window_handle(window)
                 && let RawWindowHandle::Win32(win32) = handle.as_raw()
             {
-                self.autoscroll_hwnd = win32.hwnd.get() as isize;
+                self.autoscroll_hwnd = win32.hwnd.get();
             }
             self.autoscroll_scale = window.scale_factor();
         }
@@ -6554,7 +9581,13 @@ impl XPanel {
         // style) under a "reposted" header; reply/engage target the
         // original tweet, exactly as on X.
         let display = post.engage_target();
-        let selected = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let reply_open = self.reply_post_id.as_deref() == Some(display.id.as_str());
+        let quote_open = self.quote_post_id.as_deref() == Some(display.id.as_str());
+        let selected = reply_open
+            || self
+                .thread
+                .as_ref()
+                .is_some_and(|thread| thread.focus_id == display.id);
         let replied = self.replied_ids.iter().any(|id| id == &display.id);
         // Click handlers capture only the two small strings they need:
         // cloning the whole Post (text + media) for every card on every
@@ -6572,24 +9605,24 @@ impl XPanel {
         let (down_id, down_text) = (display.id.clone(), post.card_text().to_string());
         let (move_id, move_text) = (display.id.clone(), post.card_text().to_string());
         let (up_id, up_author) = (display.id.clone(), display.author_handle.clone());
-        let mut el = div()
+        let el = div()
             .id(SharedString::from(format!("x-tweet-{scope}-{}", post.id)))
             .relative()
-            .p(px(12.0))
+            .p(px(10.0))
             .rounded(px(12.0))
             .bg(if selected {
-                tint(0x1a1030, 240)
+                rgb(0x1a2a44)
             } else {
-                tint(0x0c1422, 225)
+                rgb(0x1c1c1e)
             })
             .border_1()
             .border_color(if selected {
-                rgb(0xff4fa3)
+                rgb(0x0a84ff)
             } else {
-                tint(0x7af6ff, 40)
+                rgb(0x3a3a3c)
             })
             .cursor_pointer()
-            .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+            .hover(|style| style.bg(rgb(0x2c2c2e)).border_color(rgb(0x48484a)))
             .children(
                 if post.retweeted.is_some() {
                     Some(format!("@{} reposted", post.author_handle))
@@ -6608,11 +9641,11 @@ impl XPanel {
             )
             .child(
                 div()
-                    .mt(px(2.0))
-                    .text_size(px(13.0))
-                    .text_color(rgb(0xd7fbff))
+                    .mt(px(1.0))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x8e8e93))
                     .child(format!(
-                        "@{} \u{b7} {} likes{} \u{b7} click to reply",
+                        "@{} \u{b7} {} likes{} \u{b7} click to open thread",
                         display.author_handle,
                         display.likes,
                         if replied {
@@ -6625,11 +9658,11 @@ impl XPanel {
             .child(
                 div()
                     .id(SharedString::from(format!("x-tweet-text-{scope}-{}", post.id)))
-                    .mt(px(4.0))
+                    .mt(px(3.0))
                     .px(px(2.0))
                     .rounded(px(4.0))
-                    .text_size(px(13.0))
-                    .text_color(rgb(0xe7eefc))
+                    .text_size(px(11.0))
+                    .text_color(rgb(0xf5f5f7))
                     .bg(if text_selected { tint(0xff4fa3, 90) } else { tint(0xff4fa3, 0) })
                     .child(post.card_text().to_string())
                     .on_mouse_down(
@@ -6685,14 +9718,10 @@ impl XPanel {
                                         .into(),
                                 );
                             } else if was_drag {
-                                // Plain click on the text: same action the
-                                // card click has always done.
-                                if this.reply_post_id.as_deref() == Some(up_id.as_str()) {
-                                    this.input_target = InputTarget::Reply;
-                                    this.pending_focus = true;
-                                } else {
-                                    this.open_reply_parts(&up_id, &up_author);
-                                }
+                                // Plain click on the text opens the thread.
+                                // Reply is a button on the card so it cannot
+                                // be confused with this.
+                                this.open_thread(&up_id, &up_author, cx);
                             }
                             cx.stop_propagation();
                             cx.notify();
@@ -6705,8 +9734,43 @@ impl XPanel {
                     .text_color(rgb(0xf0a8d0))
                     .child("Selected \u{b7} Ctrl+C copies this tweet")
             }))
-            .children(self.media_box_scoped(display, scope, cx))
+            .children(post.shows_unavailable_original().then(|| {
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x93a4c3))
+                    .child(
+                        post.original_link()
+                            .map(|url| format!("Original post unavailable \u{b7} {url}"))
+                            .unwrap_or_else(|| "Original post unavailable".to_string()),
+                    )
+            }))
+            .children(post.quoted.as_ref().map(|quoted| {
+                div()
+                    .mt(px(6.0))
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0x3a3a3c))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(format!("Quote of @{}", quoted.author_handle)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(2.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xf5f5f7))
+                            .child(quoted.text.clone()),
+                    )
+                    .children(self.media_box_scoped(quoted, &format!("{scope}-quote"), cx))
+            }))
             .child(self.tweet_actions_scoped(display, scope, cx))
+            .children(reply_open.then(|| self.reply_box(display, cx)))
+            .children(quote_open.then(|| self.quote_box(display, cx)))
+            .children(self.media_box_scoped(display, scope, cx))
             .children(self.card_burst_overlay(post))
             .on_mouse_down(
                 MouseButton::Left,
@@ -6714,23 +9778,11 @@ impl XPanel {
                     this.card_copy_focus = false;
                     this.card_text_selection = None;
                     this.card_drag_start = None;
-                    if this.reply_post_id.as_deref() == Some(click_id.as_str()) {
-                        // Second click on the open tweet just refocuses it.
-                        this.input_target = InputTarget::Reply;
-                        this.pending_focus = true;
-                    } else {
-                        this.open_reply_parts(&click_id, &click_author);
-                    }
+                    this.open_thread(&click_id, &click_author, cx);
                     cx.stop_propagation();
                     cx.notify();
                 }),
             );
-        if selected {
-            el = el.child(self.reply_box(display, cx));
-        }
-        if self.quote_post_id.as_deref() == Some(display.id.as_str()) {
-            el = el.child(self.quote_box(display, cx));
-        }
         el.into_any_element()
     }
 
@@ -6752,6 +9804,7 @@ impl XPanel {
         };
         let author = post.author_handle.clone();
         let liked = self.liked_ids.iter().any(|p| p == &post.id);
+        let liked_saved = self.shown_liked(&post.id, liked).1;
         let retweeted = self.retweeted_ids.iter().any(|p| p == &post.id);
         let pending = self.engage_pending.iter().any(|p| p == &post.id);
         let (like_id, rt_id) = (id.clone(), id);
@@ -6759,20 +9812,31 @@ impl XPanel {
         let (like_author, rt_author) = (author.clone(), author);
         let quote_id = post.id.clone();
         let quote_author = post.author_handle.clone();
-        div()
-            .mt(px(8.0))
+        let reply_id = post.id.clone();
+        let reply_author = post.author_handle.clone();
+        let follow_handle = post.author_handle.clone();
+        let (follow_value, follow_saved) =
+            self.shown_follow(&post.author_handle, post.viewer_follows_author);
+        let follow_pending = self.follow_pending.as_ref().and_then(|(h, target)| {
+            termy_x::model::strip_handle(h)
+                .eq_ignore_ascii_case(termy_x::model::strip_handle(&post.author_handle))
+                .then_some(*target)
+        });
+        let own = match &self.connection {
+            ConnState::Connected { handle, .. } => Some(handle.as_str()),
+            _ => None,
+        };
+        let show_follow = !post.author_handle.is_empty() && !is_own_profile(&post.author_handle, own);
+        let mut row = div()
+            .mt(px(6.0))
+            .w_full()
             .flex()
-            .gap(px(8.0))
             .flex_wrap()
-            .child(x_button!(
+            .items_center()
+            .gap(px(4.0))
+            .child(x_action!(
                 format!("x-like-{scope}-{}", post.id),
-                if pending {
-                    "\u{2026}"
-                } else if liked {
-                    "Liked"
-                } else {
-                    "Like"
-                },
+                like_button_label(liked, pending, liked_saved),
                 liked,
                 cx.listener(move |this, _, _, cx| {
                     let action = if this.liked_ids.iter().any(|p| p == &like_id) {
@@ -6786,14 +9850,11 @@ impl XPanel {
             ))
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x93a4c3))
-                    .child(format!(
-                        "{} likes \u{b7} {} retweets",
-                        post.likes, post.reposts
-                    )),
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x8e8e93))
+                    .child(format!("{} \u{00b7} {}", post.likes, post.reposts)),
             )
-            .child(x_button!(
+            .child(x_action!(
                 format!("x-rt-{scope}-{}", post.id),
                 if pending {
                     "\u{2026}"
@@ -6813,74 +9874,131 @@ impl XPanel {
                     cx.stop_propagation();
                 })
             ))
-            .child(x_button!(
+            .child(x_action!(
                 format!("x-quote-{scope}-{}", post.id),
-                "Quote",
+                termy_x::publish::quote_action_label(),
                 cx.listener(move |this, _, _, cx| {
                     this.open_quote(&quote_id, &quote_author);
                     cx.stop_propagation();
                     cx.notify();
                 })
             ))
-            .into_any_element()
+            .child(x_action!(
+                format!("x-reply-{scope}-{}", post.id),
+                "Reply",
+                cx.listener(move |this, _, _, cx| {
+                    this.open_reply_parts(&reply_id, &reply_author);
+                    if this.thread.is_some() && !this.reply_text.trim().is_empty() {
+                        this.arm_reply_confirm();
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        if show_follow {
+            let asking = follow_confirm_on_card(
+                self.follow_ask.as_ref().map(|(handle, _)| handle.as_str()),
+                &post.author_handle,
+            );
+            row = row.child(x_action!(
+                format!("x-follow-{scope}-{}", post.id),
+                follow_button_label(follow_value, follow_pending, asking, self.follow_dots),
+                follow_value == Some(true),
+                cx.listener(move |this, _, _, cx| {
+                    this.request_follow(&follow_handle, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+            if let Some(note) = follow_awaiting_note(asking, follow_pending.is_some()) {
+                row = row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8e8e93))
+                        .child(note),
+                );
+            }
+            if !asking
+                && let Some(mark) = follow_saved_mark(
+                    follow_value == Some(true),
+                    follow_saved,
+                    follow_pending.is_some(),
+                )
+            {
+                row = row.child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x8e8e93))
+                        .child(mark),
+                );
+            }
+        }
+        if let Some(strip) =
+            self.follow_confirm_strip(&post.author_handle, &format!("{scope}-{}", post.id), cx)
+        {
+            row = row.child(strip);
+        }
+        row.into_any_element()
+    }
+
+    /// Confirm / Cancel for a follow, drawn on the card that was clicked.
+    fn follow_confirm_strip(
+        &self,
+        handle: &str,
+        scope: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let (ask_handle, follow) = self.follow_ask.clone()?;
+        if !follow_confirm_on_card(Some(ask_handle.as_str()), handle) {
+            return None;
+        }
+        let prompt = follow_confirm_prompt(&ask_handle, follow);
+        Some(
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xf5f5f7))
+                        .child(prompt),
+                )
+                .child(x_action!(
+                    format!("x-follow-yes-{scope}"),
+                    "Confirm",
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some((handle, follow)) = this.follow_ask.take() {
+                            this.toggle_follow(&handle, follow, cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .child(x_action!(
+                    format!("x-follow-no-{scope}"),
+                    "Cancel",
+                    cx.listener(|this, _, _, cx| {
+                        this.follow_ask = None;
+                        this.status = "Follow cancelled. Nothing was changed.".into();
+                        this.notice = Some(
+                            termy_x::publish::withheld_note(
+                                termy_x::publish::UserWrite::Follow,
+                                termy_x::publish::WriteOutcome::Cancelled,
+                            )
+                            .into(),
+                        );
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+        )
     }
 
     /// Inline quote composer under a card: retweet with your own words.
-    /// Same shape as the reply box (fixed height, breathing caret from
-    /// the first focused frame, Post button, Esc/Cancel, 1 image).
-    /// Body of a small (reply/quote) editor: soft-wrapped visual
-    /// lines of the draft, end caret on the last line when focused.
-    /// Rendering only — the stored text is untouched.
-    fn small_editor_body(
-        &self,
-        text: &str,
-        focused: bool,
-        caret_id: &'static str,
-        placeholder: &'static str,
-    ) -> gpui_kit::AnyElement {
-        if text.is_empty() {
-            return div()
-                .text_size(px(13.0))
-                .text_color(rgb(0x93a4c3))
-                .child(if focused {
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .child(caret_element(caret_id))
-                        .child(placeholder)
-                        .into_any_element()
-                } else {
-                    div().child(placeholder).into_any_element()
-                })
-                .into_any_element();
-        }
-        let ranges = soft_wrap_ranges(text, self.editor_max_chars());
-        let entities = entity_spans(text);
-        let last = ranges.len() - 1;
-        let mut col = div()
-            .flex()
-            .flex_col()
-            .text_size(px(13.0))
-            .text_color(rgb(0xf8fbff));
-        for (idx, (a, b)) in ranges.iter().enumerate() {
-            let seg = &text[*a..*b];
-            let mut row = div().flex().flex_row().items_center().min_h(px(19.0));
-            if seg.is_empty() {
-                row = row.child(" ".to_string());
-            } else {
-                for chunk in entity_chunk_divs(text, *a, *b, &entities) {
-                    row = row.child(chunk);
-                }
-            }
-            if focused && idx == last {
-                row = row.child(caret_element(caret_id));
-            }
-            col = col.child(row);
-        }
-        col.into_any_element()
-    }
-
     fn quote_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.quote_text, char_limit);
@@ -6900,11 +10018,14 @@ impl XPanel {
             .child(if let Some(burst) = self.burst_for(BurstTarget::Quote) {
                 posted_burst_element(burst.seq, burst.label)
             } else {
-                self.small_editor_body(
-                    &self.quote_text,
+                self.editor_canvas(
+                    EditorId::Field(TextField::Quote),
                     focused,
-                    "caret-quote",
-                    "Add your words\u{2026} (Post button sends the quote)",
+                    "Add your words\u{2026} (Post sends the Q-tweet)",
+                    editor_surface::FIELD_FONT,
+                    editor_surface::FIELD_LINE,
+                    false,
+                    cx,
                 )
             })
             .on_mouse_down(
@@ -6948,7 +10069,7 @@ impl XPanel {
                     .text_size(px(11.0))
                     .text_color(rgb(0x7af6ff))
                     .child(format!(
-                        "Quote @{} \u{b7} retweet with your own words",
+                        "Q-tweet @{}",
                         post.author_handle
                     )),
             )
@@ -6967,7 +10088,7 @@ impl XPanel {
                         rgb(0x9ad7ff)
                     })
                     .child(format!(
-                        "{} / {} characters \u{b7} Post button sends \u{b7} quotes attach 1 image",
+                        "{} / {} characters \u{b7} Post button sends \u{b7} text only",
                         count.weighted, count.limit
                     )),
             );
@@ -7013,11 +10134,11 @@ impl XPanel {
                 .flex_wrap()
                 .child(x_button!(
                     "x-quote-attach",
-                    "Attach image",
+                    "Images not supported",
                     cx.listener(|this, _, _, cx| {
-                        this.pick_target = PickTarget::Quote;
-                        this.attach_images(cx);
+                        this.notice = Some(termy_x::publish::quote_image_unsupported().to_string());
                         cx.stop_propagation();
+                        cx.notify();
                     })
                 ))
                 .child(x_button!(
@@ -7046,6 +10167,240 @@ impl XPanel {
     }
 
     /// The inline reply editor shown under the selected tweet.
+    fn new_tweet_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let identity = match &self.connection {
+            ConnState::Connected { handle, .. } => {
+                format!("As @{handle} \u{b7} new post, not a reply")
+            }
+            _ => "Connect X before posting. Nothing will be sent.".into(),
+        };
+        let mut column = div()
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(x_action!(
+                "x-new-tweet",
+                "New tweet",
+                cx.listener(|this, _, _, cx| {
+                    this.new_tweet_open = true;
+                    this.input_target = InputTarget::NewTweet;
+                    this.pending_focus = true;
+                    this.status = "New tweet. Post sends it. Nothing is sent until then.".into();
+                    cx.stop_propagation();
+                    cx.notify();
+                })
+            ));
+        if self.new_tweet_open {
+            let char_limit = self.char_limit;
+            let count = weighted_len_limited(&self.new_tweet_text, char_limit);
+            let focused = self.input_target == InputTarget::NewTweet;
+            column = column.child(
+                div()
+                    .p(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(tint(0x0f1c33, 245))
+                    .border_1()
+                    .border_color(if focused {
+                        rgb(0x7af6ff)
+                    } else {
+                        tint(0x7af6ff, 70)
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                            this.input_target = InputTarget::NewTweet;
+                            this.pending_focus = true;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xf5f5f7))
+                            .child("New tweet"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(identity),
+                    )
+                    .child(
+                        div()
+                            .id("x-new-tweet-editor")
+                            .h(px(60.0))
+                            .flex_none()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.new_tweet_scroll)
+                            .p(px(8.0))
+                            .rounded(px(8.0))
+                            .bg(tint(0x0c1422, 235))
+                            .child(self.editor_canvas(
+                                EditorId::Field(TextField::NewTweet),
+                                focused,
+                                "Write a new tweet\u{2026} Post sends it",
+                                editor_surface::FIELD_FONT,
+                                editor_surface::FIELD_LINE,
+                                false,
+                                cx,
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                                    this.input_target = InputTarget::NewTweet;
+                                    this.pending_focus = true;
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(4.0))
+                            .child(x_action!(
+                                "x-new-tweet-post",
+                                if self.new_tweet_posting {
+                                    "Posting..."
+                                } else {
+                                    "Post"
+                                },
+                                cx.listener(|this, _, _, cx| {
+                                    this.submit_new_tweet(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_action!(
+                                "x-new-tweet-cancel",
+                                "Cancel",
+                                cx.listener(|this, _, _, cx| {
+                                    if this.new_tweet_posting {
+                                        this.notice = Some(
+                                            "Still posting that tweet. Cancel does not send another."
+                                                .into(),
+                                        );
+                                    } else {
+                                        this.new_tweet_open = false;
+                                        this.status = "New tweet closed. Nothing was posted.".into();
+                                    }
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(format!("{} / {}", count.weighted, count.limit)),
+                    ),
+            );
+        }
+        column.into_any_element()
+    }
+
+    fn submit_new_tweet(&mut self, cx: &mut Context<Self>) {
+        if self.new_tweet_posting {
+            self.notice = Some("Already posting that tweet. Nothing else was sent.".into());
+            cx.notify();
+            return;
+        }
+        let text = match termy_x::publish::standalone_tweet(&self.new_tweet_text) {
+            Ok(text) => text,
+            Err(error) => {
+                self.notice = Some(error.into());
+                cx.notify();
+                return;
+            }
+        };
+        if termy_x::publish::standalone_reply_to().is_some() {
+            self.notice = Some("New tweet was blocked because it had a reply id.".into());
+            cx.notify();
+            return;
+        }
+        if !self.live {
+            self.notice = Some("Preview/mock never posts. Nothing was posted.".into());
+            cx.notify();
+            return;
+        }
+        if !matches!(self.connection, ConnState::Connected { .. }) {
+            self.notice = Some("Connect X before posting. Nothing was posted.".into());
+            cx.notify();
+            return;
+        }
+        self.new_tweet_posting = true;
+        self.status = "Posting the new tweet. Nothing else will be sent.".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err(
+                            "No in-app posting path found. Connect X first. Nothing was posted."
+                                .to_string(),
+                        );
+                    };
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        termy_x::publish::standalone_reply_to(),
+                        termy_x::publish::ConfirmDecision::Yes,
+                        false,
+                        publisher,
+                        char_limit,
+                        &[],
+                    ) {
+                        termy_x::publish::GateOutcome::Sent { receipt, .. } => Ok(receipt),
+                        termy_x::publish::GateOutcome::Rejected { plan } => Err(plan
+                            .session
+                            .unwrap_or_else(|| "posting was rejected".to_string())),
+                        termy_x::publish::GateOutcome::DryRun { .. } => {
+                            Err("unexpected dry-run".to_string())
+                        }
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                panel.new_tweet_posting = false;
+                match result {
+                    Ok(receipt) => {
+                        panel.new_tweet_text.clear();
+                        panel.new_tweet_open = false;
+                        panel.remember_receipt(
+                            termy_x::action_state::ReceiptKind::Post,
+                            "",
+                            &receipt,
+                        );
+                        panel.status = termy_x::publish::success_note(
+                            termy_x::publish::UserWrite::Post,
+                        )
+                        .to_string();
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Could not post: {} The draft is still here. Nothing was retried.",
+                            termy_x::publish::humanize_error(&error)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn reply_box(&self, post: &Post, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let char_limit = self.char_limit;
         let count = weighted_len_limited(&self.reply_text, char_limit);
@@ -7106,11 +10461,14 @@ impl XPanel {
                     .child(if let Some(burst) = self.burst_for(BurstTarget::Reply) {
                         posted_burst_element(burst.seq, burst.label)
                     } else {
-                        self.small_editor_body(
-                            &self.reply_text,
+                        self.editor_canvas(
+                            EditorId::Field(TextField::Reply),
                             focused,
-                            "caret-reply",
                             "Write your reply\u{2026} (Post button sends)",
+                            editor_surface::FIELD_FONT,
+                            editor_surface::FIELD_LINE,
+                            false,
+                            cx,
                         )
                     })
                     .on_mouse_down(
@@ -7195,11 +10553,18 @@ impl XPanel {
                     "x-reply-send",
                     if self.reply_posting {
                         "Posting\u{2026}"
+                    } else if self.thread.is_some() {
+                        "Confirm\u{2026}"
                     } else {
                         "Post"
                     },
                     cx.listener(|this, _, _, cx| {
-                        this.submit_reply(cx);
+                        if this.thread.is_some() {
+                            this.arm_reply_confirm();
+                            cx.notify();
+                        } else {
+                            this.submit_reply(cx);
+                        }
                         cx.stop_propagation();
                     })
                 ))
@@ -7256,42 +10621,87 @@ impl XPanel {
                 "caret-lookup",
                 InputTarget::Lookup,
             ),
-            TextField::Reply | TextField::Quote => {
-                unreachable!("reply/quote use the multi-line small editor")
+            TextField::FeedQuery => (
+                self.desk.feed_query.as_str(),
+                "Topic or keyword \u{2014} Add saves the feed",
+                "glow-feed-query",
+                "x-feed-query",
+                "caret-feed-query",
+                InputTarget::FeedQuery,
+            ),
+            TextField::FeedFilter => (
+                self.desk.feed_filter.as_str(),
+                "lang:en age:24 mute:spam @acct",
+                "glow-feed-filter",
+                "x-feed-filter",
+                "caret-feed-filter",
+                InputTarget::FeedFilter,
+            ),
+            TextField::QueueText => (
+                self.desk.queue_text.as_str(),
+                "Draft reply text \u{2014} never sent until Send",
+                "glow-queue-text",
+                "x-queue-text",
+                "caret-queue-text",
+                InputTarget::QueueText,
+            ),
+            TextField::QueueReplyTo => (
+                self.desk.queue_reply_to.as_str(),
+                "Tweet id or URL to reply to",
+                "glow-queue-reply",
+                "x-queue-reply",
+                "caret-queue-reply",
+                InputTarget::QueueReplyTo,
+            ),
+            TextField::Analyze => (
+                self.desk.analyze_handle.as_str(),
+                "@handle \u{2014} Enter runs a 14-day read",
+                "glow-analyze",
+                "x-analyze-input",
+                "caret-analyze",
+                InputTarget::Analyze,
+            ),
+            TextField::RgTopic => (
+                self.desk.rg_topic.as_str(),
+                "Topic or niche \u{2014} Enter fetches fresh posts via Treg",
+                "glow-rg-topic",
+                "x-rg-topic",
+                "caret-rg-topic",
+                InputTarget::RgTopic,
+            ),
+            TextField::RgKey => (
+                self.desk.rg_key_input.as_str(),
+                "Paste your key \u{2014} Enter saves it (stored in the keychain)",
+                "glow-rg-key",
+                "x-rg-key",
+                "caret-rg-key",
+                InputTarget::RgKey,
+            ),
+            TextField::Reply | TextField::Quote | TextField::NewTweet => {
+                unreachable!("reply/quote/new tweet use the multi-line small editor")
             }
+        };
+        // Never render a secret: the key field shows bullets only.
+        let masked;
+        let text = if field == TextField::RgKey && !text.is_empty() {
+            masked = masked_secret(text);
+            masked.as_str()
+        } else {
+            text
         };
         let focused = self.input_target == target;
-        let content = if text.is_empty() {
-            if focused {
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(2.0))
-                    .child(caret_element(caret_id))
-                    .child(
-                        div()
-                            .text_color(rgb(0x93a4c3))
-                            .child(placeholder.to_string()),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .text_color(rgb(0x93a4c3))
-                    .child(placeholder.to_string())
-                    .into_any_element()
-            }
-        } else {
-            let entities = entity_spans(text);
-            let mut row = div().flex().flex_row().items_center();
-            for chunk in entity_chunk_divs(text, 0, text.len(), &entities) {
-                row = row.child(chunk);
-            }
-            if focused {
-                row = row.child(caret_element(caret_id));
-            }
-            row.into_any_element()
-        };
+        let _ = (text, caret_id);
+        let masked = field == TextField::RgKey;
+        let key_len = self.desk.rg_key_input.chars().count();
+        let content = self.editor_canvas(
+            EditorId::Field(field),
+            focused,
+            placeholder,
+            editor_surface::FIELD_FONT,
+            editor_surface::FIELD_LINE,
+            masked,
+            cx,
+        );
         focus_glow(
             glow_id,
             focused,
@@ -7299,6 +10709,10 @@ impl XPanel {
             div()
                 .id(element_id)
                 .flex_1()
+                // Never wider than the panel: long text must not push
+                // the row's buttons (e.g. Save) off-screen.
+                .min_w(px(0.0))
+                .overflow_hidden()
                 .p(px(10.0))
                 .rounded(px(8.0))
                 .bg(if focused {
@@ -7315,14 +10729,28 @@ impl XPanel {
                 .cursor_pointer()
                 .text_size(px(13.0))
                 .text_color(rgb(0xf8fbff))
-                .child(content)
+                .child(if masked {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w(px(0.0))
+                        .child(div().flex_1().min_w(px(0.0)).child(content))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x8e8e93))
+                                .child(format!("({key_len} chars)")),
+                        )
+                        .into_any_element()
+                } else {
+                    content
+                })
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        this.input_target = target;
-                        this.pending_focus = true;
-                        cx.stop_propagation();
-                        cx.notify();
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        this.editor_pointer_down(EditorId::Field(field), event, window, cx);
                     }),
                 )
                 .into_any_element(),
@@ -7374,7 +10802,6 @@ impl XPanel {
         let attached = match self.pick_target {
             PickTarget::Compose => self.media.len(),
             PickTarget::Reply => self.reply_media.len(),
-            PickTarget::Quote => self.quote_media.len(),
         };
         if attached >= 4 {
             self.notice = Some("Max 4 images — remove one first.".into());
@@ -7413,7 +10840,6 @@ impl XPanel {
         let target = match self.pick_target {
             PickTarget::Compose => &mut self.media,
             PickTarget::Reply => &mut self.reply_media,
-            PickTarget::Quote => &mut self.quote_media,
         };
         let mut added = 0usize;
         let mut rejected: Vec<String> = Vec::new();
@@ -7659,23 +11085,15 @@ impl XPanel {
                             .h(px(132.0))
                             .overflow_y_scroll()
                             .track_scroll(&self.compose_scroll)
-                            .child(self.render_compose_editor()),
+                            .child(self.render_compose_editor(cx)),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.focus.focus(window, cx);
-                            this.focus_compose_editor();
-                            // Empty draft: caret at left (0). Non-empty: jump to end.
-                            if this.compose.is_empty() {
-                                this.caret = 0;
-                            } else {
-                                this.caret = this.compose.len();
-                            }
-                            this.sel_anchor = None;
-                            this.pending_focus = false;
-                            cx.stop_propagation();
-                            cx.notify();
+                        cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                            // Clicks on the label or padding focus the draft.
+                            // Clicks on the shaped text are handled by the
+                            // editor overlay, which places the caret.
+                            this.editor_pointer_down(EditorId::Compose, event, window, cx);
                         }))
                     .into_any_element(),
             ))
@@ -7735,144 +11153,32 @@ impl XPanel {
             .into_any_element()
     }
 
-    fn render_compose_editor(&self) -> gpui_kit::AnyElement {
+    fn render_compose_editor(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let focused = self.compose_focused && self.ui_focus == UiFocus::Compose && !self.confirm;
-        let show_caret = focused;
-        let caret = self.caret.min(self.compose.len());
-        let sel = self.selection_range();
-
         if let Some(burst) = self.burst_for(BurstTarget::Compose) {
             return div()
                 .mt(px(8.0))
                 .child(posted_burst_element(burst.seq, burst.label))
                 .into_any_element();
         }
-
-        if self.compose.is_empty() {
-            // Caret at LEFT (index 0). Hint only when empty AND unfocused —
-            // once the caret blinks, the placeholder must disappear.
-            return div()
-                .mt(px(8.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .children(show_caret.then(|| self.caret_bar()))
-                .children((!focused).then(|| {
-                    div()
-                        .text_size(px(14.0))
-                        .text_color(rgb(0x93a4c3))
-                        .child(
-                            "Click here - caret blinks, hint vanishes. Ctrl+V pastes. Premium counts to 25,000.",
-                        )
-                }))
-                .into_any_element();
-        }
-
-        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
-        let text = self.compose.as_str();
-        let entities = entity_spans(text);
-        let mut offset = 0usize;
-        let parts: Vec<&str> = text.split('\n').collect();
-        let max_chars = self.editor_max_chars();
-        for (idx, hard_line) in parts.iter().enumerate() {
-            for (sub_start, sub_end) in soft_wrap_ranges(hard_line, max_chars) {
-                let line = &hard_line[sub_start..sub_end];
-                let line_start = offset + sub_start;
-                let line_end = line_start + line.len();
-                let caret_on_line = caret >= line_start && caret <= line_end;
-                let mut row = div().flex().flex_row().items_center().min_h(px(20.0));
-
-                // Build character runs: [start, end, selected]
-                let mut marks = vec![0usize, line.len()];
-                if caret_on_line {
-                    marks.push((caret - line_start).min(line.len()));
-                }
-                if let Some((sa, sb)) = sel {
-                    marks.push(sa.saturating_sub(line_start).min(line.len()));
-                    marks.push(sb.saturating_sub(line_start).min(line.len()));
-                }
-                // Entity edges split chunks so mentions/tags render blue.
-                for (es, ee, _) in &entities {
-                    for edge in [*es, *ee] {
-                        if edge > line_start && edge < line_end {
-                            marks.push(edge - line_start);
-                        }
-                    }
-                }
-                marks.sort_unstable();
-                marks.dedup();
-
-                let mut caret_drawn = false;
-                for window in marks.windows(2) {
-                    let (s, e) = (window[0], window[1]);
-                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == s {
-                        row = row.child(self.caret_bar());
-                        caret_drawn = true;
-                    }
-                    if s < e {
-                        let abs_s = line_start + s;
-                        let abs_e = line_start + e;
-                        let selected = sel.is_some_and(|(sa, sb)| abs_s >= sa && abs_e <= sb);
-                        let in_entity = entities
-                            .iter()
-                            .any(|(es, ee, _)| abs_s >= *es && abs_e <= *ee);
-                        let chunk = &line[s..e];
-                        let mut el = div().text_size(px(14.0));
-                        if selected {
-                            el = el
-                                .px(px(1.0))
-                                .rounded(px(3.0))
-                                .bg(tint(0xff4fa3, 130))
-                                .text_color(rgb(0xffe8f5));
-                        } else if in_entity {
-                            el = el.text_color(rgb(ENTITY_BLUE));
-                        } else {
-                            el = el.text_color(rgb(0xf8fbff));
-                        }
-                        row = row.child(el.child(chunk.to_string()));
-                    }
-                    if show_caret && caret_on_line && !caret_drawn && (caret - line_start) == e {
-                        row = row.child(self.caret_bar());
-                        caret_drawn = true;
-                    }
-                }
-                if show_caret && caret_on_line && !caret_drawn {
-                    row = row.child(self.caret_bar());
-                }
-                if line.is_empty() && !(show_caret && caret_on_line) {
-                    row = row.child(
-                        div()
-                            .text_size(px(14.0))
-                            .text_color(rgb(0xf8fbff))
-                            .child(" "),
-                    );
-                }
-
-                rows.push(row.into_any_element());
-            }
-            offset += hard_line.len() + if idx + 1 < parts.len() { 1 } else { 0 };
-        }
-
+        // Hint only while the empty box is unfocused. Once it has the
+        // caret, the placeholder goes away (same rule as before).
+        let placeholder = if focused {
+            ""
+        } else {
+            "Click here and type. Ctrl+V pastes. Premium counts to 25,000."
+        };
         div()
             .mt(px(8.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn caret_bar(&self) -> gpui_kit::AnyElement {
-        div()
-            .w(px(2.0))
-            .h(px(16.0))
-            .rounded(px(1.0))
-            .bg(rgb(0x7af6ff))
-            .flex_none()
-            .with_animation("caret-compose", breath_animation(2_300), |el, v| {
-                el.opacity(0.12 + 0.88 * v)
-            })
+            .child(self.editor_canvas(
+                EditorId::Compose,
+                focused,
+                placeholder,
+                editor_surface::COMPOSE_FONT,
+                editor_surface::COMPOSE_LINE,
+                false,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -7917,7 +11223,7 @@ impl XPanel {
                             div()
                                 .text_size(px(12.0))
                                 .text_color(rgb(0xffd0ea))
-                                .child("Post now sends these in-app via OpenCLI --images (no browser). If you choose Open in browser instead, attach them there — a web link can't upload files."),
+                                .child("Post now sends these through your X session in the background. If you choose Open in browser instead, attach them there — a web link can't upload files."),
                         ),
                 )
                 .children(media_lines.into_iter().map(|name| {
@@ -7989,7 +11295,14 @@ impl XPanel {
                         div()
                             .text_size(px(16.0))
                             .text_color(rgb(0xffd0ea))
-                            .child("Confirm - nothing posts until you say yes"),
+                            .child(if self.confirm_reply_to.is_some() {
+                                format!(
+                                    "Confirm reply to @{} \u{2014} nothing posts until you say yes",
+                                    self.confirm_reply_author
+                                )
+                            } else {
+                                "Confirm - nothing posts until you say yes".into()
+                            }),
                     )
                     .child(media_block)
                     .child(
@@ -8024,6 +11337,9 @@ impl XPanel {
                                 cancel_active,
                                 cx.listener(|this, _, _, cx| {
                                     this.confirm = false;
+                                    this.confirm_reply_to = None;
+                                    this.confirm_reply_author.clear();
+                                    this.confirm_queue_id = None;
                                     this.focus_compose_editor();
                                     this.pending_focus = true;
                                     cx.stop_propagation();
@@ -8037,6 +11353,16 @@ impl XPanel {
                                 cx.listener(|this, _, _, cx| {
                                     this.ui_focus = UiFocus::ConfirmCopy;
                                     this.copy_current_part(cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                })
+                            ))
+                            .child(x_button!(
+                                "x-dry-run",
+                                "Dry run",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.dry_run_async(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 })
@@ -8072,9 +11398,14 @@ impl XPanel {
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
         let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
             .char_limit_or_fallback();
-        let parts = split_thread_limited(&self.compose, char_limit);
+        let source = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
+            self.reply_text.as_str()
+        } else {
+            self.compose.as_str()
+        };
+        let parts = split_thread_limited(source, char_limit);
         let text = if parts.is_empty() {
-            self.compose.clone()
+            source.to_string()
         } else {
             let index = self.intent_index.min(parts.len() - 1);
             parts[index].clone()
@@ -8098,27 +11429,32 @@ impl XPanel {
             cx.notify();
             return;
         }
-        if let Err(error) = termy_x::publish::validate_media_paths(&self.media) {
+        let reply_to = self.confirm_reply_to.clone();
+        let thread_reply = reply_to.is_some() && !self.reply_text.trim().is_empty();
+        let media = if thread_reply {
+            self.reply_media.clone()
+        } else {
+            self.media.clone()
+        };
+        if let Err(error) = termy_x::publish::validate_media_paths(&media) {
             self.notice = Some(error);
             cx.notify();
             return;
         }
-        let text = self.compose.trim().to_string();
+        let text = if thread_reply {
+            self.reply_text.trim().to_string()
+        } else {
+            self.compose.trim().to_string()
+        };
         if text.is_empty() {
             self.notice = Some("Type something before Publish.".into());
             cx.notify();
             return;
         }
-        let media = self.media.clone();
+        let queue_id = self.confirm_queue_id.clone();
         self.posting = true;
-        self.notice = Some(if media.is_empty() {
-            "Posting in-app via your X session… no browser will open.".into()
-        } else {
-            format!(
-                "Posting in-app with {} image(s) via your X session… no browser will open.",
-                media.len()
-            )
-        });
+        termy_x::publish::log_action("post", "start", &[("ack", "pending"), ("new_id", "none")]);
+        self.notice = Some(termy_x::publish::background_write_note().to_string());
         cx.notify();
         let submit_started = Instant::now();
         self.submit_seq += 1;
@@ -8149,7 +11485,7 @@ impl XPanel {
                             .char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
-                        None,
+                        reply_to.as_deref(),
                         termy_x::publish::ConfirmDecision::Yes,
                         false,
                         publisher,
@@ -8167,27 +11503,144 @@ impl XPanel {
                 })
                 .await;
             perf_log(&format!("submit post confirmed_ms={}", submit_started.elapsed().as_millis()));
-            let _ = this.update(cx, |panel, cx| {
+            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
+            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            termy_x::publish::log_action("post", "ack", &[("ack", ack), ("new_id", &new_id)]);
+            let applied = this.update(cx, |panel, cx| {
                 panel.posting = false;
                 match result {
                     Ok(receipt) => {
                         panel.confirm = false;
-                        panel.media.clear();
-                        panel.compose.clear();
-                        panel.caret = 0;
-                        panel.sel_anchor = None;
-                        panel.notice = Some(format!(
-                            "Posted in-app — no browser opened. {receipt}"
-                        ));
-                        panel.focus_compose_editor();
-                        panel.pending_focus = true;
-                        panel.begin_post_burst(BurstTarget::Compose, cx);
+                        if let Some(id) = panel.confirm_reply_to.take() {
+                            panel.remember_receipt(
+                                termy_x::action_state::ReceiptKind::Reply,
+                                &id,
+                                &receipt,
+                            );
+                            if !panel.replied_ids.contains(&id) {
+                                panel.replied_ids.push(id);
+                            }
+                            panel.reply_text.clear();
+                            panel.reply_media.clear();
+                            panel.confirm_reply_author.clear();
+                            panel.close_reply();
+                            panel.notice = Some(
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Reply)
+                                    .to_string(),
+                            );
+                            panel.begin_post_burst(
+                                BurstTarget::Reply,
+                                termy_x::publish::reply_sent_label(),
+                                cx,
+                            );
+                        } else {
+                            panel.media.clear();
+                            panel.compose.clear();
+                            panel.caret = 0;
+                            panel.sel_anchor = None;
+                            panel.notice = Some(
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Post)
+                                    .to_string(),
+                            );
+                            panel.focus_compose_editor();
+                            panel.pending_focus = true;
+                            panel.remember_receipt(
+                                termy_x::action_state::ReceiptKind::Post,
+                                "",
+                                &receipt,
+                            );
+                            panel.begin_post_burst(
+                                BurstTarget::Compose,
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::Post),
+                                cx,
+                            );
+                        }
+                        if let Some(id) = &queue_id {
+                            termy_x::queue::remove_item(&mut panel.desk.queue, id);
+                            let config = termy_x::config::XConfig::load(
+                                &termy_x::config::default_config_dir(),
+                            );
+                            let _ = panel.desk.persist_queue(&config);
+                        }
+                        panel.confirm_queue_id = None;
                     }
                     Err(error) => {
                         // Stay on confirm so the user can retry or explicitly
                         // choose 'Open in browser'. Nothing auto-opens.
                         panel.notice = Some(format!(
-                            "Could not post in-app: {} Nothing was posted; no browser opened.",
+                            "Could not post: {} Nothing was posted. The draft is still here.",
+                            termy_x::publish::humanize_error(&error)
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+            termy_x::publish::log_action(
+                "post",
+                "ui",
+                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+            );
+        })
+        .detach();
+    }
+
+    fn dry_run_async(&mut self, cx: &mut Context<Self>) {
+        let text = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
+            self.reply_text.trim().to_string()
+        } else {
+            self.compose.trim().to_string()
+        };
+        if text.is_empty() {
+            self.notice = Some("Type something before Dry run.".into());
+            cx.notify();
+            return;
+        }
+        let reply_to = self.confirm_reply_to.clone();
+        let media = self.media.clone();
+        self.notice = Some("Dry run \u{2014} building the plan. Nothing will be posted.".into());
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let service = XPanel::service_free();
+                    let publishers = service.publishers;
+                    let Some(publisher) =
+                        termy_x::publish::first_available(publishers.as_slice())
+                    else {
+                        return Err("No publish path to plan against.".to_string());
+                    };
+                    let char_limit =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                            .char_limit_or_fallback();
+                    match termy_x::publish::confirm_and_publish_with_media(
+                        &text,
+                        reply_to.as_deref(),
+                        termy_x::publish::ConfirmDecision::Yes,
+                        true,
+                        publisher,
+                        char_limit,
+                        &media,
+                    ) {
+                        termy_x::publish::GateOutcome::DryRun { plan } => Ok(plan),
+                        other => Err(format!("expected dry-run, got {other:?}")),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                match result {
+                    Ok(plan) => {
+                        panel.notice = Some(format!(
+                            "Dry run \u{2014} {} part(s), {} weighted, provider {}. Nothing was posted.",
+                            plan.parts.len(),
+                            plan.count.weighted,
+                            plan.provider.label()
+                        ));
+                        panel.status = "dry run \u{b7} nothing posted".into();
+                    }
+                    Err(error) => {
+                        panel.notice = Some(format!(
+                            "Dry run failed: {} Nothing was posted.",
                             termy_x::publish::humanize_error(&error)
                         ));
                     }
@@ -8264,23 +11717,24 @@ impl XPanel {
 
 fn card(title: String, body: String) -> gpui_kit::AnyElement {
     div()
-        .p(px(12.0))
-        .rounded(px(12.0))
-        .bg(tint(0x0c1422, 225))
+        .p(px(10.0))
+        .rounded(px(10.0))
+        .bg(rgb(0x1c1c1e))
         .border_1()
-        .border_color(tint(0x7af6ff, 40))
-        .hover(|style| style.bg(tint(0x122038, 245)).border_color(rgb(0x7af6ff)))
+        .border_color(rgb(0x3a3a3c))
+        .hover(|style| style.bg(rgb(0x2c2c2e)).border_color(rgb(0x48484a)))
         .child(
             div()
-                .text_size(px(13.0))
-                .text_color(rgb(0xd7fbff))
+                .text_size(px(11.0))
+                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                .text_color(rgb(0xf5f5f7))
                 .child(title),
         )
         .child(
             div()
                 .mt(px(4.0))
-                .text_size(px(13.0))
-                .text_color(rgb(0xe7eefc))
+                .text_size(px(11.0))
+                .text_color(rgb(0xaeaeb2))
                 .child(body),
         )
         .into_any_element()
@@ -8289,18 +11743,70 @@ fn card(title: String, body: String) -> gpui_kit::AnyElement {
 /// Small section header used by Lookup (Pinned / Latest) and friends.
 fn section_label(text: &str) -> gpui_kit::AnyElement {
     div()
-        .mt(px(4.0))
-        .text_size(px(13.0))
+        .mt(px(2.0))
+        .text_size(px(11.0))
         .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-        .text_color(rgb(0xd7fbff))
+        .text_color(rgb(0xf5f5f7))
         .child(text.to_string())
         .into_any_element()
 }
 
+/// Profile totals from the OpenCLI profile payload, plus sums over the
+/// loaded tweet window. Missing fields render as n/a — never a guessed
+/// `len()` of a capped followers page.
+fn profile_stats_rows(profile: &Profile) -> Vec<gpui_kit::AnyElement> {
+    let stats = termy_x::account_stats_from_profile(profile);
+    let totals = &stats.totals;
+    let window = &stats.window;
+    let line = |text: String| {
+        div()
+            .text_size(px(12.0))
+            .text_color(rgb(0x9ad7ff))
+            .child(text)
+            .into_any_element()
+    };
+    let dim = |text: String| {
+        div()
+            .text_size(px(11.0))
+            .text_color(rgb(0x93a4c3))
+            .child(text)
+            .into_any_element()
+    };
+    vec![
+        line(format!(
+            "{} followers \u{b7} {} following \u{b7} {} posts \u{b7} {} likes",
+            termy_x::fmt_count(totals.followers),
+            termy_x::fmt_count(totals.following),
+            termy_x::fmt_count(totals.tweets),
+            termy_x::fmt_count(totals.likes),
+        )),
+        line(format!(
+            "verified {} \u{b7} created_at {}",
+            termy_x::fmt_verified(totals.verified),
+            termy_x::fmt_created(totals.created_at.as_deref()),
+        )),
+        dim(window.window_note()),
+        line(format!(
+            "views {} \u{b7} likes {} \u{b7} replies {} \u{b7} reposts {} \u{b7} quotes {} \u{b7} bookmarks {}",
+            termy_x::fmt_count(window.views),
+            termy_x::fmt_count(window.likes),
+            termy_x::fmt_count(window.replies),
+            termy_x::fmt_count(window.reposts),
+            termy_x::fmt_count(window.quotes),
+            termy_x::fmt_count(window.bookmarks),
+        )),
+        line(format!(
+            "engagement {} \u{b7} rate {}",
+            termy_x::fmt_count(window.engagement),
+            termy_x::fmt_rate(window.engagement_rate),
+        )),
+    ]
+}
+
 fn hint(text: String) -> gpui_kit::AnyElement {
     div()
-        .text_size(px(12.0))
-        .text_color(rgb(0xf0a8d0))
+        .text_size(px(11.0))
+        .text_color(rgb(0x8e8e93))
         .child(text)
         .into_any_element()
 }
@@ -8309,23 +11815,23 @@ fn empty_state(title: &str, detail: impl Into<String>) -> gpui_kit::AnyElement {
     div()
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .p(px(16.0))
-        .rounded_xl()
+        .gap(px(4.0))
+        .p(px(14.0))
+        .rounded(px(12.0))
         .border_1()
-        .border_color(rgb(0x2f7bff))
-        .bg(tint(0x0b1220, 0xcc))
+        .border_color(rgb(0x3a3a3c))
+        .bg(rgb(0x1c1c1e))
         .child(
             div()
-                .text_size(px(16.0))
+                .text_size(px(13.0))
                 .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                .text_color(rgb(0x7af6ff))
+                .text_color(rgb(0xf5f5f7))
                 .child(title.to_string()),
         )
         .child(
             div()
-                .text_size(px(12.0))
-                .text_color(rgb(0xc5d2ea))
+                .text_size(px(11.0))
+                .text_color(rgb(0x8e8e93))
                 .child(detail.into()),
         )
         .into_any_element()
@@ -8339,25 +11845,123 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 mod edit_keys_tests {
     use super::next_timeline_limit;
     use super::{
-        BURST_MS, burst_style_at, caret_visual_line, follow_button_label, is_own_profile,
+        BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
+        FollowClick, FOLLOW_DOT_MS, XSection, burst_style_at, caret_visual_line, fetch_section,
+        follow_awaiting_note, follow_button_label, follow_click, follow_click_status,
+        follow_confirm_on_card, follow_confirm_prompt, follow_dots_keep_going, follow_pending_label,
+        follow_saved_mark, follow_step, follow_wait_label, is_own_profile,
+        like_button_label,
         soft_wrap_ranges,
     };
+    use termy_x::providers::TimelineFeed;
+
+    #[test]
+    fn quote_image_button_does_not_start_a_post() {
+        let note = termy_x::publish::quote_image_unsupported();
+        assert!(note.contains("cannot attach an image"));
+        assert!(note.contains("new post"));
+        assert!(note.contains("Nothing was posted"));
+        assert!(note.contains("Post was not clicked"));
+        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet));
+        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::Post));
+    }
 
     #[test]
     fn follow_button_labels_reflect_payload_state_and_flight() {
         // Payload silent: honest Follow (no invented Following state).
-        assert_eq!(follow_button_label(None, None), "Follow");
-        assert_eq!(follow_button_label(Some(false), None), "Follow");
-        assert_eq!(
-            follow_button_label(Some(true), None),
-            "Following \u{b7} Unfollow"
-        );
+        assert_eq!(follow_button_label(None, None, false, 1), "Follow");
+        assert_eq!(follow_button_label(Some(false), None, false, 2), "Follow");
+        assert_eq!(follow_button_label(Some(true), None, false, 2), "Unfollow");
+        assert_eq!(follow_button_label(Some(true), None, false, 0), "Unfollow");
+        assert_eq!(follow_saved_mark(true, true, false), Some("saved"));
+        assert_eq!(follow_saved_mark(true, false, false), None);
+        assert_eq!(follow_saved_mark(true, true, true), None);
+        assert_eq!(like_button_label(true, false, true), "Liked \u{b7} saved");
+        assert_eq!(like_button_label(true, true, true), "\u{2026}");
+        assert_eq!(like_button_label(true, false, false), "Liked");
         // In flight: progress label wins; the click guard ignores clicks.
-        assert_eq!(follow_button_label(None, Some(true)), "Following\u{2026}");
+        assert_eq!(follow_button_label(None, Some(true), false, 1), "Following..");
+        assert_eq!(follow_button_label(Some(true), Some(false), false, 0), "Unfollowing.");
+    }
+
+    #[test]
+    fn follow_dots_roll_only_while_the_request_is_in_flight() {
+        assert_eq!(follow_pending_label(true, 0), "Following.");
+        assert_eq!(follow_pending_label(true, 1), "Following..");
+        assert_eq!(follow_pending_label(true, 2), "Following...");
+        assert_eq!(follow_pending_label(true, 3), "Following.");
+        assert_ne!(follow_pending_label(true, 0), follow_pending_label(true, 1));
+        assert_eq!(follow_pending_label(false, 2), "Unfollowing...");
+        assert_eq!(follow_button_label(Some(true), None, false, 2), "Unfollow");
+        assert_eq!(follow_wait_label(2), "...");
+        assert_eq!(follow_pending_label(true, 2), "Following...");
+        assert_eq!(follow_button_label(None, None, true, 2), "...");
+        assert_eq!(follow_button_label(None, Some(true), true, 2), "Following...");
+        assert_eq!(follow_awaiting_note(true, false), Some("Awaiting confirmation"));
+        assert_eq!(follow_awaiting_note(true, true), None);
+        assert!(follow_dots_keep_going(true, true, false));
+        assert!(follow_dots_keep_going(true, false, true));
+        assert!(!follow_dots_keep_going(true, false, false));
+        assert!(!follow_dots_keep_going(false, true, true));
         assert_eq!(
-            follow_button_label(Some(true), Some(false)),
-            "Unfollowing\u{2026}"
+            termy_x::publish::follow_burst_label(true),
+            "\u{2713} Followed"
         );
+        assert!(FOLLOW_DOT_MS >= 200 && FOLLOW_DOT_MS <= 1000);
+    }
+
+    #[test]
+    fn follow_click_dispatches_a_visible_result_on_the_clicked_card() {
+        let ask = follow_click(false, true, false, false, "@Jack");
+        assert_eq!(
+            ask,
+            FollowClick::Confirm {
+                handle: "Jack".into(),
+                follow: true
+            }
+        );
+        let status = follow_click_status(&ask);
+        assert_eq!(follow_confirm_prompt("Jack", true), "Do you want to follow @Jack");
+        assert_eq!(
+            follow_confirm_prompt("@Jack", false),
+            "Do you want to unfollow @Jack"
+        );
+        assert!(!follow_confirm_prompt("Jack", true).contains('?'));
+        assert!(!follow_button_label(Some(false), None, false, 0).contains('?'));
+        assert!(!follow_button_label(Some(true), None, false, 0).contains('?'));
+        assert!(!follow_button_label(None, None, true, 1).contains('?'));
+        assert!(status.contains("Do you want to follow @Jack"));
+        assert!(status.contains("Press Confirm"));
+        assert!(status.contains("Nothing is sent"));
+        assert!(follow_confirm_on_card(Some("Jack"), "jack"));
+        assert!(!follow_confirm_on_card(Some("Jack"), "reposter"));
+        assert_eq!(
+            follow_click(false, true, false, true, "jack"),
+            FollowClick::Confirm {
+                handle: "jack".into(),
+                follow: false
+            }
+        );
+        assert_eq!(
+            follow_click(true, true, false, false, "jack"),
+            FollowClick::InFlight
+        );
+        assert!(follow_click_status(&FollowClick::InFlight).contains("already in progress"));
+        assert!(
+            follow_click_status(&FollowClick::ConnectFirst).contains("Nothing was changed")
+        );
+        assert!(follow_click_status(&FollowClick::OwnAccount).contains("Nothing was changed"));
+        for click in [
+            FollowClick::InFlight,
+            FollowClick::ConnectFirst,
+            FollowClick::OwnAccount,
+            FollowClick::Confirm {
+                handle: "a".into(),
+                follow: true,
+            },
+        ] {
+            assert!(!follow_click_status(&click).is_empty());
+        }
     }
 
     #[test]
@@ -8414,6 +12018,31 @@ mod edit_keys_tests {
     }
 
     #[test]
+    fn wrapped_arrow_motion_moves_by_visual_line_and_grapheme() {
+        use termy_x::draft_edit::{DraftCaret, Motion};
+        let text = "hello world this is a long line";
+        let lines = soft_wrap_ranges(text, 10);
+        assert!(lines.len() > 1);
+        let mut caret = DraftCaret::collapsed(0);
+        caret.move_by(text, &lines, Motion::End, false);
+        let (start, end) = lines[0];
+        assert_eq!(caret.caret, end);
+        assert!(end > start);
+        caret.move_by(text, &lines, Motion::Down, false);
+        assert_eq!(caret_visual_line(text, caret.caret, 10), 1);
+        caret.move_by(text, &lines, Motion::Home, false);
+        assert_eq!(caret.caret, lines[1].0);
+        caret.move_by(text, &lines, Motion::Right, true);
+        assert_eq!(
+            caret.selection(),
+            Some((
+                lines[1].0,
+                termy_x::draft_edit::next_grapheme(text, lines[1].0)
+            ))
+        );
+    }
+
+    #[test]
     fn burst_grows_then_explodes_and_fades() {
         assert_eq!(BURST_MS, 1_150);
         let (f0, o0) = burst_style_at(0.0);
@@ -8425,17 +12054,146 @@ mod edit_keys_tests {
     }
 
     #[test]
-    fn load_more_limit_grows_by_batch_to_cap() {
-        assert_eq!(next_timeline_limit(160), Some(320));
-        assert_eq!(next_timeline_limit(320), Some(480));
-        assert_eq!(next_timeline_limit(1440), Some(1600));
-        assert_eq!(next_timeline_limit(1600), None);
-        assert_eq!(next_timeline_limit(9999), None);
+    fn load_more_asks_for_one_page_until_the_ceiling() {
+        assert_eq!(next_timeline_limit(0), Some(TIMELINE_PAGE));
+        assert_eq!(next_timeline_limit(20), Some(TIMELINE_PAGE));
+        assert_eq!(next_timeline_limit(TIMELINE_MAX), None);
+        assert_eq!(TIMELINE_PAGE, 100);
+        assert_eq!(TIMELINE_INITIAL, TIMELINE_PAGE);
+    }
+
+    #[test]
+    fn mock_home_feed_pages_past_five_and_dedups() {
+        let first = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            TimelineFeed::ForYou,
+            false,
+            TIMELINE_PAGE,
+            None,
+        );
+        let FetchPayload::Timeline {
+            posts,
+            next_cursor,
+            cursor_ok,
+            failed,
+            ..
+        } = first
+        else {
+            panic!("timeline payload");
+        };
+        assert!(!failed);
+        assert!(cursor_ok);
+        assert!(posts.len() >= 100, "first page {}", posts.len());
+        let cursor = next_cursor.expect("fixture has another page");
+        let second = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            false,
+            TimelineFeed::ForYou,
+            true,
+            TIMELINE_PAGE,
+            Some(cursor),
+        );
+        let FetchPayload::Timeline {
+            posts: more,
+            next_cursor: next,
+            ..
+        } = second
+        else {
+            panic!("second page");
+        };
+        assert!(more.len() >= 100, "second page {}", more.len());
+        let kept = termy_x::providers::append_new_posts(posts.clone(), more.clone());
+        assert_eq!(kept.len(), posts.len() + more.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for post in posts.iter().chain(more.iter()) {
+            assert!(seen.insert(post.id.clone()), "duplicate {}", post.id);
+        }
+        assert!(next.is_some());
+        let popular = {
+            let mut ranked = posts.clone();
+            ranked.sort_by(|left, right| {
+                termy_x::sort::cmp_posts(left, right, termy_x::sort::ResultSort::Popular)
+            });
+            ranked
+        };
+        let newest = {
+            let mut ranked = posts.clone();
+            ranked.sort_by(|left, right| {
+                termy_x::sort::cmp_posts(left, right, termy_x::sort::ResultSort::Newest)
+            });
+            ranked
+        };
+        assert_ne!(popular[0].id, newest[0].id);
+    }
+
+    #[test]
+    fn live_timeline_does_not_render_the_fy_fixture() {
+        let payload = fetch_section(
+            XSection::Timeline,
+            String::new(),
+            String::new(),
+            String::new(),
+            false,
+            true,
+            TimelineFeed::ForYou,
+            false,
+            TIMELINE_PAGE,
+            None,
+        );
+        let FetchPayload::Timeline {
+            posts, status, ..
+        } = payload
+        else {
+            panic!("timeline");
+        };
+        assert!(
+            posts.iter().all(|post| !post.text.contains("fy home post")),
+            "production timeline showed fixture text: {status}"
+        );
+        assert!(
+            !status.contains("fixture page"),
+            "production status labelled a fixture page: {status}"
+        );
+    }
+
+    #[test]
+    fn follow_requires_confirm_and_refuses_self_or_logged_out() {
+        assert_eq!(
+            follow_step(false, false, false, "ada"),
+            FollowStep::ConnectFirst
+        );
+        assert_eq!(
+            follow_step(true, true, false, "me"),
+            FollowStep::OwnAccount
+        );
+        assert_eq!(
+            follow_step(true, false, false, "@ada"),
+            FollowStep::Confirm {
+                handle: "ada".into(),
+                follow: true
+            }
+        );
+        assert_eq!(
+            follow_step(true, false, true, "ada"),
+            FollowStep::Confirm {
+                handle: "ada".into(),
+                follow: false
+            }
+        );
     }
 
     use super::{CardTextSelection, card_drag_promotes, copy_text_for_focus};
     use super::{
-        EnterAction, InputTarget, TextField, XSection, edit_action_goes_to_panel, edit_keys_owned,
+        EnterAction, InputTarget, TextField, edit_action_goes_to_panel, edit_keys_owned,
         enter_action,
     };
 
@@ -8476,7 +12234,17 @@ mod edit_keys_tests {
         assert_eq!(enter_action(TextField::Trends), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Research), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Lookup), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::FeedQuery), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::QueueText), EnterAction::RunSearch);
+        assert_eq!(enter_action(TextField::Analyze), EnterAction::RunSearch);
         assert_eq!(enter_action(TextField::Reply), EnterAction::Newline);
+        assert_eq!(enter_action(TextField::NewTweet), EnterAction::Newline);
+        assert_eq!(
+            termy_x::publish::standalone_tweet("  hi there  ").unwrap(),
+            "hi there"
+        );
+        assert!(termy_x::publish::standalone_reply_to().is_none());
+        assert!(termy_x::publish::standalone_tweet(" ").is_err());
         assert_eq!(enter_action(TextField::Quote), EnterAction::Newline);
         // Focus routing matrix: panel must actually hold focus before
         // any edit chord is intercepted (the Ctrl+C-in-PowerShell bug).
@@ -8563,5 +12331,111 @@ mod edit_keys_tests {
             false,
             false
         ));
+    }
+}
+
+mod reply_guy_ui;
+pub use reply_guy_ui::XAskEvent;
+
+/// Fixed-width bullets for a pasted secret: a 100+ char API key must not
+/// grow the field past the panel (it pushed Save off-screen). Shows only
+/// the length, never any characters.
+fn masked_secret(text: &str) -> String {
+    let count = text.chars().count();
+    format!("{} ({count} chars)", "\u{2022}".repeat(count.min(12)))
+}
+
+#[cfg(test)]
+mod masked_secret_tests {
+    #[test]
+    fn long_keys_mask_to_a_short_fixed_width() {
+        let shown = super::masked_secret(&"k".repeat(200));
+        assert_eq!(shown, format!("{} (200 chars)", "\u{2022}".repeat(12)));
+        assert!(!shown.contains('k'));
+        assert_eq!(
+            super::masked_secret("abc"),
+            "\u{2022}\u{2022}\u{2022} (3 chars)"
+        );
+    }
+}
+
+impl XPanel {
+    fn field_text_mut(&mut self, field: TextField) -> Option<&mut String> {
+        Some(match field {
+            TextField::Search => &mut self.search_input,
+            TextField::Reply => &mut self.reply_text,
+            TextField::Quote => &mut self.quote_text,
+            TextField::NewTweet => &mut self.new_tweet_text,
+            TextField::Trends => &mut self.trends_filter,
+            TextField::Research => &mut self.research_input,
+            TextField::Lookup => &mut self.lookup,
+            TextField::FeedQuery => &mut self.desk.feed_query,
+            TextField::FeedFilter => &mut self.desk.feed_filter,
+            TextField::QueueText => &mut self.desk.queue_text,
+            TextField::QueueReplyTo => &mut self.desk.queue_reply_to,
+            TextField::Analyze => &mut self.desk.analyze_handle,
+            TextField::RgTopic => &mut self.desk.rg_topic,
+            TextField::RgKey => &mut self.desk.rg_key_input,
+        })
+    }
+}
+
+/// The single-line text field an input target edits, if any.
+fn single_line_field_for(target: InputTarget) -> Option<TextField> {
+    Some(match target {
+        InputTarget::Search => TextField::Search,
+        InputTarget::Trends => TextField::Trends,
+        InputTarget::Research => TextField::Research,
+        InputTarget::Lookup => TextField::Lookup,
+        InputTarget::FeedQuery => TextField::FeedQuery,
+        InputTarget::FeedFilter => TextField::FeedFilter,
+        InputTarget::QueueText => TextField::QueueText,
+        InputTarget::QueueReplyTo => TextField::QueueReplyTo,
+        InputTarget::Analyze => TextField::Analyze,
+        InputTarget::RgTopic => TextField::RgTopic,
+        InputTarget::RgKey => TextField::RgKey,
+        _ => return None,
+    })
+}
+
+/// Ctrl+Backspace: drop trailing spaces, then the last word.
+fn delete_last_word(text: &mut String) {
+    let trimmed = text.trim_end().len();
+    text.truncate(trimmed);
+    let cut = text
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    text.truncate(cut);
+}
+
+#[cfg(test)]
+mod single_line_edit_tests {
+    use super::*;
+
+    #[test]
+    fn ctrl_backspace_deletes_the_last_word() {
+        let mut text = "rust build in public  ".to_string();
+        delete_last_word(&mut text);
+        assert_eq!(text, "rust build in ");
+        delete_last_word(&mut text);
+        assert_eq!(text, "rust build ");
+        let mut one = "word".to_string();
+        delete_last_word(&mut one);
+        assert_eq!(one, "");
+    }
+
+    #[test]
+    fn reply_guy_topic_is_a_single_line_field() {
+        assert_eq!(
+            single_line_field_for(InputTarget::RgTopic),
+            Some(TextField::RgTopic)
+        );
+        assert_eq!(
+            single_line_field_for(InputTarget::RgKey),
+            Some(TextField::RgKey)
+        );
+        assert_eq!(single_line_field_for(InputTarget::Compose), None);
     }
 }

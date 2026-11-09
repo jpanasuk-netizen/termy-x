@@ -1,8 +1,9 @@
 use crate::config_core::{
     AppConfig, AppIcon, AppearanceMode, ConfigDiagnosticKind, ConfigParseReport, CursorStyle,
     DEFAULT_LINE_HEIGHT, PaneFocusEffect, Rgb8, RootSettingId, RootSettingValueKind,
-    TabCloseVisibility, TabTitleMode, TabTitleSource, TabWidthMode, TerminalScrollbarStyle,
-    TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback, root_setting_specs,
+    TabCloseVisibility, TabStyle, TabTitleMode, TabTitleSource, TabWidthMode,
+    TerminalScrollbarStyle, TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback,
+    root_setting_specs,
 };
 
 fn parse(input: &str) -> AppConfig {
@@ -28,6 +29,22 @@ fn defaults_enable_tmux_persistence_and_raise_pane_focus_strength() {
 fn native_tab_persistence_parses_as_boolean() {
     assert!(parse("native_tab_persistence = true\n").native_tab_persistence);
     assert!(!parse("native_tab_persistence = false\n").native_tab_persistence);
+}
+
+#[test]
+fn tab_style_defaults_to_native_and_accepts_custom() {
+    assert_eq!(parse("").tab_style, TabStyle::Native);
+    assert_eq!(parse("tab_style = custom\n").tab_style, TabStyle::Custom);
+    assert_eq!(parse("tab_style = Native\n").tab_style, TabStyle::Native);
+
+    let report = parse_report("tab_style = floating\n");
+    assert_eq!(report.config.tab_style, TabStyle::Native);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("native, custom"))
+    );
 }
 
 #[test]
@@ -330,6 +347,8 @@ fn enum_keys_parse_table_driven() {
     );
 
     let windows_shell_cases = [
+        ("auto", WindowsShell::Auto),
+        ("Automatic", WindowsShell::Auto),
         ("cmd", WindowsShell::Cmd),
         ("powershell", WindowsShell::PowerShell),
         ("pwsh", WindowsShell::PowerShellCore),
@@ -342,8 +361,9 @@ fn enum_keys_parse_table_driven() {
     }
     assert_eq!(
         parse("windows_shell = invalid\n").windows_shell,
-        WindowsShell::Cmd
+        WindowsShell::Auto
     );
+    assert_eq!(parse("").windows_shell, WindowsShell::Auto);
 
     assert!(parse("chrome_contrast = true\n").chrome_contrast);
     assert!(parse("chrome_contrast = 1\n").chrome_contrast);
@@ -831,6 +851,14 @@ fn root_settings_in_colors_section_parse_for_legacy_settings_writes() {
     assert_eq!(report.config.theme_dark, "tokyo-night");
     assert!(report.config.colors.foreground.is_some());
     assert!(report.diagnostics.is_empty());
+}
+
+#[test]
+fn leading_bom_and_crlf_line_endings_are_ignored() {
+    let report = parse_report("\u{feff}theme = gruvbox\r\nfont_size = 12\r\n");
+    assert!(report.diagnostics.is_empty());
+    assert_eq!(report.config.theme, "gruvbox");
+    assert!((report.config.font_size - 12.0).abs() < f32::EPSILON);
 }
 
 #[test]

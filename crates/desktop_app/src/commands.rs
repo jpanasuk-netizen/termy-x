@@ -250,14 +250,8 @@ macro_rules! define_commands {
                 COMMAND_SPECS.iter().map(|spec| spec.action)
             }
 
-            #[allow(dead_code)]
             pub fn from_config_name(name: &str) -> Option<Self> {
                 CommandId::from_config_name(name).map(Self::from_command_id)
-            }
-
-            #[allow(dead_code)]
-            pub fn all_config_names() -> impl std::iter::ExactSizeIterator<Item = &'static str> {
-                CommandId::all_config_names()
             }
 
             #[cfg(test)]
@@ -391,7 +385,6 @@ macro_rules! impl_command_action_id_mapping {
                 }
             }
 
-            #[allow(dead_code)]
             pub fn to_command_id(self) -> CommandId {
                 match self {
                     $(Self::$variant => CommandId::$variant,)+
@@ -414,6 +407,37 @@ define_commands!(
             MenuRoot::File,
             0,
             "New Tab",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    (
+        NewWindow,
+        GLOBAL_CONTEXT,
+        Some(palette(
+            "New Window",
+            "create open window",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::File,
+            0,
+            "New Window",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
+    // Listed in the palette only while the built-in multiplexer runs (see
+    // `command_palette_multiplexer_items`), so it has no static palette entry.
+    // Menus are static: without the multiplexer the menu item explains that.
+    (
+        ReopenDetachedWindow,
+        TERMINAL_CONTEXT,
+        None,
+        Some(menu(
+            MenuRoot::Window,
+            0,
+            "Reopen Detached Window",
             MenuVisibility::Always,
             MenuActionRole::Normal
         ))
@@ -1218,24 +1242,25 @@ define_commands!(
 
 termy_core::termy_command_catalog!(impl_command_action_id_mapping);
 
-actions!(
-    termy_inline_input,
-    [
-        InlineBackspace,
-        InlineDelete,
-        InlineMoveLeft,
-        InlineMoveRight,
-        InlineSelectLeft,
-        InlineSelectRight,
-        InlineSelectAll,
-        InlineMoveToStart,
-        InlineMoveToEnd,
-        InlineDeleteWordBackward,
-        InlineDeleteWordForward,
-        InlineDeleteToStart,
-        InlineDeleteToEnd,
-    ]
-);
+actions!(termy_inline_input, [
+    InlineBackspace,
+    InlineDelete,
+    InlineMoveLeft,
+    InlineMoveRight,
+    InlineMoveUp,
+    InlineMoveDown,
+    InlineSelectLeft,
+    InlineSelectRight,
+    InlineSelectUp,
+    InlineSelectDown,
+    InlineSelectAll,
+    InlineMoveToStart,
+    InlineMoveToEnd,
+    InlineDeleteWordBackward,
+    InlineDeleteWordForward,
+    InlineDeleteToStart,
+    InlineDeleteToEnd,
+]);
 
 pub fn inline_input_keybindings() -> Vec<KeyBinding> {
     vec![
@@ -1245,8 +1270,12 @@ pub fn inline_input_keybindings() -> Vec<KeyBinding> {
         KeyBinding::new("delete", InlineDelete, INLINE_INPUT_CONTEXT),
         KeyBinding::new("left", InlineMoveLeft, INLINE_INPUT_CONTEXT),
         KeyBinding::new("right", InlineMoveRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("up", InlineMoveUp, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("down", InlineMoveDown, INLINE_INPUT_CONTEXT),
         KeyBinding::new("shift-left", InlineSelectLeft, INLINE_INPUT_CONTEXT),
         KeyBinding::new("shift-right", InlineSelectRight, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-up", InlineSelectUp, INLINE_INPUT_CONTEXT),
+        KeyBinding::new("shift-down", InlineSelectDown, INLINE_INPUT_CONTEXT),
         KeyBinding::new("secondary-a", InlineSelectAll, INLINE_INPUT_CONTEXT),
         KeyBinding::new("home", InlineMoveToStart, INLINE_INPUT_CONTEXT),
         KeyBinding::new("end", InlineMoveToEnd, INLINE_INPUT_CONTEXT),

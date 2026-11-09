@@ -46,7 +46,7 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 - Group: `FONT`
 
 `ui_font_family`
-- Default: `Menlo` (macOS), `Consolas` (Windows), `monospace` (Linux/other)
+- Default: `.SystemUIFont` (macOS), `Consolas` (Windows), `monospace` (Linux/other)
 - Font family used for tabs, command palette, and settings UI (not the terminal cells)
 - Group: `FONT`
 
@@ -89,7 +89,7 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 
 `multiplexer_enabled`
 - Default: `false`
-- Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy.
+- Keep programs running after quitting and restore tabs, panes, and terminal state when reopening. Applies after restarting Termy. Turning it off leaves running sessions in the background; run `termy mux shutdown` to end them.
 - Group: `SESSIONS`
 
 `tmux_enabled`
@@ -123,7 +123,7 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 - Group: `TMUX`
 
 `windows_shell`
-- Default: `cmd`
+- Default: `auto`
 - Preset shell used for new sessions on Windows
 - Group: `SHELL`
 
@@ -140,6 +140,11 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 `colorterm`
 - Default: `truecolor`
 - COLORTERM value exposed to child applications
+- Group: `SHELL`
+
+`term_program`
+- Default: `ghostty`
+- Terminal identity exposed to child applications: ghostty enables features such as Claude Code progress bars, termy reports Termy in tools like neofetch
 - Group: `SHELL`
 
 `macos_option_as_alt`
@@ -203,6 +208,11 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 - Show a toast when text is copied on select
 - Group: `CLIPBOARD`
 
+`clipboard_read`
+- Default: `ask`
+- Whether programs may read the clipboard with OSC 52 (ask, allow, or deny)
+- Group: `CLIPBOARD`
+
 `command_palette_show_keybinds`
 - Default: `true`
 - Show shortcut badges in command palette rows
@@ -215,7 +225,7 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 
 `progress_indicator_enabled`
 - Default: `true`
-- Show progress from OSC 9;4 sequences in tab badges
+- Show OSC 9;4 progress bars and OSC 7501 program status badges
 - Group: `UI`
 
 ## Tabs
@@ -268,6 +278,11 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 `tab_bar_position`
 - Default: `top`
 - Where the tab bar is rendered: top strip or right sidebar
+- Group: `TAB STRIP`
+
+`tab_style`
+- Default: `native`
+- native: macOS window tabs (applies to new windows) or the WinUI tab strip on Windows (opaque windows, after a restart); custom: Termy's tab strip
 - Group: `TAB STRIP`
 
 `tab_switch_modifier_hints`
@@ -355,12 +370,12 @@ Platform note: the Agent Sidebar/Workspace is currently unavailable on Windows b
 
 `window_width`
 - Default: `1280`
-- Default startup window width in pixels
+- Startup window width in pixels before a window size has been saved
 - Group: `WINDOW`
 
 `window_height`
 - Default: `820`
-- Default startup window height in pixels
+- Startup window height in pixels before a window size has been saved
 - Group: `WINDOW`
 
 `inspector_height`

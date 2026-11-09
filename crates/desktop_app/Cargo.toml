@@ -1,7 +1,7 @@
 [package]
 name = "termy"
 default-run = "termy"
-version = "0.2.81"
+version = "1.0.0-rc.10"
 edition = "2024"
 
 [package.metadata]
@@ -17,19 +17,19 @@ icon = ["../../assets/termy.icns"]
 workspace = true
 
 [dependencies]
+raw-window-handle = "0.6"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 gpui-kit = { workspace = true }
 flume = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
+dunce = { workspace = true }
 log = { workspace = true }
 env_logger = "0.11"
 rfd = "0.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-p256 = { workspace = true }
-rand_core = { workspace = true }
 bincode = "1.3"
 url = { workspace = true }
 tempfile = { workspace = true }
@@ -46,23 +46,11 @@ unicode-width = { workspace = true }
 termy_core = { path = "../core" }
 termy_x = { path = "../x_core" }
 
+
 [target."cfg(target_os = \"linux\")".dependencies]
 font-kit = { package = "zed-font-kit", version = "0.14.1-zed", features = ["source-fontconfig-dlopen"] }
-
-# Linux I/O fast-path crates (tokio-uring / glommio) are deliberately NOT
-# added here yet: nothing cfg(linux)-gated calls them, and an unused dep
-# would only add build/link risk. The network/loop #[cfg] refactor must
-# add the exact crate+version in the same commit that first calls it.
-# This section is the designated home for it.
-#
-# NOTE (shared, audited): mimalloc (in [dependencies] above) is the one C-backed direct dep
-# (libmimalloc-sys, cc-built) -- fine for native Linux/Windows builds and
-# measured, but cross builds need a C compiler for the *target*.
-# `sqlx` is used with default-features=false + runtime-tokio and no TLS
-# feature, so it pulls no OpenSSL; the explicit libsqlite3-sys above
-# (cfg(not(windows))) links system sqlite on Linux -- a Linux build host
-# needs libsqlite3-dev, or a follow-up should enable `bundled`. Left
-# untouched here: changing it would alter the working Windows link.
+raw-window-handle = "0.6"
+x11rb = "0.13"
 
 
 [target."cfg(target_os = \"macos\")".dependencies]
@@ -73,23 +61,18 @@ objc = "0.2"
 raw-window-handle = "0.6"
 dispatch2 = "0.3.0"
 objc2 = "0.6.3"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData", "NSDictionary", "NSGeometry", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSBundle", "NSData", "NSDictionary", "NSGeometry", "NSString"] }
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSAccessibility", "NSAlert", "NSApplication", "NSBitmapImageRep", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSImage", "NSImageRep", "NSMenu", "NSMenuItem", "NSResponder", "NSView", "NSWorkspace"] }
 objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTType"] }
 
 
 [target."cfg(target_os = \"windows\")".build-dependencies]
 winresource = "0.1"
+cc = "1"
+sha2 = "0.10"
 
 [target."cfg(target_os = \"windows\")".dependencies]
-# Jeremy's speed stack, step 1: mimalloc as the process-global allocator.
-# Windows-only on purpose: the shipped app is Windows, the default Windows
-# heap is the weak one, and this keeps allocator behaviour on macOS/Linux
-# (where the GPUI/font stacks are already tuned) completely untouched.
-# Revert = delete this line and the #[global_allocator] static in src/main.rs.
-mimalloc = "0.1"
-raw-window-handle = "0.6"
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Registry", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Media_MediaFoundation", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 
 [target."cfg(any(target_os = \"macos\", target_os = \"linux\", target_os = \"windows\"))".dependencies]

@@ -1,0 +1,5 @@
+{
+  "title": "libtermy",
+  "pages": ["index", "rust", "c", "engine", "swift", "swift-rendering", "configuration", "rendering", "input", "events", "reference", "agents", "troubleshooting"],
+  "defaultOpen": false
+}

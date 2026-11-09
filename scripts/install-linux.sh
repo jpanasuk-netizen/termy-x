@@ -26,6 +26,26 @@ json_string_values() {
     | sed -n 's/.*"[[:space:]]*:[[:space:]]*"\([^"]*\)"$/\1/p'
 }
 
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+# Prints the checksum listed for a file name in a sha256sum-style manifest
+# ("<hash>  name", "<hash>  ./name" or "<hash> *name").
+expected_sha256() {
+  local manifest="$1" name="$2"
+  awk -v name="$name" '{
+    file = $2
+    sub(/^\*/, "", file)
+    sub(/^\.\//, "", file)
+    if (file == name) { print tolower($1); exit }
+  }' "$manifest"
+}
+
 detect_arch() {
   local arch
   arch="$(uname -m)"
@@ -40,6 +60,10 @@ require_cmd curl
 require_cmd tar
 require_cmd grep
 require_cmd sed
+require_cmd awk
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+  die "'sha256sum' or 'shasum' is required to verify the download"
+fi
 
 log "Detecting system architecture..."
 ARCH="$(detect_arch)"
@@ -79,6 +103,18 @@ fi
 
 log "Download URL: $DOWNLOAD_URL"
 
+CHECKSUMS_URL="$(
+  printf '%s\n' "$RELEASE_JSON" \
+    | json_string_values "browser_download_url" \
+    | grep -E '/checksums\.txt$' \
+    | head -n1 \
+    || true
+)"
+
+if [[ -z "$CHECKSUMS_URL" ]]; then
+  die "Release $TAG has no checksums.txt; refusing to install an unverified download"
+fi
+
 TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEMP_DIR"' EXIT
 
@@ -86,6 +122,20 @@ TARBALL_PATH="$TEMP_DIR/termy.tar.gz"
 
 log "Downloading Termy $TAG..."
 curl -fsSL "$DOWNLOAD_URL" -o "$TARBALL_PATH"
+
+log "Verifying checksum..."
+CHECKSUMS_PATH="$TEMP_DIR/checksums.txt"
+curl -fsSL "$CHECKSUMS_URL" -o "$CHECKSUMS_PATH"
+TARBALL_NAME="${DOWNLOAD_URL##*/}"
+EXPECTED_SHA256="$(expected_sha256 "$CHECKSUMS_PATH" "$TARBALL_NAME")"
+if [[ -z "$EXPECTED_SHA256" ]]; then
+  die "checksums.txt has no entry for $TARBALL_NAME; refusing to install"
+fi
+ACTUAL_SHA256="$(sha256_of "$TARBALL_PATH")"
+if [[ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]]; then
+  die "Checksum mismatch for $TARBALL_NAME (expected $EXPECTED_SHA256, got $ACTUAL_SHA256)"
+fi
+log "Checksum OK"
 
 log "Extracting..."
 tar -xzf "$TARBALL_PATH" -C "$TEMP_DIR"

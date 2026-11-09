@@ -71,6 +71,7 @@ pub fn exchange_code(
         body: Some(body),
         bearer: None,
         content_type: Some("application/x-www-form-urlencoded".into()),
+        headers: Vec::new(),
     })?;
     parse_token(&response)
 }

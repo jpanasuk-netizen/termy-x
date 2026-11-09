@@ -33,6 +33,11 @@ at the library root. Supporting modules are grouped by responsibility:
 - `cli_install_core/` and `release_core/`: installation and release helpers.
 - `ffi/`: C ABI, with its public header at `include/termy.h`.
 
+The default `native` feature carries the PTY runtime, config files, plugins,
+multiplexer, SSH and the C ABI. `--no-default-features` builds only the headless
+engine (parser, grid, input encoding, kitty protocols, glyph geometry, themes),
+which is what `crates/wasm` compiles for `wasm32-unknown-unknown`.
+
 `termy-session-host` remains a standalone binary target inside this package.
 The shared library artifact is `libtermy_core` (`termy_core.dll` on Windows);
 C exports and header contracts are unchanged.
@@ -52,6 +57,30 @@ same command set as the standalone `x` binary.
 - `crates/x_cli`: the `x` executable. Behavior stays in `termy_x`.
 - `crates/desktop_app/src/x_panel`: the side panel. Background art is `assets/x/termy-x-bird.svg`.
 - `crates/desktop_app/src/bin/x_panel_preview.rs`: opens the panel on fixture data for review.
+
+## Web: `crates/wasm` (`termy_wasm`) and `packages/`
+
+`crates/wasm` is the wasm-bindgen surface over the engine-only `termy_core`.
+`packages/` is a Bun workspace of npm packages built with tsdown:
+`@termysh/core` (wasm + headless API), `@termysh/web` (browser terminal) and
+`@termysh/xterm` (xterm.js-compatible adapter). See `packages/README.md`.
+They are published manually by `.github/workflows/npm-publish.yml`, separate
+from desktop releases.
+
+## Engine C library: `crates/engine_ffi` (`termy_engine_ffi`)
+
+`crates/engine_ffi` builds `libtermy_engine` (static, shared and rlib), a C ABI
+over the engine-only `termy_core` for hosts that own their transport and
+renderer, such as clients mirroring a remote multiplexer. Its header is
+`crates/engine_ffi/include/termy_engine.h`; it covers full-state snapshots,
+a replica mode that never answers queries, cells with grapheme clusters, mode
+queries, input encoders and text extraction. `scripts/package-libtermy-engine.sh`
+packages it per target (musl Linux, macOS, plus an xcframework on macOS).
+
+`crates/pty` (`termy_pty`) is the Node-API addon behind `@termysh/pty`, a
+node-pty replacement. It wraps `termy_core::pty` (the `pty` feature: the native
+PTY process layer with no other dependencies). Prebuilt binaries ship as
+per-platform npm packages; see `packages/pty/README.md`.
 
 ## Repository support
 

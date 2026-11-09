@@ -37,8 +37,27 @@ fn display_terminal_intercepts_and_places_kitty_graphics() {
     assert_eq!(placements[0].display_rows, Some(3));
     assert!(placements[0].image.png().starts_with(b"\x89PNG"));
 
+    // As in kitty: just past the image's last column, on its last row.
     let cursor = terminal.cursor_position();
-    assert_eq!(cursor, (2, 3));
+    assert_eq!(cursor, (2, 2));
+}
+
+#[test]
+fn display_terminal_places_iterm2_inline_images() {
+    // A 1x1 RGB PNG, as `imgcat` sends it.
+    let terminal = Terminal::new_display(test_terminal_size(), None);
+    terminal.feed_output(
+        b"\x1b]1337;File=inline=1;width=2;preserveAspectRatio=0:iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC\x07",
+    );
+
+    let placements = terminal.kitty_graphics_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        (placements[0].image_width, placements[0].image_height),
+        (1, 1)
+    );
+    assert_eq!(placements[0].display_cols, Some(2));
+    assert_eq!(placements[0].display_rows, Some(1));
 }
 
 #[test]
@@ -61,6 +80,48 @@ fn display_terminal_notifier_coalesces_until_events_are_drained() {
     let _ = terminal.drain_events(&mut reply_host);
     terminal.feed_output(b"c");
     assert_eq!(notifications.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn hidden_terminal_wakes_only_for_tab_chrome_changes() {
+    let notifications = Arc::new(AtomicU64::new(0));
+    let notification_count = notifications.clone();
+    let terminal = Terminal::new_display_with_wakeup_notifier(
+        test_terminal_size(),
+        None,
+        Some(TerminalWakeupNotifier::new(move || {
+            notification_count.fetch_add(1, Ordering::Relaxed);
+        })),
+    );
+    terminal.set_wakeup_enabled(false);
+    let baseline = notifications.load(Ordering::Relaxed);
+
+    terminal.feed_output(b"output");
+    assert_eq!(notifications.load(Ordering::Relaxed), baseline);
+
+    terminal.feed_output(b"\x1b]7501;state=working:app=claude-code\x07");
+    assert_eq!(notifications.load(Ordering::Relaxed), baseline + 1);
+
+    let mut reply_host = RecordingReplyHost::default();
+    let (events, _) = terminal.drain_events(&mut reply_host);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::ProgramStatus(records) if records[0].state == crate::ProgramState::Working))
+    );
+    terminal.feed_output(b"more output");
+    assert_eq!(notifications.load(Ordering::Relaxed), baseline + 1);
+
+    terminal.feed_output(b"\x1b]2;background title\x07");
+    assert_eq!(notifications.load(Ordering::Relaxed), baseline + 2);
+    let (events, _) = terminal.drain_events(&mut reply_host);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::Title(title) if title == "background title"))
+    );
+    terminal.feed_output(b"even more output");
+    assert_eq!(notifications.load(Ordering::Relaxed), baseline + 2);
 }
 
 #[test]
@@ -153,11 +214,13 @@ fn display_terminal_scrolls_for_kitty_cursor_advance_at_bottom() {
     let terminal = Terminal::new_display(test_terminal_size(), None);
     terminal.feed_output(b"\x1b[4;1H\x1b_Ga=T,f=32,s=1,v=1,i=78,c=2,r=3;AQID/w==\x1b\\");
 
-    assert_eq!(terminal.scroll_state(), (0, 3));
+    // As in kitty, the cursor stays on the image's last row, so a 3-row
+    // image on the bottom row scrolls 2 lines.
+    assert_eq!(terminal.scroll_state(), (0, 2));
     assert_eq!(terminal.cursor_position(), (2, 3));
     let placements = terminal.kitty_graphics_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].viewport_row, 0);
+    assert_eq!(placements[0].viewport_row, 1);
 }
 
 #[test]
@@ -173,7 +236,7 @@ fn kitty_cursor_advance_tracks_zero_history_screen_scroll() {
     assert_eq!(terminal.cursor_position(), (2, 3));
     let placements = terminal.kitty_graphics_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].viewport_row, 0);
+    assert_eq!(placements[0].viewport_row, 1);
 }
 
 #[test]
@@ -192,7 +255,7 @@ fn kitty_cursor_advance_tracks_full_history_screen_scroll() {
     assert_eq!(terminal.cursor_position(), (2, 3));
     let placements = terminal.kitty_graphics_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].viewport_row, 0);
+    assert_eq!(placements[0].viewport_row, 1);
 }
 
 #[test]
@@ -205,7 +268,7 @@ fn kitty_cursor_advance_tracks_alternate_screen_scroll() {
     assert_eq!(terminal.cursor_position(), (2, 3));
     let placements = terminal.kitty_graphics_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].viewport_row, 0);
+    assert_eq!(placements[0].viewport_row, 1);
 }
 
 #[test]
@@ -368,7 +431,7 @@ fn primary_kitty_placement_survives_alternate_screen_scroll() {
     let alternate = terminal.kitty_graphics_placements();
     assert_eq!(alternate.len(), 1);
     assert_eq!(alternate[0].image_id, 84);
-    assert_eq!(alternate[0].viewport_row, 0);
+    assert_eq!(alternate[0].viewport_row, 1);
 
     terminal.feed_output(b"\x1b[?1049l");
     let restored_primary = terminal.kitty_graphics_placements();
@@ -433,8 +496,9 @@ fn kitty_cursor_advance_caps_linefeeds_to_screen_height() {
     );
     engine.feed(b"\x1b[4;1H");
     engine.feed(b"\x1b_Ga=T,f=32,s=1,v=1,i=77,c=4294967295,r=4294967295;AQID/w==\x1b\\");
+    // The image's last row, then past the right edge wraps, as in kitty.
     assert_eq!(engine.history_size(), usize::from(size.rows));
-    assert_eq!(engine.cursor().col, usize::from(size.cols) - 1);
+    assert_eq!(engine.cursor().col, 0);
     assert_eq!(engine.cursor().row, usize::from(size.rows) - 1);
 }
 
@@ -564,6 +628,79 @@ fn search_includes_scrollback_rows() {
     assert_eq!(matches[0].row, 0);
     assert_eq!(matches[0].start_col, 0);
     assert_eq!(matches[0].end_col, 4);
+}
+
+#[test]
+fn search_preserves_unicode_clusters_and_physical_columns() {
+    let terminal = Terminal::new_display(TerminalSize::default(), None);
+    terminal.feed_output("A日本語 e\u{301} 👩🏽‍💻Z".as_bytes());
+    for (query, first, last) in [
+        ("日本語", 1, 6),
+        ("e\u{301}", 8, 8),
+        ("\u{301}", 8, 8),
+        ("👩🏽‍💻", 10, 11),
+        ("👩", 10, 11),
+        ("Z", 12, 12),
+    ] {
+        let matches = terminal.search(query);
+        assert_eq!(matches.len(), 1, "query {query}");
+        assert_eq!(
+            (matches[0].start_col, matches[0].end_col),
+            (first, last),
+            "query {query}"
+        );
+    }
+    let matches = crate::search::search_frame(&terminal.snapshot(), "日本語");
+    assert_eq!(matches.len(), 1);
+    assert_eq!((matches[0].start_col, matches[0].end_col), (1, 6));
+}
+
+#[test]
+fn search_omits_hidden_wide_text_without_shifting_following_columns() {
+    let terminal = Terminal::new_display(TerminalSize::default(), None);
+    terminal.feed_output("A\x1b[8m界\x1b[0mZ".as_bytes());
+    assert!(terminal.search("界").is_empty());
+    let matches = terminal.search("Z");
+    assert_eq!((matches[0].start_col, matches[0].end_col), (3, 3));
+    let matches = crate::search::search_frame(&terminal.snapshot(), "Z");
+    assert_eq!((matches[0].start_col, matches[0].end_col), (3, 3));
+}
+
+#[test]
+fn search_uses_physical_cells_for_separately_rendered_emoji() {
+    let terminal = Terminal::new_display(TerminalSize::default(), None);
+    terminal.feed_output("👩\x07\u{200d}💻Z".as_bytes());
+    for (query, start, end) in [("👩", 0, 1), ("💻", 2, 3), ("Z", 4, 4)] {
+        let matches = terminal.search(query);
+        assert_eq!(
+            (matches[0].start_col, matches[0].end_col),
+            (start, end),
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn search_clips_wide_clusters_to_one_column_grids() {
+    let terminal = Terminal::new_display(
+        TerminalSize {
+            cols: 1,
+            rows: 4,
+            ..Default::default()
+        },
+        None,
+    );
+    terminal.feed_output("界\r\n👩🏽‍💻".as_bytes());
+    for query in ["界", "👩", "💻"] {
+        let matches = terminal.search(query);
+        assert_eq!(
+            (matches[0].start_col, matches[0].end_col),
+            (0, 0),
+            "{query}"
+        );
+    }
+    let matches = crate::search::search_frame(&terminal.snapshot(), "界");
+    assert_eq!((matches[0].start_col, matches[0].end_col), (0, 0));
 }
 
 fn cursor_state_after_bytes(
@@ -711,6 +848,19 @@ fn resolve_launch_working_directory_falls_back_when_configured_path_is_invalid()
     assert_eq!(resolved, fallback);
 }
 
+/// An absolute directory whose name ends in a space is used as given, not
+/// trimmed into another path.
+#[cfg(unix)]
+#[test]
+fn absolute_directories_are_not_trimmed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let spaced = temp.path().join("project ");
+    std::fs::create_dir(&spaced).expect("directory");
+    let resolved =
+        resolve_launch_working_directory(Some(&spaced.to_string_lossy()), WorkingDirFallback::Home);
+    assert_eq!(resolved, Some(spaced));
+}
+
 #[test]
 fn normalize_working_directory_candidate_expands_home_directory() {
     let expected = user_home_dir()
@@ -822,314 +972,6 @@ fn mouse_mode_detects_sgr_encoding() {
 fn mouse_mode_detects_utf8_reporting() {
     let mode = mouse_mode_after_bytes(b"\x1b[?1005h");
     assert!(mode.utf8_encoding);
-}
-
-#[test]
-fn terminal_damage_snapshot_is_full_for_new_terminal() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    assert!(matches!(
-        terminal.take_damage_snapshot(),
-        TerminalDamageSnapshot::Full
-    ));
-}
-
-#[test]
-fn terminal_damage_snapshot_resets_damage_after_read() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    let _ = terminal.take_damage_snapshot();
-    let second = terminal.take_damage_snapshot();
-    let third = terminal.take_damage_snapshot();
-    assert!(matches!(second, TerminalDamageSnapshot::Partial(_)));
-    assert_eq!(second, third);
-}
-
-#[test]
-fn terminal_damage_snapshot_returns_partial_spans_for_output() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    let _ = terminal.take_damage_snapshot();
-    terminal.feed_output(b"abc");
-    assert!(matches!(
-        terminal.take_damage_snapshot(),
-        TerminalDamageSnapshot::Partial(spans) if !spans.is_empty()
-    ));
-}
-
-#[test]
-fn terminal_damage_snapshot_while_scrolled_returns_empty_partial_without_damage() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    let _ = terminal.take_damage_snapshot();
-    terminal.feed_output(b"1\n2\n3\n4\n5\n6\n");
-    let _ = terminal.take_damage_snapshot();
-
-    assert!(terminal.scroll_display(1));
-    assert!(terminal.scroll_state().0 > 0);
-
-    assert!(matches!(
-        terminal.take_damage_snapshot(),
-        TerminalDamageSnapshot::Full
-    ));
-    assert_eq!(
-        terminal.take_damage_snapshot(),
-        TerminalDamageSnapshot::Partial(Vec::new())
-    );
-}
-
-#[test]
-fn terminal_damage_snapshot_while_scrolled_maps_damage_to_viewport_rows() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    let _ = terminal.take_damage_snapshot();
-    terminal.feed_output(b"1\n2\n3\n4\n5\n6\n");
-    let _ = terminal.take_damage_snapshot();
-
-    assert!(terminal.scroll_display(1));
-    let _ = terminal.take_damage_snapshot();
-    let _ = terminal.take_damage_snapshot();
-
-    terminal.feed_output(b"\x1b[1;1H");
-    match terminal.take_damage_snapshot() {
-        TerminalDamageSnapshot::Partial(spans) => {
-            assert!(spans.iter().any(|span| span.row == 1), "spans: {spans:?}");
-            assert!(spans.iter().all(|span| span.row < 4), "spans: {spans:?}");
-        }
-        TerminalDamageSnapshot::Full => {
-            panic!("visible damage while scrolled should stay partial")
-        }
-    }
-}
-
-#[test]
-fn terminal_damage_snapshot_while_scrolled_drops_damage_below_viewport() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    let _ = terminal.take_damage_snapshot();
-    terminal.feed_output(b"1\n2\n3\n4\n5\n6\n");
-    let _ = terminal.take_damage_snapshot();
-
-    assert!(terminal.scroll_display(3));
-    let _ = terminal.take_damage_snapshot();
-    let _ = terminal.take_damage_snapshot();
-
-    terminal.feed_output(b"x");
-    match terminal.take_damage_snapshot() {
-        TerminalDamageSnapshot::Partial(spans) => {
-            assert!(spans.iter().all(|span| span.row < 4), "spans: {spans:?}");
-        }
-        TerminalDamageSnapshot::Full => {
-            panic!("invisible damage while scrolled should stay partial")
-        }
-    }
-}
-
-#[test]
-fn rich_render_read_preserves_text_colors_attributes_and_metadata() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    terminal.feed_output(
-        "\x1b[38;2;1;2;3;48;5;4;4:3;58:2::7:8:9;1;2;3;7;8;9me\u{301}\x1b[0m 界".as_bytes(),
-    );
-
-    let read = terminal.render_read(true);
-    assert_eq!((read.metadata.cols, read.metadata.rows), (32, 4));
-    assert_eq!(read.metadata.generation, read.update.generation);
-    assert_eq!(read.metadata.palette_revision, read.update.palette_revision);
-    assert_eq!(read.metadata.palette_revision, read.palette.revision);
-    assert!(matches!(read.update.damage, TerminalDamageSnapshot::Full));
-    assert!(read.update.scrolls.is_empty());
-
-    let cell = &read.cells[0];
-    assert_eq!(cell.text, "e\u{301}");
-    assert_eq!(
-        cell.foreground,
-        crate::TerminalRenderColor::Rgb(crate::TerminalColor { r: 1, g: 2, b: 3 })
-    );
-    assert_eq!(cell.background, crate::TerminalRenderColor::Indexed(4));
-    assert_eq!(
-        cell.underline_color,
-        Some(crate::TerminalRenderColor::Rgb(crate::TerminalColor {
-            r: 7,
-            g: 8,
-            b: 9,
-        }))
-    );
-    assert_eq!(cell.underline_style, crate::TerminalUnderlineStyle::Curly);
-    assert!(cell.bold);
-    assert!(cell.dim);
-    assert!(cell.italic);
-    assert!(cell.inverse);
-    assert!(cell.hidden);
-    assert!(cell.strikethrough);
-    assert!(read.cells.iter().any(|cell| cell.wide_character_spacer));
-}
-
-#[test]
-fn viewport_visitors_allow_reentrant_terminal_reads() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    terminal.feed_output(b"abc");
-
-    let mut viewport_reentered = false;
-    terminal.visit_viewport_cells(|_, _, _, _| {
-        if !viewport_reentered {
-            viewport_reentered = true;
-            assert_eq!(terminal.line_bounds().1, 3);
-        }
-    });
-    assert!(viewport_reentered);
-
-    let update = terminal.take_render_damage_snapshot();
-    let spans = match &update.damage {
-        TerminalDamageSnapshot::Partial(spans) if !spans.is_empty() => spans.clone(),
-        TerminalDamageSnapshot::Full | TerminalDamageSnapshot::Partial(_) => {
-            vec![crate::TerminalDirtySpan {
-                row: 0,
-                left_col: 0,
-                right_col: 0,
-            }]
-        }
-    };
-    let mut range_reentered = false;
-    assert!(terminal.visit_viewport_ranges_at_generation(
-        update.generation,
-        &spans,
-        |_, _, _, _, _| {
-            if !range_reentered {
-                range_reentered = true;
-                let _ = terminal.palette();
-            }
-        },
-    ));
-    assert!(range_reentered);
-}
-
-#[test]
-fn locked_viewport_visitors_stream_cells_and_reject_stale_ranges() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    terminal.feed_output(b"abc");
-
-    let mut first_row = String::new();
-    let mut visited = 0;
-    let metadata = terminal.visit_viewport_cells_locked(|viewport_row, _, _, cell| {
-        visited += 1;
-        if viewport_row == 0 {
-            first_row.push_str(&cell.text);
-        }
-    });
-    assert!(first_row.starts_with("abc"));
-    assert_eq!(
-        visited,
-        usize::from(test_terminal_size().cols) * usize::from(test_terminal_size().rows)
-    );
-
-    let spans = [crate::TerminalDirtySpan {
-        row: 0,
-        left_col: 0,
-        right_col: 2,
-    }];
-    let mut selected = String::new();
-    assert!(terminal.visit_viewport_ranges_locked_at_generation(
-        metadata.generation,
-        &spans,
-        |_, _, _, _, cell| selected.push_str(&cell.text),
-    ));
-    assert_eq!(selected, "abc");
-
-    terminal.feed_output(b"d");
-    let mut stale_visited = false;
-    assert!(!terminal.visit_viewport_ranges_locked_at_generation(
-        metadata.generation,
-        &spans,
-        |_, _, _, _, _| stale_visited = true,
-    ));
-    assert!(!stale_visited);
-}
-
-#[test]
-fn rich_line_visitor_streams_cells_in_buffer_order() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    terminal.feed_output(b"abc\r\ndef");
-
-    let mut visited = Vec::new();
-    let bounds = terminal.visit_line_cells(0, 1, |range, line, col, cell| {
-        if col < 3 {
-            visited.push((range, line, col, cell.text.to_string()));
-        }
-    });
-
-    assert_eq!(bounds, (0, 3, 32));
-    assert_eq!(
-        visited,
-        vec![
-            ((0, 3, 32), 0, 0, "a".to_string()),
-            ((0, 3, 32), 0, 1, "b".to_string()),
-            ((0, 3, 32), 0, 2, "c".to_string()),
-            ((0, 3, 32), 1, 0, "d".to_string()),
-            ((0, 3, 32), 1, 1, "e".to_string()),
-            ((0, 3, 32), 1, 2, "f".to_string()),
-        ]
-    );
-}
-
-#[test]
-fn rich_render_cell_keeps_common_text_inline() {
-    let terminal = Terminal::new_display(test_terminal_size(), None);
-    terminal.feed_output(b"plain");
-
-    let read = terminal.render_read(true);
-    assert!(read.cells.iter().all(|cell| !cell.text.is_heap_allocated()));
-
-    terminal.feed_output("\rcombined e\u{301}".as_bytes());
-    let read = terminal.render_read(true);
-    assert!(
-        read.cells
-            .iter()
-            .filter(|cell| !cell.text.is_empty())
-            .all(|cell| !cell.text.is_heap_allocated())
-    );
-}
-
-#[test]
-fn rich_render_read_reports_wrap_generation_palette_and_partial_cells() {
-    let terminal = Terminal::new_display(
-        TerminalSize {
-            cols: 4,
-            rows: 2,
-            ..test_terminal_size()
-        },
-        None,
-    );
-    let initial = terminal.render_read(true);
-    let _ = terminal.take_render_damage_snapshot();
-    terminal.feed_output(b"abcde");
-
-    let update = terminal.take_render_damage_snapshot();
-    assert!(update.generation > initial.metadata.generation);
-    assert!(matches!(
-        update.damage,
-        TerminalDamageSnapshot::Partial(ref spans) if !spans.is_empty()
-    ));
-    let spans = match &update.damage {
-        TerminalDamageSnapshot::Partial(spans) => spans,
-        TerminalDamageSnapshot::Full => unreachable!(),
-    };
-    let mut visited = Vec::new();
-    assert!(terminal.visit_viewport_ranges_at_generation(
-        update.generation,
-        spans,
-        |row, display_offset, line, col, cell| {
-            visited.push((row, display_offset, line, col, cell.text.clone()));
-        },
-    ));
-    assert!(!visited.is_empty());
-
-    terminal.feed_output(b"\x1b]4;1;#123456\x07");
-    let read = terminal.render_read(true);
-    assert!(read.cells[3].line_wrapped);
-    assert_eq!(
-        read.palette.indexed[1],
-        Some(crate::TerminalColor {
-            r: 0x12,
-            g: 0x34,
-            b: 0x56,
-        })
-    );
-    assert!(read.metadata.palette_revision > initial.metadata.palette_revision);
 }
 
 #[test]
@@ -1305,85 +1147,49 @@ fn applying_runtime_options_preserves_scrollback_when_cursor_style_changes() {
     );
 }
 
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_forces_lc_ctype_when_no_utf8_and_no_lc_all() {
-    assert_eq!(
-        super::utf8_locale_override_plan(None, Some("C"), Some("")),
-        super::Utf8LocaleOverridePlan::LcCtypeOnly
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_forces_lc_all_when_lc_all_is_non_utf8() {
-    assert_eq!(
-        super::utf8_locale_override_plan(Some("C"), Some("C"), Some("")),
-        super::Utf8LocaleOverridePlan::LcAllAndLcCtype
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_skips_when_utf8_present() {
-    assert_eq!(
-        super::utf8_locale_override_plan(Some("en_US.UTF-8"), Some("C"), Some("")),
-        super::Utf8LocaleOverridePlan::None
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_prefers_lc_all_over_lang() {
-    assert_eq!(
-        super::utf8_locale_override_plan(Some("fr_FR.ISO8859-1"), Some("C"), Some("en_US.UTF-8")),
-        super::Utf8LocaleOverridePlan::LcAllAndLcCtype
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_does_not_skip_for_utf8_substring_false_positive() {
-    assert_eq!(
-        super::utf8_locale_override_plan(Some("en_US.fakeutf8"), Some("C"), Some("")),
-        super::Utf8LocaleOverridePlan::LcAllAndLcCtype
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn locale_override_plan_skips_for_utf8_with_modifier() {
-    assert_eq!(
-        super::utf8_locale_override_plan(Some("en_US.UTF-8@variant"), Some("C"), Some("")),
-        super::Utf8LocaleOverridePlan::None
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn preferred_utf8_locale_preserves_lang_region_from_lc_all() {
-    assert_eq!(
-        super::preferred_utf8_locale(Some("fr_FR.ISO8859-1"), Some("C"), Some("en_US.ISO8859-1")),
-        "fr_FR.UTF-8"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn preferred_utf8_locale_preserves_locale_modifier() {
-    assert_eq!(
-        super::preferred_utf8_locale(None, Some("sr_RS@latin"), Some("")),
-        "sr_RS.UTF-8@latin"
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn preferred_utf8_locale_falls_back_for_c_or_posix() {
-    assert_eq!(
-        super::preferred_utf8_locale(Some("C"), Some("POSIX"), Some("")),
-        crate::locale::DEFAULT_UTF8_LOCALE
-    );
-}
-
 mod input_and_launch;
+#[cfg(unix)]
+mod locale;
+mod render;
+
+#[test]
+fn program_status_reports_are_coalesced_and_clear_through_public_events() {
+    let terminal = Terminal::new_display(test_terminal_size(), None);
+    terminal.feed_output(
+        b"\x1b]7501;?\x07\x1b]7501;state=working:app=cargo\x07\x1b]7501;state=done:msg=SGk=\x07",
+    );
+    let mut host = RecordingReplyHost::default();
+    let (events, _) = terminal.drain_events(&mut host);
+    assert_eq!(host.protocol_replies, b"\x1b]7501;?\x1b\\");
+    let snapshots: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            TerminalEvent::ProgramStatus(records) => Some(records),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0][0].state, crate::ProgramState::Done);
+    assert_eq!(snapshots[0][0].app, None);
+    terminal.feed_output(b"\x1b]133;A\x07");
+    let (events, _) = terminal.drain_events(&mut host);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::ProgramStatus(_)))
+    );
+    terminal.feed_output(b"\x1bc");
+    let (events, _) = terminal.drain_events(&mut host);
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, TerminalEvent::ProgramStatus(records) if records.is_empty()))
+    );
+}
+
+#[test]
+fn mouse_mode_maps_x10_to_presses_only() {
+    let mode = mouse_mode_after_bytes(b"\x1b[?9h");
+    assert!(mode.presses_only());
+    assert!(!mouse_mode_after_bytes(b"\x1b[?1000h").presses_only());
+}

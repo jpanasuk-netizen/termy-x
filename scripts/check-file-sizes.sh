@@ -9,7 +9,6 @@ MAX_LINES=1500
 # docs/engineering/terminal-view-decomposition.md — do not add entries casually.
 ALLOWLIST=(
   crates/core/src/keyboard.rs
-  crates/core/src/kitty_graphics.rs
   crates/core/src/runtime.rs
   crates/desktop_app/src/settings_view/sections.rs
   crates/desktop_app/src/terminal_view/command_palette/mod.rs

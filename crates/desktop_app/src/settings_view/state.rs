@@ -10,7 +10,7 @@ pub(super) enum EditableField {
     ThemeMode,
     ThemeLight,
     ThemeDark,
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AppIcon,
     BackgroundOpacity,
     FontFamily,
@@ -24,6 +24,7 @@ pub(super) enum EditableField {
     Shell,
     Term,
     Colorterm,
+    TermProgram,
     TmuxBinary,
     TmuxCommandPrefix,
     ScrollbackHistory,
@@ -34,6 +35,7 @@ pub(super) enum EditableField {
     ScrollbarStyle,
     PaneFocusEffect,
     PaneFocusStrength,
+    ClipboardRead,
     TabFallbackTitle,
     TabTitlePriority,
     TabTitleMode,
@@ -43,6 +45,8 @@ pub(super) enum EditableField {
     TabCloseVisibility,
     TabWidthMode,
     TabBarPosition,
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+    TabStyle,
     SidebarWidth,
     WorkingDirectory,
     WorkingDirFallback,
@@ -212,8 +216,7 @@ impl SettingsWindow {
             SettingsSection::Terminal => Some(CoreSettingsSection::Terminal),
             SettingsSection::Tabs => Some(CoreSettingsSection::Tabs),
             SettingsSection::Advanced => Some(CoreSettingsSection::Advanced),
-            SettingsSection::ThemeStore
-            | SettingsSection::Plugins
+            SettingsSection::Plugins
             | SettingsSection::Ssh
             | SettingsSection::Colors
             | SettingsSection::Keybindings => None,
@@ -273,7 +276,7 @@ impl SettingsWindow {
             SettingsSection::Colors => color_setting_specs()
                 .iter()
                 .any(|spec| self.custom_color_for_id(spec.id).is_some()),
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => false,
+            SettingsSection::Plugins | SettingsSection::Ssh => false,
             SettingsSection::Keybindings => !self.config.keybind_lines.is_empty(),
             _ => Self::section_root_settings(section)
                 .any(|setting| !self.is_root_setting_at_default(setting)),
@@ -327,7 +330,7 @@ impl SettingsWindow {
             SettingsSection::Advanced => "General",
             SettingsSection::Colors => "Colors",
             SettingsSection::Keybindings => "Keyboard shortcuts",
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => return,
+            SettingsSection::Plugins | SettingsSection::Ssh => return,
         };
         let title = "Reset Section";
         let message = format!(
@@ -391,7 +394,7 @@ impl SettingsWindow {
             SettingsSection::Colors => color_setting_specs()
                 .iter()
                 .try_for_each(|spec| config::set_color_setting(spec.id, None)),
-            SettingsSection::ThemeStore | SettingsSection::Plugins | SettingsSection::Ssh => Ok(()),
+            SettingsSection::Plugins | SettingsSection::Ssh => Ok(()),
             SettingsSection::Keybindings => Ok(()),
         };
 
@@ -424,6 +427,7 @@ impl SettingsWindow {
             | EditableField::Shell
             | EditableField::Term
             | EditableField::Colorterm
+            | EditableField::TermProgram
             | EditableField::TmuxBinary
             | EditableField::TmuxCommandPrefix
             | EditableField::ScrollbackHistory
@@ -433,7 +437,8 @@ impl SettingsWindow {
             | EditableField::ScrollbarVisibility
             | EditableField::ScrollbarStyle
             | EditableField::PaneFocusEffect
-            | EditableField::PaneFocusStrength => Self::terminal_field_spec(field),
+            | EditableField::PaneFocusStrength
+            | EditableField::ClipboardRead => Self::terminal_field_spec(field),
             EditableField::TabFallbackTitle
             | EditableField::TabTitlePriority
             | EditableField::TabTitleMode
@@ -443,6 +448,7 @@ impl SettingsWindow {
             | EditableField::TabCloseVisibility
             | EditableField::TabWidthMode
             | EditableField::TabBarPosition
+            | EditableField::TabStyle
             | EditableField::SidebarWidth => Self::tabs_field_spec(field),
             EditableField::WorkingDirectory
             | EditableField::WorkingDirFallback
@@ -551,6 +557,7 @@ impl SettingsWindow {
             EditableField::Shell => Self::text_field_spec(Some(RootSettingId::Shell)),
             EditableField::Term => Self::text_field_spec(Some(RootSettingId::Term)),
             EditableField::Colorterm => Self::text_field_spec(Some(RootSettingId::Colorterm)),
+            EditableField::TermProgram => Self::enum_field_spec(RootSettingId::TermProgram),
             EditableField::TmuxBinary => Self::text_field_spec(Some(RootSettingId::TmuxBinary)),
             EditableField::TmuxCommandPrefix => {
                 Self::text_field_spec(Some(RootSettingId::TmuxCommandPrefix))
@@ -585,6 +592,7 @@ impl SettingsWindow {
             }
             EditableField::ScrollbarStyle => Self::enum_field_spec(RootSettingId::ScrollbarStyle),
             EditableField::PaneFocusEffect => Self::enum_field_spec(RootSettingId::PaneFocusEffect),
+            EditableField::ClipboardRead => Self::enum_field_spec(RootSettingId::ClipboardRead),
             EditableField::PaneFocusStrength => Self::numeric_field_spec(
                 RootSettingId::PaneFocusStrength,
                 NumericStepSpec {
@@ -620,6 +628,7 @@ impl SettingsWindow {
             }
             EditableField::TabWidthMode => Self::enum_field_spec(RootSettingId::TabWidthMode),
             EditableField::TabBarPosition => Self::enum_field_spec(RootSettingId::TabBarPosition),
+            EditableField::TabStyle => Self::enum_field_spec(RootSettingId::TabStyle),
             EditableField::SidebarWidth => Self::numeric_field_spec(
                 RootSettingId::SidebarWidth,
                 NumericStepSpec {
@@ -903,6 +912,7 @@ impl SettingsWindow {
             EditableField::PaddingX => format!("{}", self.config.padding_x.round() as i32),
             EditableField::PaddingY => format!("{}", self.config.padding_y.round() as i32),
             EditableField::WindowsShell => match self.config.windows_shell {
+                termy_core::config_core::WindowsShell::Auto => "auto",
                 termy_core::config_core::WindowsShell::Cmd => "cmd",
                 termy_core::config_core::WindowsShell::PowerShell => "powershell",
                 termy_core::config_core::WindowsShell::PowerShellCore => "pwsh",
@@ -912,6 +922,7 @@ impl SettingsWindow {
             EditableField::Shell => self.config.shell.clone().unwrap_or_default(),
             EditableField::Term => self.config.term.clone(),
             EditableField::Colorterm => self.config.colorterm.clone().unwrap_or_default(),
+            EditableField::TermProgram => self.config.term_program.as_str().to_string(),
             EditableField::TmuxBinary => self.config.tmux_binary.clone(),
             EditableField::TmuxCommandPrefix => {
                 self.config.tmux_command_prefix.clone().unwrap_or_default()
@@ -942,6 +953,7 @@ impl SettingsWindow {
                 termy_core::config_core::TerminalScrollbarStyle::Theme => "theme",
             }
             .to_string(),
+            EditableField::ClipboardRead => self.config.clipboard_read.as_str().to_string(),
             EditableField::PaneFocusEffect => match self.config.pane_focus_effect {
                 termy_core::config_core::PaneFocusEffect::Off => "off",
                 termy_core::config_core::PaneFocusEffect::SoftSpotlight => "soft_spotlight",
@@ -992,6 +1004,11 @@ impl SettingsWindow {
             EditableField::TabBarPosition => match self.config.tab_bar_position {
                 termy_core::config_core::TabBarPosition::Top => "top",
                 termy_core::config_core::TabBarPosition::Right => "right",
+            }
+            .to_string(),
+            EditableField::TabStyle => match self.config.tab_style {
+                termy_core::config_core::TabStyle::Native => "native",
+                termy_core::config_core::TabStyle::Custom => "custom",
             }
             .to_string(),
             EditableField::SidebarWidth => {
@@ -1175,27 +1192,26 @@ impl SettingsWindow {
         cx.notify();
     }
 
+    /// Every theme the app can apply, then shell-decide and whatever the
+    /// config names that is not one of them.
+    /// The configured themes first, then Termy's themes and the shell-decided
+    /// theme, then the rest. The dropdown shows only the first few without a
+    /// query, so these must not sink below the ~800 built-in themes.
     pub(super) fn ordered_theme_ids_for_settings(&self) -> Vec<String> {
-        let mut theme_ids: Vec<String> = self
-            .theme_store_installed_versions
-            .keys()
-            .cloned()
-            .collect();
-        theme_ids.push("shell-decide".to_string());
-
-        for current in [
-            &self.config.theme,
-            &self.config.theme_light,
-            &self.config.theme_dark,
-        ] {
-            if !theme_ids.iter().any(|theme| theme == current) {
-                theme_ids.push(current.clone());
-            }
-        }
-
-        theme_ids.sort_unstable();
-        theme_ids.dedup();
-        theme_ids
+        let mut seen = std::collections::HashSet::new();
+        let leading = [
+            self.config.theme.as_str(),
+            self.config.theme_light.as_str(),
+            self.config.theme_dark.as_str(),
+        ]
+        .into_iter()
+        .chain(termy_core::themes::TERMY_THEME_IDS)
+        .chain([config::SHELL_DECIDE_THEME_ID])
+        .map(str::to_string);
+        leading
+            .chain(crate::theme_library::available_theme_ids())
+            .filter(|theme| !theme.is_empty() && seen.insert(theme.clone()))
+            .collect()
     }
 
     pub(super) fn ordered_font_families_for_settings(&self) -> Vec<String> {
@@ -1282,6 +1298,7 @@ mod tests {
             EditableField::Shell,
             EditableField::Term,
             EditableField::Colorterm,
+            EditableField::TermProgram,
             EditableField::TmuxBinary,
             EditableField::TmuxCommandPrefix,
             EditableField::ScrollbackHistory,
@@ -1292,6 +1309,7 @@ mod tests {
             EditableField::ScrollbarStyle,
             EditableField::PaneFocusEffect,
             EditableField::PaneFocusStrength,
+            EditableField::ClipboardRead,
             EditableField::TabFallbackTitle,
             EditableField::TabTitlePriority,
             EditableField::TabTitleMode,
@@ -1301,6 +1319,7 @@ mod tests {
             EditableField::TabCloseVisibility,
             EditableField::TabWidthMode,
             EditableField::TabBarPosition,
+            EditableField::TabStyle,
             EditableField::SidebarWidth,
             EditableField::WorkingDirectory,
             EditableField::WorkingDirFallback,
@@ -1328,11 +1347,14 @@ mod tests {
             EditableField::ScrollbarVisibility,
             EditableField::ScrollbarStyle,
             EditableField::PaneFocusEffect,
+            EditableField::ClipboardRead,
+            EditableField::TermProgram,
             EditableField::AppIcon,
             EditableField::TabTitleMode,
             EditableField::TabCloseVisibility,
             EditableField::TabWidthMode,
             EditableField::TabBarPosition,
+            EditableField::TabStyle,
             EditableField::WorkingDirFallback,
         ];
 

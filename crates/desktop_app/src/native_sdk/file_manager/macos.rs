@@ -16,25 +16,47 @@ pub(super) fn register(
         .join(format!("{OPEN_TAB_HERE_LABEL}.workflow"))
         .join("Contents");
     // Overwrite the old absolute-path workflow on the first launch after updating.
-    install_user_service(&service_dir)?;
-    let status = std::process::Command::new("/System/Library/CoreServices/pbs")
-        .arg("-update")
-        .status()
-        .map_err(|error| format!("failed to refresh Finder services: {error}"))?;
-    if !status.success() {
-        return Err(format!("failed to refresh Finder services: {status}"));
+    if !install_user_service(&service_dir)? {
+        return Ok(());
     }
+    // This runs during startup on the main thread; refreshing the Services
+    // registry can take a while, so do it in the background.
+    std::thread::Builder::new()
+        .name("termy-finder-services".to_string())
+        .spawn(|| {
+            match std::process::Command::new("/System/Library/CoreServices/pbs")
+                .arg("-update")
+                .status()
+            {
+                Ok(status) if status.success() => {}
+                Ok(status) => log::warn!("failed to refresh Finder services: {status}"),
+                Err(error) => log::warn!("failed to refresh Finder services: {error}"),
+            }
+        })
+        .map_err(|error| format!("failed to refresh Finder services: {error}"))?;
     Ok(())
 }
 
-fn install_user_service(service_dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(service_dir)
-        .map_err(|error| format!("failed to create Finder service: {error}"))?;
-    std::fs::write(service_dir.join("Info.plist"), SERVICE_INFO)
-        .map_err(|error| format!("failed to write Finder service Info.plist: {error}"))?;
-    std::fs::write(service_dir.join("document.wflow"), SERVICE_WORKFLOW)
-        .map_err(|error| format!("failed to write Finder service workflow: {error}"))?;
-    Ok(())
+/// Writes the service files that differ from the shipped ones. Returns whether
+/// anything changed, so unchanged launches skip the Services refresh.
+fn install_user_service(service_dir: &Path) -> Result<bool, String> {
+    let files = [
+        ("Info.plist", SERVICE_INFO),
+        ("document.wflow", SERVICE_WORKFLOW),
+    ];
+    let mut changed = false;
+    for (name, contents) in files {
+        let path = service_dir.join(name);
+        if std::fs::read(&path).is_ok_and(|existing| existing == contents.as_bytes()) {
+            continue;
+        }
+        std::fs::create_dir_all(service_dir)
+            .map_err(|error| format!("failed to create Finder service: {error}"))?;
+        std::fs::write(&path, contents)
+            .map_err(|error| format!("failed to write Finder service {name}: {error}"))?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -50,7 +72,11 @@ mod tests {
         std::fs::create_dir_all(&service_dir).unwrap();
         let workflow = service_dir.join("document.wflow");
         std::fs::write(&workflow, "/old/build/Termy.app/Contents/MacOS/Termy").unwrap();
-        install_user_service(&service_dir).unwrap();
+        assert!(install_user_service(&service_dir).unwrap());
+        assert!(
+            !install_user_service(&service_dir).unwrap(),
+            "an up-to-date service must not be rewritten"
+        );
 
         let extracted = Command::new("/usr/bin/plutil")
             .args([

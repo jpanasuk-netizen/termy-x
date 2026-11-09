@@ -1,9 +1,10 @@
+use super::search::SearchEditCommand;
 use super::*;
 use crate::text_editing;
 use gpui_kit::{
-    Bounds, ContentMask, ElementInputHandler, Entity, EntityInputHandler, Font, Hsla, IntoElement,
-    PaintQuad, Pixels, ShapedLine, TextRun, UTF16Selection, UnderlineStyle, Window, canvas, fill,
-    point, px, size,
+    App, Bounds, ClipboardItem, ContentMask, ElementInputHandler, Entity, EntityInputHandler, Font,
+    Hsla, InputHandler, IntoElement, PaintQuad, Pixels, Point, ShapedLine, TextInputConfiguration,
+    TextRun, UTF16Selection, UnderlineStyle, Window, canvas, fill, point, px, size,
 };
 use std::ops::Range;
 
@@ -23,8 +24,7 @@ fn terminal_ime_selected_text_range(ime_selected_range: Option<Range<usize>>) ->
 fn ime_candidate_bounds(
     cursor: Bounds<Pixels>,
     element_bounds: Bounds<Pixels>,
-    range_start_utf16: usize,
-    cell_width: f32,
+    range_start_x: Pixels,
 ) -> Bounds<Pixels> {
     let mut bounds = Bounds::new(
         point(
@@ -33,8 +33,27 @@ fn ime_candidate_bounds(
         ),
         cursor.size,
     );
-    bounds.origin.x += px(range_start_utf16 as f32 * cell_width);
+    bounds.origin.x += range_start_x;
     bounds
+}
+
+/// Byte offset of the first `utf16_len` UTF-16 units of `text`.
+fn utf16_prefix_byte_len(text: &str, utf16_len: usize) -> usize {
+    let mut units = 0;
+    text.char_indices()
+        .find_map(|(byte, character)| {
+            units += character.len_utf16();
+            (units > utf16_len).then_some(byte)
+        })
+        .unwrap_or(text.len())
+}
+
+/// The viewport row showing the cursor at screen row `cursor_row`, kept in
+/// the viewport while it is scrolled `display_offset` rows into history.
+fn ime_cursor_viewport_row(cursor_row: usize, display_offset: usize, rows: usize) -> usize {
+    cursor_row
+        .saturating_add(display_offset)
+        .min(rows.saturating_sub(1))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,6 +255,77 @@ impl InlineInputState {
 
     pub(super) fn move_to_start(&mut self) {
         self.set_cursor_utf8(0);
+    }
+
+    fn hard_line_bounds(&self, cursor: usize) -> (usize, usize) {
+        let cursor = cursor.min(self.text.len());
+        let start = self.text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+        let end = self.text[cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |index| cursor + index);
+        (start, end)
+    }
+
+    fn vertical_offset(&self, direction: isize) -> Option<usize> {
+        let cursor = self.cursor_offset();
+        let (line_start, line_end) = self.hard_line_bounds(cursor);
+        let column = termy_x::draft_edit::grapheme_col(&self.text, line_start, line_end, cursor);
+        if direction < 0 {
+            let previous_end = line_start.checked_sub(1)?;
+            let (previous_start, _) = self.hard_line_bounds(previous_end);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text,
+                previous_start,
+                previous_end,
+                column,
+            ))
+        } else if line_end >= self.text.len() {
+            None
+        } else {
+            let next_start = line_end + 1;
+            let (_, next_end) = self.hard_line_bounds(next_start);
+            Some(termy_x::draft_edit::offset_at_col(
+                &self.text, next_start, next_end, column,
+            ))
+        }
+    }
+
+    pub(super) fn move_up(&mut self) {
+        if !self.selected_range.is_empty() {
+            self.set_cursor_utf8(self.selected_range.start);
+        } else if let Some(offset) = self.vertical_offset(-1) {
+            self.set_cursor_utf8(offset);
+        }
+    }
+
+    pub(super) fn move_down(&mut self) {
+        if !self.selected_range.is_empty() {
+            self.set_cursor_utf8(self.selected_range.end);
+        } else if let Some(offset) = self.vertical_offset(1) {
+            self.set_cursor_utf8(offset);
+        }
+    }
+
+    pub(super) fn select_up(&mut self) {
+        if let Some(offset) = self.vertical_offset(-1) {
+            self.select_to_utf8(offset);
+        }
+    }
+
+    pub(super) fn select_down(&mut self) {
+        if let Some(offset) = self.vertical_offset(1) {
+            self.select_to_utf8(offset);
+        }
+    }
+
+    pub(super) fn move_to_line_start(&mut self) {
+        let (start, _) = self.hard_line_bounds(self.cursor_offset());
+        self.set_cursor_utf8(start);
+    }
+
+    pub(super) fn move_to_line_end(&mut self) {
+        let (_, end) = self.hard_line_bounds(self.cursor_offset());
+        self.set_cursor_utf8(end);
     }
 
     pub(super) fn delete_backward(&mut self) {
@@ -487,10 +577,7 @@ pub(super) struct InlineInputElement {
     alignment: InlineInputAlignment,
 }
 
-// Retained for upcoming inline input layout variants and to keep call sites stable
-// while alignment options are wired through additional UI surfaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) enum InlineInputAlignment {
     Left,
     Center,
@@ -1003,7 +1090,14 @@ impl TerminalView {
     }
 
     pub(super) fn notify_search_inline_input(&mut self, cx: &mut Context<Self>) {
+        self.sync_native_search_bar();
         self.notify_for_inline_input_target(InlineInputTarget::Search, cx);
+    }
+
+    /// Whether search owns text input now (nothing drawn over it does).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(super) fn search_owns_inline_input(&self) -> bool {
+        self.active_inline_input_target() == Some(InlineInputTarget::Search)
     }
 
     fn active_inline_input_target(&self) -> Option<InlineInputTarget> {
@@ -1265,6 +1359,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteBackward) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_backward, cx);
     }
 
@@ -1274,6 +1371,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteForward) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_forward, cx);
     }
 
@@ -1283,6 +1383,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveLeft) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::move_left, cx);
     }
 
@@ -1292,6 +1395,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveRight) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::move_right, cx);
     }
 
@@ -1301,6 +1407,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectLeft) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::select_left, cx);
     }
 
@@ -1310,6 +1419,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectRight) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::select_right, cx);
     }
 
@@ -1319,6 +1431,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::SelectAll) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::select_all, cx);
     }
 
@@ -1328,7 +1443,10 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_to_start, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveToStart) {
+            return;
+        }
+        self.apply_inline_input_mutation(InlineInputState::move_to_line_start, cx);
     }
 
     pub(super) fn handle_inline_move_to_end_action(
@@ -1337,7 +1455,46 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.apply_inline_input_mutation(InlineInputState::move_to_end, cx);
+        if self.forward_edit_to_native_search(SearchEditCommand::MoveToEnd) {
+            return;
+        }
+        self.apply_inline_input_mutation(InlineInputState::move_to_line_end, cx);
+    }
+
+    pub(super) fn handle_inline_move_up_action(
+        &mut self,
+        _: &crate::commands::InlineMoveUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::move_up, cx);
+    }
+
+    pub(super) fn handle_inline_move_down_action(
+        &mut self,
+        _: &crate::commands::InlineMoveDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::move_down, cx);
+    }
+
+    pub(super) fn handle_inline_select_up_action(
+        &mut self,
+        _: &crate::commands::InlineSelectUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::select_up, cx);
+    }
+
+    pub(super) fn handle_inline_select_down_action(
+        &mut self,
+        _: &crate::commands::InlineSelectDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_inline_input_mutation(InlineInputState::select_down, cx);
     }
 
     pub(super) fn handle_inline_delete_word_backward_action(
@@ -1346,6 +1503,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteWordBackward) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_word_backward, cx);
     }
 
@@ -1355,6 +1515,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteWordForward) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_word_forward, cx);
     }
 
@@ -1364,6 +1527,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteToStart) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_to_start, cx);
     }
 
@@ -1373,6 +1539,9 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.forward_edit_to_native_search(SearchEditCommand::DeleteToEnd) {
+            return;
+        }
         self.apply_inline_input_mutation(InlineInputState::delete_to_end, cx);
     }
 }
@@ -1388,12 +1557,153 @@ impl TerminalView {
         // Use cursor_position() instead of cursor_state() so that IME
         // preedit is shown even when the TUI app hides the cursor.
         let (cursor_col, cursor_row) = terminal.cursor_position();
+        let cursor_row = ime_cursor_viewport_row(
+            cursor_row,
+            terminal.scroll_state().0,
+            usize::from(size.rows),
+        );
         let x = geometry.origin_x + (cursor_col as f32) * cell_width;
         let y = geometry.origin_y + (cursor_row as f32) * cell_height;
         Some(Bounds::new(
             point(px(x), px(y)),
             gpui_kit::size(px(cell_width), px(cell_height)),
         ))
+    }
+}
+
+/// Terminal input handler that opts out of macOS press-and-hold, so held keys
+/// repeat (e.g. `hjkl` in vim) instead of opening the accent picker.
+pub(super) struct TerminalInputHandler(ElementInputHandler<TerminalView>);
+
+impl TerminalInputHandler {
+    pub(super) fn new(element_bounds: Bounds<Pixels>, view: Entity<TerminalView>) -> Self {
+        Self(ElementInputHandler::new(element_bounds, view))
+    }
+}
+
+impl InputHandler for TerminalInputHandler {
+    fn selected_text_range(
+        &mut self,
+        ignore_disabled_input: bool,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.0
+            .selected_text_range(ignore_disabled_input, window, cx)
+    }
+
+    fn marked_text_range(&mut self, window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.0.marked_text_range(window, cx)
+    }
+
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.0
+            .text_for_range(range_utf16, adjusted_range, window, cx)
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        replacement_range: Option<Range<usize>>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0
+            .replace_text_in_range(replacement_range, text, window, cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.replace_and_mark_text_in_range(
+            range_utf16,
+            new_text,
+            new_selected_range,
+            window,
+            cx,
+        );
+    }
+
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut App) {
+        self.0.unmark_text(window, cx);
+    }
+
+    fn paste(&mut self, item: ClipboardItem, window: &mut Window, cx: &mut App) {
+        self.0.paste(item, window, cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.0.bounds_for_range(range_utf16, window, cx)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        point: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.0.character_index_for_point(point, window, cx)
+    }
+
+    fn set_selected_text_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.0.set_selected_text_range(range_utf16, window, cx);
+    }
+
+    fn element_bounds(&mut self, window: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        self.0.element_bounds(window, cx)
+    }
+
+    fn text_length_utf16(&mut self, window: &mut Window, cx: &mut App) -> Option<usize> {
+        self.0.text_length_utf16(window, cx)
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+
+    fn accepts_text_input(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.0.accepts_text_input(window, cx)
+    }
+
+    fn text_input_editable_range(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<Range<usize>> {
+        self.0.text_input_editable_range(window, cx)
+    }
+
+    fn prefers_ime_for_printable_keys(&mut self, window: &mut Window, cx: &mut App) -> bool {
+        self.0.prefers_ime_for_printable_keys(window, cx)
+    }
+
+    fn text_input_configuration(
+        &mut self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> TextInputConfiguration {
+        self.0.text_input_configuration(window, cx)
     }
 }
 
@@ -1504,7 +1814,7 @@ impl EntityInputHandler for TerminalView {
         &mut self,
         range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         if let Some(state) = self.active_inline_input_state() {
@@ -1514,17 +1824,27 @@ impl EntityInputHandler for TerminalView {
         // content area.  Offset by element_bounds.origin to convert to
         // window coordinates so macOS positions the candidate window correctly.
         let cursor = self.ime_cursor_bounds()?;
-        let cell_width: f32 = self
-            .active_pane_ref()
-            .map(TerminalPane::terminal)
-            .map(|terminal| terminal.size().cell_width)
-            .unwrap_or_default();
-        Some(ime_candidate_bounds(
-            cursor,
-            element_bounds,
-            range_utf16.start,
-            cell_width,
-        ))
+        // The range counts UTF-16 units of the preedit, which the overlay draws
+        // as plain text from the cursor: measure that text, since a CJK glyph
+        // spans two cells and an astral character two UTF-16 units.
+        let range_start_x = self.ime_marked_text.as_deref().map_or(px(0.0), |marked| {
+            let run = TextRun {
+                len: marked.len(),
+                font: Font {
+                    family: self.font_family.clone(),
+                    ..gpui_kit::font("")
+                },
+                color: Hsla::default(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            window
+                .text_system()
+                .shape_line(marked.to_string().into(), self.font_size, &[run], None)
+                .x_for_index(utf16_prefix_byte_len(marked, range_utf16.start))
+        });
+        Some(ime_candidate_bounds(cursor, element_bounds, range_start_x))
     }
 
     fn character_index_for_point(
@@ -1695,9 +2015,26 @@ mod tests {
         let cursor = Bounds::new(point(px(10.0), px(20.0)), size(px(8.0), px(16.0)));
         let element_bounds = Bounds::new(point(px(100.0), px(200.0)), size(px(320.0), px(240.0)));
 
-        let bounds = ime_candidate_bounds(cursor, element_bounds, 2, 8.0);
+        let bounds = ime_candidate_bounds(cursor, element_bounds, px(16.0));
 
         assert_eq!(bounds.origin, point(px(126.0), px(220.0)));
         assert_eq!(bounds.size, cursor.size);
+    }
+
+    #[test]
+    fn ime_range_offsets_map_utf16_units_to_preedit_bytes() {
+        assert_eq!(utf16_prefix_byte_len("ab", 1), 1);
+        // Each CJK character is one UTF-16 unit but three bytes.
+        assert_eq!(utf16_prefix_byte_len("你好", 1), 3);
+        // An astral character is two UTF-16 units and four bytes.
+        assert_eq!(utf16_prefix_byte_len("\u{20000}x", 2), 4);
+        assert_eq!(utf16_prefix_byte_len("你好", 9), "你好".len());
+    }
+
+    #[test]
+    fn ime_cursor_row_follows_the_cursor_while_scrolled_into_history() {
+        assert_eq!(ime_cursor_viewport_row(3, 0, 24), 3);
+        assert_eq!(ime_cursor_viewport_row(3, 5, 24), 8);
+        assert_eq!(ime_cursor_viewport_row(20, 10, 24), 23);
     }
 }

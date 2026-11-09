@@ -1,0 +1,175 @@
+---
+title: Swift Metal renderer
+description: How the Swift SDK's TerminalView turns libtermy frames into GPU draw calls, from damage tracking and the glyph atlas to frame pacing and fallbacks.
+---
+
+`TerminalView` in the [Swift SDK](/docs/developer/libtermy/swift) renders with
+Metal. This page explains how a frame gets from libtermy to the screen, what is
+cached, and what each piece costs. The sources are in
+[`sdk/swift/Sources/TermyAppKit/Metal`](https://github.com/lassejlv/termy/tree/main/sdk/swift/Sources/TermyAppKit/Metal).
+
+## From output to pixels
+
+```text
+PTY output
+  → libtermy parses it and records damage
+  → TerminalSession.poll() takes a frame update (full, or dirty spans)
+  → FrameStore applies it and reports a FrameChange
+  → TerminalView invalidates the changed rows and schedules one Metal frame
+  → MetalTerminalRenderer rebuilds those rows' quads, adds overlays, draws
+  → CAMetalLayer presents the drawable
+```
+
+1. **Damage.** libtermy reports which cells changed. `TerminalSession` applies
+   the update to its retained `FrameStore`, which returns a `FrameChange`:
+   full or partial damage, a resize, a cursor move, or a scroll.
+2. **Invalidation.** `TerminalView` rebuilds libtermy's special-glyph plan for
+   the damaged rows and tells the renderer which rows changed. A full update,
+   resize, config change or display-scale change invalidates every row.
+3. **Scheduling.** AppKit does not run its display cycle for a
+   `CAMetalLayer`-backed view, so `TerminalView` schedules frames itself.
+   Marking the view for display queues one render on the main run loop in
+   common modes, so it also runs during live resize and mouse tracking. Many
+   invalidations in one run-loop turn produce one frame.
+4. **Drawing.** The renderer rebuilds quads only for invalidated rows, adds
+   per-frame overlays, uploads one instance buffer and issues a handful of draw
+   calls.
+
+## One shader, instanced quads
+
+Everything on screen is a quad. Each one is a 64-byte instance:
+
+| Field | Meaning |
+| --- | --- |
+| `rect` | Position and size in device pixels, top-left origin |
+| `uv` | Source rectangle in texels, for textured quads |
+| `color` | sRGB color with straight alpha |
+| `mode` | How the fragment shader colors the quad |
+
+The vertex shader expands each instance into a four-vertex triangle strip. The
+fragment shader has four modes:
+
+| Mode | Used for | Output |
+| --- | --- | --- |
+| `solid` | Cell backgrounds, selection, cursor, underlines, block-element geometry | `color` |
+| `mask` | Text, stroked box-drawing geometry, IME text | `color` × texture coverage |
+| `colorGlyph` | Emoji and other color-font glyphs | Texture colors, unfiltered |
+| `image` | Kitty graphics | Texture colors, linearly filtered |
+
+All quads use premultiplied source-over blending into a `bgra8Unorm` drawable
+in sRGB, which matches how the CoreGraphics fallback composites. Consecutive
+quads that sample the same texture share a draw call. Without images or IME
+text, a whole frame is a single draw call; each visible image adds one, plus
+one for the atlas layers drawn after it.
+
+The shader is compiled from source with `makeLibrary(source:)` when the view is
+created, because command-line SwiftPM builds don't compile `.metal` files.
+
+## Draw order
+
+Each frame draws these layers, back to front:
+
+1. Clear to the theme background at the configured opacity.
+2. Cell backgrounds (cached per row).
+3. Selection.
+4. Kitty images with a negative z-index.
+5. Foreground (cached per row): glyphs, underline and strikethrough, and
+   special-glyph geometry.
+6. Kitty images with a z-index of zero or more.
+7. Cursor: a bar, a hollow block when the view is unfocused, or a filled block
+   with the character under it redrawn in the background color.
+8. IME marked text.
+
+Only layers 2 and 5 are cached. Everything else is rebuilt each frame, which is
+cheap because it is a few quads. A cursor blink or a selection drag rebuilds no
+rows.
+
+## The glyph atlas
+
+Glyphs are rasterized on first use by CoreText into a 2048×2048 BGRA texture
+and packed in shelves. Each entry records its texel rectangle and its offset
+from the pen position on the baseline.
+
+- **Font resolution.** `TerminalFonts` resolves each cell's code point and
+  style (regular, bold, italic, bold italic) to a glyph. When the configured
+  font lacks a character, CoreText's fallback (`CTFontCreateForString`)
+  supplies one, such as Apple Color Emoji or a CJK font. The CoreGraphics
+  renderer uses the same resolver, so both backends pick the same glyphs.
+- **Monochrome glyphs** are rasterized in white and tinted in the shader, so a
+  glyph is stored once no matter how many colors it appears in.
+- **Color glyphs** keep their own colors and are only faded by opacity.
+- **Device scale.** Glyphs are rasterized at the display's backing scale and
+  placed on whole pixels, then sampled with nearest filtering. Each texel maps
+  to one pixel, so text stays sharp. Moving the window to a display with a
+  different scale rebuilds the atlas.
+- **Eviction.** When the atlas fills, the renderer starts a new texture and
+  rebuilds every row once. Frames already in flight keep the old texture.
+
+## Special glyphs
+
+Box drawing, block elements, sextants, Braille, rounded corners and diagonals
+are drawn from libtermy's
+[glyph geometry](/docs/developer/libtermy/rendering#special-glyph-geometry)
+instead of font glyphs, so lines meet seamlessly across cells at any font size.
+
+- **Rectangles** become solid quads. Their edges are snapped to device pixels
+  using each rectangle's snap rule: nearest, or outward so that adjacent parts
+  overlap rather than leave a gap.
+- **Strokes** (rounded corners and diagonals) are rasterized once into the atlas
+  for the current cell size and reused for every cell with the same geometry.
+
+## Frame pacing and memory
+
+- Up to three frames are in flight. A ring of three instance buffers is reused
+  and grows only when a frame needs more quads.
+- The layer presents in step with Core Animation (`presentsWithTransaction`).
+  The main thread waits until the GPU has accepted the frame, not until it
+  finishes, so live window resizes don't show stretched content.
+- Kitty image textures are cached by image ID and generation and released when
+  their placements disappear.
+
+## Performance
+
+Measured on Apple silicon at 2× scale with a full 200×60 grid of colored text
+and a warm glyph atlas:
+
+| Renderer | Main-thread CPU per frame | GPU per frame |
+| --- | --- | --- |
+| CoreGraphics fallback | 5.55 ms | n/a |
+| Metal, every row rebuilt | 1.17 ms | 1.19 ms |
+| Metal, no rows changed | 0.10 ms | 0.80 ms |
+
+A 120 Hz display allows about 8.3 ms per frame. These numbers cover drawing
+only. They exclude parsing output in libtermy and applying frame updates, which
+dominate under heavy output. The first appearance of each glyph also pays a
+one-time CoreText rasterization.
+
+## Choosing a backend
+
+```swift
+let view = try TerminalView()                       // Metal when available
+let cpu = try TerminalView(backend: .coreGraphics)  // force the fallback
+print(view.renderingBackend)                        // .metal or .coreGraphics
+```
+
+`TerminalView` uses CoreGraphics when the system has no Metal device or the
+shader fails to compile. Snapshots made with `cacheDisplay(in:to:)` always go
+through `draw(_:)`, which uses the CoreGraphics renderer on either backend.
+
+## Limitations
+
+- Glyphs are placed on whole pixels; there is no subpixel positioning.
+- A cell holds one Unicode scalar, so combining marks are not composed with
+  their base character, and ligatures are not shaped.
+- `background_blur` is not applied; `background_opacity` is.
+
+## Testing
+
+`MetalRendererTests` renders views offscreen and checks pixels for text, cell
+backgrounds, box drawing, color emoji, Kitty images, the cursor, and correct
+redraws after partial updates. The tests skip themselves on machines without a
+Metal device. Run them with:
+
+```sh
+just test-swift-sdk
+```

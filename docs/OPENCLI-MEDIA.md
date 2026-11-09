@@ -55,3 +55,7 @@ Legacy check-only wrapper: `scripts/patch-opencli-media.ps1` (now calls the reap
 
 - Live keep post with image: https://x.com/Jasper_Black/status/2107570911679246724 (`has_media: true`)
 - Free OpenCLI path only — no X API credits used
+
+## Quote image
+
+Quote images are not in this release. One Windows inspect of OpenCLI 2.0.2 `browser upload` returned `-32000 Not allowed` on a single attempt, then closed the session (0 groups, 0 tabs). Termy does not call upload again. The Q-tweet button and `write quote --media` stop with a plain unsupported message before the browser opens. A new post can still use `twitter post --images`. In-app image viewing and libVLC playback are unchanged. Text quotes stay on the native quote card.

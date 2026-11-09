@@ -98,6 +98,31 @@ impl TerminalView {
         }
     }
 
+    /// The resize pass is skipped while nothing local changed. A session-host
+    /// pane can still change size under it when another client (`termy mux
+    /// resize`, a second window) resizes it; then the pass runs so this view
+    /// re-asserts the size it draws (see `HostSizeClaim` for the limits).
+    fn can_skip_terminal_resize_sync(
+        signature_unchanged: bool,
+        apply_deferred_inactive_resize: bool,
+        host_size_reassert_pending: bool,
+    ) -> bool {
+        signature_unchanged && !apply_deferred_inactive_resize && !host_size_reassert_pending
+    }
+
+    fn active_tab_host_size_reassert_pending(&self) -> bool {
+        self.multiplexer.is_some()
+            && self
+                .session
+                .tabs
+                .get(self.session.active_tab)
+                .is_some_and(|tab| {
+                    tab.panes
+                        .iter()
+                        .any(|pane| pane.terminal().host_size_reassert_pending())
+                })
+    }
+
     fn schedule_deferred_inactive_resize(
         &mut self,
         signature: TerminalResizeSignature,
@@ -268,7 +293,7 @@ impl TerminalView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn terminal_grid_size_for_pane_count(
+    pub(in super::super) fn terminal_grid_size_for_pane_count(
         pane_count: usize,
         viewport_width: f32,
         viewport_height: f32,
@@ -324,7 +349,7 @@ impl TerminalView {
         action: CommandAction,
         cx: &mut Context<Self>,
     ) -> bool {
-        match action {
+        let handled = match action {
             CommandAction::ZoomIn => {
                 if self.active_pane_uses_local_zoom() {
                     self.adjust_active_pane_zoom_steps(1, cx);
@@ -352,7 +377,22 @@ impl TerminalView {
                 true
             }
             _ => false,
+        };
+        // Zoom is part of the multiplexer's live layout so a relaunch reattaches
+        // panes at the size they were last shown.
+        if handled && self.multiplexer.is_some() {
+            self.schedule_persist_native_workspace(cx);
         }
+        handled
+    }
+
+    pub(in super::super) fn font_zoom_steps(&self) -> i16 {
+        let current: f32 = self.font_size.into();
+        ((current - self.base_font_size) / ZOOM_STEP).round() as i16
+    }
+
+    pub(in super::super) fn set_font_zoom_steps(&mut self, steps: i16, cx: &mut Context<Self>) {
+        self.update_zoom(self.base_font_size + steps as f32 * ZOOM_STEP, cx);
     }
 
     pub(in super::super) fn update_zoom(&mut self, next_size: f32, cx: &mut Context<Self>) {
@@ -441,12 +481,8 @@ impl TerminalView {
             .tabs
             .get(self.session.active_tab)
             .map_or(0, |tab| tab.panes.len());
-        // The docked X panel reserves width on the right just like the
-        // sidebars: including it here both shrinks the grid to the space
-        // left of the panel and changes the resize signature, so
-        // toggling the panel (Ctrl+Shift+X) reflows the terminal
-        // instead of leaving the grid sized for the full window with
-        // the panel drawn over its right edge.
+        // The docked X panel reserves width on the right like the sidebars, so
+        // toggling it (Ctrl+Shift+X) reflows the grid instead of painting over it.
         let total_sidebar_width =
             sidebar_width + self.workspace_sidebar_width() + self.x_panel_reserved_width();
         let resize_signature = self.terminal_resize_signature(
@@ -460,9 +496,14 @@ impl TerminalView {
         );
         let apply_deferred_inactive_resize =
             self.deferred_inactive_resize.is_ready_for(resize_signature);
-        if self.last_terminal_resize_signature == Some(resize_signature)
-            && !apply_deferred_inactive_resize
-        {
+        let signature_unchanged = self.last_terminal_resize_signature == Some(resize_signature);
+        if Self::can_skip_terminal_resize_sync(
+            signature_unchanged,
+            apply_deferred_inactive_resize,
+            // Only checked when nothing local changed; the pass below
+            // re-checks each pane anyway.
+            signature_unchanged && self.active_tab_host_size_reassert_pending(),
+        ) {
             return;
         }
 
@@ -595,11 +636,14 @@ impl TerminalView {
                     cell_height: pane_cell_size.height.into(),
                 };
                 let terminal = pane.terminal();
-                let current = terminal.size();
-                let needs_resize = current.cols != next_size.cols
-                    || current.rows != next_size.rows
-                    || current.cell_width != next_size.cell_width
-                    || current.cell_height != next_size.cell_height;
+                // A reattached session-host pane reports its last frame, which
+                // lags queued resizes. Comparing with that stale size can drop
+                // the final resize of a burst (e.g. window setup after restart)
+                // and leave the program at an intermediate size.
+                // When another client resized a session-host pane, this view
+                // re-asserts the size it draws, within `HostSizeClaim` limits.
+                let current = terminal.requested_size();
+                let needs_resize = terminal.needs_resize(current, next_size, now);
 
                 if needs_resize {
                     if can_resize {
@@ -669,6 +713,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: test_terminal(),
             render_cache: RefCell::new(TerminalPaneRenderCache::default()),
             last_alternate_screen: Cell::new(false),
@@ -690,6 +735,83 @@ mod tests {
             active_tab_id: Some(active_tab_id),
             pane_layout_fingerprint: 1,
         }
+    }
+
+    #[test]
+    fn resize_pass_runs_when_the_host_size_drifted_under_an_unchanged_layout() {
+        assert!(TerminalView::can_skip_terminal_resize_sync(
+            true, false, false
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            true, false, true
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            false, false, false
+        ));
+        assert!(!TerminalView::can_skip_terminal_resize_sync(
+            true, true, false
+        ));
+    }
+
+    fn grid(cols: u16, rows: u16) -> TerminalSize {
+        TerminalSize {
+            cols,
+            rows,
+            ..TerminalSize::default()
+        }
+    }
+
+    #[test]
+    fn a_pane_created_at_the_view_size_reasserts_it_after_another_clients_resize() {
+        let now = Instant::now();
+        let view = grid(120, 40);
+        let mut claim = HostSizeClaim::new(view);
+        assert!(!claim.needs_resize(view, false, false, now));
+        // `termy mux resize` made it 40x10; the view never resized it itself.
+        assert!(claim.wants_reassert(true));
+        assert!(claim.needs_resize(view, true, true, now));
+        claim.applied(view, true, now);
+        assert!(!claim.needs_resize(view, false, false, now));
+        // A layout change of this view is a plain resize, overridden or not.
+        assert!(claim.needs_resize(grid(100, 40), true, true, now));
+        assert!(!claim.needs_resize(grid(100, 40), false, true, now));
+    }
+
+    #[test]
+    fn two_views_of_one_pane_stop_resizing_it_back_and_forth() {
+        let start = Instant::now();
+        let view = grid(120, 40);
+        let mut claim = HostSizeClaim::new(view);
+        for step in 0..HostSizeClaim::MAX_REASSERTS {
+            let now = start + Duration::from_millis(step as u64 * 100);
+            assert!(
+                claim.needs_resize(view, true, true, now),
+                "re-assert {step}"
+            );
+            claim.applied(view, true, now);
+        }
+        // Out of re-asserts: the view keeps the other client's size.
+        let later = start + Duration::from_secs(1);
+        assert!(!claim.needs_resize(view, true, true, later));
+        assert!(!claim.wants_reassert(true));
+        assert!(
+            !claim.needs_resize(view, true, true, later + HostSizeClaim::REASSERT_WINDOW * 2),
+            "a yielded view does not resume the fight on its own"
+        );
+
+        // Once the host is back at this view's size, a later conflict is new.
+        assert!(!claim.needs_resize(view, false, false, later));
+        let much_later = later + HostSizeClaim::REASSERT_WINDOW * 2;
+        assert!(claim.needs_resize(view, true, true, much_later));
+
+        // So is one after a layout change of this view.
+        let mut claim = HostSizeClaim::new(view);
+        for _ in 0..=HostSizeClaim::MAX_REASSERTS {
+            claim.applied(view, true, start);
+        }
+        assert!(!claim.needs_resize(view, true, true, start));
+        claim.applied(grid(100, 40), true, start);
+        assert!(claim.needs_resize(grid(100, 40), true, true, start));
     }
 
     #[test]
@@ -909,39 +1031,5 @@ mod tests {
             "non-zero sidebar must reduce column count (no_sidebar={cols_no_sidebar}, with_sidebar={cols_with_sidebar})"
         );
         assert_eq!(cols_no_sidebar - cols_with_sidebar, 30);
-    }
-
-    #[test]
-    fn docked_x_panel_reservation_shrinks_grid_beside_other_chrome() {
-        // Ctrl+Shift+X with other content already open (tab sidebar +
-        // workspace sidebar on screen): the panel's slice stacks with
-        // the existing chrome, and the grid loses exactly the panel's
-        // columns -- terminal pane shrinks, panel never overlaps it.
-        let panel = termy::x_panel::PANEL_DOCKED_WIDTH;
-        let other_chrome = 240.0 + 48.0;
-        let grid = |total_sidebar: f32| {
-            TerminalView::terminal_grid_size_for_pane_count(
-                1,
-                1296.0,
-                800.0,
-                total_sidebar,
-                32.0,
-                8.0,
-                8.0,
-                8.0,
-                16.0,
-            )
-            .0
-        };
-        let without_panel = grid(other_chrome);
-        let with_panel = grid(other_chrome + panel);
-        assert!(with_panel < without_panel);
-        assert_eq!(
-            without_panel - with_panel,
-            (panel / 8.0) as u16,
-            "grid must lose exactly the docked panel's columns"
-        );
-        // Closing the panel hands the columns straight back.
-        assert_eq!(grid(other_chrome), without_panel);
     }
 }

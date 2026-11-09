@@ -7,54 +7,154 @@ license = "MIT"
 [lints]
 workspace = true
 
+[features]
+default = ["native"]
+# PTY transport, config files, plugins, multiplexer, SSH and the C ABI. Disable it
+# to build only the headless engine (parser, grid, input encoding, themes), e.g.
+# for wasm32-unknown-unknown.
+native = [
+  "pty",
+  "dep:bincode",
+  "dep:parking_lot",
+  "dep:dirs",
+  "dep:flume",
+  "dep:fontdb",
+  "dep:fs4",
+  "dep:keyring",
+  "dep:regex",
+  "dep:semver",
+  "dep:sha2",
+  "dep:tempfile",
+  "dep:ureq",
+  "dep:url",
+  "dep:uuid",
+]
+# Only the native PTY process layer (`termy_core::pty`), with no extra
+# dependencies. Used by the @termysh/pty Node addon.
+pty = []
+
 [dependencies]
 anyhow = { workspace = true }
+dunce = { workspace = true }
 base64 = "0.22"
 compact_str = { version = "0.8.1", features = ["serde"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-flume = { workspace = true }
+flume = { workspace = true, optional = true }
 log = { workspace = true }
-dirs = { workspace = true }
-# rust_backend = miniz_oxide (pure Rust). Explicit so the zlib/zlib-ng C
-# backends can never be unified in; identical to flate2's previous default.
-flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
-fontdb = "0.23"
-polling = { workspace = true }
+dirs = { workspace = true, optional = true }
+flate2 = "1.1"
+fontdb = { version = "0.23", optional = true }
+parking_lot = { version = "0.12", optional = true }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
 png = "0.18"
 rand_core = { workspace = true }
 ttf-parser = "0.25"
 unicode-width = { workspace = true }
 unicode-segmentation = "=1.12.0"
-bincode = { version = "1.3" }
+bincode = { version = "1.3", optional = true }
 serde_json = { workspace = true }
-ureq = { workspace = true }
-fs4 = { version = "0.13.1", features = ["sync"] }
-uuid = { workspace = true }
-keyring = { workspace = true }
-sha2 = { workspace = true }
-url = { workspace = true }
-semver = { workspace = true }
-regex = "1"
-tempfile = { workspace = true }
+ureq = { workspace = true, optional = true }
+fs4 = { version = "0.13.1", features = ["sync"], optional = true }
+uuid = { workspace = true, optional = true }
+keyring = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+url = { workspace = true, optional = true }
+semver = { workspace = true, optional = true }
+regex = { version = "1", optional = true }
+tempfile = { workspace = true, optional = true }
+# Re-exports std::time on native targets; wasm32-unknown-unknown has no std clock.
+web-time = "1"
 
-# Platform layout (audited for Linux migration, agent L1):
-# - unix: PTY/rustix (Linux+macOS), windows: winreg+windows-sys (registry,
-#   console) -- both already correctly gated, do not ungate.
-# - Everything above is shared/pure-Rust; `dirs`/`keyring` select their
-#   per-OS backend internally (keyring: Secret Service/zbus on Linux,
-#   Credential Manager on Windows, Keychain on macOS), so they stay shared.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+
 [target."cfg(unix)".dependencies]
 rustix-openpty = { version = "0.2" }
 libc = "0.2"
+# Not imported directly: enables `std` on the rustix that rustix-openpty
+# re-exports, so its errors and fds convert to std types (`pty`-only builds).
 rustix = { version = "1", features = ["std"] }
 
 [target."cfg(windows)".dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 unicode-width = { workspace = true }
 
+[target."cfg(windows)".dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_JobObjects"] }
+
 [lib]
-crate-type = ["rlib", "cdylib"]
+# `staticlib` links the native C ABI into hosts without a dylib. Hosts that
+# need only the engine use `crates/engine_ffi` (libtermy_engine) instead.
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "termy-session-host"
+path = "src/bin/termy-session-host.rs"
+required-features = ["native"]
+
+# These drive `Terminal` (or other native-only modules), so
+# `cargo test --no-default-features` builds only the engine targets.
+
+[[test]]
+name = "display_snapshot"
+required-features = ["native"]
+
+[[test]]
+name = "display_terminal"
+required-features = ["native"]
+
+[[test]]
+name = "ipc"
+required-features = ["native"]
+
+[[test]]
+name = "kitty_clipboard"
+required-features = ["native"]
+
+[[test]]
+name = "kitty_conformance"
+required-features = ["native"]
+
+[[test]]
+name = "lifecycle"
+required-features = ["native"]
+
+[[test]]
+name = "remote_graphics"
+required-features = ["native"]
+
+[[test]]
+name = "remote_resize"
+required-features = ["native"]
+
+[[test]]
+name = "remote_selection"
+required-features = ["native"]
+
+[[test]]
+name = "resize_clear"
+required-features = ["native"]
+
+[[test]]
+name = "tmux_control_ffi"
+required-features = ["native"]
+
+[[test]]
+name = "windows_host"
+required-features = ["native"]
+
+[[example]]
+name = "install_cli"
+required-features = ["native"]
+
+[[example]]
+name = "native_roundtrip_bench"
+required-features = ["native"]
+
+[[example]]
+name = "terminal_facade_bench"
+required-features = ["native"]

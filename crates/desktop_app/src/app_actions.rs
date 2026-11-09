@@ -81,32 +81,9 @@ pub(crate) fn close_terminal_window<V: 'static>(handle: gpui_kit::AnyWindowHandl
     }
 }
 
-pub(crate) fn update_open_settings_windows(
-    cx: &mut App,
-    mut update: impl FnMut(&mut SettingsWindow, &mut gpui_kit::Context<SettingsWindow>),
-) {
-    for settings_window in cx
-        .windows()
-        .into_iter()
-        .filter_map(|handle| handle.downcast::<SettingsWindow>())
-    {
-        let _ = settings_window.update(cx, |view, _window, cx| update(view, cx));
-    }
-}
-
-pub(crate) fn refresh_open_terminal_theme_assets(cx: &mut App) {
-    for terminal_window in cx
-        .windows()
-        .into_iter()
-        .filter_map(|handle| handle.downcast::<TerminalView>())
-    {
-        let _ = terminal_window.update(cx, |view, _window, cx| {
-            view.reload_theme_assets(cx);
-        });
-    }
-}
-
 pub(crate) fn close_settings_windows(cx: &mut App) {
+    #[cfg(all(target_os = "macos", not(test)))]
+    crate::native_settings::close();
     for settings_window in cx
         .windows()
         .into_iter()
@@ -146,6 +123,11 @@ fn open_settings_window_with_section(
     section: Option<SettingsSection>,
     cx: &mut App,
 ) -> Result<(), String> {
+    // macOS 13 and later get the SwiftUI window for the sections it draws.
+    #[cfg(all(target_os = "macos", not(test)))]
+    if crate::native_settings::supported() && crate::native_settings::open(section, cx) {
+        return Ok(());
+    }
     // Key-repeat and repeated action dispatch should raise the existing settings window,
     // not spawn duplicate windows.
     if section.is_none() && focus_existing_window::<SettingsWindow>(cx) {
@@ -220,6 +202,16 @@ fn open_settings_window_with_section(
             #[cfg(target_os = "linux")]
             {
                 window.set_window_title("Settings");
+            }
+            // The settings window keeps the OS caption; registering lets its
+            // DWM frame follow the Termy theme.
+            #[cfg(target_os = "windows")]
+            crate::native_sdk::win32_window::register_window(window, "Settings");
+            // Opening a window without a tabbing identifier turns AppKit's
+            // automatic tabbing off app-wide; native terminal tabs need it on.
+            #[cfg(target_os = "macos")]
+            if crate::native_window_tabs_enabled(&settings_load.config) {
+                crate::macos_native_tabs::allow_automatic_window_tabbing();
             }
             cx.new(|cx| {
                 let mut view = SettingsWindow::new(window, cx);

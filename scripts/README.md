@@ -22,4 +22,9 @@ See `docs/architecture/release-packaging.md` for artifact names and release work
 - `generate-icon.sh`: regenerates app icon assets from the source image.
 - `test_osc_sequences.sh`: exercises OSC behavior manually.
 
+## Benchmarks
+
+- `benchmark-terminal-facades.py`: paired baseline/candidate libtermy throughput for PRs.
+- `vt-library-bench/vt_library_bench.c` + `benchmark-vt-libraries.py`: one C harness compiled against libtermy and libghostty-vt, compared with alternating paired runs. Run it from the `libtermy vs libghostty-vt` GitHub Actions workflow (Actions → Run workflow); it builds Ghostty with Zig on hosted Linux and macOS runners. `vt-library-bench/run-local.sh [MiB] [pairs] [--frame]` runs the same comparison on this machine (needs Zig 0.16.0).
+
 Keep platform packaging entrypoints here unless the architecture docs and release workflow move with them.

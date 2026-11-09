@@ -1,6 +1,6 @@
 use std::io;
 
-use super::{PtySize, SpawnConfig};
+use super::{ChildExit, PtySize, SpawnConfig};
 
 pub(crate) struct Transport;
 
@@ -12,11 +12,33 @@ fn unsupported() -> io::Error {
 }
 
 impl Transport {
+    // Hosts that answer terminal queries use `spawn_answering_queries`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn(
         _config: SpawnConfig,
         _size: PtySize,
         _on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
         _on_exit: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn spawn_answering_queries(
+        _config: SpawnConfig,
+        _size: PtySize,
+        _inherit_environment: bool,
+        _on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        _on_exit: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
+        Err(unsupported())
+    }
+
+    pub(crate) fn spawn_with_exit(
+        _config: SpawnConfig,
+        _size: PtySize,
+        _inherit_environment: bool,
+        _on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        _on_exit: impl FnOnce(ChildExit) + Send + 'static,
     ) -> io::Result<Self> {
         Err(unsupported())
     }
@@ -27,6 +49,9 @@ impl Transport {
     pub(crate) fn write_owned(&self, _input: Vec<u8>) -> io::Result<()> {
         Err(unsupported())
     }
+    pub(crate) fn write_motion_owned(&self, _input: Vec<u8>) -> io::Result<()> {
+        Err(unsupported())
+    }
     pub(crate) fn write_protocol_reply_owned(&self, _input: Vec<u8>) -> io::Result<()> {
         Err(unsupported())
     }
@@ -35,5 +60,13 @@ impl Transport {
     }
     pub(crate) fn child_pid(&self) -> u32 {
         0
+    }
+    pub(crate) fn terminate_and_wait(&self) {}
+    pub(crate) fn signal(&self, _signal: i32) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub(crate) fn terminate(&self) {}
+    pub(crate) fn foreground_process_name(&self) -> Option<String> {
+        None
     }
 }

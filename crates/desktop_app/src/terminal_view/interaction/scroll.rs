@@ -384,7 +384,7 @@ impl TerminalView {
             .active_terminal()
             .is_some_and(|terminal| terminal.scroll_to_bottom())
         {
-            self.content_scroll_baseline = 0;
+            self.sync_content_scroll_baseline();
             self.mark_terminal_scrollbar_activity(cx);
             cx.notify();
         }

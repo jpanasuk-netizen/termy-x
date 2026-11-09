@@ -1,0 +1,53 @@
+name: Swift SDK
+
+# Builds libtermy and runs the Swift SDK tests against it. The SDK compiles
+# against crates/core/include/termy.h directly, so ABI changes run this too.
+on:
+  pull_request:
+    paths:
+      - sdk/swift/**
+      - crates/core/**
+      - Cargo.lock
+      - .github/workflows/swift-sdk.yml
+  push:
+    branches: [main]
+    paths:
+      - sdk/swift/**
+      - crates/core/**
+      - Cargo.lock
+      - .github/workflows/swift-sdk.yml
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Swift SDK (macOS)
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build libtermy
+        run: sdk/swift/scripts/build-libtermy.sh debug
+
+      - name: Test
+        run: swift test --package-path sdk/swift
+
+      - name: Build examples
+        run: swift build --package-path sdk/swift --product TermyDemo && swift build --package-path sdk/swift --product TermyHeadless
+
+      - name: Run headless example
+        run: swift run --package-path sdk/swift TermyHeadless

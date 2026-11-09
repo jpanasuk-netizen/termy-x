@@ -1,11 +1,12 @@
-use super::{MAX_COMMAND_BYTES, MAX_CONTROL_BYTES, MAX_CONTROL_FIELDS};
-use std::borrow::Cow;
+use super::{MAX_CONTROL_BYTES, MAX_CONTROL_FIELDS, inline::InlineImage};
 
 #[derive(Clone, Debug)]
 pub struct KittyGraphicsCommand {
     pub(super) control: Vec<(char, String)>,
     pub(super) payload: Vec<u8>,
     pub(super) oversized: bool,
+    /// Set for an OSC 1337 image, which kitty's protocol can't send.
+    pub(super) inline: Option<InlineImage>,
 }
 
 impl KittyGraphicsCommand {
@@ -14,20 +15,28 @@ impl KittyGraphicsCommand {
         self.char_value('a').unwrap_or('t')
     }
 
-    pub(crate) fn parse(mut bytes: Vec<u8>, oversized: bool) -> Self {
+    #[cfg(test)]
+    pub(crate) fn parse(bytes: Vec<u8>, oversized: bool) -> Self {
+        Self::parse_after(bytes, 0, oversized)
+    }
+
+    /// Parse the command that starts at `start`, keeping the payload in the
+    /// given allocation instead of copying it past a prefix.
+    pub(crate) fn parse_after(mut bytes: Vec<u8>, start: usize, oversized: bool) -> Self {
+        let body = &bytes[start.min(bytes.len())..];
         // A missing separator must not turn a payload-sized command into a control string.
         // Inspect one byte past the limit so a separator at the exact boundary is accepted.
-        let separator = bytes[..bytes.len().min(MAX_CONTROL_BYTES + 1)]
+        let separator = body[..body.len().min(MAX_CONTROL_BYTES + 1)]
             .iter()
             .position(|byte| *byte == b';');
-        let control_oversized = separator.is_none() && bytes.len() > MAX_CONTROL_BYTES;
-        let control_end = separator.unwrap_or(bytes.len().min(MAX_CONTROL_BYTES));
-        let field_count = bytes[..control_end]
+        let control_oversized = separator.is_none() && body.len() > MAX_CONTROL_BYTES;
+        let control_end = separator.unwrap_or(body.len().min(MAX_CONTROL_BYTES));
+        let field_count = body[..control_end]
             .split(|byte| *byte == b',')
             .take(MAX_CONTROL_FIELDS + 1)
             .count();
         let fields_oversized = field_count > MAX_CONTROL_FIELDS;
-        let control = bytes[..control_end]
+        let control = body[..control_end]
             .split(|byte| *byte == b',')
             .take(MAX_CONTROL_FIELDS)
             .filter_map(|field| {
@@ -43,12 +52,12 @@ impl KittyGraphicsCommand {
         let oversized = oversized || control_oversized || fields_oversized;
         let payload = if oversized {
             // Drop an already-rejected payload with its original allocation instead of
-            // shifting up to MAX_COMMAND_BYTES only for `apply` to discard it.
+            // shifting it only for `apply` to discard it.
             Vec::new()
         } else if let Some(index) = separator {
             // Keep the potentially large payload in the parser's allocation. Draining the
             // small control prefix moves it in place instead of cloning it into another Vec.
-            bytes.drain(..=index);
+            bytes.drain(..=start + index);
             bytes
         } else {
             Vec::new()
@@ -57,6 +66,7 @@ impl KittyGraphicsCommand {
             control,
             payload,
             oversized,
+            inline: None,
         }
     }
 
@@ -110,202 +120,5 @@ impl KittyGraphicsCommand {
 
     pub(super) fn i32_value(&self, key: char) -> Option<i32> {
         self.value(key)?.parse().ok()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum KittyGraphicsItem {
-    Text(Vec<u8>),
-    Command(KittyGraphicsCommand),
-}
-
-/// Graphics input whose ordinary text can borrow the current PTY read buffer.
-#[derive(Clone, Debug)]
-pub enum KittyGraphicsItemRef<'a> {
-    Text(Cow<'a, [u8]>),
-    Command(KittyGraphicsCommand),
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-enum InterceptorState {
-    #[default]
-    Ground,
-    Escape,
-    ApcStart {
-        c1: bool,
-    },
-    OtherApc,
-    OtherApcEscape,
-    Kitty,
-    KittyEscape,
-}
-
-#[derive(Default)]
-pub struct KittyGraphicsInterceptor {
-    state: InterceptorState,
-    command: Vec<u8>,
-    pub(super) oversized: bool,
-    utf8_remaining: u8,
-}
-
-impl KittyGraphicsInterceptor {
-    /// Intercept graphics commands without copying ordinary ASCII/ANSI output.
-    /// The owned [`Self::process`] API remains available for callers retaining
-    /// text beyond the lifetime of their input buffer.
-    pub fn process_borrowed<'a>(
-        &mut self,
-        bytes: &'a [u8],
-    ) -> impl Iterator<Item = KittyGraphicsItemRef<'a>> + use<'a> {
-        let passthrough = self.can_borrow_text(bytes);
-        let items = if passthrough {
-            Vec::new()
-        } else {
-            self.process(bytes)
-        };
-        passthrough
-            .then_some(bytes)
-            .filter(|bytes| !bytes.is_empty())
-            .into_iter()
-            .map(|bytes| KittyGraphicsItemRef::Text(Cow::Borrowed(bytes)))
-            .chain(items.into_iter().map(|item| match item {
-                KittyGraphicsItem::Text(text) => KittyGraphicsItemRef::Text(Cow::Owned(text)),
-                KittyGraphicsItem::Command(command) => KittyGraphicsItemRef::Command(command),
-            }))
-    }
-
-    fn can_borrow_text(&mut self, bytes: &[u8]) -> bool {
-        if !matches!(self.state, InterceptorState::Ground) || !bytes.is_ascii() {
-            return false;
-        }
-        let mut remaining = bytes;
-        while let Some(escape) = remaining.iter().position(|byte| *byte == 0x1b) {
-            match remaining.get(escape + 1) {
-                // Graphics APCs, repeated ESCs, and split prefixes keep the
-                // original state machine. All other ASCII escape pairs pass
-                // through unchanged and return it to Ground.
-                None | Some(b'_' | 0x1b) => return false,
-                Some(_) => remaining = &remaining[escape + 2..],
-            }
-        }
-        if !bytes.is_empty() {
-            // ASCII terminates any incomplete UTF-8 prefix from a previous
-            // read. Empty reads must preserve that prefix for C1 detection.
-            self.utf8_remaining = 0;
-        }
-        true
-    }
-
-    pub fn process(&mut self, bytes: &[u8]) -> Vec<KittyGraphicsItem> {
-        let mut items = Vec::new();
-        let mut text = Vec::with_capacity(bytes.len().min(8192));
-
-        let flush_text = |items: &mut Vec<KittyGraphicsItem>, text: &mut Vec<u8>| {
-            if !text.is_empty() {
-                items.push(KittyGraphicsItem::Text(std::mem::take(text)));
-            }
-        };
-
-        for &byte in bytes {
-            if matches!(self.state, InterceptorState::Ground) {
-                if self.utf8_remaining > 0 && byte & 0xc0 == 0x80 {
-                    self.utf8_remaining -= 1;
-                    text.push(byte);
-                    continue;
-                }
-                self.utf8_remaining = match byte {
-                    0xc2..=0xdf => 1,
-                    0xe0..=0xef => 2,
-                    0xf0..=0xf4 => 3,
-                    _ => 0,
-                };
-            }
-            match self.state {
-                InterceptorState::Ground => match byte {
-                    0x1b => self.state = InterceptorState::Escape,
-                    0x9f => self.state = InterceptorState::ApcStart { c1: true },
-                    _ => text.push(byte),
-                },
-                InterceptorState::Escape => {
-                    if byte == b'_' {
-                        self.state = InterceptorState::ApcStart { c1: false };
-                    } else if byte == 0x1b {
-                        text.push(0x1b);
-                        self.state = InterceptorState::Escape;
-                    } else {
-                        text.push(0x1b);
-                        text.push(byte);
-                        self.state = InterceptorState::Ground;
-                    }
-                }
-                InterceptorState::ApcStart { c1 } => {
-                    if byte == b'G' {
-                        flush_text(&mut items, &mut text);
-                        self.command.clear();
-                        self.oversized = false;
-                        self.state = InterceptorState::Kitty;
-                    } else {
-                        if c1 {
-                            text.push(0x9f);
-                        } else {
-                            text.extend_from_slice(b"\x1b_");
-                        }
-                        text.push(byte);
-                        self.state = InterceptorState::OtherApc;
-                    }
-                }
-                InterceptorState::OtherApc => {
-                    text.push(byte);
-                    if byte == 0x9c {
-                        self.state = InterceptorState::Ground;
-                    } else if byte == 0x1b {
-                        self.state = InterceptorState::OtherApcEscape;
-                    }
-                }
-                InterceptorState::OtherApcEscape => {
-                    text.push(byte);
-                    if byte == b'\\' || byte == 0x9c {
-                        self.state = InterceptorState::Ground;
-                    } else if byte != 0x1b {
-                        self.state = InterceptorState::OtherApc;
-                    }
-                }
-                InterceptorState::Kitty => {
-                    if byte == 0x1b {
-                        self.state = InterceptorState::KittyEscape;
-                    } else if byte == 0x9c {
-                        flush_text(&mut items, &mut text);
-                        items.push(KittyGraphicsItem::Command(KittyGraphicsCommand::parse(
-                            std::mem::take(&mut self.command),
-                            self.oversized,
-                        )));
-                        self.state = InterceptorState::Ground;
-                    } else if self.command.len() < MAX_COMMAND_BYTES {
-                        self.command.push(byte);
-                    } else {
-                        self.oversized = true;
-                    }
-                }
-                InterceptorState::KittyEscape => {
-                    if byte == b'\\' {
-                        flush_text(&mut items, &mut text);
-                        items.push(KittyGraphicsItem::Command(KittyGraphicsCommand::parse(
-                            std::mem::take(&mut self.command),
-                            self.oversized,
-                        )));
-                        self.state = InterceptorState::Ground;
-                    } else {
-                        if self.command.len() < MAX_COMMAND_BYTES {
-                            self.command.push(0x1b);
-                            self.command.push(byte);
-                        } else {
-                            self.oversized = true;
-                        }
-                        self.state = InterceptorState::Kitty;
-                    }
-                }
-            }
-        }
-        flush_text(&mut items, &mut text);
-        items
     }
 }

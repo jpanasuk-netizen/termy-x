@@ -869,12 +869,14 @@ async function capturePlugin(source: PluginSource): Promise<CapturedFile[]> {
       Buffer.from(right.relativePath),
     ),
   );
+  // Matches the host's key: each file contributes its own digest, which the
+  // host caches for unchanged files.
   const hash = createHash("sha256");
-  hash.update("termy-plugin-bundle-v2\0");
+  hash.update("termy-plugin-bundle-v3\0");
   for (const file of files) {
     hash.update(file.relativePath);
     hash.update(new Uint8Array([0]));
-    hash.update(file.contents);
+    hash.update(createHash("sha256").update(file.contents).digest());
     hash.update(new Uint8Array([0]));
   }
   const actualCacheKey = hash.digest("hex");

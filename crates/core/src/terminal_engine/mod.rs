@@ -8,25 +8,40 @@
 mod dispatch;
 mod graphics;
 mod grid;
+mod hyperlinks;
 pub mod media;
 mod parser;
 mod queries;
+pub(crate) mod snapshot;
 mod sync;
+#[cfg(feature = "pty")]
 pub(crate) mod transport;
 mod types;
 #[cfg(test)]
 mod unicode_tests;
 
-use std::{collections::VecDeque, time::Instant};
+use std::collections::VecDeque;
+use web_time::Instant;
 
 pub use types::{
-    Cell, CellExtra, Color, Cursor, CursorShape, Damage, DirtySpan, Hyperlink, Size, Style,
+    Cell, CellExtra, Color, Cursor, CursorShape, Damage, DirtySpan, Hyperlink, Line, Size, Style,
     UnderlineStyle, ViewportScroll,
 };
+
+pub use snapshot::{MIN_SNAPSHOT_VERSION, SNAPSHOT_VERSION, SnapshotError, snapshot_version};
+
+/// The default scrollback byte limit, 16 MiB; see [`Options::scrollback_bytes`].
+pub const DEFAULT_SCROLLBACK_BYTES: usize = grid::DEFAULT_HISTORY_BYTES;
+/// The default (and largest) OSC and DCS payload, 64 KiB.
+pub const MAX_STRING_PAYLOAD_BYTES: usize = parser::MAX_STRING_BYTES;
+/// The default (and largest) OSC 52 clipboard payload, 8 MiB.
+pub const MAX_CLIPBOARD_PAYLOAD_BYTES: usize = parser::MAX_CLIPBOARD_OSC_BYTES;
 
 use dispatch::State;
 use parser::Parser;
 use sync::SynchronizedUpdate;
+
+use crate::kitty_graphics::{KittyPreparedUpload, KittyUpload};
 
 const MAX_EVENTS: usize = 1024;
 const MAX_REPLY_BYTES: usize = 64 * 1024;
@@ -34,13 +49,29 @@ const PARSE_CHUNK: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
+    /// History rows to keep. `usize::MAX` leaves only `scrollback_bytes`.
     pub scrollback_history: usize,
+    /// Bytes history may hold, whichever of the two limits binds first. Each
+    /// row is charged its cells as packed with room for the whole row (see
+    /// the module README) and the cell metadata it references, whether it is
+    /// stored dense or packed, so engines fed the same bytes evict the same
+    /// rows however their feeds were split and whenever they compacted.
+    pub scrollback_bytes: usize,
+    /// OSC and DCS payloads longer than this are dropped whole. Clamped to
+    /// `1..=`[`MAX_STRING_PAYLOAD_BYTES`].
+    pub max_string_bytes: usize,
+    /// The same for OSC 52 (clipboard) payloads. Clamped to
+    /// `1..=`[`MAX_CLIPBOARD_PAYLOAD_BYTES`].
+    pub max_clipboard_bytes: usize,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             scrollback_history: 1000,
+            scrollback_bytes: DEFAULT_SCROLLBACK_BYTES,
+            max_string_bytes: MAX_STRING_PAYLOAD_BYTES,
+            max_clipboard_bytes: MAX_CLIPBOARD_PAYLOAD_BYTES,
         }
     }
 }
@@ -74,7 +105,8 @@ pub enum MouseEncoding {
     Default,
     Utf8,
     Sgr,
-    Urxvt,
+    /// SGR with pixel coordinates (`?1016`); only recognized after
+    /// [`Engine::set_pixel_mouse_reports`].
     SgrPixels,
 }
 
@@ -86,9 +118,16 @@ pub struct Modes {
     pub focus_events: bool,
     pub mouse_tracking: MouseTracking,
     pub mouse_encoding: MouseEncoding,
+    /// `?1007`: on the alternate screen, hosts send wheel motion as cursor
+    /// keys when no mouse tracking is active.
+    pub alternate_scroll: bool,
     pub kitty_keyboard: u8,
     pub synchronized_update: bool,
     pub clipboard_paste_events: bool,
+    /// DECSCNM (`?5`): renderers draw the screen with the default
+    /// foreground and background swapped. Toggling it bumps
+    /// [`Engine::palette_revision`].
+    pub reverse_video: bool,
 }
 
 /// Reusable, single-owner parser and grid. The runtime controls synchronization;
@@ -102,8 +141,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(size: Size, options: Options) -> Self {
+        let mut parser = Parser::with_apc_limit(parser::MAX_APC_BYTES);
+        parser.set_string_limits(options.max_string_bytes, options.max_clipboard_bytes);
         Self {
-            parser: Parser::with_apc_limit(256 * 1024 * 1024),
+            parser,
             synchronized_update: SynchronizedUpdate::default(),
             state: State::new(size, options),
             generation: 0,
@@ -111,36 +152,181 @@ impl Engine {
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.feed_at(bytes, Instant::now());
+        self.feed_impl(bytes, None, false);
     }
 
+    /// Like [`Self::feed`], but stops right after a kitty image upload
+    /// completes, without decoding it, and returns the bytes consumed. The
+    /// caller decodes [`Self::take_deferred_upload`] (e.g. without holding a
+    /// lock), passes the result to [`Self::commit_upload`], then feeds the
+    /// rest. Uploads inside a synchronized update are still applied inline.
+    ///
+    /// It also stops right after a clipboard request (OSC 52 query or kitty
+    /// OSC 5522 packet): replies drained then answer output before the
+    /// request, whose own reply the host may give later.
+    pub(crate) fn feed_deferring_uploads(&mut self, bytes: &[u8]) -> usize {
+        self.feed_impl(bytes, None, true)
+    }
+
+    pub(crate) fn has_deferred_upload(&self) -> bool {
+        self.state.has_deferred_upload()
+    }
+
+    /// True after [`Self::feed_deferring_uploads`] stopped early because
+    /// kitty animation edits did enough pixel work for one lock hold. The
+    /// caller should release the engine lock before feeding the rest.
+    pub(crate) fn animation_budget_spent(&self) -> bool {
+        self.state.animation_budget_spent()
+    }
+
+    pub(crate) fn take_deferred_upload(&mut self) -> Option<KittyUpload> {
+        self.state.take_deferred_upload()
+    }
+
+    pub(crate) fn commit_upload(&mut self, prepared: KittyPreparedUpload) {
+        // The caller may have read history while the upload decoded, and the
+        // placement's cursor advance can scroll (and evict) history.
+        self.state.grid.release_history_read_cache();
+        self.state.commit_upload(prepared);
+        self.state.flush_graphics_effects();
+        self.generation = self.generation.wrapping_add(1);
+    }
+
+    #[cfg(test)]
     fn feed_at(&mut self, bytes: &[u8], now: Instant) {
+        self.feed_impl(bytes, Some(now), false);
+    }
+
+    /// Only synchronized updates need the time, and reading the clock would
+    /// dominate small PTY reads, so `now` is read when first needed.
+    #[inline]
+    fn feed_impl(&mut self, bytes: &[u8], now: Option<Instant>, defer_uploads: bool) -> usize {
+        if let [byte] = *bytes
+            && self.feed_ascii_cell(byte)
+        {
+            return 1;
+        }
+        self.feed_parsed(bytes, now, defer_uploads)
+    }
+
+    /// `feed_impl` through the parser.
+    #[inline(never)]
+    fn feed_parsed(&mut self, bytes: &[u8], now: Option<Instant>, defer_uploads: bool) -> usize {
+        // Most feeds are one parse pass with nothing deferred or buffered.
+        if bytes.len() <= PARSE_CHUNK
+            && !self.state.has_deferred_upload()
+            && self.synchronized_update_deadline().is_none()
+        {
+            self.state.reset_animation_work();
+            self.state.grid.prepare_output(bytes.len());
+            let consumed = self.parse_pass(bytes, defer_uploads, &mut || {
+                now.unwrap_or_else(Instant::now)
+            });
+            if consumed == bytes.len()
+                || self.state.has_deferred_upload()
+                || (defer_uploads && self.state.animation_budget_spent())
+                || self.state.clipboard_pause
+            {
+                return consumed;
+            }
+            // A synchronized update began: the general path buffers the rest.
+            return consumed + self.feed_impl_general(&bytes[consumed..], now, defer_uploads);
+        }
+        self.feed_impl_general(bytes, now, defer_uploads)
+    }
+
+    /// Typed and echoed text arrives a byte at a time. Feed one printable
+    /// byte that the grid writes in place with exactly the effects of
+    /// `parse_pass`, minus its setup; returns false, having changed nothing,
+    /// when that pass would do more (an upload or synchronized update is
+    /// pending, a sequence is open, or the write wraps, inserts or repairs).
+    #[inline]
+    fn feed_ascii_cell(&mut self, byte: u8) -> bool {
+        if !(0x20..=0x7e).contains(&byte)
+            || !self.parser.at_ground()
+            || self.state.has_deferred_upload()
+            || self.state.modes.synchronized_update
+            || self.synchronized_update_deadline().is_some()
+            || !self.state.print_ascii_cell(byte)
+        {
+            return false;
+        }
+        // The rest of `feed_impl` and `parse_pass` for this byte: printing
+        // leaves no pending clear, upload deferral or synchronized update.
+        self.state.reset_animation_work();
+        self.state.grid.prepare_output(1);
+        self.state.flush_graphics_effects();
+        self.generation = self.generation.wrapping_add(1);
+        true
+    }
+
+    /// Parse `bytes` (at most one chunk) through the grid, as one iteration
+    /// of `feed_impl_general`'s loop outside a synchronized update.
+    #[inline]
+    fn parse_pass(
+        &mut self,
+        bytes: &[u8],
+        defer_uploads: bool,
+        now: &mut impl FnMut() -> Instant,
+    ) -> usize {
+        self.state.set_defer_uploads(defer_uploads);
+        self.state.clipboard_pause = false;
+        let consumed = self.parser.advance(&mut self.state, bytes);
+        // Nothing outside parsing may see a partly blanked row.
+        self.state.grid.flush_pending_clear();
+        self.state.set_defer_uploads(false);
+        self.state.flush_graphics_effects();
+        self.generation = self.generation.wrapping_add(1);
+        if self.state.modes.synchronized_update {
+            self.synchronized_update
+                .begin(now(), self.state.saved_private_mode(2026));
+        }
+        consumed
+    }
+
+    #[inline(never)]
+    fn feed_impl_general(
+        &mut self,
+        bytes: &[u8],
+        now: Option<Instant>,
+        defer_uploads: bool,
+    ) -> usize {
+        let mut now = now;
+        let mut now = move || *now.get_or_insert_with(Instant::now);
+        // An upload nobody took must not keep pausing the parser.
+        if self.state.has_deferred_upload()
+            && let Some(upload) = self.state.take_deferred_upload()
+        {
+            self.commit_upload(upload.prepare());
+        }
+        self.state.reset_animation_work();
         self.state.grid.prepare_output(bytes.len());
         if self
             .synchronized_update_deadline()
-            .is_some_and(|deadline| deadline <= now)
+            .is_some_and(|deadline| deadline <= now())
         {
             self.stop_synchronized_update();
         }
         let mut offset = 0;
         while offset < bytes.len() {
             if self.synchronized_update_deadline().is_some() {
-                let buffered = self.synchronized_update.push(&bytes[offset..], now);
+                let buffered = self.synchronized_update.push(&bytes[offset..], now());
                 offset += buffered.consumed;
                 if buffered.commit {
                     self.stop_synchronized_update();
                 }
             } else {
                 let end = offset.saturating_add(PARSE_CHUNK).min(bytes.len());
-                let consumed = self.parser.advance(&mut self.state, &bytes[offset..end]);
-                offset += consumed;
-                self.state.flush_graphics_effects();
-                self.generation = self.generation.wrapping_add(1);
-                if self.state.modes.synchronized_update {
-                    self.synchronized_update.begin(now);
+                offset += self.parse_pass(&bytes[offset..end], defer_uploads, &mut now);
+                if self.state.has_deferred_upload()
+                    || (defer_uploads && self.state.animation_budget_spent())
+                    || self.state.clipboard_pause
+                {
+                    break;
                 }
             }
         }
+        offset
     }
 
     /// The runtime can schedule a watchdog without polling or copying a frame.
@@ -158,6 +344,7 @@ impl Engine {
         };
         for chunk in bytes.chunks(PARSE_CHUNK) {
             self.parser.advance_uninterrupted(&mut self.state, chunk);
+            self.state.grid.flush_pending_clear();
             self.state.flush_graphics_effects();
         }
         self.state.modes.synchronized_update = false;
@@ -165,6 +352,27 @@ impl Engine {
         self.synchronized_update.recycle_buffer(bytes);
         self.generation = self.generation.wrapping_add(1);
         true
+    }
+
+    /// Current OSC 7501 records, oldest update first, with inherited apps resolved.
+    pub fn program_status(&self) -> Vec<crate::ProgramStatusRecord> {
+        self.state.program_status.snapshot()
+    }
+
+    pub(crate) fn has_program_status_changes(&self) -> bool {
+        self.state.program_status.has_changes()
+    }
+
+    /// Coalesced status snapshot, independent of the bounded transient event queue.
+    /// An empty snapshot means that the final record was cleared.
+    pub fn take_program_status(&mut self) -> Option<Vec<crate::ProgramStatusRecord>> {
+        self.state.program_status.take_changed()
+    }
+
+    /// Hosts must call this when the process attached to this terminal exits.
+    pub fn process_exited(&mut self) {
+        self.stop_synchronized_update();
+        self.state.program_status.finish();
     }
 
     pub fn size(&self) -> Size {
@@ -175,6 +383,65 @@ impl Engine {
     }
     pub fn modes(&self) -> Modes {
         self.state.modes
+    }
+
+    /// DECRQM state of an ANSI (`private == false`) or DEC private mode:
+    /// `None` when the engine does not recognize the mode.
+    pub fn mode(&self, private: bool, mode: u16) -> Option<bool> {
+        if private && mode == 2027 {
+            // Grapheme clustering is permanently enabled.
+            return Some(true);
+        }
+        self.state.mode_state(private, mode)
+    }
+
+    /// The window title from OSC 0/2 (and XTWINOPS title restores).
+    pub fn title(&self) -> &str {
+        self.state.title()
+    }
+
+    /// The last working directory reported with OSC 7 or OSC 9;9.
+    pub fn working_directory(&self) -> Option<&str> {
+        self.state.working_directory()
+    }
+
+    /// The configured scrollback, in rows. History also stays within
+    /// [`Self::scrollback_byte_limit`]; see `README.md`.
+    pub fn scrollback_limit(&self) -> usize {
+        self.state.grid.history_limit()
+    }
+
+    /// The configured scrollback byte limit.
+    pub fn scrollback_byte_limit(&self) -> usize {
+        self.state.grid.history_byte_limit()
+    }
+
+    /// The options in effect (payload limits after clamping).
+    pub fn options(&self) -> Options {
+        let (max_string_bytes, max_clipboard_bytes) = self.parser.string_limits();
+        Options {
+            scrollback_history: self.scrollback_limit(),
+            scrollback_bytes: self.scrollback_byte_limit(),
+            max_string_bytes,
+            max_clipboard_bytes,
+        }
+    }
+
+    /// Rows output has scrolled into history so far. History row `index`
+    /// (0 the oldest) has the stable number `scrolled_into_history() -
+    /// history_size() + index`, and live row `row` has
+    /// `scrolled_into_history() + row`, so a host can anchor a selection to
+    /// content while output scrolls and old history is evicted. Resizing
+    /// reflows rows without updating this count; hosts reset anchors then.
+    pub fn scrolled_into_history(&self) -> u64 {
+        self.state.grid.scrolled_into_history()
+    }
+
+    /// Drop queued protocol replies without touching other state. Replica
+    /// engines, whose replies the authoritative terminal already sent, call
+    /// this after each feed.
+    pub fn discard_replies(&mut self) {
+        self.state.replies.clear();
     }
     pub fn generation(&self) -> u64 {
         self.generation
@@ -215,22 +482,18 @@ impl Engine {
     }
 
     pub fn set_options(&mut self, options: Options) {
+        self.parser
+            .set_string_limits(options.max_string_bytes, options.max_clipboard_bytes);
         self.state
             .grid
-            .set_history_limit(options.scrollback_history);
+            .set_history_limits(options.scrollback_history, options.scrollback_bytes);
         self.state.flush_graphics_effects();
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// The lifetime of the slice prevents mutation while the renderer reads it.
-    pub fn viewport_row(&self, row: usize) -> Option<&[Cell]> {
-        if self.display_offset() != 0 {
-            self.state
-                .grid
-                .history_read_cache
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.state.grid.visible_row(row).map(|row| row.cells())
+    /// The lifetime of the line prevents mutation while the renderer reads it.
+    pub fn viewport_row(&self, row: usize) -> Option<Line<'_>> {
+        self.state.grid.visible_row_line(row)
     }
 
     /// Visit a viewport row without retaining a dense copy of cold history.
@@ -239,12 +502,30 @@ impl Engine {
         &self,
         row: usize,
         scratch: &mut Vec<Cell>,
-        read: impl FnOnce(&[Cell]) -> T,
+        read: impl FnOnce(Line<'_>) -> T,
     ) -> Option<T> {
         self.state
             .grid
             .visible_row(row)
-            .map(|row| row.with_cells(scratch, read))
+            .map(|row| row.with_line(scratch, read))
+    }
+
+    /// [`Self::with_viewport_row`], also passing whether the row wraps
+    /// ([`Self::viewport_row_wrapped`]), where its erase blanks start (at
+    /// most its length; past it for no blanks) and their background. Every
+    /// cell from there on is a space in the default style on that
+    /// background, so a renderer can fill instead of converting.
+    pub(crate) fn with_viewport_row_blanks<T>(
+        &self,
+        row: usize,
+        scratch: &mut Vec<Cell>,
+        read: impl FnOnce(&[Cell], bool, usize, Color) -> T,
+    ) -> Option<T> {
+        self.state.grid.visible_row(row).map(|row| {
+            let (blanks, background) = row.blank_suffix();
+            let wrapped = row.wrapped;
+            row.with_cells(scratch, |cells| read(cells, wrapped, blanks, background))
+        })
     }
 
     pub fn viewport_row_wrapped(&self, row: usize) -> bool {
@@ -258,14 +539,8 @@ impl Engine {
     /// A cold history row is expanded on demand. Expanded history is released
     /// on the next output, resize, or scroll; the borrowed slice remains valid
     /// until that exclusive mutation.
-    pub fn line(&self, line: i32) -> Option<&[Cell]> {
-        if line < 0 {
-            self.state
-                .grid
-                .history_read_cache
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.state.grid.row(line).map(|row| row.cells())
+    pub fn line(&self, line: i32) -> Option<Line<'_>> {
+        self.state.grid.row_line(line)
     }
 
     /// Visit a line without retaining a dense copy of cold history. Scratch
@@ -274,12 +549,12 @@ impl Engine {
         &self,
         line: i32,
         scratch: &mut Vec<Cell>,
-        read: impl FnOnce(&[Cell]) -> T,
+        read: impl FnOnce(Line<'_>) -> T,
     ) -> Option<T> {
         self.state
             .grid
             .row(line)
-            .map(|row| row.with_cells(scratch, read))
+            .map(|row| row.with_line(scratch, read))
     }
 
     pub fn line_wrapped(&self, line: i32) -> bool {
@@ -299,6 +574,17 @@ impl Engine {
         }
     }
 
+    /// Recognize `?1016` (SGR pixel mouse reports). Enable it only when the
+    /// host reports pointer positions in pixels; otherwise the mode stays
+    /// unrecognized, as DECRQM reports. Engines that must agree (a server
+    /// and its replicas) need the same setting; snapshots carry it.
+    pub fn set_pixel_mouse_reports(&mut self, enabled: bool) {
+        self.state.pixel_mouse_reports = enabled;
+        if !enabled && self.state.modes.mouse_encoding == MouseEncoding::SgrPixels {
+            self.state.modes.mouse_encoding = MouseEncoding::Default;
+        }
+    }
+
     pub fn set_cell_pixels(&mut self, width: f32, height: f32) {
         let clamp = |value: f32| {
             if value.is_finite() {
@@ -311,11 +597,6 @@ impl Engine {
         self.state.resize_graphics();
     }
 
-    pub fn discard_events_and_replies(&mut self) {
-        self.state.events.clear();
-        self.state.replies.clear();
-    }
-
     pub fn take_damage(&mut self) -> Damage {
         self.state.grid.take_damage()
     }
@@ -326,7 +607,12 @@ impl Engine {
         self.state.grid.take_render_damage()
     }
 
+    /// Resizing to the current size changes nothing: it neither commits a
+    /// synchronized update nor closes the grapheme being printed.
     pub fn resize(&mut self, size: Size) {
+        if size.clamped() == self.size() {
+            return;
+        }
         self.stop_synchronized_update();
         self.state.grid.resize(size);
         self.state.resize_graphics();
@@ -347,6 +633,12 @@ impl Engine {
         self.state.grid.clear_scrollback();
         self.state.flush_graphics_effects();
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    /// Whether `pop_event` or `drain_replies` has anything to hand out.
+    #[inline]
+    pub(crate) fn has_output(&self) -> bool {
+        !self.state.events.is_empty() || !self.state.replies.is_empty()
     }
 
     pub fn pop_event(&mut self) -> Option<Event> {

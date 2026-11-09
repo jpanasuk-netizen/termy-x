@@ -1,0 +1,135 @@
+---
+title: Headless core
+description: Drive Termy's WebAssembly engine directly from a worker, Node or your own renderer.
+---
+
+`@termysh/core` is the engine without a renderer. It runs in browsers, web
+workers, Node and Bun, does no I/O, and has no DOM dependency. Use it to
+render with your own stack (WebGL, React, a canvas in a worker), to snapshot
+terminal output on a server, or to test programs that draw to a terminal.
+
+```ts
+import { Slot, TermyCore, decodeColor, init } from '@termysh/core'
+
+await init()
+const term = new TermyCore({ cols: 80, rows: 24, scrollback: 1000 })
+
+term.write('\x1b[1;32mready\x1b[0m\r\n$ ')
+term.lineText(0)           // 'ready'
+term.cursor()              // { row: 1, col: 2, visible: true, shape: 'block', blinking: false }
+```
+
+In Node or Bun, `init()` reads `termy.wasm` from disk. In a worker you can
+pass bytes or a compiled module to `initSync`.
+
+## Rendering loop
+
+```ts
+const damage = term.takeDamage()          // { full, scrolls, spans }
+const rows = term.readRows(0, term.rows)  // flat cells for the viewport
+
+for (let row = 0; row < rows.rowCount; row++) {
+  for (let col = 0; col < rows.cols; col++) {
+    const text = rows.text(row, col)
+    const at = rows.offset(row, col)
+    const fg = decodeColor(rows.data[at + Slot.Foreground])
+    const style = rows.data[at + Slot.Style]
+    // draw ...
+  }
+}
+```
+
+Each cell is six `u32` slots: text, foreground, background, underline color,
+style bits and hyperlink. Colors keep their kind (`default`, `indexed` or
+`rgb`) so you resolve them against your own theme. Reads are copies, so they
+stay valid however the engine's memory changes.
+
+## Input
+
+Encode input with the engine so it follows the modes the application enabled
+(application cursor keys, bracketed paste, mouse tracking, the kitty keyboard
+protocol), then send the bytes to your host:
+
+```ts
+import { Modifier } from '@termysh/core'
+
+term.encodeKey('up', undefined, 0)                      // bytes of '\x1b[A', or '\x1bOA' in application cursor mode
+term.encodeKey('c', 'c', Modifier.Ctrl)                 // bytes of '\x03'
+term.encodeKey('enter', '\r', 0)                        // bytes of '\r'
+term.encodePaste(text)                                  // bracketed when the program enabled it
+term.encodeMouse('press', 'left', col, row, 0)          // undefined unless the program tracks the mouse
+term.encodeFocus(true)
+```
+
+Every encoder returns a `Uint8Array` (or `undefined` when the input produces
+no bytes). Send it to the host as is. `key` is a Termy key name such as
+`enter`, `up`, `f5` or `a`, and `text` is the character the key produced.
+Combine modifiers with `|`, for example `Modifier.Ctrl | Modifier.Shift`.
+
+Protocol replies (device attributes, cursor position reports, color queries)
+are collected after each write; forward them to the host too:
+
+```ts
+term.write(output)
+const replies = term.takeReplies()
+if (replies.length) host.send(replies)
+for (const event of term.takeEvents()) {
+  switch (event.type) {
+    case 'title': setTitle(event.title); break
+    case 'resetTitle': setTitle(''); break
+    case 'bell': ring(); break
+    case 'cwd': setCwd(event.cwd); break
+    case 'progress': setProgress(event.state, event.value); break
+    case 'programStatus': setStatus(event.records); break // OSC 7501
+    case 'clipboard': copy(event.data); break             // OSC 52, data is base64
+    case 'shellIntegration': mark(event.payload); break   // OSC 133
+  }
+}
+```
+
+When the host process exits, call `term.processExited()` so working or blocked
+[program status](/docs/using-termy/program-status) records expire.
+
+## Reading text
+
+```ts
+term.lineText(0)              // first line of the live screen
+term.lineText(term.rows - 1)  // last line of the live screen
+term.lineText(-1)             // newest scrollback line
+term.historySize              // number of scrollback lines
+term.lineWrapped(0)           // whether line 0 soft-wraps into line 1
+```
+
+Line numbers here are relative to the live screen: `0` to `rows - 1` is the
+screen and negative numbers reach back into scrollback, down to
+`-historySize`. (`@termysh/web` uses absolute line numbers instead, starting
+from the oldest scrollback line.)
+
+## Testing terminal output
+
+Because the core runs in Node and Bun with no setup, you can assert on what a
+program draws:
+
+```ts
+import { init, TermyCore } from '@termysh/core'
+import { expect, test } from 'vitest'
+
+await init()
+
+test('renders a progress line', () => {
+  const term = new TermyCore({ cols: 40, rows: 5 })
+  term.write('Downloading...\r\x1b[2KDone\r\n')
+  expect(term.lineText(0)).toBe('Done')
+  term.dispose()
+})
+```
+
+## Images and glyphs
+
+- `readGraphics(cellWidth, cellHeight)` returns visible kitty graphics
+  placements with pixel clip and draw rectangles; `graphicsImage(index)`
+  returns their RGBA or PNG data.
+- `glyphPlan(codePoint, neighbors, cellWidth, cellHeight, fontSize)` returns
+  Termy's rectangles and strokes for box drawing, block elements, sextants and
+  Braille, so they line up exactly across cells.
+- `builtinTheme(id)` and `builtinThemeIds()` expose the bundled themes.

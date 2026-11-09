@@ -49,6 +49,7 @@ struct RawAuthorObj<'a> {
     username: Option<&'a str>,
     #[serde(borrow, alias = "display_name")]
     name: Option<&'a str>,
+    following: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +72,8 @@ struct RawMetrics {
     bookmark_count: u64,
     #[serde(alias = "views", alias = "view_count")]
     impression_count: u64,
+    #[serde(alias = "quotes", alias = "quoteCount")]
+    quote_count: Option<u64>,
 }
 
 /// X API / OpenCLI / GraphQL-eval tweet row, borrowed from the payload.
@@ -109,6 +112,8 @@ struct RawPost<'a> {
     inline_bookmark_count: u64,
     #[serde(rename = "impression_count", alias = "views", alias = "view_count")]
     inline_impression_count: u64,
+    #[serde(rename = "quote_count", alias = "quotes", alias = "quoteCount")]
+    inline_quote_count: Option<u64>,
     #[serde(borrow)]
     media_urls: Option<Vec<&'a str>>,
     #[serde(borrow)]
@@ -120,6 +125,27 @@ struct RawPost<'a> {
     images: Option<serde::de::IgnoredAny>,
     #[serde(borrow, alias = "retweeted_status", alias = "retweeted_tweet")]
     retweeted: Option<Box<RawPost<'a>>>,
+    #[serde(borrow, alias = "quoted_status", alias = "quoted_tweet")]
+    quoted: Option<Box<RawPost<'a>>>,
+    #[serde(
+        borrow,
+        alias = "retweeted_status_id_str",
+        alias = "retweeted_status_id"
+    )]
+    referenced_status_id: Option<&'a str>,
+    #[serde(borrow)]
+    unavailable_original_url: Option<&'a str>,
+    #[serde(
+        borrow,
+        alias = "in_reply_to_status_id_str",
+        alias = "in_reply_to_status_id",
+        alias = "in_reply_to_tweet_id",
+        alias = "inReplyToStatusId",
+        alias = "reply_to"
+    )]
+    in_reply_to: Option<&'a str>,
+    #[serde(alias = "favorited", alias = "liked", alias = "favorited_by_viewer")]
+    viewer_liked: Option<bool>,
 }
 
 fn raw_post_supported(raw: &RawPost<'_>) -> bool {
@@ -127,6 +153,7 @@ fn raw_post_supported(raw: &RawPost<'_>) -> bool {
         return false;
     }
     raw.retweeted.as_deref().is_none_or(raw_post_supported)
+        && raw.quoted.as_deref().is_none_or(raw_post_supported)
 }
 
 /// Media kind from a URL, case-insensitively, without allocating a
@@ -219,22 +246,25 @@ fn raw_post_to_post(raw: RawPost<'_>, users: &[(&str, &str, &str)]) -> Option<Po
     if name.is_empty() {
         name = handle.clone();
     }
-    let (likes, reposts, replies, bookmarks, views) = match raw.public_metrics.or(raw.metrics) {
-        Some(m) => (
-            m.like_count,
-            m.retweet_count,
-            m.reply_count,
-            m.bookmark_count,
-            m.impression_count,
-        ),
-        None => (
-            raw.inline_like_count,
-            raw.inline_retweet_count,
-            raw.inline_reply_count,
-            raw.inline_bookmark_count,
-            raw.inline_impression_count,
-        ),
-    };
+    let (likes, reposts, replies, bookmarks, views, quotes) =
+        match raw.public_metrics.or(raw.metrics) {
+            Some(m) => (
+                m.like_count,
+                m.retweet_count,
+                m.reply_count,
+                m.bookmark_count,
+                m.impression_count,
+                m.quote_count,
+            ),
+            None => (
+                raw.inline_like_count,
+                raw.inline_retweet_count,
+                raw.inline_reply_count,
+                raw.inline_bookmark_count,
+                raw.inline_impression_count,
+                raw.inline_quote_count,
+            ),
+        };
     Some(Post {
         url: post_url(&handle, &id),
         author_handle: handle,
@@ -245,6 +275,7 @@ fn raw_post_to_post(raw: RawPost<'_>, users: &[(&str, &str, &str)]) -> Option<Po
         replies,
         bookmarks,
         views,
+        quotes,
         text,
         id,
         media: raw_media_to_items(&raw),
@@ -252,6 +283,28 @@ fn raw_post_to_post(raw: RawPost<'_>, users: &[(&str, &str, &str)]) -> Option<Po
             .retweeted
             .and_then(|inner| raw_post_to_post(*inner, &[]))
             .map(Box::new),
+        quoted: raw
+            .quoted
+            .and_then(|inner| raw_post_to_post(*inner, &[]))
+            .map(Box::new),
+        referenced_status_id: raw
+            .referenced_status_id
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        unavailable_original_url: raw
+            .unavailable_original_url
+            .filter(|url| !url.is_empty())
+            .map(str::to_string),
+        in_reply_to: raw
+            .in_reply_to
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != "0")
+            .map(str::to_string),
+        viewer_liked: raw.viewer_liked,
+        viewer_follows_author: match raw.user.as_ref().or(raw.author.as_ref()) {
+            Some(RawAuthor::Obj(o)) => o.following,
+            _ => None,
+        },
     })
 }
 

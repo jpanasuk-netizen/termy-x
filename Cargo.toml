@@ -1,23 +1,25 @@
 [workspace]
 members = [
-    "crates/core",
-    "crates/desktop_app",
-    "crates/cli",
-    "crates/x_core",
-    "crates/x_cli",
+  "crates/core",
+  "crates/desktop_app",
+  "crates/cli",
+  "crates/wasm",
+  "crates/pty",
+  "crates/engine_ffi",
+  "crates/x_core",
+  "crates/x_cli",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1.0"
 dirs = "6.0"
+dunce = "1"
 flume = "0.11"
 # Keep Termy's own controls and assets; Kit supplies GPUI and the native platforms.
 gpui-kit = { version = "=0.7.0", default-features = false }
 keyring = "4.1.1"
 log = "0.4"
-p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
-polling = "3.11"
 rand_core = { version = "0.6", features = ["getrandom"] }
 semver = "1.0"
 serde = { version = "1.0", features = ["derive"] }
@@ -25,14 +27,7 @@ serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3"
 unicode-width = "0.2"
-# Pure-Rust TLS only: ureq's "tls" feature is rustls + webpki-roots (ring
-# crypto), never native-tls/OpenSSL. Spelled out with default-features = false
-# (identical set to ureq's old defaults: tls + gzip) so no future default or
-# feature unification can silently pull openssl-sys/native-tls into any
-# target -- notably x86_64-unknown-linux-gnu cross builds. The app's own
-# endpoints are unchanged: local Ollama/LM Studio over plain http on
-# 127.0.0.1, plus https to api.x.com / api.github.com through this stack.
-ureq = { version = "2", default-features = false, features = ["gzip", "json", "tls"] }
+ureq = { version = "2", features = ["json"] }
 url = "2.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -79,3 +74,11 @@ strip = "symbols"
 inherits = "release"
 debug = 1
 strip = "none"
+
+# Size-optimized wasm build for the @termysh/* npm packages.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"

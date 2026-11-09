@@ -1,6 +1,7 @@
 use crate::frame::TermyFrame;
-use crate::search_engine::{SearchConfig, SearchEngine, SearchMode};
+use crate::search_engine::{SearchConfig, SearchEngine, SearchLineMapping, SearchMode};
 use std::sync::Arc;
+use unicode_width::UnicodeWidthChar;
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct TermySearchMatch {
@@ -43,25 +44,13 @@ pub struct TermySearchOptions {
 }
 
 pub fn search_frame(frame: &TermyFrame, query: &str) -> Vec<TermySearchMatch> {
-    search_frame_with_options(frame, query, TermySearchOptions::default())
-}
-
-pub fn search_frame_with_options(
-    frame: &TermyFrame,
-    query: &str,
-    options: TermySearchOptions,
-) -> Vec<TermySearchMatch> {
-    search_frame_shared_with_options(frame, query, options)
+    search_frame_shared_with_options(frame, query, TermySearchOptions::default())
         .into_iter()
         .map(Into::into)
         .collect()
 }
 
-pub fn search_frame_shared(frame: &TermyFrame, query: &str) -> Vec<TermySharedSearchMatch> {
-    search_frame_shared_with_options(frame, query, TermySearchOptions::default())
-}
-
-pub fn search_frame_shared_with_options(
+fn search_frame_shared_with_options(
     frame: &TermyFrame,
     query: &str,
     options: TermySearchOptions,
@@ -73,14 +62,17 @@ pub fn search_frame_shared_with_options(
     let cols = usize::from(frame.cols);
     let rows = usize::from(frame.rows);
     search_lines_shared(
-        (0..rows).map(|row| (row, line_text(frame, row, cols))),
+        (0..rows).map(|row| {
+            let (text, mapping) = line_text(frame, row, cols);
+            (row, text, mapping)
+        }),
         query,
         options,
     )
 }
 
 pub(crate) fn search_lines_shared(
-    lines: impl IntoIterator<Item = (usize, String)>,
+    lines: impl IntoIterator<Item = (usize, String, SearchLineMapping)>,
     query: &str,
     options: TermySearchOptions,
 ) -> Vec<TermySharedSearchMatch> {
@@ -101,8 +93,8 @@ pub(crate) fn search_lines_shared(
     }
 
     let mut matches = Vec::new();
-    for (row, line) in lines {
-        let line_matches = engine.search_line(row as i32, &line);
+    for (row, line, mapping) in lines {
+        let line_matches = engine.search_line_mapped(row as i32, &line, &mapping);
         if line_matches.is_empty() {
             continue;
         }
@@ -124,20 +116,29 @@ pub(crate) fn search_lines_shared(
     matches
 }
 
-fn line_text(frame: &TermyFrame, row: usize, cols: usize) -> String {
+fn line_text(frame: &TermyFrame, row: usize, cols: usize) -> (String, SearchLineMapping) {
     let start = row.saturating_mul(cols);
     let end = start.saturating_add(cols);
     if end > frame.cells.len() {
-        return String::new();
+        return (String::new(), SearchLineMapping::default());
     }
 
-    let mut text = frame.cells[start..end]
-        .iter()
-        .map(|cell| if cell.render_text { cell.char } else { ' ' })
-        .collect::<String>();
+    let cells = &frame.cells[start..end];
+    let mut text = String::with_capacity(cols);
+    let mut mapping = SearchLineMapping::default();
+    let mut previous_start = 0;
+    for (col, cell) in cells.iter().enumerate() {
+        if cell.wide_character_spacer && col > 0 && cells[col - 1].char.width() == Some(2) {
+            mapping.record_cell(&text, previous_start, col - 1, 2);
+            continue;
+        }
+        previous_start = text.len();
+        text.push(if cell.render_text { cell.char } else { ' ' });
+        mapping.record_cell(&text, previous_start, col, 1);
+    }
     let trimmed_len = text.trim_end().len();
     text.truncate(trimmed_len);
-    text
+    (text, mapping)
 }
 
 #[cfg(test)]
@@ -174,7 +175,8 @@ mod tests {
     fn matches_on_the_same_row_share_line_text() {
         let frame = frame_from_rows(20, &["needle needle", "needle"]);
 
-        let matches = search_frame_shared(&frame, "needle");
+        let matches =
+            search_frame_shared_with_options(&frame, "needle", TermySearchOptions::default());
 
         assert_eq!(matches.len(), 3);
         assert!(Arc::ptr_eq(&matches[0].line, &matches[1].line));
@@ -190,7 +192,7 @@ mod tests {
     fn search_options_can_enable_case_sensitive_matching() {
         let frame = frame_from_rows(12, &["Hello HELLO"]);
 
-        let matches = search_frame_with_options(
+        let matches = search_with_options(
             &frame,
             "HELLO",
             TermySearchOptions {
@@ -214,7 +216,7 @@ mod tests {
     fn search_options_can_enable_regex_matching() {
         let frame = frame_from_rows(16, &["foo 123 bar"]);
 
-        let matches = search_frame_with_options(
+        let matches = search_with_options(
             &frame,
             r"\d+",
             TermySearchOptions {
@@ -238,7 +240,7 @@ mod tests {
     fn invalid_regex_returns_no_matches() {
         let frame = frame_from_rows(12, &["hello"]);
 
-        let matches = search_frame_with_options(
+        let matches = search_with_options(
             &frame,
             "[",
             TermySearchOptions {
@@ -248,6 +250,17 @@ mod tests {
         );
 
         assert!(matches.is_empty());
+    }
+
+    fn search_with_options(
+        frame: &TermyFrame,
+        query: &str,
+        options: TermySearchOptions,
+    ) -> Vec<TermySearchMatch> {
+        search_frame_shared_with_options(frame, query, options)
+            .into_iter()
+            .map(Into::into)
+            .collect()
     }
 
     fn frame_from_rows(cols: u16, rows: &[&str]) -> TermyFrame {

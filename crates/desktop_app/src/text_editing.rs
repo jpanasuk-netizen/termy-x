@@ -1,5 +1,13 @@
 use std::ops::Range;
 
+fn grapheme_before(text: &str, offset: usize) -> usize {
+    termy_x::draft_edit::prev_grapheme(text, offset)
+}
+
+fn grapheme_after(text: &str, offset: usize) -> usize {
+    termy_x::draft_edit::next_grapheme(text, offset)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextCharClass {
     Word,
@@ -19,33 +27,11 @@ pub(crate) fn classify_char(ch: char) -> TextCharClass {
 }
 
 pub(crate) fn previous_char_boundary(text: &str, offset: usize) -> usize {
-    if offset == 0 {
-        return 0;
-    }
-
-    let mut index = offset.min(text.len());
-    while index > 0 {
-        index -= 1;
-        if text.is_char_boundary(index) {
-            return index;
-        }
-    }
-    0
+    grapheme_before(text, offset)
 }
 
 pub(crate) fn next_char_boundary(text: &str, offset: usize) -> usize {
-    if offset >= text.len() {
-        return text.len();
-    }
-
-    let mut index = offset + 1;
-    while index < text.len() {
-        if text.is_char_boundary(index) {
-            return index;
-        }
-        index += 1;
-    }
-    text.len()
+    grapheme_after(text, offset)
 }
 
 pub(crate) fn previous_word_boundary(text: &str, offset: usize) -> usize {
@@ -67,7 +53,7 @@ pub(crate) fn previous_word_boundary(text: &str, offset: usize) -> usize {
         }
         boundary = idx;
     }
-    boundary
+    termy_x::draft_edit::floor_grapheme(text, boundary)
 }
 
 pub(crate) fn next_word_boundary(text: &str, offset: usize) -> usize {
@@ -81,10 +67,10 @@ pub(crate) fn next_word_boundary(text: &str, offset: usize) -> usize {
         if is_word {
             seen_word = true;
         } else if seen_word {
-            return offset + rel_idx;
+            return termy_x::draft_edit::ceil_grapheme(text, offset + rel_idx);
         }
     }
-    text.len()
+    termy_x::draft_edit::ceil_grapheme(text, text.len())
 }
 
 pub(crate) fn token_range_at_utf8(text: &str, offset: usize) -> Range<usize> {
@@ -211,6 +197,20 @@ mod tests {
     }
 
     #[test]
+    fn grapheme_motion_does_not_split_a_zwj_sequence() {
+        let family = "👨‍👩‍👧";
+        let text = format!("a{family}b");
+        let after_a = 1;
+        assert_eq!(next_char_boundary(&text, after_a), after_a + family.len());
+        assert_eq!(
+            previous_char_boundary(&text, after_a + family.len()),
+            after_a
+        );
+        // An offset inside the cluster snaps to the cluster start, then
+        // steps to the previous grapheme, so the caret never rests inside it.
+        assert_eq!(previous_char_boundary(&text, after_a + 1), 0);
+    }
+
     fn token_range_groups_matching_character_classes() {
         let text = "foo==bar";
         assert_eq!(token_range_at_utf8(text, 1), 0..3);

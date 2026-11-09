@@ -1,0 +1,24 @@
+[package]
+name = "termy_engine_ffi"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "C ABI over Termy's headless terminal engine, without PTY, config or threads"
+
+[lints]
+workspace = true
+
+[lib]
+# `libtermy_engine.a` for static linking (Linux musl, macOS), plus a shared
+# library and an rlib for Rust tests.
+name = "termy_engine"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# The engine alone: parser, grid, encoders and snapshots. No PTY, config,
+# keyring, fonts, network, plugins, multiplexer or SSH.
+termy_core = { path = "../core", default-features = false }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

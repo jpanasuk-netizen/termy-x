@@ -17,6 +17,10 @@ pub struct TermyKeystroke {
 pub type Modifiers = TermyModifiers;
 pub type Keystroke = TermyKeystroke;
 
+mod legacy;
+
+use legacy::basic_keystroke_to_input;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TerminalKeyboardMode {
     application_cursor_keys: bool,
@@ -25,6 +29,9 @@ pub struct TerminalKeyboardMode {
     report_alternate_keys: bool,
     report_all_keys_as_esc: bool,
     report_associated_text: bool,
+    /// DECKPAM. Skipped on the wire so the multiplexer state format is unchanged.
+    #[serde(skip)]
+    application_keypad: bool,
 }
 
 impl TerminalKeyboardMode {
@@ -43,7 +50,17 @@ impl TerminalKeyboardMode {
             report_alternate_keys,
             report_all_keys_as_esc,
             report_associated_text,
+            application_keypad: false,
         }
+    }
+
+    pub const fn with_application_keypad(mut self, application_keypad: bool) -> Self {
+        self.application_keypad = application_keypad;
+        self
+    }
+
+    pub fn application_keypad(self) -> bool {
+        self.application_keypad
     }
 
     pub fn disambiguate_escape_codes(self) -> bool {
@@ -100,12 +117,51 @@ pub fn keystroke_to_input_with_options(
     prompt_shortcuts_enabled: bool,
     macos_option_as_alt: bool,
 ) -> Option<Vec<u8>> {
+    encode_keystroke(
+        keystroke,
+        event_kind,
+        keyboard_mode,
+        Some(NativeOptions {
+            prompt_shortcuts_enabled,
+            macos_option_as_alt,
+        }),
+    )
+}
+
+/// Encodes `keystroke` as xterm on Linux does, whatever platform this runs
+/// on, for keys sent without a keyboard (`termy mux key`): Alt sends ESC
+/// before the key's text (Option is Alt on macOS), no prompt shortcut
+/// rewrites a modified key, and neither macOS Option composition nor Windows
+/// AltGr apply. Text a key types, like Shift's capitals, must be in
+/// `key_char`. The same keystroke always yields the same bytes (audit B25).
+pub fn portable_keystroke_to_input(
+    keystroke: &Keystroke,
+    event_kind: TerminalKeyEventKind,
+    keyboard_mode: TerminalKeyboardMode,
+) -> Option<Vec<u8>> {
+    encode_keystroke(keystroke, event_kind, keyboard_mode, None)
+}
+
+/// The platform conventions of a keyboard typing into this terminal.
+#[derive(Clone, Copy)]
+struct NativeOptions {
+    prompt_shortcuts_enabled: bool,
+    macos_option_as_alt: bool,
+}
+
+/// `native` is `None` for [`portable_keystroke_to_input`].
+fn encode_keystroke(
+    keystroke: &Keystroke,
+    event_kind: TerminalKeyEventKind,
+    keyboard_mode: TerminalKeyboardMode,
+    native: Option<NativeOptions>,
+) -> Option<Vec<u8>> {
     // Option-as-Alt only overrides legacy composed-character input. When the
     // kitty keyboard protocol is active the enhanced encoder already reports
     // the base key with the Alt modifier (and paired press/release events), so
     // short-circuiting here would send legacy ESC-prefixed bytes that break
     // the disambiguation TUIs negotiated.
-    if macos_option_as_alt
+    if native.is_some_and(|native| native.macos_option_as_alt)
         && !keyboard_mode.enhanced_reporting_active()
         && let Some(input) = macos_option_as_alt_input(keystroke, event_kind)
     {
@@ -115,28 +171,34 @@ pub fn keystroke_to_input_with_options(
     // "Natural text editing" shortcuts (cmd/alt+arrows, cmd+backspace, etc.) send
     // legacy bytes (Ctrl-U, ESC b, ...) even when the kitty keyboard protocol is
     // active, so they keep working in TUIs that opted into enhanced reporting.
-    if matches!(
-        event_kind,
-        TerminalKeyEventKind::Press | TerminalKeyEventKind::Repeat
-    ) && let Some(input) = modified_special_keystroke_input(keystroke, prompt_shortcuts_enabled)
+    if let Some(native) = native
+        && matches!(
+            event_kind,
+            TerminalKeyEventKind::Press | TerminalKeyEventKind::Repeat
+        )
+        && let Some(input) =
+            modified_special_keystroke_input(keystroke, native.prompt_shortcuts_enabled)
     {
         return Some(input.to_vec());
     }
 
+    let native = native.is_some();
     if !keyboard_mode.enhanced_reporting_active() {
         return match event_kind {
             TerminalKeyEventKind::Press | TerminalKeyEventKind::Repeat => {
-                basic_keystroke_to_input(keystroke, keyboard_mode)
+                basic_keystroke_to_input(keystroke, keyboard_mode, native)
             }
             TerminalKeyEventKind::Release => None,
         };
     }
 
-    enhanced_keystroke_to_input(keystroke, event_kind, keyboard_mode).or_else(|| match event_kind {
-        TerminalKeyEventKind::Press | TerminalKeyEventKind::Repeat => {
-            basic_keystroke_to_input(keystroke, keyboard_mode)
+    enhanced_keystroke_to_input(keystroke, event_kind, keyboard_mode, native).or_else(|| {
+        match event_kind {
+            TerminalKeyEventKind::Press | TerminalKeyEventKind::Repeat => {
+                basic_keystroke_to_input(keystroke, keyboard_mode, native)
+            }
+            TerminalKeyEventKind::Release => None,
         }
-        TerminalKeyEventKind::Release => None,
     })
 }
 
@@ -179,8 +241,9 @@ fn enhanced_keystroke_to_input(
     keystroke: &Keystroke,
     event_kind: TerminalKeyEventKind,
     keyboard_mode: TerminalKeyboardMode,
+    native: bool,
 ) -> Option<Vec<u8>> {
-    SequenceBuilder::new(keystroke, event_kind, keyboard_mode).build()
+    SequenceBuilder::new(keystroke, event_kind, keyboard_mode, native).build()
 }
 
 fn should_disambiguate_escape_code(key: &str, modifiers: Modifiers) -> bool {
@@ -204,134 +267,6 @@ fn modifiers_are_empty(modifiers: Modifiers) -> bool {
         && !modifiers.function
 }
 
-fn basic_keystroke_to_input(
-    keystroke: &Keystroke,
-    keyboard_mode: TerminalKeyboardMode,
-) -> Option<Vec<u8>> {
-    let key = keystroke.key.as_str();
-    let modifiers = keystroke.modifiers;
-
-    let input = match key {
-        "enter" => {
-            if modifiers.shift {
-                Some(vec![b'\n'])
-            } else {
-                Some(vec![b'\r'])
-            }
-        }
-        "tab" => {
-            if modifiers.shift
-                && !modifiers.control
-                && !modifiers.alt
-                && !modifiers.platform
-                && !modifiers.function
-            {
-                Some(b"\x1b[Z".to_vec())
-            } else {
-                Some(vec![b'\t'])
-            }
-        }
-        "escape" => Some(vec![0x1b]),
-        "backspace" => Some(vec![0x7f]),
-        "delete" => Some(b"\x1b[3~".to_vec()),
-        "up" => Some(legacy_cursor_key_input('A', keyboard_mode, modifiers)),
-        "down" => Some(legacy_cursor_key_input('B', keyboard_mode, modifiers)),
-        "right" => Some(legacy_cursor_key_input('C', keyboard_mode, modifiers)),
-        "left" => Some(legacy_cursor_key_input('D', keyboard_mode, modifiers)),
-        "home" => Some(legacy_cursor_key_input('H', keyboard_mode, modifiers)),
-        "end" => Some(legacy_cursor_key_input('F', keyboard_mode, modifiers)),
-        "pageup" => Some(b"\x1b[5~".to_vec()),
-        "pagedown" => Some(b"\x1b[6~".to_vec()),
-        "space" => Some(vec![b' ']),
-        _ => None,
-    };
-
-    if let Some(input) = input {
-        return Some(input);
-    }
-
-    if let Some(input) = legacy_function_key_input(key, modifiers) {
-        return Some(input.to_vec());
-    }
-
-    #[cfg(target_os = "windows")]
-    if let Some(text) = windows_altgr_text(keystroke) {
-        return Some(text.as_bytes().to_vec());
-    }
-
-    if modifiers.control && !modifiers.platform && !modifiers.function && key.len() == 1 {
-        let c = key.chars().next().unwrap();
-        if c.is_ascii_alphabetic() {
-            let ctrl_char = (c.to_ascii_lowercase() as u8) - b'a' + 1;
-            return Some(vec![ctrl_char]);
-        }
-        // Handle CTRL with @, [, \, ], ^, _ (standard ASCII control range)
-        if matches!(c, '@'..='_') {
-            let ctrl_char = (c as u8) & 0x1F;
-            return Some(vec![ctrl_char]);
-        }
-    }
-
-    if !modifiers.control
-        && !modifiers.platform
-        && !modifiers.function
-        && let Some(key_char) = keystroke.key_char.as_deref()
-        && !key_char.is_empty()
-    {
-        return Some(key_char.as_bytes().to_vec());
-    }
-
-    if !modifiers.control && !modifiers.platform && !modifiers.function && key.len() == 1 {
-        let c = key.chars().next().unwrap();
-        if c.is_ascii() {
-            return Some(vec![c as u8]);
-        }
-
-        let mut buf = [0u8; 4];
-        let s = c.encode_utf8(&mut buf);
-        return Some(s.as_bytes().to_vec());
-    }
-
-    None
-}
-
-fn legacy_cursor_key_input(
-    suffix: char,
-    keyboard_mode: TerminalKeyboardMode,
-    modifiers: Modifiers,
-) -> Vec<u8> {
-    // Full-screen TUIs toggle DECCKM and expect SS3 cursor/home/end sequences
-    // only for unmodified keys; modified keys keep the existing legacy fallback.
-    let prefix = if modifiers_are_empty(modifiers) && keyboard_mode.application_cursor_keys {
-        "\x1bO"
-    } else {
-        "\x1b["
-    };
-    format!("{prefix}{suffix}").into_bytes()
-}
-
-fn legacy_function_key_input(key: &str, modifiers: Modifiers) -> Option<&'static [u8]> {
-    if modifiers.control || modifiers.alt || modifiers.shift || modifiers.platform {
-        return None;
-    }
-
-    Some(match key {
-        "f1" => b"\x1bOP".as_slice(),
-        "f2" => b"\x1bOQ".as_slice(),
-        "f3" => b"\x1bOR".as_slice(),
-        "f4" => b"\x1bOS".as_slice(),
-        "f5" => b"\x1b[15~".as_slice(),
-        "f6" => b"\x1b[17~".as_slice(),
-        "f7" => b"\x1b[18~".as_slice(),
-        "f8" => b"\x1b[19~".as_slice(),
-        "f9" => b"\x1b[20~".as_slice(),
-        "f10" => b"\x1b[21~".as_slice(),
-        "f11" => b"\x1b[23~".as_slice(),
-        "f12" => b"\x1b[24~".as_slice(),
-        _ => return None,
-    })
-}
-
 fn modifier_or_control_sequence_base(
     keystroke: &Keystroke,
     keyboard_mode: TerminalKeyboardMode,
@@ -343,33 +278,35 @@ fn modifier_or_control_sequence_base(
         "escape" => "27",
         "space" => "32",
         "backspace" => "127",
+        // Hosts don't say which side a modifier is on, so report the kitty
+        // LEFT_* codes (57441..=57444); RIGHT_* starts at 57447.
         "shift" => {
             if !keyboard_mode.report_all_keys_as_esc() {
                 return None;
             }
             modifiers.set(SequenceModifiers::SHIFT, keystroke.modifiers.shift);
-            "57447"
+            "57441"
         }
         "control" => {
             if !keyboard_mode.report_all_keys_as_esc() {
                 return None;
             }
             modifiers.set(SequenceModifiers::CONTROL, keystroke.modifiers.control);
-            "57448"
+            "57442"
         }
         "alt" => {
             if !keyboard_mode.report_all_keys_as_esc() {
                 return None;
             }
             modifiers.set(SequenceModifiers::ALT, keystroke.modifiers.alt);
-            "57449"
+            "57443"
         }
         "super" | "cmd" => {
             if !keyboard_mode.report_all_keys_as_esc() {
                 return None;
             }
             modifiers.set(SequenceModifiers::SUPER, keystroke.modifiers.platform);
-            "57450"
+            "57444"
         }
         "capslock" => {
             if !keyboard_mode.report_all_keys_as_esc() {
@@ -649,8 +586,10 @@ impl<'a> SequenceBuilder<'a> {
         keystroke: &'a Keystroke,
         event_kind: TerminalKeyEventKind,
         keyboard_mode: TerminalKeyboardMode,
+        native: bool,
     ) -> Self {
-        let pure_text_event = pure_text_event_text(keystroke).is_some();
+        // Option and AltGr text only comes from a real keyboard.
+        let pure_text_event = native && pure_text_event_text(keystroke).is_some();
         let include_event_type = keyboard_mode.report_event_types()
             && matches!(
                 event_kind,
@@ -954,11 +893,13 @@ impl SequenceModifiers {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use super::keystroke_to_input_with_options;
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     use super::pure_text_event_text;
     use super::{
         Keystroke, Modifiers, TerminalKeyEventKind, TerminalKeyboardMode, associated_text,
-        keystroke_to_input, keystroke_to_input_with_options,
+        keystroke_to_input,
     };
 
     fn keystroke(key: &str, key_char: Option<&str>, modifiers: Modifiers) -> Keystroke {
@@ -1012,8 +953,29 @@ mod tests {
                 report_all_mode(),
                 true,
             ),
-            Some(b"\x1b[57450;9u".to_vec())
+            Some(b"\x1b[57444;9u".to_vec())
         );
+    }
+
+    #[test]
+    fn enhanced_mode_reports_left_modifier_key_codes() {
+        for (key, code) in [
+            ("shift", "57441"),
+            ("control", "57442"),
+            ("alt", "57443"),
+            ("super", "57444"),
+        ] {
+            assert_eq!(
+                keystroke_to_input(
+                    &keystroke(key, None, Modifiers::default()),
+                    TerminalKeyEventKind::Release,
+                    report_all_with_event_types_mode(),
+                    true,
+                ),
+                Some(format!("\x1b[{code};1:3u").into_bytes()),
+                "{key}"
+            );
+        }
     }
 
     #[test]
@@ -1027,7 +989,7 @@ mod tests {
                 report_all_with_event_types_mode(),
                 true,
             ),
-            Some(b"\x1b[57450;1:3u".to_vec())
+            Some(b"\x1b[57444;1:3u".to_vec())
         );
     }
 
@@ -1311,24 +1273,6 @@ mod tests {
                 true,
             ),
             Some(b"\x1bOP".to_vec())
-        );
-    }
-
-    #[test]
-    fn legacy_mode_does_not_emit_modified_function_keys() {
-        let modifiers = Modifiers {
-            shift: true,
-            ..Modifiers::default()
-        };
-
-        assert_eq!(
-            keystroke_to_input(
-                &keystroke("f1", None, modifiers),
-                TerminalKeyEventKind::Press,
-                TerminalKeyboardMode::default(),
-                true,
-            ),
-            None
         );
     }
 
@@ -1668,6 +1612,65 @@ mod tests {
                 true,
             ),
             Some(b"\x1b[98;3:3u".to_vec())
+        );
+    }
+
+    /// Audit B25: portable encoding is the same on every platform. Alt
+    /// prefixes ESC (also on macOS, and for named keys), no prompt shortcut
+    /// rewrites a modified arrow, and AltGr or Option text is not inferred.
+    #[test]
+    fn portable_encoding_ignores_platform_conventions() {
+        use super::portable_keystroke_to_input;
+        let encode = |key: &str, key_char: Option<&str>, modifiers: Modifiers| {
+            portable_keystroke_to_input(
+                &keystroke(key, key_char, modifiers),
+                TerminalKeyEventKind::Press,
+                TerminalKeyboardMode::default(),
+            )
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(encode("left", None, control), Some(b"\x1b[1;5D".to_vec()));
+        assert_eq!(encode("left", None, alt), Some(b"\x1b[1;3D".to_vec()));
+        assert_eq!(encode("backspace", None, control), Some(b"\x7f".to_vec()));
+        assert_eq!(encode("backspace", None, alt), Some(b"\x1b\x7f".to_vec()));
+        assert_eq!(encode("b", Some("b"), alt), Some(b"\x1bb".to_vec()));
+        assert_eq!(encode("enter", None, alt), Some(b"\x1b\r".to_vec()));
+        assert_eq!(encode("a", Some("A"), shift), Some(b"A".to_vec()));
+        assert_eq!(
+            encode("a", Some("A"), Modifiers { alt: true, ..shift }),
+            Some(b"\x1bA".to_vec())
+        );
+        // A Ctrl+Alt key with text is a chord, not Windows AltGr text.
+        assert_eq!(
+            encode(
+                "q",
+                Some("@"),
+                Modifiers {
+                    alt: true,
+                    ..control
+                }
+            ),
+            Some(b"\x1b\x11".to_vec())
+        );
+        // Under the kitty protocol, Alt is a modifier, not Option text.
+        assert_eq!(
+            portable_keystroke_to_input(
+                &keystroke("b", Some("b"), alt),
+                TerminalKeyEventKind::Press,
+                disambiguate_mode(),
+            ),
+            Some(b"\x1b[98;3u".to_vec())
         );
     }
 }

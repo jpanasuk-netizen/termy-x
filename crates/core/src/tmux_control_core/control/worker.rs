@@ -2,7 +2,9 @@ use std::io::{BufRead, BufReader, Read, Write};
 
 use flume::{Receiver, Sender, TrySendError};
 
-use super::super::command::{command_with_completion_token, split_control_completion_token};
+use super::super::command::{
+    command_with_completion_token, is_control_completion_token, split_control_completion_token,
+};
 use super::super::types::{TmuxControlError, TmuxNotification};
 
 use super::{
@@ -219,7 +221,6 @@ pub fn spawn_control_threads<W, R>(
                                 Some(ActiveControlCommand::Tracked(TrackedPendingCommand {
                                     pending,
                                     output: String::new(),
-                                    is_error: false,
                                 }));
                         }
                         Ok(None) => {
@@ -262,21 +263,31 @@ pub fn spawn_control_threads<W, R>(
                         continue;
                     };
 
+                    if is_error {
+                        // tmux abandons the rest of a `;` command list after a
+                        // failing command, so the completion token never arrives.
+                        // Fail the request now instead of wedging the writer.
+                        let response =
+                            map_command_completion_response(&tracked.pending.command, true, output);
+                        complete_pending_command(tracked.pending, response);
+                        continue;
+                    }
+
                     let Some(output_chunk) = split_control_completion_token(
                         output.as_str(),
                         tracked.pending.completion_token.as_str(),
                     ) else {
-                        append_command_output_chunk(&mut tracked.output, output.as_str());
-                        tracked.is_error |= is_error;
+                        if !is_control_completion_token(output.as_str()) {
+                            append_command_output_chunk(&mut tracked.output, output.as_str());
+                        }
                         current_command = Some(ActiveControlCommand::Tracked(tracked));
                         continue;
                     };
 
                     append_command_output_chunk(&mut tracked.output, output_chunk.as_str());
-                    tracked.is_error |= is_error;
                     let response = map_command_completion_response(
                         &tracked.pending.command,
-                        tracked.is_error,
+                        false,
                         tracked.output,
                     );
                     complete_pending_command(tracked.pending, response);
@@ -320,4 +331,130 @@ pub fn spawn_control_threads<W, R>(
             }
         }
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::super::channel::{ControlCommandResult, ControlRequest};
+    use super::spawn_control_threads;
+    use crate::tmux_control_core::types::{TmuxControlError, TmuxControlErrorKind};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    type Response = Result<ControlCommandResult, TmuxControlError>;
+
+    /// Drives the worker threads against a scripted fake tmux.
+    struct FakeTmux {
+        request_tx: flume::Sender<ControlRequest>,
+        commands: BufReader<UnixStream>,
+        output: UnixStream,
+    }
+
+    impl FakeTmux {
+        fn spawn() -> Self {
+            let (worker_stdin, fake_stdin) = UnixStream::pair().expect("stdin pair");
+            let (worker_stdout, fake_stdout) = UnixStream::pair().expect("stdout pair");
+            fake_stdin
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let (request_tx, request_rx) = flume::bounded(16);
+            let (pending_tx, pending_rx) = flume::bounded(1);
+            let (notifications_tx, _notifications_rx) = flume::bounded(64);
+            let (fatal_exit_tx, _fatal_exit_rx) = flume::bounded(1);
+            spawn_control_threads(
+                None,
+                worker_stdin,
+                worker_stdout,
+                request_rx,
+                pending_tx,
+                pending_rx,
+                notifications_tx,
+                fatal_exit_tx,
+                None,
+            );
+            Self {
+                request_tx,
+                commands: BufReader::new(fake_stdin),
+                output: fake_stdout,
+            }
+        }
+
+        /// Enqueues `command` and returns the completion token the worker wrote.
+        fn send(&mut self, command: &str, token: &str) -> flume::Receiver<Response> {
+            let (response_tx, response_rx) = flume::bounded(1);
+            self.request_tx
+                .send(ControlRequest {
+                    command: command.to_string(),
+                    completion_token: token.to_string(),
+                    response_tx: Some(response_tx),
+                })
+                .expect("enqueue");
+            let mut line = String::new();
+            self.commands
+                .read_line(&mut line)
+                .expect("worker should write the command to tmux");
+            assert!(
+                line.starts_with(command),
+                "unexpected command line {line:?}"
+            );
+            response_rx
+        }
+
+        fn emit(&mut self, lines: &str) {
+            self.output.write_all(lines.as_bytes()).expect("emit");
+        }
+    }
+
+    fn recv(response_rx: &flume::Receiver<Response>) -> Response {
+        response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("command should complete")
+    }
+
+    #[test]
+    fn error_block_fails_command_and_keeps_channel_usable() {
+        let mut tmux = FakeTmux::spawn();
+
+        // tmux 3.4 output for `select-pane -t %999 ; display-message -p <token>`:
+        // the list stops at the error, so the token block never arrives.
+        let failed = tmux.send("select-pane -t %999", "__termy_cmd_done_101");
+        tmux.emit("%begin 1 10 1\ncan't find pane: %999\n%error 1 10 1\n");
+        let error = recv(&failed).expect_err("failing command must fail");
+        assert_eq!(error.kind, TmuxControlErrorKind::Runtime);
+        assert_eq!(error.message, "can't find pane: %999");
+
+        let ok = tmux.send("display-message -p ok", "__termy_cmd_done_102");
+        tmux.emit(
+            "%begin 1 11 1\nok\n%end 1 11 1\n%begin 1 12 1\n__termy_cmd_done_102\n%end 1 12 1\n",
+        );
+        assert_eq!(recv(&ok).expect("command succeeds").output.trim_end(), "ok");
+    }
+
+    #[test]
+    fn stray_token_after_nested_error_is_not_next_command_output() {
+        let mut tmux = FakeTmux::spawn();
+
+        // A failing command nested in `if-shell` doesn't stop the outer list,
+        // so its completion token still arrives after the error block.
+        let failed = tmux.send(
+            "if-shell true 'select-pane -t %999'",
+            "__termy_cmd_done_201",
+        );
+        tmux.emit(
+            "%begin 1 20 1\n%end 1 20 1\n%begin 1 21 1\ncan't find pane: %999\n%error 1 21 1\n",
+        );
+        assert!(recv(&failed).is_err());
+
+        let next = tmux.send("display-message -p next", "__termy_cmd_done_202");
+        tmux.emit(concat!(
+            "%begin 1 22 1\n__termy_cmd_done_201\n%end 1 22 1\n",
+            "%begin 1 23 1\nnext\n%end 1 23 1\n",
+            "%begin 1 24 1\n__termy_cmd_done_202\n%end 1 24 1\n",
+        ));
+        assert_eq!(
+            recv(&next).expect("command succeeds").output.trim_end(),
+            "next"
+        );
+    }
 }

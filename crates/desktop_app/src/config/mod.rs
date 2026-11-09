@@ -3,10 +3,10 @@ mod io;
 mod mutate;
 mod preview;
 
-use crate::theme_store;
+use crate::theme_library;
 use std::time::Duration;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
@@ -14,11 +14,13 @@ use std::{
 };
 
 pub use error::ConfigIoError;
+#[cfg(target_os = "windows")]
+pub(crate) use io::shell_execute_open;
+pub(crate) use io::write_atomic_unsynced;
 pub use io::{ensure_config_file, open_config_file, subscribe_config_changes};
 pub use mutate::{
-    import_colors_from_json, prettify_config_file, remove_root_setting,
-    reset_theme_references_in_config, set_color_setting, set_keybind_lines, set_root_setting,
-    set_theme_in_config, upsert_task,
+    import_colors_from_json, prettify_config_file, remove_root_setting, set_color_setting,
+    set_keybind_lines, set_root_setting, set_theme_in_config, upsert_task,
 };
 pub use preview::{
     BackgroundOpacityPreview, current_background_opacity_preview, effective_background_opacity,
@@ -26,10 +28,11 @@ pub use preview::{
     synced_background_opacity_preview,
 };
 pub use termy_core::config_core::{
-    AppConfig, AppearanceMode, ConfigDiagnostic, ConfigDiagnosticKind, CursorStyle, CustomColors,
-    PaneFocusEffect, SHELL_DECIDE_THEME_ID, SystemAppearance, TabBarPosition, TabCloseVisibility,
-    TabTitleConfig, TabTitleSource, TabWidthMode, TaskConfig, TerminalScrollbarStyle,
-    TerminalScrollbarVisibility, WindowsShell, WorkingDirFallback, resolve_active_theme,
+    AppConfig, AppearanceMode, ClipboardReadPolicy, ConfigDiagnostic, ConfigDiagnosticKind,
+    CursorStyle, CustomColors, PaneFocusEffect, SHELL_DECIDE_THEME_ID, SystemAppearance,
+    TabBarPosition, TabCloseVisibility, TabStyle, TabTitleConfig, TabTitleSource, TabWidthMode,
+    TaskConfig, TermProgram, TerminalScrollbarStyle, TerminalScrollbarVisibility, WindowsShell,
+    WorkingDirFallback, resolve_active_theme,
 };
 
 pub fn system_appearance_from_window(appearance: gpui_kit::WindowAppearance) -> SystemAppearance {
@@ -107,69 +110,146 @@ pub fn summarize_parse_diagnostics(diagnostics: &[ConfigDiagnostic]) -> Option<S
     ))
 }
 
-/// Maps toast ID → list of raw config keys to remove when "Fix" is clicked.
-static PENDING_FIXES: LazyLock<Mutex<HashMap<u64, Vec<String>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// A one-click fix offered by the config diagnostics toast.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigFix {
+    /// Remove every occurrence of an unknown root key.
+    RemoveUnknownKey(String),
+    /// Remove all but the last (effective) occurrence of a duplicated root key.
+    RemoveDuplicateKey(String),
+}
+
+/// The diagnostics toast currently shown for the config file, if any.
+struct DiagnosticsToast {
+    fingerprint: u64,
+    toast_id: u64,
+    fixes: Vec<ConfigFix>,
+}
+
+/// The config is reloaded from many places (each window, settings, tmux), so
+/// the toast is only shown again when the diagnostics themselves change. This
+/// also bounds the pending fixes to the latest toast.
+static DIAGNOSTICS_TOAST: LazyLock<Mutex<Option<DiagnosticsToast>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn diagnostics_fingerprint(diagnostics: &[ConfigDiagnostic]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for diagnostic in diagnostics {
+        diagnostic.line_number.hash(&mut hasher);
+        diagnostic_kind_label(diagnostic.kind).hash(&mut hasher);
+        diagnostic.message.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn fixes_for_diagnostics(diagnostics: &[ConfigDiagnostic]) -> Vec<ConfigFix> {
+    let mut fixes = Vec::new();
+    for diagnostic in diagnostics {
+        // Messages look like "Unknown root key 'key'" and
+        // "Duplicate root key 'key' (first defined on line N)".
+        let fix = match diagnostic.kind {
+            ConfigDiagnosticKind::UnknownRootKey => diagnostic
+                .message
+                .strip_prefix("Unknown root key '")
+                .and_then(|rest| rest.split_once('\''))
+                .map(|(key, _)| ConfigFix::RemoveUnknownKey(key.to_string())),
+            ConfigDiagnosticKind::DuplicateRootKey => diagnostic
+                .message
+                .strip_prefix("Duplicate root key '")
+                .and_then(|rest| rest.split_once('\''))
+                .map(|(key, _)| ConfigFix::RemoveDuplicateKey(key.to_string())),
+            _ => None,
+        };
+        if let Some(fix) = fix
+            && !fixes.contains(&fix)
+        {
+            fixes.push(fix);
+        }
+    }
+    fixes
+}
 
 pub fn show_parse_diagnostics_toast(diagnostics: &[ConfigDiagnostic]) {
+    let mut state = DIAGNOSTICS_TOAST.lock().expect("diagnostics toast lock");
+    show_parse_diagnostics_toast_with_state(
+        &mut state,
+        diagnostics,
+        |summary, action_label| {
+            crate::ui::toast::enqueue_actionable_toast_with_id(
+                crate::ui::toast::ToastKind::Warning,
+                summary,
+                Some(Duration::from_secs(10)),
+                action_label,
+            )
+        },
+        crate::ui::toast::dismiss_toast,
+    );
+}
+
+fn show_parse_diagnostics_toast_with_state(
+    state: &mut Option<DiagnosticsToast>,
+    diagnostics: &[ConfigDiagnostic],
+    enqueue: impl FnOnce(String, Option<String>) -> u64,
+    mut dismiss: impl FnMut(u64),
+) {
     let Some(summary) = summarize_parse_diagnostics(diagnostics) else {
+        if let Some(previous) = state.take() {
+            dismiss(previous.toast_id);
+        }
         return;
     };
 
-    // Collect fixable keys (unknown/duplicate root keys can simply be removed).
-    let fixable_keys: Vec<String> = diagnostics
-        .iter()
-        .filter(|d| {
-            matches!(
-                d.kind,
-                ConfigDiagnosticKind::UnknownRootKey | ConfigDiagnosticKind::DuplicateRootKey
-            )
-        })
-        .filter_map(|d| {
-            // The message format is "Unknown root key 'key'" — extract the key.
-            d.message
-                .strip_prefix("Unknown root key '")
-                .or_else(|| d.message.strip_prefix("Duplicate root key '"))
-                .and_then(|s| s.strip_suffix('\''))
-                .map(|s| s.to_string())
-        })
-        .collect();
+    let fingerprint = diagnostics_fingerprint(diagnostics);
+    if state
+        .as_ref()
+        .is_some_and(|previous| previous.fingerprint == fingerprint)
+    {
+        return;
+    }
+    if let Some(previous) = state.take() {
+        dismiss(previous.toast_id);
+    }
 
-    let action_label = if fixable_keys.is_empty() {
+    let fixes = fixes_for_diagnostics(diagnostics);
+    let action_label = if fixes.is_empty() {
         None
     } else {
         Some("Fix".to_string())
     };
 
-    let toast_id = crate::ui::toast::enqueue_actionable_toast_with_id(
-        crate::ui::toast::ToastKind::Warning,
-        summary,
-        Some(Duration::from_secs(10)),
-        action_label,
-    );
+    let toast_id = enqueue(summary, action_label);
 
-    if !fixable_keys.is_empty() {
-        let mut fixes = PENDING_FIXES.lock().expect("pending fixes lock");
-        fixes.insert(toast_id, fixable_keys);
-    }
+    *state = Some(DiagnosticsToast {
+        fingerprint,
+        toast_id,
+        fixes,
+    });
 }
 
 /// Execute the fix registered for a toast (remove unknown/duplicate keys from config).
 /// Returns true if any fix was applied.
 pub fn execute_fix_for_toast(toast_id: u64) -> bool {
-    let keys = {
-        let mut fixes = PENDING_FIXES.lock().expect("pending fixes lock");
-        fixes.remove(&toast_id)
+    let fixes = {
+        let mut state = DIAGNOSTICS_TOAST.lock().expect("diagnostics toast lock");
+        match state.as_mut() {
+            Some(toast) if toast.toast_id == toast_id => std::mem::take(&mut toast.fixes),
+            _ => return false,
+        }
     };
-    let Some(keys) = keys else {
-        return false;
-    };
-    for key in &keys {
-        if let Err(e) = mutate::remove_raw_root_key_from_config(key) {
-            log::warn!("Failed to fix config key '{key}': {e}");
+    let mut fixed_any = false;
+    for fix in &fixes {
+        let result = match fix {
+            ConfigFix::RemoveUnknownKey(key) => mutate::remove_raw_root_key_from_config(key),
+            ConfigFix::RemoveDuplicateKey(key) => {
+                mutate::remove_duplicate_root_key_from_config(key)
+            }
+        };
+        match result {
+            Ok(_) => fixed_any = true,
+            Err(e) => log::warn!("Failed to fix config: {fix:?}: {e}"),
         }
     }
-    !keys.is_empty()
+    fixed_any
 }
 
 // This uses Rust's default SipHash-based hasher and is only for in-process
@@ -253,9 +333,8 @@ fn diagnostic_kind_label(kind: ConfigDiagnosticKind) -> &'static str {
 }
 
 fn migrate_legacy_builtin_theme_in_contents(contents: &str) -> String {
-    let installed_theme_ids: HashSet<String> = theme_store::load_installed_theme_ids()
-        .into_iter()
-        .collect();
+    let installed_theme_ids: HashSet<String> =
+        theme_library::local_theme_ids().into_iter().collect();
     migrate_legacy_builtin_theme_in_contents_with_installed_ids(contents, &installed_theme_ids)
 }
 
@@ -264,11 +343,22 @@ fn migrate_legacy_builtin_theme_in_contents_with_installed_ids(
     installed_theme_ids: &HashSet<String>,
 ) -> String {
     let report = AppConfig::from_contents(contents);
+    // A theme that resolves as written (built in or a local file) is never
+    // rewritten, even when it looks like a legacy alias such as `tokyonight`.
+    if termy_core::themes::builtin_theme(&report.theme).is_some()
+        || installed_theme_ids.contains(&termy_core::themes::normalize_theme_id(&report.theme))
+    {
+        return contents.to_string();
+    }
     let Some(canonical_legacy_theme) = canonical_legacy_builtin_theme_id(&report.theme) else {
         return contents.to_string();
     };
 
-    let next_theme = if installed_theme_ids.contains(canonical_legacy_theme) {
+    // Legacy aliases move to their canonical id when that resolves, and to
+    // shell-decide otherwise.
+    let next_theme = if termy_core::themes::builtin_theme(canonical_legacy_theme).is_some()
+        || installed_theme_ids.contains(canonical_legacy_theme)
+    {
         canonical_legacy_theme.to_string()
     } else {
         SHELL_DECIDE_THEME_ID.to_string()
@@ -395,20 +485,135 @@ mod tests {
     }
 
     #[test]
-    fn migrates_removed_builtin_theme_to_shell_decide_when_not_installed() {
+    fn keeps_earlier_builtin_theme_ids_that_ship_again() {
+        for theme in ["monokai", "tokyo-night", "palenight"] {
+            let input = format!("theme = {theme}\nfont_size = 14\n");
+            let output = migrate_legacy_builtin_theme_in_contents_with_installed_ids(
+                &input,
+                &HashSet::new(),
+            );
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
+    fn keeps_legacy_ids_that_are_now_builtin_themes() {
+        for input in [
+            "theme = dracula\nfont_size = 14\n",
+            "theme = tokyonight\nfont_size = 14\n",
+        ] {
+            let output =
+                migrate_legacy_builtin_theme_in_contents_with_installed_ids(input, &HashSet::new());
+            assert_eq!(output, input);
+        }
+    }
+
+    #[test]
+    fn migrates_legacy_alias_to_builtin_canonical_id() {
         let output = migrate_legacy_builtin_theme_in_contents_with_installed_ids(
-            "theme = termy\nfont_size = 14\n",
+            "theme = catppuccin\nfont_size = 14\n",
             &HashSet::new(),
         );
-        assert_eq!(output, "theme = shell-decide\nfont_size = 14\n");
+        assert_eq!(output, "theme = catppuccin-mocha\nfont_size = 14\n");
+    }
+
+    #[test]
+    fn keeps_builtin_termy_theme_unchanged() {
+        let input = "theme = termy\nfont_size = 14\n";
+        let output =
+            migrate_legacy_builtin_theme_in_contents_with_installed_ids(input, &HashSet::new());
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn default_config_template_is_not_migrated() {
+        let output = migrate_legacy_builtin_theme_in_contents_with_installed_ids(
+            DEFAULT_CONFIG,
+            &HashSet::new(),
+        );
+        assert_eq!(output, DEFAULT_CONFIG);
+    }
+
+    #[test]
+    fn migrates_legacy_default_theme_alias_to_builtin_termy() {
+        let output = migrate_legacy_builtin_theme_in_contents_with_installed_ids(
+            "theme = default\nfont_size = 14\n",
+            &HashSet::new(),
+        );
+        assert_eq!(output, "theme = termy\nfont_size = 14\n");
+    }
+
+    fn diagnostic(kind: ConfigDiagnosticKind, message: &str) -> ConfigDiagnostic {
+        ConfigDiagnostic {
+            line_number: 3,
+            kind,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn duplicate_and_unknown_root_keys_are_fixable() {
+        let report =
+            AppConfig::from_contents_with_report("font_size = 12\nfont_size = 14\nbogus = 1\n");
+        assert_eq!(
+            fixes_for_diagnostics(&report.diagnostics),
+            vec![
+                ConfigFix::RemoveDuplicateKey("font_size".to_string()),
+                ConfigFix::RemoveUnknownKey("bogus".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn identical_diagnostics_show_a_single_toast() {
+        let diagnostics = vec![diagnostic(
+            ConfigDiagnosticKind::UnknownRootKey,
+            "Unknown root key 'bogus'",
+        )];
+        let mut state = None;
+        let mut next_id = 0;
+        let mut dismissed = Vec::new();
+        let mut show = |state: &mut Option<DiagnosticsToast>, diagnostics: &[ConfigDiagnostic]| {
+            show_parse_diagnostics_toast_with_state(
+                state,
+                diagnostics,
+                |_, _| {
+                    next_id += 1;
+                    next_id
+                },
+                |id| dismissed.push(id),
+            );
+        };
+
+        show(&mut state, &diagnostics);
+        let first_id = state.as_ref().expect("toast shown").toast_id;
+        show(&mut state, &diagnostics);
+        assert_eq!(state.as_ref().expect("toast kept").toast_id, first_id);
+
+        let changed = vec![diagnostic(
+            ConfigDiagnosticKind::UnknownRootKey,
+            "Unknown root key 'other'",
+        )];
+        show(&mut state, &changed);
+        let second = state.as_ref().expect("new toast shown");
+        assert_ne!(second.toast_id, first_id);
+        assert_eq!(
+            second.fixes,
+            vec![ConfigFix::RemoveUnknownKey("other".to_string())]
+        );
+
+        let second_id = second.toast_id;
+        show(&mut state, &[]);
+        assert!(state.is_none());
+        assert_eq!(dismissed, vec![first_id, second_id]);
     }
 
     #[test]
     fn migrates_legacy_builtin_alias_to_installed_slug() {
         let output = migrate_legacy_builtin_theme_in_contents_with_installed_ids(
-            "theme = tokyonight\nfont_size = 14\n",
-            &HashSet::from([String::from("tokyo-night")]),
+            "theme = one\nfont_size = 14\n",
+            &HashSet::from([String::from("one-dark")]),
         );
-        assert_eq!(output, "theme = tokyo-night\nfont_size = 14\n");
+        assert_eq!(output, "theme = one-dark\nfont_size = 14\n");
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use gpui_kit::prelude::FluentBuilder as _;
 use std::ops::Range;
+use termy_core::search_engine::SearchLineMapping;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchKeyAction {
@@ -51,6 +52,29 @@ fn visible_search_line_range(display_offset: usize, rows: u16) -> (i32, i32) {
     let first = -(i32::try_from(display_offset).unwrap_or(i32::MAX));
     let last = first.saturating_add(i32::from(rows.max(1)).saturating_sub(1));
     (first, last)
+}
+
+/// Edits that GPUI shortcuts make to the search query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SearchEditCommand {
+    Copy,
+    Cut,
+    Undo,
+    Redo,
+    Paste,
+    SelectAll,
+    DeleteBackward,
+    DeleteForward,
+    MoveLeft,
+    MoveRight,
+    SelectLeft,
+    SelectRight,
+    MoveToStart,
+    MoveToEnd,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteToStart,
+    DeleteToEnd,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +168,10 @@ impl TerminalView {
     }
 
     pub(super) fn open_search(&mut self, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        {
+            self.search_focus_request = self.search_focus_request.wrapping_add(1);
+        }
         let prefill = Self::search_prefill_from_selection(self.selected_text());
 
         if self.search_open {
@@ -216,6 +244,7 @@ impl TerminalView {
     }
 
     fn notify_search_ui(&mut self, cx: &mut Context<Self>) {
+        self.sync_native_search_bar();
         self.notify_overlay(cx);
         cx.notify();
     }
@@ -332,7 +361,9 @@ impl TerminalView {
         let start_line = line_texts.first_line;
         let end_line = line_texts.last_line();
         self.search_state
-            .search(start_line, end_line, |line_idx| line_texts.line(line_idx));
+            .search_mapped(start_line, end_line, |line_idx| {
+                line_texts.mapped_line(line_idx)
+            });
         self.search_scan_incomplete = matches!(kind, SearchScanKind::Viewport)
             && search_line_span(full_bounds.0, full_bounds.1) > search_line_span(first, last);
 
@@ -351,9 +382,23 @@ impl TerminalView {
     pub(super) fn handle_search_key_down(
         &mut self,
         key: &str,
-        shift_pressed: bool,
+        modifiers: gpui_kit::Modifiers,
         cx: &mut Context<Self>,
     ) -> bool {
+        let shift_pressed = modifiers.shift;
+        // Cut, Undo and Redo have no binding, so they arrive as plain keys;
+        // the AppKit field handles them while it has focus.
+        if modifiers.platform && !modifiers.control && !modifiers.alt {
+            let command = match (key, shift_pressed) {
+                ("x", false) => Some(SearchEditCommand::Cut),
+                ("z", false) => Some(SearchEditCommand::Undo),
+                ("z", true) => Some(SearchEditCommand::Redo),
+                _ => None,
+            };
+            if command.is_some_and(|command| self.forward_edit_to_native_search(command)) {
+                return true;
+            }
+        }
         match search_key_action(key, shift_pressed) {
             Some(SearchKeyAction::Close) => {
                 self.close_search(cx);
@@ -430,6 +475,166 @@ impl TerminalView {
             });
         })
         .detach();
+    }
+
+    /// Whether AppKit draws the search bar (native tab windows on macOS).
+    pub(super) fn uses_native_search_bar(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.native_search_bar.is_some()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn install_native_search_bar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some((bar, events)) = macos_native_search::NativeSearchBar::new(window) else {
+            log::warn!("No AppKit view for the native search bar; using Termy's own");
+            return;
+        };
+        self.native_search_bar = Some(bar);
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            while let Ok(event) = events.recv_async().await {
+                let updated = cx.update(|cx| {
+                    this.update(cx, |view, cx| view.handle_native_search_event(event, cx))
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn handle_native_search_event(
+        &mut self,
+        event: macos_native_search::NativeSearchEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use macos_native_search::NativeSearchEvent;
+
+        if let NativeSearchEvent::QueryChanged(query) = &event {
+            if let Some(bar) = self.native_search_bar.as_mut() {
+                bar.note_query(query);
+            }
+            // The field reports a change twice (text change and action).
+            if query == self.search_input.text() {
+                return;
+            }
+        }
+        if !self.search_open {
+            // An edit that raced the bar closing still belongs to the query
+            // the bar shows when it opens again.
+            if let NativeSearchEvent::QueryChanged(query) = event {
+                self.search_input.set_text(query);
+            }
+            return;
+        }
+        match event {
+            NativeSearchEvent::QueryChanged(query) => {
+                self.search_input.set_text(query);
+                self.handle_search_input_changed(cx);
+            }
+            NativeSearchEvent::Next => self.search_next(cx),
+            NativeSearchEvent::Previous => self.search_previous(cx),
+            NativeSearchEvent::Close => self.close_search(cx),
+            NativeSearchEvent::Options {
+                case_sensitive,
+                regex,
+            } => {
+                if case_sensitive != self.search_state.is_case_sensitive() {
+                    self.execute_search_command_action(
+                        CommandAction::ToggleSearchCaseSensitive,
+                        cx,
+                    );
+                }
+                let regex_mode = matches!(
+                    self.search_state.mode(),
+                    termy_core::search_engine::SearchMode::Regex
+                );
+                if regex != regex_mode {
+                    self.execute_search_command_action(CommandAction::ToggleSearchRegex, cx);
+                }
+            }
+        }
+    }
+
+    /// Give keyboard focus back to the terminal when the AppKit bar holds it.
+    pub(super) fn release_native_search_focus(&self) {
+        #[cfg(target_os = "macos")]
+        if let Some(bar) = self.native_search_bar.as_ref() {
+            bar.release_focus();
+        }
+    }
+
+    /// Push the search state to the AppKit bar, if this window has one.
+    pub(super) fn sync_native_search_bar(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            if self.native_search_bar.is_none() {
+                return;
+            }
+            let (current, total) = self.search_state.results().position().unwrap_or((0, 0));
+            let invalid_pattern = self.search_state.error().is_some();
+            let state = macos_native_search::NativeSearchBarState {
+                open: self.search_open,
+                query: self.search_input.text().to_string(),
+                status: search_counter_label(
+                    current,
+                    total,
+                    self.search_input.text().is_empty(),
+                    invalid_pattern,
+                    self.search_scan_incomplete,
+                ),
+                invalid_pattern,
+                case_sensitive: self.search_state.is_case_sensitive(),
+                regex: matches!(
+                    self.search_state.mode(),
+                    termy_core::search_engine::SearchMode::Regex
+                ),
+                focus_request: self.search_focus_request,
+            };
+            if let Some(bar) = self.native_search_bar.as_mut() {
+                bar.apply(state);
+            }
+        }
+    }
+
+    /// Copy, Paste and Select All belong to the AppKit field while it has
+    /// keyboard focus.
+    pub(super) fn forward_edit_command_to_native_search(&self, action: CommandAction) -> bool {
+        let command = match action {
+            CommandAction::Copy => SearchEditCommand::Copy,
+            CommandAction::Paste => SearchEditCommand::Paste,
+            CommandAction::SelectAll => SearchEditCommand::SelectAll,
+            _ => return false,
+        };
+        self.forward_edit_to_native_search(command)
+    }
+
+    /// GPUI matches Cmd and Ctrl shortcuts before the AppKit field sees them.
+    /// While the field has keyboard focus, the edit goes to the field instead
+    /// of GPUI's copy of the query.
+    pub(super) fn forward_edit_to_native_search(&self, command: SearchEditCommand) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            // The command palette draws over an open search and takes its
+            // edits even if the field still has focus.
+            self.search_owns_inline_input()
+                && self
+                    .native_search_bar
+                    .as_ref()
+                    .is_some_and(|bar| bar.forward_edit_command(command))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = command;
+            false
+        }
     }
 
     pub(super) fn render_search_bar(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -834,6 +1039,7 @@ struct SearchLineSnapshot {
     first_line: i32,
     text: String,
     ranges: Vec<Range<usize>>,
+    mappings: Vec<SearchLineMapping>,
 }
 
 impl SearchLineSnapshot {
@@ -844,6 +1050,7 @@ impl SearchLineSnapshot {
             first_line,
             text: String::new(),
             ranges: Vec::with_capacity(line_count),
+            mappings: vec![SearchLineMapping::default(); line_count],
         }
     }
 
@@ -861,6 +1068,11 @@ impl SearchLineSnapshot {
             .ok()
             .and_then(|offset| self.first_line.checked_add(offset))
             .unwrap_or(self.first_line)
+    }
+
+    fn mapped_line(&self, line_idx: i32) -> Option<(&str, &SearchLineMapping)> {
+        let offset = usize::try_from(line_idx.checked_sub(self.first_line)?).ok()?;
+        Some((self.line(line_idx)?, self.mappings.get(offset)?))
     }
 
     #[cfg(test)]
@@ -883,8 +1095,9 @@ fn collect_search_line_texts(
     end_line: i32,
 ) -> SearchLineSnapshot {
     let mut line_texts = None;
+    let mut previous_cell_start = 0;
     let captured_range =
-        terminal.for_each_line_cell_range(start_line, end_line, |range, line_idx, _, cell| {
+        terminal.for_each_line_cell_range(start_line, end_line, |range, line_idx, col, cell| {
             let snapshot = line_texts.get_or_insert_with(|| {
                 let first = start_line.max(range.first_line);
                 let last = end_line.min(range.last_line);
@@ -912,12 +1125,34 @@ fn collect_search_line_texts(
                 *cell_range = snapshot.text.len()..snapshot.text.len();
             }
             let character = cell.character();
-            if character == '\0' || cell.is_trailing_wide_spacer() || character.is_control() {
+            if cell.is_trailing_wide_spacer() {
+                if col > 0 {
+                    snapshot.mappings[index].record_cell(
+                        &snapshot.text[cell_range.start..],
+                        previous_cell_start - cell_range.start,
+                        col - 1,
+                        2,
+                    );
+                }
+                return;
+            }
+            previous_cell_start = snapshot.text.len();
+            if cell.is_hidden()
+                || cell.is_wide_spacer()
+                || character == '\0'
+                || character.is_control()
+            {
                 snapshot.text.push(' ');
             } else {
                 snapshot.text.push(character);
                 cell.append_combining_to(&mut snapshot.text);
             }
+            snapshot.mappings[index].record_cell(
+                &snapshot.text[cell_range.start..],
+                previous_cell_start - cell_range.start,
+                col,
+                1,
+            );
             cell_range.end = snapshot.text.len();
         });
 
@@ -1074,6 +1309,52 @@ mod tests {
 
         let lines = collect_search_line_texts(&terminal, -1, -1);
         assert_eq!(lines.line(-1), Some("e\u{301}   "));
+    }
+
+    #[test]
+    fn terminal_read_adapter_keeps_adjacent_wide_and_joined_text_searchable() {
+        let terminal = Terminal::new_test_display(TerminalSize::default());
+        terminal.hydrate_output("A日本語 e\u{301} 👩🏽‍💻Z".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 0);
+        assert_eq!(lines.line(0).unwrap().trim_end(), "A日本語 e\u{301} 👩🏽‍💻Z");
+    }
+
+    #[test]
+    fn terminal_search_maps_hidden_and_separate_cells_without_resegmenting() {
+        let terminal = Terminal::new_test_display(TerminalSize::default());
+        terminal.hydrate_output("A\x1b[8m界\x1b[0mZ\r\n👩\x07\u{200d}💻Z".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 1);
+        let mut state = termy_core::search_engine::SearchState::new();
+        state.set_query("Z");
+        state.search_mapped(0, 1, |line| lines.mapped_line(line));
+        let positions: Vec<_> = state
+            .results()
+            .matches()
+            .iter()
+            .map(|found| (found.line, found.start_col, found.end_col))
+            .collect();
+        assert_eq!(positions, [(1, 4, 5), (0, 3, 4)]);
+        state.set_query("界");
+        state.search_mapped(0, 1, |line| lines.mapped_line(line));
+        assert!(state.results().is_empty());
+    }
+
+    #[test]
+    fn terminal_search_maps_wide_clusters_in_one_physical_column() {
+        let terminal = Terminal::new_test_display(TerminalSize {
+            cols: 1,
+            rows: 4,
+            ..Default::default()
+        });
+        terminal.hydrate_output("界\r\n👩🏽‍💻".as_bytes());
+        let lines = collect_search_line_texts(&terminal, 0, 3);
+        let mut state = termy_core::search_engine::SearchState::new();
+        for query in ["界", "💻"] {
+            state.set_query(query);
+            state.search_mapped(0, 3, |line| lines.mapped_line(line));
+            let found = &state.results().matches()[0];
+            assert_eq!((found.start_col, found.end_col), (0, 1));
+        }
     }
 
     #[test]

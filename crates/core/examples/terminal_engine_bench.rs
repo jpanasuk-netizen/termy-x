@@ -62,6 +62,7 @@ fn run(label: &str, line: &[u8], target: usize, fragmentation: usize, zero_alloc
         },
         Options {
             scrollback_history: 1000,
+            ..Options::default()
         },
     );
     let mut payload = Vec::with_capacity(64 * 1024 + line.len());

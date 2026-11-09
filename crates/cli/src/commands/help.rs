@@ -26,9 +26,6 @@ pub fn run() {
     println!("  -edit-config      Open config file in editor");
     println!("  -show-config      Display current configuration");
     println!("  -validate-config  Validate configuration file");
-    println!("  -prettify-config  Prettify config (removes comments, formats)");
+    println!("  -prettify-config  Prettify config (removes comments, keeps .bak)");
     println!("  -update           Check for updates");
-    println!("  -export-theme     Export current colors to a themes repo checkout");
-    println!("  -validate-theme-repo");
-    println!("                    Validate a themes repo checkout");
 }

@@ -1,14 +1,16 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use super::{
-    CellExtra, Color, CursorShape, Event, Hyperlink, MAX_REPLY_BYTES, Modes, MouseEncoding,
-    MouseTracking, Options, Size, Style, UnderlineStyle, enqueue,
+    CellExtra, Color, CursorShape, Event, MAX_REPLY_BYTES, Modes, MouseEncoding, MouseTracking,
+    Options, Size, Style, UnderlineStyle, enqueue,
     grid::Grid,
     parser::{Handler, Param},
 };
 
 const MAX_TITLE_STACK: usize = 64;
 const MAX_KEYBOARD_STACK: usize = 32;
+/// ASCII runs at most this long try `Grid::write_short_ascii` first.
+const SHORT_ASCII_RUN: usize = 16;
 
 pub(super) struct State {
     pub(super) graphics: super::graphics::Graphics,
@@ -19,6 +21,9 @@ pub(super) struct State {
     pub(super) replies: Vec<u8>,
     pub(super) dropped_events: u64,
     pub(super) dropped_reply_bytes: u64,
+    /// Set by a clipboard request in a deferring feed, which then pauses so
+    /// the caller can tell replies before the request from those after it.
+    pub(super) clipboard_pause: bool,
     pub(super) palette: [Option<Color>; 256],
     pub(super) foreground: Option<Color>,
     pub(super) background: Option<Color>,
@@ -28,27 +33,35 @@ pub(super) struct State {
     pub(super) default_cursor_shape: CursorShape,
     pub(super) cursor_shape_overridden: bool,
     pub(super) cell_pixels: (u16, u16),
+    pub(super) pixel_mouse_reports: bool,
+    pub(super) program_status: crate::program_status::ProgramStatus,
     title: String,
     title_stack: Vec<String>,
+    /// The last OSC 7 (or OSC 9;9) working directory.
+    working_directory: Option<String>,
     keyboard_stack: [Vec<u8>; 2],
     keyboard_flags: [u8; 2],
     charsets: [bool; 2],
     active_charset: usize,
     saved_charsets: [([bool; 2], usize); 2],
+    saved_private_modes: Vec<(u16, bool)>,
+    pub(super) column_mode: bool,
     last_printed: Option<char>,
+    hyperlinks: super::hyperlinks::Hyperlinks,
 }
 
 impl State {
     pub(super) fn new(size: Size, options: Options) -> Self {
         Self {
             graphics: super::graphics::Graphics::default(),
-            grid: Grid::new(size, options.scrollback_history),
+            grid: Grid::with_limits(size, options.scrollback_history, options.scrollback_bytes),
             modes: Modes::default(),
             alternate_screen: false,
             events: VecDeque::new(),
             replies: Vec::new(),
             dropped_events: 0,
             dropped_reply_bytes: 0,
+            clipboard_pause: false,
             palette: [None; 256],
             foreground: None,
             background: None,
@@ -58,24 +71,49 @@ impl State {
             default_cursor_shape: CursorShape::Block,
             cursor_shape_overridden: false,
             cell_pixels: (9, 18),
+            pixel_mouse_reports: false,
+            program_status: crate::program_status::ProgramStatus::default(),
             title: String::new(),
             title_stack: Vec::new(),
+            working_directory: None,
             keyboard_stack: [Vec::new(), Vec::new()],
             keyboard_flags: [0, 0],
             charsets: [false; 2],
             active_charset: 0,
             saved_charsets: [([false; 2], 0); 2],
+            saved_private_modes: Vec::new(),
+            column_mode: false,
             last_printed: None,
+            hyperlinks: super::hyperlinks::Hyperlinks::default(),
         }
     }
 
     fn event(&mut self, event: Event) {
+        let host_request = match &event {
+            Event::Clipboard { data, .. } => data == "?",
+            Event::KittyClipboard(_) => true,
+            _ => false,
+        };
+        self.clipboard_pause |= host_request && self.defers_uploads();
         enqueue(
             &mut self.events,
             &mut self.dropped_events,
             self.modes.clipboard_paste_events,
             event,
         );
+    }
+
+    fn set_working_directory(&mut self, path: String) {
+        self.working_directory = Some(path.clone());
+        self.event(Event::WorkingDirectory(path));
+    }
+
+    pub(super) fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub(super) fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
     }
 
     pub(super) fn reply(&mut self, bytes: &[u8]) {
@@ -105,14 +143,51 @@ impl State {
             attributes: protected,
             ..Style::default()
         };
+        self.grid.pen.set_underline_color(Color::DEFAULT);
+    }
+
+    fn soft_reset(&mut self) {
+        self.grid.soft_reset(self.default_cursor_shape);
+        self.cursor_shape_overridden = false;
+        self.modes.application_cursor = false;
+        self.modes.application_keypad = false;
+        self.charsets = [false; 2];
+        self.active_charset = 0;
+        self.saved_charsets[usize::from(self.alternate_screen)] = ([false; 2], 0);
+        self.last_printed = None;
+    }
+
+    fn save_private_mode(&mut self, mode: u16) {
+        // Only recognized, stateful modes enter the one-level cache. Its size
+        // is bounded by the modes supported by mode_state, not the input.
+        // DECCOLM and 1048 are reportable but act rather than hold state, so
+        // restoring them would clear the screen or move the cursor.
+        if matches!(mode, 3 | 1048) {
+            return;
+        }
+        let Some(enabled) = self.mode_state(true, mode) else {
+            return;
+        };
+        if let Some((_, saved)) = self
+            .saved_private_modes
+            .iter_mut()
+            .find(|(saved_mode, _)| *saved_mode == mode)
+        {
+            *saved = enabled;
+        } else {
+            self.saved_private_modes.push((mode, enabled));
+        }
+    }
+
+    pub(super) fn saved_private_mode(&self, mode: u16) -> Option<bool> {
+        self.saved_private_modes
+            .iter()
+            .find_map(|&(saved_mode, enabled)| (saved_mode == mode).then_some(enabled))
     }
 
     fn mouse_tracking(&mut self, mode: MouseTracking, enabled: bool) {
-        if enabled {
-            self.modes.mouse_tracking = mode;
-        } else if self.modes.mouse_tracking == mode {
-            self.modes.mouse_tracking = MouseTracking::None;
-        }
+        // Like xterm, resetting any tracking mode turns tracking off.
+        self.modes.mouse_tracking = if enabled { mode } else { MouseTracking::None };
     }
 
     fn mouse_encoding(&mut self, mode: MouseEncoding, enabled: bool) {
@@ -136,15 +211,28 @@ impl State {
         match value {
             1 => self.modes.application_cursor = enabled,
             3 => {
+                // The width never changes, but DECCOLM still clears and homes.
+                self.column_mode = enabled;
                 self.grid.set_scroll_region(0, self.grid.size().rows);
+                self.grid.reset_lr_margins();
                 self.grid.erase_display(2, false);
                 self.grid.goto(0, 0);
+            }
+            5 => {
+                if self.modes.reverse_video != enabled {
+                    self.modes.reverse_video = enabled;
+                    // Renderers swap the default colors, so repaint like a
+                    // palette change.
+                    self.palette_revision = self.palette_revision.wrapping_add(1);
+                    self.grid.mark_full_damage();
+                }
             }
             6 => {
                 self.grid.origin_mode = enabled;
                 self.grid.goto(0, 0);
             }
             7 => self.grid.autowrap = enabled,
+            69 => self.grid.set_lr_margin_mode(enabled),
             9 => self.mouse_tracking(MouseTracking::Press, enabled),
             12 => self.grid.cursor.blinking = enabled,
             25 => self.grid.cursor.visible = enabled,
@@ -165,6 +253,12 @@ impl State {
                         self.restore_cursor();
                     }
                     self.modes.kitty_keyboard = self.keyboard_flags[usize::from(enabled)];
+                } else if enabled && value == 1049 {
+                    // Like xterm, 1049 on the alternate screen (entered with
+                    // 47 or 1047) still saves the cursor, now in the
+                    // alternate screen's slot, and clears the screen.
+                    self.save_cursor();
+                    self.grid.erase_display(2, false);
                 }
             }
             1048 => {
@@ -180,8 +274,14 @@ impl State {
             1004 => self.modes.focus_events = enabled,
             1005 => self.mouse_encoding(MouseEncoding::Utf8, enabled),
             1006 => self.mouse_encoding(MouseEncoding::Sgr, enabled),
-            1015 => self.mouse_encoding(MouseEncoding::Urxvt, enabled),
-            1016 => self.mouse_encoding(MouseEncoding::SgrPixels, enabled),
+            1007 => self.modes.alternate_scroll = enabled,
+            // 1016 needs a host that reports pixel positions; see
+            // `Engine::set_pixel_mouse_reports`. 1015 (urxvt) is not
+            // implemented. Unrecognized modes keep the current encoding and
+            // make DECRQM answer 0.
+            1016 if self.pixel_mouse_reports => {
+                self.mouse_encoding(MouseEncoding::SgrPixels, enabled);
+            }
             2004 => self.modes.bracketed_paste = enabled,
             2026 => self.modes.synchronized_update = enabled,
             5522 => {
@@ -249,13 +349,13 @@ impl State {
                 }
                 39 => self.grid.pen.style.foreground = Color::DEFAULT,
                 49 => self.grid.pen.style.background = Color::DEFAULT,
-                59 => self.grid.pen.style.underline_color = Color::DEFAULT,
+                59 => self.grid.pen.set_underline_color(Color::DEFAULT),
                 38 | 48 | 58 => {
                     if let Some(color) = extended_color(params, &mut index) {
                         match value {
                             38 => self.grid.pen.style.foreground = color,
                             48 => self.grid.pen.style.background = color,
-                            _ => self.grid.pen.style.underline_color = color,
+                            _ => self.grid.pen.set_underline_color(color),
                         }
                     }
                 }
@@ -294,7 +394,8 @@ impl State {
         self.keyboard_flags[screen] = self.modes.kitty_keyboard;
     }
 
-    fn osc_color(&mut self, command: u16, rest: &str) {
+    /// Replies end with the query's terminator, BEL or ST, like xterm.
+    fn osc_color(&mut self, command: u16, rest: &str, bell: bool) {
         if command == 4 {
             let mut fields = rest.split(';');
             while let (Some(index), Some(spec)) = (fields.next(), fields.next()) {
@@ -303,7 +404,7 @@ impl State {
                         let color = self.palette[usize::from(index)].unwrap_or_else(|| {
                             terminal_color(self.query_colors.indexed_color(index))
                         });
-                        self.color_reply(&format!("4;{index}"), color);
+                        self.color_reply(&format!("4;{index}"), color, bell);
                     } else if let Some(color) = parse_color(spec) {
                         self.palette[usize::from(index)] = Some(color);
                         self.palette_revision = self.palette_revision.wrapping_add(1);
@@ -329,14 +430,19 @@ impl State {
                     _ => break,
                 };
                 if spec == "?" {
-                    let color = current.or_else(|| match cmd {
-                        10 => Some(terminal_color(self.query_colors.foreground)),
-                        11 => Some(terminal_color(self.query_colors.background)),
-                        _ => None,
+                    let color = current.unwrap_or_else(|| match cmd {
+                        10 => terminal_color(self.query_colors.foreground),
+                        11 => terminal_color(self.query_colors.background),
+                        // Like xterm, an unset cursor color is the foreground.
+                        _ => self.query_colors.cursor.map_or_else(
+                            || {
+                                self.foreground
+                                    .unwrap_or(terminal_color(self.query_colors.foreground))
+                            },
+                            terminal_color,
+                        ),
                     });
-                    if let Some(color) = color {
-                        self.color_reply(&cmd.to_string(), color);
-                    }
+                    self.color_reply(&cmd.to_string(), color, bell);
                 } else if let Some(color) = parse_color(spec) {
                     match cmd {
                         10 => self.foreground = Some(color),
@@ -349,11 +455,12 @@ impl State {
         }
     }
 
-    fn color_reply(&mut self, command: &str, color: Color) {
+    fn color_reply(&mut self, command: &str, color: Color, bell: bool) {
         if let Some((r, g, b)) = color.as_rgb() {
+            let terminator = if bell { "\x07" } else { "\x1b\\" };
             self.reply(
                 format!(
-                    "\x1b]{command};rgb:{:04x}/{:04x}/{:04x}\x1b\\",
+                    "\x1b]{command};rgb:{:04x}/{:04x}/{:04x}{terminator}",
                     u16::from(r) * 257,
                     u16::from(g) * 257,
                     u16::from(b) * 257
@@ -362,14 +469,169 @@ impl State {
             );
         }
     }
+
+    /// `bell` is true when the OSC ended with BEL rather than ST.
+    fn osc_with_terminator(&mut self, bytes: &[u8], bell: bool) {
+        self.grid.end_grapheme();
+        let Ok(text) = std::str::from_utf8(bytes) else {
+            return;
+        };
+        let (command, rest) = text.split_once(';').unwrap_or((text, ""));
+        let Ok(command) = command.parse::<u16>() else {
+            return;
+        };
+        let palette_revision = self.palette_revision;
+        match command {
+            0 | 2 => {
+                self.title.clear();
+                self.title.push_str(rest);
+                self.event(Event::Title(rest.to_owned()));
+            }
+            4 | 10..=12 | 104 => self.osc_color(command, rest, bell),
+            110..=112 => {
+                match command {
+                    110 => self.foreground = None,
+                    111 => self.background = None,
+                    _ => self.cursor_color = None,
+                }
+                self.palette_revision = self.palette_revision.wrapping_add(1);
+            }
+            7 => {
+                let path = match split_url(rest) {
+                    // vte.sh and fish percent-encode the path of a file URL.
+                    // Other shells send a literal `%`, so keep malformed
+                    // escapes as written.
+                    Some((scheme, url)) if scheme.eq_ignore_ascii_case("file") => {
+                        url.find('/').map(|offset| file_url_path(&url[offset..]))
+                    }
+                    Some(_) => None,
+                    None => Some(rest.to_owned()),
+                };
+                if let Some(path) = path {
+                    self.set_working_directory(path);
+                }
+            }
+            9 => {
+                if let Some(rest) = rest.strip_prefix("4;") {
+                    let mut parts = rest.split(';');
+                    if let Some(state) = parts.next().and_then(|s| s.parse::<u8>().ok()) {
+                        let progress = parts.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+                        self.event(Event::Progress(crate::ProgressState::from_osc(
+                            state, progress,
+                        )));
+                    }
+                } else if let Some(path) = rest.strip_prefix("9;") {
+                    let path = path.trim().trim_matches('"');
+                    if !path.is_empty() {
+                        self.set_working_directory(path.to_owned());
+                    }
+                }
+            }
+            8 => {
+                let Some((params, uri)) = rest.split_once(';') else {
+                    return;
+                };
+                let id = params
+                    .split(':')
+                    .find_map(|param| param.strip_prefix("id="))
+                    .unwrap_or("");
+                // Oversized links, or links past the table budget, print as text.
+                let link = (!uri.is_empty())
+                    .then(|| self.hyperlinks.intern(id, uri))
+                    .flatten();
+                // Reopening the pen's link keeps its metadata, so cells on
+                // either side keep sharing one allocation.
+                let unchanged = match (&link, self.grid.pen.hyperlink()) {
+                    (Some(link), Some(current)) => Arc::ptr_eq(link, current),
+                    (None, None) => true,
+                    _ => false,
+                };
+                if unchanged {
+                    return;
+                }
+                let underline_color = self.grid.pen.underline_color();
+                self.grid.pen.extra = link.map(|link| {
+                    Arc::new(CellExtra {
+                        hyperlink: Some(link),
+                        ..CellExtra::default()
+                    })
+                });
+                self.grid.pen.set_underline_color(underline_color);
+            }
+            52 => {
+                if let Some((selection, data)) = rest.split_once(';') {
+                    // Replies echo the selection, so keep only xterm's target
+                    // letters, once each, instead of program-chosen text.
+                    let mut targets = String::new();
+                    for target in selection.chars().filter(|c| "cpqs01234567".contains(*c)) {
+                        if !targets.contains(target) {
+                            targets.push(target);
+                        }
+                    }
+                    self.event(Event::Clipboard {
+                        selection: targets,
+                        data: data.to_owned(),
+                    });
+                }
+            }
+            133 => {
+                if rest.split(';').next() == Some("A") {
+                    self.program_status.finish();
+                }
+                self.event(Event::ShellIntegration(rest.to_owned()));
+            }
+            7501 if rest == "?" => self.reply(b"\x1b]7501;?\x1b\\"),
+            7501 => self.program_status.report(rest),
+            _ => {}
+        }
+        if self.palette_revision != palette_revision {
+            self.grid.mark_full_damage();
+        }
+    }
+}
+
+impl State {
+    /// `print_ascii` of one byte when the grid writes it in place; see
+    /// `Grid::write_ascii_cell`. Returns false, having changed nothing,
+    /// otherwise.
+    #[inline]
+    pub(super) fn print_ascii_cell(&mut self, byte: u8) -> bool {
+        if self.charsets[self.active_charset] || !self.grid.write_ascii_cell(byte) {
+            return false;
+        }
+        self.last_printed = Some(char::from(byte));
+        true
+    }
+
+    #[inline(never)]
+    fn print_ascii_run(&mut self, bytes: &[u8]) {
+        if self.charsets[self.active_charset] {
+            for &byte in bytes {
+                self.print(char::from(byte));
+            }
+        } else {
+            // Short runs (words between other text) mostly fit the row
+            // as they are; longer ones are stored in vector blocks.
+            if bytes.len() > SHORT_ASCII_RUN || !self.grid.write_short_ascii(bytes) {
+                self.grid.write_ascii(bytes);
+            }
+            if let Some(&byte) = bytes.last() {
+                self.last_printed = Some(char::from(byte));
+            }
+        }
+    }
 }
 
 impl Handler for State {
     fn pause_requested(&self) -> bool {
         self.modes.synchronized_update
+            || self.has_deferred_upload()
+            || self.pauses_for_animation_work()
+            || self.clipboard_pause
     }
 
     fn print(&mut self, character: char) {
+        self.grid.flush_pending_clear();
         let character = if self.charsets[self.active_charset] {
             dec_graphic(character)
         } else {
@@ -379,26 +641,38 @@ impl Handler for State {
         self.last_printed = Some(character);
     }
 
-    fn print_ascii(&mut self, bytes: &[u8]) {
+    fn print_utf8(&mut self, bytes: &[u8]) -> usize {
         if self.charsets[self.active_charset] {
-            for &byte in bytes {
-                self.print(char::from(byte));
-            }
-        } else {
-            self.grid.write_ascii(bytes);
-            if let Some(&byte) = bytes.last() {
-                self.last_printed = Some(char::from(byte));
-            }
+            return 0;
         }
+        let (written, last) = self.grid.write_utf8_run(bytes);
+        if let Some(character) = last {
+            self.last_printed = Some(character);
+        }
+        written
+    }
+
+    // Out of line, as the parser's loop runs faster without it on some
+    // targets; left to the inliner, unrelated changes to the crate flip it.
+    #[inline(never)]
+    fn print_ascii(&mut self, bytes: &[u8]) {
+        // Byte-at-a-time output (echo, small PTY reads) writes one cell.
+        if let &[byte] = bytes
+            && self.print_ascii_cell(byte)
+        {
+            return;
+        }
+        self.print_ascii_run(bytes);
     }
 
     fn execute(&mut self, byte: u8) {
+        self.grid.flush_pending_clear();
         self.grid.end_grapheme();
         match byte {
             0x07 => self.event(Event::Bell),
             0x08 => self.grid.backspace(),
             0x09 => self.grid.tab(),
-            0x0a..=0x0c => self.grid.linefeed(),
+            0x0a..=0x0c => self.grid.linefeed_deferring_clear(),
             0x0d => self.grid.carriage_return(),
             0x0e => self.active_charset = 1,
             0x0f => self.active_charset = 0,
@@ -407,6 +681,7 @@ impl Handler for State {
     }
 
     fn escape(&mut self, intermediates: &[u8], final_byte: u8) {
+        self.grid.flush_pending_clear();
         self.grid.end_grapheme();
         match (intermediates, final_byte) {
             ([], b'D') => {
@@ -426,8 +701,10 @@ impl Handler for State {
             ([], b'=') => self.modes.application_keypad = true,
             ([], b'>') => self.modes.application_keypad = false,
             ([], b'Z') => self.reply(b"\x1b[?62;22c"),
+            ([b'#'], b'8') => self.grid.screen_alignment_test(),
             ([], b'c') => {
                 self.grid.reset();
+                self.program_status.clear();
                 self.grid.cursor.shape = self.default_cursor_shape;
                 self.cursor_shape_overridden = false;
                 self.modes = Modes::default();
@@ -435,6 +712,8 @@ impl Handler for State {
                 self.charsets = [false; 2];
                 self.active_charset = 0;
                 self.saved_charsets = [([false; 2], 0); 2];
+                self.saved_private_modes.clear();
+                self.column_mode = false;
                 self.last_printed = None;
                 self.keyboard_stack.iter_mut().for_each(Vec::clear);
                 self.keyboard_flags = [0; 2];
@@ -450,16 +729,21 @@ impl Handler for State {
                     crate::KittyClipboardControl::Reset,
                 ));
             }
-            ([b'('], b'0' | b'B') => self.charsets[0] = final_byte == b'0',
-            ([b')'], b'0' | b'B') => self.charsets[1] = final_byte == b'0',
+            // Only DEC special graphics is translated. Other designations,
+            // such as UK or national sets, select an ASCII-equivalent set.
+            ([b'('], _) => self.charsets[0] = final_byte == b'0',
+            ([b')'], _) => self.charsets[1] = final_byte == b'0',
             _ => {}
         }
     }
 
     fn csi(&mut self, params: &[Param], private: Option<u8>, intermediates: &[u8], final_byte: u8) {
         if final_byte != b'm' || private.is_some() || !intermediates.is_empty() {
+            self.grid.flush_pending_clear();
             self.grid.end_grapheme();
         }
+        // SGR only changes the pen. A pending clear keeps the blank chosen
+        // when its line feed scrolled, so it may stay pending across colors.
         let count = count(params, 0);
         if intermediates == b"$" && final_byte == b'p' && matches!(private, None | Some(b'?')) {
             for param in params {
@@ -487,7 +771,13 @@ impl Handler for State {
                     _ => CursorShape::Block,
                 };
                 self.cursor_shape_overridden = style != 0;
-                self.grid.cursor.blinking = style == 0 || style % 2 == 1;
+                // Like kitty and Ghostty, 0 restores the startup cursor,
+                // which is steady, instead of xterm's blinking block.
+                self.grid.cursor.blinking = if style == 0 {
+                    super::Cursor::default().blinking
+                } else {
+                    style % 2 == 1
+                };
                 if self.grid.cursor != old_cursor {
                     self.grid.cursor_changed(old_cursor);
                 }
@@ -503,6 +793,9 @@ impl Handler for State {
             return;
         }
         if !intermediates.is_empty() {
+            if intermediates == b"!" && private.is_none() && final_byte == b'p' {
+                self.soft_reset();
+            }
             return;
         }
         match (private, final_byte) {
@@ -518,17 +811,12 @@ impl Handler for State {
                 self.grid.move_cursor(-(count as isize), 0);
                 self.grid.carriage_return();
             }
-            (None, b'G' | b'`') => {
-                self.grid.carriage_return();
-                self.grid.move_cursor(0, count.saturating_sub(1) as isize);
-            }
+            (None, b'G' | b'`') => self.grid.goto_col(count.saturating_sub(1)),
             (None, b'H' | b'f') => self.grid.goto(
                 count.saturating_sub(1),
                 super::dispatch::count(params, 1).saturating_sub(1),
             ),
-            (None, b'd') => self
-                .grid
-                .goto(count.saturating_sub(1), self.grid.cursor.col),
+            (None, b'd') => self.grid.goto_row(count.saturating_sub(1)),
             (None, b'I') => {
                 for _ in 0..count.min(self.grid.size().cols) {
                     self.grid.tab();
@@ -559,8 +847,19 @@ impl Handler for State {
             (None, b'T') => self.grid.scroll_down(count),
             (None, b'b') => {
                 if let Some(character) = self.last_printed {
-                    for _ in 0..count {
-                        self.grid.put_char(character);
+                    self.grid.repeat_char(character, count);
+                }
+            }
+            (Some(b'?'), b's' | b'r') => {
+                for param in params {
+                    if !param.subparams().is_empty() {
+                        continue;
+                    }
+                    let mode = param.value().unwrap_or(0);
+                    if final_byte == b's' {
+                        self.save_private_mode(mode);
+                    } else if let Some(enabled) = self.saved_private_mode(mode) {
+                        self.mode(true, mode, enabled);
                     }
                 }
             }
@@ -572,6 +871,16 @@ impl Handler for State {
                     usize::from(bottom)
                 };
                 self.grid.set_scroll_region(count.saturating_sub(1), bottom);
+            }
+            // With DECLRMM set, `CSI s` is DECSLRM instead of SCOSC.
+            (None, b's') if self.grid.lr_margin_mode() => {
+                let right = value(params, 1, 0);
+                let right = if right == 0 {
+                    self.grid.size().cols
+                } else {
+                    usize::from(right)
+                };
+                self.grid.set_lr_margins(count.saturating_sub(1), right);
             }
             (None, b's') => self.save_cursor(),
             (None, b'u') => self.restore_cursor(),
@@ -590,16 +899,23 @@ impl Handler for State {
             }
             (None, b'c') if value(params, 0, 0) == 0 => self.reply(b"\x1b[?62;22c"),
             (Some(b'>'), b'c') if value(params, 0, 0) == 0 => self.reply(b"\x1b[>1;1;0c"),
+            // XTVERSION reports the engine crate, which every host embeds.
+            (Some(b'>'), b'q') if value(params, 0, 0) == 0 => {
+                self.reply(
+                    concat!("\x1bP>|Termy ", env!("CARGO_PKG_VERSION"), "\x1b\\").as_bytes(),
+                );
+            }
             (None, b'n') if value(params, 0, 0) == 5 => self.reply(b"\x1b[0n"),
             (None | Some(b'?'), b'n') if value(params, 0, 0) == 6 => {
                 let private = if private.is_some() { "?" } else { "" };
-                let top = if self.grid.origin_mode {
-                    self.grid.scroll_region().0
+                let (top, left) = if self.grid.origin_mode {
+                    (self.grid.scroll_region().0, self.grid.lr_margins().0)
                 } else {
-                    0
+                    (0, 0)
                 };
                 let row = self.grid.cursor.row.saturating_sub(top) + 1;
-                self.reply(format!("\x1b[{private}{row};{}R", self.grid.cursor.col + 1).as_bytes());
+                let col = self.grid.cursor.col.saturating_sub(left) + 1;
+                self.reply(format!("\x1b[{private}{row};{col}R").as_bytes());
             }
             (None, b't') => match value(params, 0, 0) {
                 14 => self.reply(
@@ -639,6 +955,7 @@ impl Handler for State {
     }
 
     fn osc_terminated(&mut self, bytes: &[u8], bell: bool) {
+        self.grid.flush_pending_clear();
         if let Some(body) = bytes.strip_prefix(b"5522;") {
             let terminator = if bell {
                 crate::KittyClipboardOscTerminator::Bell
@@ -649,100 +966,101 @@ impl Handler for State {
                 body, terminator,
             )));
         } else {
-            self.osc(bytes);
+            self.osc_with_terminator(bytes, bell);
         }
     }
 
     fn osc(&mut self, bytes: &[u8]) {
-        self.grid.end_grapheme();
-        let Ok(text) = std::str::from_utf8(bytes) else {
-            return;
-        };
-        let (command, rest) = text.split_once(';').unwrap_or((text, ""));
-        let Ok(command) = command.parse::<u16>() else {
-            return;
-        };
-        let palette_revision = self.palette_revision;
-        match command {
-            0 | 2 => {
-                self.title.clear();
-                self.title.push_str(rest);
-                self.event(Event::Title(rest.to_owned()));
-            }
-            4 | 10..=12 | 104 => self.osc_color(command, rest),
-            110..=112 => {
-                match command {
-                    110 => self.foreground = None,
-                    111 => self.background = None,
-                    _ => self.cursor_color = None,
-                }
-                self.palette_revision = self.palette_revision.wrapping_add(1);
-            }
-            7 => {
-                let path = rest
-                    .strip_prefix("file://")
-                    .and_then(|rest| rest.find('/').map(|offset| &rest[offset..]))
-                    .unwrap_or(rest);
-                self.event(Event::WorkingDirectory(path.to_owned()));
-            }
-            9 => {
-                if let Some(rest) = rest.strip_prefix("4;") {
-                    let mut parts = rest.split(';');
-                    if let Some(state) = parts.next().and_then(|s| s.parse::<u8>().ok()) {
-                        let progress = parts.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
-                        self.event(Event::Progress(crate::ProgressState::from_osc(
-                            state, progress,
-                        )));
-                    }
-                } else if let Some(path) = rest.strip_prefix("9;") {
-                    let path = path.trim().trim_matches('"');
-                    if !path.is_empty() {
-                        self.event(Event::WorkingDirectory(path.to_owned()));
-                    }
-                }
-            }
-            8 => {
-                let Some((params, uri)) = rest.split_once(';') else {
-                    return;
-                };
-                if uri.is_empty() {
-                    self.grid.pen.extra = None;
-                } else {
-                    let id = params
-                        .split(':')
-                        .find_map(|param| param.strip_prefix("id="))
-                        .unwrap_or("");
-                    self.grid.pen.extra = Some(Arc::new(CellExtra {
-                        combining: String::new(),
-                        hyperlink: Some(Arc::new(Hyperlink {
-                            id: id.to_owned(),
-                            uri: uri.to_owned(),
-                        })),
-                    }));
-                }
-            }
-            52 => {
-                if let Some((selection, data)) = rest.split_once(';') {
-                    self.event(Event::Clipboard {
-                        selection: selection.to_owned(),
-                        data: data.to_owned(),
-                    });
-                }
-            }
-            133 => self.event(Event::ShellIntegration(rest.to_owned())),
-            _ => {}
-        }
-        if self.palette_revision != palette_revision {
-            self.grid.mark_full_damage();
+        self.grid.flush_pending_clear();
+        self.osc_with_terminator(bytes, false);
+    }
+
+    fn osc_owned(&mut self, bytes: &mut Vec<u8>, bell: bool) {
+        if bytes.starts_with(b"1337;") {
+            self.grid.flush_pending_clear();
+            self.grid.end_grapheme();
+            self.apply_inline_image(bytes);
+        } else {
+            self.osc_terminated(bytes, bell);
         }
     }
 
     fn dcs(&mut self, bytes: &[u8]) {
+        self.grid.flush_pending_clear();
         self.device_control_query(bytes);
     }
-    fn apc(&mut self, bytes: &[u8]) {
+    fn apc(&mut self, bytes: &mut Vec<u8>) {
+        self.grid.flush_pending_clear();
         self.apply_graphics(bytes);
     }
+}
+
+/// Split `scheme://rest`; `None` for a bare path, including `C:\dir`.
+fn split_url(text: &str) -> Option<(&str, &str)> {
+    let (scheme, rest) = text.split_once("://")?;
+    let mut bytes = scheme.bytes();
+    (bytes.next()?.is_ascii_alphabetic()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')))
+    .then_some((scheme, rest))
+}
+
+/// The working directory named by the path of a `file://host/path` URL.
+fn file_url_path(path: &str) -> String {
+    let path = percent_decode(path).unwrap_or_else(|| path.to_owned());
+    if cfg!(windows) {
+        windows_file_url_path(path)
+    } else {
+        path
+    }
+}
+
+/// A decoded `file://` URL path as a Windows path: `/C:/dir` becomes `C:\dir`
+/// and `//server/share/dir` (`file://host//server/share` or
+/// `file:////server/share`) becomes the UNC path `\\server\share\dir`.
+///
+/// A plain path is kept as sent even when the URL names another host: that is
+/// usually a shell over SSH or in WSL reporting its own `/home/me`, and reading
+/// it as `\\host\home\me` would make every cwd lookup try an SMB connection.
+fn windows_file_url_path(path: String) -> String {
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+        && matches!(bytes.get(3).copied(), None | Some(b'/' | b'\\'));
+    if drive {
+        let mut path = path[1..].replace('/', "\\");
+        // `C:` alone is the drive's current directory, not its root.
+        if path.len() == 2 {
+            path.push('\\');
+        }
+        return path;
+    }
+    if let Some(share) = path.strip_prefix("//") {
+        let share = share.trim_start_matches('/');
+        if !share.is_empty() {
+            return format!(r"\\{}", share.replace('/', "\\"));
+        }
+    }
+    path
+}
+
+/// Decode `%XX` escapes; `None` for malformed escapes or non-UTF-8 results.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(index + 1..index + 3)?).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn value(params: &[Param], index: usize, default: u16) -> u16 {
@@ -840,13 +1158,20 @@ fn dec_graphic(character: char) -> char {
         '◆', '▒', '␉', '␌', '␍', '␊', '°', '±', '␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺', '⎻', '─',
         '⎼', '⎽', '├', '┤', '┴', '┬', '│', '≤', '≥', 'π', '≠', '£', '·',
     ];
-    if ('`'..='~').contains(&character) {
-        GRAPHICS[character as usize - '`' as usize]
-    } else {
-        character
+    match character {
+        '_' => ' ',
+        '`'..='~' => GRAPHICS[character as usize - '`' as usize],
+        _ => character,
     }
 }
 
 #[cfg(test)]
 #[path = "dispatch/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dispatch/margin_tests.rs"]
+mod margin_tests;
+
+#[path = "dispatch/snapshot.rs"]
+mod snapshot;

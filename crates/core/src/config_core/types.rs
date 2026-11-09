@@ -190,6 +190,25 @@ impl TabBarPosition {
     }
 }
 
+/// Who draws the tabs on macOS: AppKit's native window tabs (default) or
+/// Termy's own tab strip. Other platforms always use the custom strip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TabStyle {
+    #[default]
+    Native,
+    Custom,
+}
+
+impl TabStyle {
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "native" => Some(Self::Native),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabTitleConfig {
     pub mode: TabTitleMode,
@@ -272,7 +291,9 @@ impl TerminalScrollbarStyle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowsShell {
+    /// PowerShell 7 when installed, else Windows PowerShell, else `COMSPEC`.
     #[default]
+    Auto,
     Cmd,
     PowerShell,
     PowerShellCore,
@@ -282,6 +303,7 @@ pub enum WindowsShell {
 impl WindowsShell {
     pub(crate) fn from_str(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
+            "auto" | "automatic" => Some(Self::Auto),
             "cmd" | "command_prompt" | "commandprompt" => Some(Self::Cmd),
             "powershell" | "power_shell" | "windows_powershell" | "ps" => Some(Self::PowerShell),
             "pwsh" | "powershell_core" | "powershellcore" | "powershell_7" | "powershell-7"
@@ -309,6 +331,73 @@ impl PaneFocusEffect {
             "cinematic" => Some(Self::Cinematic),
             "minimal" => Some(Self::Minimal),
             _ => None,
+        }
+    }
+}
+
+/// Policy for OSC 52 clipboard reads, which any program (including one on
+/// a remote host) can request by writing `ESC ] 52 ; c ; ? ST`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClipboardReadPolicy {
+    #[default]
+    Ask,
+    Allow,
+    Deny,
+}
+
+impl std::str::FromStr for ClipboardReadPolicy {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "ask" => Ok(Self::Ask),
+            "allow" | "true" => Ok(Self::Allow),
+            "deny" | "false" => Ok(Self::Deny),
+            _ => Err(()),
+        }
+    }
+}
+
+impl ClipboardReadPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+
+/// Terminal identity advertised to child processes through `TERM_PROGRAM`.
+///
+/// `Ghostty` is the default because CLIs such as Claude Code only emit
+/// features like OSC 9;4 progress to terminals they recognise. The cost is
+/// that system info tools such as neofetch report Ghostty; `Termy` reports
+/// the real identity instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TermProgram {
+    Termy,
+    #[default]
+    Ghostty,
+}
+
+impl std::str::FromStr for TermProgram {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "termy" => Ok(Self::Termy),
+            "ghostty" => Ok(Self::Ghostty),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TermProgram {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Termy => "termy",
+            Self::Ghostty => "ghostty",
         }
     }
 }
@@ -349,6 +438,7 @@ pub struct AppConfig {
     pub tab_close_visibility: TabCloseVisibility,
     pub tab_width_mode: TabWidthMode,
     pub tab_bar_position: TabBarPosition,
+    pub tab_style: TabStyle,
     pub tab_switch_modifier_hints: bool,
     pub auto_hide_tabbar: bool,
     pub sidebar_enabled: bool,
@@ -358,6 +448,7 @@ pub struct AppConfig {
     pub shell: Option<String>,
     pub term: String,
     pub colorterm: Option<String>,
+    pub term_program: TermProgram,
     pub macos_option_as_alt: bool,
     pub window_width: f32,
     pub window_height: f32,
@@ -385,6 +476,7 @@ pub struct AppConfig {
     pub pane_focus_strength: f32,
     pub copy_on_select: bool,
     pub copy_on_select_toast: bool,
+    pub clipboard_read: ClipboardReadPolicy,
     pub command_palette_show_keybinds: bool,
     pub simple_mode: bool,
     pub onboarding_complete: bool,
@@ -450,6 +542,7 @@ impl Default for AppConfig {
             tab_close_visibility: TabCloseVisibility::default(),
             tab_width_mode: TabWidthMode::default(),
             tab_bar_position: TabBarPosition::default(),
+            tab_style: TabStyle::default(),
             tab_switch_modifier_hints: DEFAULT_TAB_SWITCH_MODIFIER_HINTS,
             auto_hide_tabbar: true,
             sidebar_enabled: false,
@@ -459,12 +552,13 @@ impl Default for AppConfig {
             shell: None,
             term: DEFAULT_TERM.to_string(),
             colorterm: Some(DEFAULT_COLORTERM.to_string()),
+            term_program: TermProgram::default(),
             macos_option_as_alt: false,
             window_width: 1280.0,
             window_height: 820.0,
             inspector_height: 280.0,
             font_family: crate::config_core::constants::DEFAULT_FONT_FAMILY.to_string(),
-            ui_font_family: crate::config_core::constants::DEFAULT_FONT_FAMILY.to_string(),
+            ui_font_family: crate::config_core::constants::DEFAULT_UI_FONT_FAMILY.to_string(),
             font_size: 14.0,
             line_height: crate::config_core::constants::DEFAULT_LINE_HEIGHT,
             cursor_style: CursorStyle::default(),
@@ -483,6 +577,7 @@ impl Default for AppConfig {
             pane_focus_strength: DEFAULT_PANE_FOCUS_STRENGTH,
             copy_on_select: false,
             copy_on_select_toast: true,
+            clipboard_read: ClipboardReadPolicy::default(),
             command_palette_show_keybinds: true,
             simple_mode: false,
             onboarding_complete: true,

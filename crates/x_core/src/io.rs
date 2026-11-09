@@ -37,6 +37,19 @@ pub trait CommandRunner: Send + Sync {
     ) -> Result<CommandOutput, String> {
         self.run(program, args)
     }
+
+    /// Like `run_timeout`, but does not minimize the Chrome window.
+    /// Quote native input is refused when the page is hidden, so that
+    /// flow must leave the owned window visible. Other OpenCLI calls
+    /// still use `run_timeout` and stay quiet.
+    fn run_keeping_window(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.run_timeout(program, args, timeout)
+    }
 }
 
 pub struct SystemRunner;
@@ -56,20 +69,44 @@ impl CommandRunner for SystemRunner {
         args: &[String],
         timeout: Duration,
     ) -> Result<CommandOutput, String> {
+        self.execute(program, args, timeout, true)
+    }
+
+    fn run_keeping_window(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<CommandOutput, String> {
+        self.execute(program, args, timeout, false)
+    }
+}
+
+impl SystemRunner {
+    fn execute(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        silence_opencli: bool,
+    ) -> Result<CommandOutput, String> {
         let resolved =
             resolve_program(program).ok_or_else(|| format!("command not found: {program}"))?;
         let mut command = command_for(&resolved, args);
         hide_console(&mut command);
-        // OpenCLI drives Chrome through a separate, visible "automation"
-        // window that cycles x.com pages and parks on about:blank. Keep
-        // that window minimized for the whole call so it runs silently.
+        // OpenCLI's owned window is visible unless `--window background`
+        // or this minimizer parks it. Native click/key input is refused
+        // while Chrome reports the page hidden, so quote commands pass
+        // `silence_opencli = false` and open with `--window foreground`.
+        // Reads and other writes still minimize.
         let silence = OpencliSilence::begin(
-            is_opencli_program(program)
-                || resolved
-                    .path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(is_opencli_program),
+            silence_opencli
+                && (is_opencli_program(program)
+                    || resolved
+                        .path
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .is_some_and(is_opencli_program)),
         );
         let result = output_with_timeout(command, timeout);
         silence.finish();
@@ -133,7 +170,9 @@ impl OpencliSilence {
             std::thread::spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     silence_sweep(&baseline, &tracked);
-                    std::thread::sleep(Duration::from_millis(400));
+                    // 15 ms: park a fresh automation window before it is
+                    // seen (400 ms let it flash for ~0.3 s).
+                    std::thread::sleep(Duration::from_millis(15));
                 }
             })
         };
@@ -208,9 +247,12 @@ fn silence_sweep(baseline: &[isize], tracked: &Arc<Mutex<Vec<isize>>>) {
 
 #[cfg(windows)]
 fn minimize_window(hwnd: isize) {
-    // SW_MINIMIZE (6). Never touches focus or the window's contents.
+    // SW_SHOWMINNOACTIVE (7): minimize without taking focus. Do not move the
+    // window. SetWindowPos to (-32000, -32000) made Chrome restore it there,
+    // so the window stayed state normal and focused while the document was
+    // hidden because it had no pixels on a monitor.
     unsafe {
-        win32::show_window(hwnd as win32::Hwnd, 6);
+        win32::show_window(hwnd as win32::Hwnd, 7);
     }
 }
 
@@ -284,7 +326,10 @@ mod win32 {
             }
         }
         unsafe {
-            EnumWindows(Some(callback), found as *mut Vec<(isize, String)> as Lparam);
+            EnumWindows(
+                Some(callback),
+                std::ptr::from_mut::<Vec<(isize, String)>>(found) as Lparam,
+            );
         }
     }
 
@@ -350,12 +395,12 @@ fn find_in_dir(dir: &Path, program: &str, exts: &[String]) -> Option<ResolvedPro
             }
         }
         let bare = dir.join(program);
-        if let Some(found) = classify_existing(&bare) {
-            if found.kind != ProgramKind::Native || pe_executable(&bare) {
-                return Some(found);
-            }
+        if let Some(found) = classify_existing(&bare)
+            && (found.kind != ProgramKind::Native || pe_executable(&bare))
+        {
+            return Some(found);
         }
-        return None;
+        None
     }
     #[cfg(not(windows))]
     {
@@ -373,9 +418,8 @@ fn find_in_dir(dir: &Path, program: &str, exts: &[String]) -> Option<ResolvedPro
 
 #[cfg(windows)]
 fn pe_executable(path: &Path) -> bool {
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
     };
     let mut magic = [0u8; 2];
     std::io::Read::read_exact(&mut file, &mut magic).is_ok() && &magic == b"MZ"
@@ -483,7 +527,6 @@ fn powershell_command(path: &Path, args: &[String]) -> Command {
     command
 }
 
-#[cfg(windows)]
 fn cmd_c_argument(path: &Path, args: &[String]) -> String {
     let mut inner = quote_cmd_token(&path.to_string_lossy());
     for arg in args {
@@ -493,7 +536,9 @@ fn cmd_c_argument(path: &Path, args: &[String]) -> String {
     format!("\"{inner} \"")
 }
 
-#[cfg(windows)]
+/// Quote one `cmd.exe /S /C` token. The quote composer URL does not use
+/// percent-encoding: `cmd` and the OpenCLI `.cmd` shim expand `%3A%`, and
+/// doubling those percents made the evaluated page leave x.com.
 fn quote_cmd_token(token: &str) -> String {
     if token.is_empty() {
         return "\"\"".to_string();
@@ -745,6 +790,8 @@ pub struct HttpRequest {
     pub body: Option<String>,
     pub bearer: Option<String>,
     pub content_type: Option<String>,
+    /// Extra request headers (e.g. Treg's `X-Treg-Token`). Never logged.
+    pub headers: Vec<(String, String)>,
 }
 
 pub trait Http: Send + Sync {
@@ -774,6 +821,9 @@ impl Http for UreqHttp {
         };
         if let Some(token) = &request.bearer {
             call = call.set("Authorization", &format!("Bearer {token}"));
+        }
+        for (name, value) in &request.headers {
+            call = call.set(name, value);
         }
         if let Some(content_type) = &request.content_type {
             call = call.set("Content-Type", content_type);
@@ -979,6 +1029,20 @@ mod tests {
             "Kalshi - Prediction Market - Google Chrome"
         ));
         assert!(!is_automation_title("Billing - Google Chrome"));
+    }
+
+    #[test]
+    fn cmd_quoting_keeps_percent_encoded_compose_urls() {
+        let url = crate::publish::quote_composer_url("2118971448614334959");
+        assert!(!url.contains('%'), "{url}");
+        assert!(url.contains("url=https://x.com/i/status/2118971448614334959"), "{url}");
+        let line = super::cmd_c_argument(std::path::Path::new("opencli.cmd"), &[
+            "browser".into(),
+            "open".into(),
+            url,
+        ]);
+        assert!(line.contains("url=https://x.com/i/status/2118971448614334959"), "{line}");
+        assert!(!line.contains('%'), "{line}");
     }
 
     #[test]

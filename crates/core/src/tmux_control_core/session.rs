@@ -156,6 +156,48 @@ mod tests {
         let output = session.send_command("display-message -p termy-ok");
         assert!(output.is_ok(), "send_command failed: {output:?}");
 
+        // A failing command makes tmux skip the rest of the `;` list (including
+        // the completion token); it must fail fast and leave the channel usable.
+        let failed = session.send_command("select-pane -t %999");
+        let error = failed.expect_err("select-pane on a missing pane should fail");
+        assert!(
+            error.message.contains("can't find pane"),
+            "unexpected error: {error:?}"
+        );
+        let output = session
+            .send_command("display-message -p termy-after-error")
+            .expect("channel must stay usable after a failed command");
+        assert_eq!(output.trim_end(), "termy-after-error");
+
+        // Pane text that looks like protocol lines comes back verbatim inside
+        // the capture-pane block; it must stay command output.
+        session
+            .send_command(r#"send-keys 'clear; printf "%%exit\n%%output %%3 x\n"' Enter"#)
+            .expect("send-keys");
+        let mut captured = String::new();
+        for _ in 0..40 {
+            captured = session.send_command("capture-pane -p").expect("capture");
+            if captured.contains("%output %3 x") {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(captured.contains("%exit\n%output %3 x"), "{captured:?}");
+        assert!(
+            session.fatal_exit().is_none(),
+            "pane text ended control mode"
+        );
+        assert!(
+            !session
+                .poll()
+                .iter()
+                .any(|notification| match notification {
+                    TmuxNotification::Exit(_) => true,
+                    TmuxNotification::Output { pane_id, .. } => pane_id == "%3",
+                    _ => false,
+                })
+        );
+
         drop(session);
         let _ = Command::new("tmux")
             .args(["-L", &socket, "kill-server"])

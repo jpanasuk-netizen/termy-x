@@ -1,0 +1,143 @@
+---
+title: Swift quick start
+description: Embed libtermy in a macOS app with the Swift SDK, from a SwiftUI terminal view to headless and display-only sessions.
+---
+
+The Swift SDK lives in
+[`sdk/swift`](https://github.com/lassejlv/termy/tree/main/sdk/swift) and wraps
+the [C ABI](/docs/developer/libtermy/c). It compiles against the repository's
+`termy.h`, so build the SDK and libtermy from the same Termy revision.
+
+| Product | Use it for |
+| --- | --- |
+| `Termy` | Terminals, sessions, frames, input encoding, events, config, search, Kitty graphics and clipboard, tmux control mode. No UI dependency. |
+| `TermyAppKit` | `TerminalView` (AppKit) and `TermyTerminal` (SwiftUI) with Metal rendering, IME, mouse reporting, selection, scrollback, links, and Kitty graphics. |
+
+Requires macOS 13+, Swift 6.2+, and a Rust toolchain.
+
+## Build and test
+
+libtermy is built by Cargo. The SDK script builds it and stages
+`libtermy_core.dylib` in `sdk/swift/lib`:
+
+```sh
+cd sdk/swift
+scripts/build-libtermy.sh
+swift test
+swift run TermyDemo
+```
+
+`just test-swift-sdk` runs the build and tests from the repository root.
+Set `TERMY_LIBRARY_PATH` to link a libtermy staged somewhere else.
+
+## Add it to an app
+
+The package passes linker flags SwiftPM treats as unsafe, so depend on it by
+local path rather than by Git URL. SwiftPM names a path dependency after its
+directory, so the package is `swift`:
+
+```swift title="Package.swift"
+.package(path: "../termy/sdk/swift"),
+// in your target's dependencies:
+.product(name: "TermyAppKit", package: "swift"),
+```
+
+Ship `libtermy_core.dylib` in `Contents/Frameworks`. The script sets its install
+name to `@rpath/libtermy_core.dylib`, so add `@executable_path/../Frameworks` to
+the app's runpath search paths.
+
+## A SwiftUI terminal
+
+`TerminalView()` loads the user's Termy config, resolves its theme for the
+current appearance, and starts their shell in a PTY.
+
+```swift
+import SwiftUI
+import TermyAppKit
+
+@MainActor
+final class Model: ObservableObject {
+    let view = try! TerminalView()
+    @Published var title = "Terminal"
+}
+
+struct ContentView: View {
+    @StateObject private var model = Model()
+
+    var body: some View {
+        TermyTerminal(view: model.view)
+            .onTitleChange { model.title = $0 ?? "Terminal" }
+            .navigationTitle(model.title)
+    }
+}
+```
+
+Keep the view in a model. SwiftUI rebuilds `TermyTerminal` often; the
+`TerminalView` owns the shell and must outlive those rebuilds.
+
+## Rendering
+
+`TerminalView` draws with Metal: instanced quads for cell backgrounds and
+decorations, and glyphs from a CoreText-rasterized texture atlas. Quads are
+cached per row and rebuilt only for rows libtermy reports as damaged. Special
+glyphs such as box drawing, blocks and Braille use libtermy's
+[glyph geometry](/docs/developer/libtermy/rendering#special-glyph-geometry), so they join seamlessly
+across cells.
+
+Without a Metal device, the view falls back to CoreGraphics. Pass
+`backend: .coreGraphics` to `TerminalView` to force it; `renderingBackend`
+reports the active one.
+
+[Swift Metal renderer](/docs/developer/libtermy/swift-rendering) explains the
+pipeline in detail: damage tracking, the shader, the glyph atlas, frame pacing,
+and performance.
+
+## Headless sessions
+
+`TerminalSession` drains events and keeps a retained `FrameStore` current on the
+main actor. A PTY session polls when the child writes output.
+
+```swift
+import Termy
+
+@MainActor
+func run() async throws {
+    let session = try TerminalSession(
+        size: TerminalSize(cols: 120, rows: 40),
+        options: TerminalOptions(startupCommand: "make test")
+    )
+    defer { session.stop() }
+
+    while !session.hasExited { try await Task.sleep(for: .milliseconds(20)) }
+    session.poll()
+    for row in 0..<session.frame.rows { print(session.frame.text(row: row)) }
+}
+```
+
+## Display-only sessions
+
+A display session parses output without a process. Use it for SSH, tmux, or
+recordings. Route both user input and protocol replies back to the program:
+
+```swift
+let session = try TerminalSession.display(size: TerminalSize(cols: 80, rows: 24))
+session.terminal.onInput = { bytes in channel.write(bytes) }
+session.onProtocolReply = { bytes in channel.write(bytes) }
+channel.onOutput = { bytes in try? session.feed(bytes) }
+```
+
+`feed(_:)` polls after each call, so the frame and session state are current
+when it returns.
+
+## Threading and lifetime
+
+`Terminal` is not thread-safe. `TerminalSession` and `TerminalView` confine it
+to the main actor. A PTY terminal runs one background thread blocked on
+libtermy's wake channel; `stop()` or deinitialization wakes and joins that
+thread before the handle is freed, as the
+[handle contract](/docs/developer/libtermy/reference#threading-and-shutdown) requires.
+
+Returned C buffers are copied into Swift values and freed inside the call that
+produced them. Use `Terminal.updateFrame(_:)` with a `FrameStore` in render
+loops: it applies dirty spans in place and falls back to a full frame when the
+store can't apply a partial update.

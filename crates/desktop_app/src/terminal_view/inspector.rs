@@ -259,6 +259,9 @@ fn mouse_mode_label(mode: TerminalMouseMode) -> String {
         return "disabled".to_string();
     }
     let mut parts = Vec::new();
+    if mode.presses_only() {
+        parts.push("press");
+    }
     if mode.report_click {
         parts.push("click");
     }

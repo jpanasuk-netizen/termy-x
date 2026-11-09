@@ -40,7 +40,6 @@ pub enum ActiveControlCommand {
 pub struct TrackedPendingCommand {
     pub pending: PendingCommand,
     pub output: String,
-    pub is_error: bool,
 }
 
 pub fn try_enqueue_control_request(

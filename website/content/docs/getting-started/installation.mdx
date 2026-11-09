@@ -8,7 +8,7 @@ The fastest path is the [Termy download page](/download). It detects your platfo
 <Cards>
   <Card title="macOS" description="Install the DMG on Apple silicon or Intel." href="#macos" />
   <Card title="Linux" description="Run the AppImage or unpack the archive." href="#linux" />
-  <Card title="Windows" description="Install Termy with the MSI package." href="#windows" />
+  <Card title="Windows" description="Run the Setup installer on x64 or ARM64." href="#windows" />
   <Card title="Build from source" description="Compile the Rust workspace locally." href="#from-source" />
 </Cards>
 
@@ -37,7 +37,69 @@ the titlebar theme independently of Termy's terminal color theme.
 
 ## Windows
 
-Download and run the `.msi` installer from [GitHub Releases](https://github.com/lassejlv/termy/releases).
+1. From [GitHub Releases](https://github.com/lassejlv/termy/releases), download the installer for your PC:
+   - `Termy-<version>-windows-x64-Setup.exe` for Intel and AMD PCs.
+   - `Termy-<version>-windows-arm64-Setup.exe` for ARM64 PCs such as Snapdragon laptops.
+2. Run the installer. By default it installs Termy for your account only, in
+   `%LOCALAPPDATA%\Programs\Termy`, without an administrator prompt. To install
+   for every user under Program Files, choose **Install for all users** when
+   Setup asks, or run it with `/ALLUSERS`.
+3. Open Termy from the Start menu. A desktop shortcut is optional; tick it on
+   the **Additional tasks** page.
+
+Termy checks for updates itself and installs them in the same place, for the
+same users, as the existing install.
+
+The Windows installer is not code-signed, so Windows SmartScreen may show
+**Windows protected your PC** with an unknown publisher. Choose **More info**,
+check that the file name is the one you downloaded from the Termy release, then
+choose **Run anyway**. To confirm the download, compare its SHA-256 hash
+(`Get-FileHash .\Termy-<version>-windows-x64-Setup.exe` in PowerShell) with
+`checksums.txt` on the same release.
+
+## Video on Windows
+
+Playing a video uses libVLC 3 from a `vlc` folder next to `termy.exe`. Termy
+does not install VLC, and that folder is not downloaded by the installer on its
+own. The tested files are the official VideoLAN **3.0.24** 64-bit archive
+(not a statement that 3.0.24 is the newest release):
+
+https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip
+
+`sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
+
+Before building the Setup exe, stage that archive with
+`scripts/windows/stage-libvlc.ps1`. The script copies `libvlc.dll`,
+`libvlccore.dll`, and the playback plugins. It leaves `vlc.exe` out and does
+not modify `C:\Program Files\VideoLAN\VLC` if VLC is already installed. Photos
+stay inside Termy without this folder. A missing or incomplete `vlc` folder
+makes video fail with an error. Termy does not open VLC's own window or mpv
+instead. The DLLs must be 64-bit; a 32-bit tree is rejected.
+
+The stage step places next to `termy.exe`:
+
+- `vlc\source\vlc-3.0.24.tar.xz` (sha256 `e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`), plus `COPYING` (GPL-2.0) and `COPYING.LIB` (LGPL-2.1)
+- `vlc\source\ffmpeg-8.1.2.tar.xz`, the file named by VLC's `contrib/src/ffmpeg/SHA512SUMS` (sha512 `b3adc16fe426217bb607da01c4137cee0a9788fc08e077874336db185d2b7287746a7dc94cf0181ea92cd8afcdb06094ee9456e2986112354f84538cb9a5ed0b`), checked against VideoLAN's 3.0.24 win64 build artifacts
+- `vlc\source\x264-e067ab0b530395f90b578f6d05ab0a225e2efdf9.tar.xz` (sha256 `fa11489fecc4655152a7dc3eab1a8b33bf84b67ff6c62f919f07958e1bd44cae`), the snapshot named by `contrib/src/x264/rules.mak`
+- `prereqs\VC_redist.x64.exe`, Microsoft's x64 Visual C++ redistributable, file version 14.51.36247 (sha256 `843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
+
+`termy.exe` needs `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
+The package contains the official installer for them. Setup does not run it,
+and the DLLs are not copied from System32. Run `VC_redist.x64.exe` on a PC
+that does not already have those files. `libavcodec` stays in the video
+folder. x264 and x265 encoder plugins are omitted. The dummy interface plugin
+stays, and so do the other GPL-2.0-or-later plugins named in
+`docs/architecture/release-packaging.md`. FFmpeg and x264 source archives are
+included. Other VLC contrib archives are not, and this repo does not rebuild
+the DLLs. Termy's license is not changed. Staging and tests are not a public
+release.
+
+Termy will also be available through winget as `lassejlv.Termy` once the
+package is accepted into the winget repository:
+
+```powershell
+winget install lassejlv.Termy
+```
 
 ## From source
 

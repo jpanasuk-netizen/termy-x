@@ -1,14 +1,9 @@
 use compact_str::CompactString;
 
 use crate::runtime::{TerminalCursorState, TerminalDamageSnapshot};
+pub use crate::terminal_types::TerminalColor;
 
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TerminalColor {
-    pub r: u8,
-    pub g: u8,
-    pub b: u8,
-}
-
+#[repr(C)]
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TermyColor {
     pub r: u8,
@@ -47,6 +42,10 @@ pub struct TerminalRenderText(CompactString);
 impl TerminalRenderText {
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    pub(crate) fn new(text: &str) -> Self {
+        Self(CompactString::from(text))
     }
 
     pub(crate) fn from_cell_suffix(base: char, combining: Option<&str>) -> Self {
@@ -179,6 +178,10 @@ pub struct TerminalRenderRead {
 /// One viewport cell. Carries no position: full frames are row-major
 /// (`index = row * cols + col`) and partial updates list cells in dirty-span
 /// order, so position is derived from context on the consuming side.
+///
+/// The layout matches the C ABI's `TermyFfiCell` field for field, so frame
+/// updates reach C hosts without another pass over their cells.
+#[repr(C)]
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TermyCell {
     pub char: char,
@@ -186,12 +189,46 @@ pub struct TermyCell {
     pub bg: TermyColor,
     pub uses_terminal_default_bg: bool,
     pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
-    pub strikethrough: bool,
     pub render_text: bool,
     pub wide_character_spacer: bool,
     pub line_wrapped: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikethrough: bool,
+}
+
+/// One spare cell buffer: a host that frees its frame updates through the
+/// C ABI hands theirs back here, and the next update reuses it. A host
+/// polling frames then keeps one allocation instead of allocating and
+/// freeing one per frame, whose pages an allocator may return to the
+/// system in between.
+static SPARE_CELLS: std::sync::Mutex<Vec<TermyCell>> = std::sync::Mutex::new(Vec::new());
+/// Larger buffers (over 1.25 MiB) are freed rather than kept.
+const MAX_SPARE_CELLS: usize = 1 << 16;
+
+/// An empty cell buffer with room for `capacity` cells.
+pub(crate) fn frame_cells(capacity: usize) -> Vec<TermyCell> {
+    let mut cells = std::mem::take(
+        &mut *SPARE_CELLS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    cells.reserve_exact(capacity);
+    cells
+}
+
+/// Keep `cells`' allocation for the next `frame_cells`.
+pub(crate) fn recycle_frame_cells(mut cells: Vec<TermyCell>) {
+    if cells.capacity() > MAX_SPARE_CELLS {
+        return;
+    }
+    cells.clear();
+    let mut spare = SPARE_CELLS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if spare.capacity() < cells.capacity() {
+        *spare = cells;
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -219,6 +256,33 @@ pub struct TermyFrameUpdate {
 mod tests {
     use super::*;
     use crate::{Terminal, TerminalDirtySpan, TerminalQueryColors, TerminalSize};
+
+    // A returned buffer is handed out again, empty; an oversized one isn't
+    // kept. The spare is shared, so other tests may take it in between:
+    // only what a test can observe on its own is asserted.
+    #[test]
+    fn frame_cell_buffers_are_reused_empty() {
+        let mut cells = frame_cells(100);
+        assert!(cells.is_empty() && cells.capacity() >= 100);
+        cells.push(TermyCell {
+            char: 'x',
+            fg: TermyColor::default(),
+            bg: TermyColor::default(),
+            uses_terminal_default_bg: false,
+            bold: false,
+            render_text: true,
+            wide_character_spacer: false,
+            line_wrapped: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        });
+        recycle_frame_cells(cells);
+        let cells = frame_cells(10);
+        assert!(cells.is_empty() && cells.capacity() >= 10);
+        recycle_frame_cells(Vec::with_capacity(MAX_SPARE_CELLS + 1));
+        assert!(frame_cells(0).capacity() <= MAX_SPARE_CELLS);
+    }
 
     #[test]
     fn default_render_cell_uses_role_correct_terminal_colors() {

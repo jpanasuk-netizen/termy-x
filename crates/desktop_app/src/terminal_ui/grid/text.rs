@@ -15,7 +15,6 @@ pub(super) struct TextBatchBuilder {
     cell_offsets: Vec<(usize, usize)>,
     positioned: bool,
     start_col: usize,
-    row: usize,
     text: String,
     bold: bool,
     italic: bool,
@@ -28,7 +27,6 @@ pub(super) struct TextBatchBuilder {
 impl TextBatchBuilder {
     pub(super) fn new(
         start_col: usize,
-        row: usize,
         initial_char: char,
         initial_combining: Option<&str>,
         key: TextBatchKey,
@@ -47,7 +45,6 @@ impl TextBatchBuilder {
             },
             positioned: initial_combining.is_some(),
             start_col,
-            row,
             text,
             bold: key.bold,
             italic: key.italic,
@@ -61,12 +58,10 @@ impl TextBatchBuilder {
     pub(super) fn can_append(
         &self,
         col: usize,
-        row: usize,
         key: TextBatchKey,
         underline: &Option<TerminalUnderline>,
     ) -> bool {
-        self.row == row
-            && self.start_col + self.cell_len == col
+        self.start_col + self.cell_len == col
             && self.bold == key.bold
             && self.italic == key.italic
             && self.strikethrough == key.strikethrough
@@ -115,7 +110,6 @@ impl TextBatchBuilder {
             cell_offsets: self.cell_offsets,
             positioned: self.positioned,
             start_col: self.start_col,
-            row: self.row,
             text: SharedString::from(self.text),
             bold: self.bold,
             italic: self.italic,
@@ -179,7 +173,7 @@ mod tests {
             strikethrough: false,
             fg: Hsla::transparent_black(),
         };
-        let mut builder = TextBatchBuilder::new(0, 0, '你', None, key, None);
+        let mut builder = TextBatchBuilder::new(0, '你', None, key, None);
         builder.add_wide_spacer();
         builder.append_cell('e', Some("\u{301}"));
         builder.append_cell('x', None);
@@ -221,10 +215,10 @@ mod tests {
             strikethrough: false,
             fg: Hsla::transparent_black(),
         };
-        let mut builder = TextBatchBuilder::new(0, 0, '你', None, key, None);
+        let mut builder = TextBatchBuilder::new(0, '你', None, key, None);
         builder.add_wide_spacer();
         for (index, character) in "好世界日本語".chars().enumerate() {
-            assert!(builder.can_append((index + 1) * 2, 0, key, &None));
+            assert!(builder.can_append((index + 1) * 2, key, &None));
             builder.append_cell(character, None);
             builder.add_wide_spacer();
         }

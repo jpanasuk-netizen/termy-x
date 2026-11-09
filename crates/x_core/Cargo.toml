@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 dirs = { workspace = true }
 keyring = { workspace = true }
 rand_core = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

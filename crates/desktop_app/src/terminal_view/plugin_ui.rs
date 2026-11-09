@@ -286,8 +286,33 @@ impl PluginUiView {
         }
     }
 
+    fn is_filtering_list(&self, id: &str) -> bool {
+        matches!(
+            Self::node_with_id(&self.nodes, id),
+            Some(PluginUiNode::List {
+                filtering: true,
+                ..
+            })
+        )
+    }
+
+    fn mirror_filter_query(&mut self) {
+        let Some(input) = self.active_input.as_ref() else {
+            return;
+        };
+        if self.is_filtering_list(&input.id) {
+            self.list_queries
+                .insert(input.id.clone(), input.state.text().to_string());
+        }
+    }
+
     fn commit_active_input(&mut self) {
         if let Some(input) = self.active_input.as_ref() {
+            if self.is_filtering_list(&input.id) {
+                self.list_queries
+                    .insert(input.id.clone(), input.state.text().to_string());
+                return;
+            }
             self.values.insert(
                 input.id.clone(),
                 PluginViewValue::Text(input.state.text().to_string()),
@@ -308,14 +333,17 @@ impl PluginUiView {
             return;
         }
         self.commit_active_input();
-        let value = self
-            .values
-            .get(id)
-            .and_then(|value| match value {
-                PluginViewValue::Text(value) => Some(value.clone()),
-                PluginViewValue::Toggle(_) => None,
-            })
-            .unwrap_or_default();
+        let value = if self.is_filtering_list(id) {
+            self.list_queries.get(id).cloned().unwrap_or_default()
+        } else {
+            self.values
+                .get(id)
+                .and_then(|value| match value {
+                    PluginViewValue::Text(value) => Some(value.clone()),
+                    PluginViewValue::Toggle(_) => None,
+                })
+                .unwrap_or_default()
+        };
         self.active_input = Some(ActiveInput {
             id: id.to_string(),
             state: TextInputState::new(value),
@@ -892,6 +920,13 @@ impl PluginUiView {
             self.cycle_control_focus(shift_only, window, cx);
             return;
         }
+        if self.active_input.is_none()
+            && let Some(id) = self.focused_control.clone()
+            && self.is_filtering_list(&id)
+            && Self::filter_key_edits_text(event.keystroke.key.as_str(), &event.keystroke.modifiers)
+        {
+            self.activate_input(&id, window, cx);
+        }
         let Some(active_id) = self.active_input.as_ref().map(|input| input.id.clone()) else {
             let handled = match event.keystroke.key.as_str() {
                 key if plain && self.edit_focused_list_query(key, cx) => true,
@@ -1048,24 +1083,47 @@ impl PluginUiView {
                 }
                 true
             }
-            "home" if plain => {
+            "home" if plain || shift_only => {
                 if let Some(input) = self.active_input.as_mut() {
-                    input.state.move_to_start();
+                    if shift_only {
+                        input.state.select_to_line_start();
+                    } else {
+                        input.state.move_to_line_start();
+                    }
                 }
                 true
             }
-            "end" if plain => {
+            "end" if plain || shift_only => {
                 if let Some(input) = self.active_input.as_mut() {
-                    input.state.move_to_end();
+                    if shift_only {
+                        input.state.select_to_line_end();
+                    } else {
+                        input.state.move_to_line_end();
+                    }
                 }
                 true
             }
             _ => false,
         };
         if handled {
+            self.mirror_filter_query();
             cx.stop_propagation();
             cx.notify();
         }
+    }
+
+    fn filter_key_edits_text(key: &str, modifiers: &gpui_kit::Modifiers) -> bool {
+        if modifiers.function {
+            return false;
+        }
+        if matches!(
+            key,
+            "left" | "right" | "home" | "end" | "backspace" | "delete"
+        ) {
+            return true;
+        }
+        let typing = !modifiers.control && !modifiers.alt && !modifiers.platform;
+        typing && key.chars().count() == 1 && !key.chars().all(char::is_control)
     }
 
     fn handle_copy_action(

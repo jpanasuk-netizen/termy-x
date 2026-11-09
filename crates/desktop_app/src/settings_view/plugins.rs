@@ -276,27 +276,12 @@ impl SettingsWindow {
                 }
                 cx.notify();
             }
-            "left" => {
+            "left" | "right" | "up" | "down" | "home" | "end" => {
                 if let Some(input) = self.plugin_setting_input.as_mut() {
-                    input.state.move_left();
-                }
-                cx.notify();
-            }
-            "right" => {
-                if let Some(input) = self.plugin_setting_input.as_mut() {
-                    input.state.move_right();
-                }
-                cx.notify();
-            }
-            "home" => {
-                if let Some(input) = self.plugin_setting_input.as_mut() {
-                    input.state.move_to_start();
-                }
-                cx.notify();
-            }
-            "end" => {
-                if let Some(input) = self.plugin_setting_input.as_mut() {
-                    input.state.move_to_end();
+                    input.state.apply_navigation_key(
+                        event.keystroke.key.as_str(),
+                        event.keystroke.modifiers.shift,
+                    );
                 }
                 cx.notify();
             }
@@ -811,6 +796,7 @@ impl SettingsWindow {
                 let toggle_key = key.clone();
                 self.render_switch(
                     SharedString::from(format!("plugin-setting-toggle-{plugin_id}-{key}")),
+                    title.clone(),
                     checked,
                     cx,
                     move |view, _, cx| {
@@ -923,13 +909,10 @@ impl SettingsWindow {
                 SettingsSection::Plugins,
                 cx,
             ))
-            .child(self.render_settings_group(
-                "Runtime",
-                vec![
-                    self.render_plugin_runtime_row(),
-                    self.render_plugin_actions_row(cx),
-                ],
-            ))
+            .child(self.render_settings_group("Runtime", vec![
+                self.render_plugin_runtime_row(),
+                self.render_plugin_actions_row(cx),
+            ]))
             .child(self.render_settings_group("Installed plugins", installed_rows));
 
         for (plugin_id, settings) in self.plugin_settings.clone() {

@@ -175,6 +175,7 @@ fn ai_line(config: &XConfig, http: &dyn Http) -> String {
         body: None,
         bearer: config.api_key(),
         content_type: None,
+        headers: Vec::new(),
     }) {
         Ok(_) => true,
         Err(error) => error.starts_with("http "),

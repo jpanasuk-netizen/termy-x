@@ -1,9 +1,9 @@
 use super::scrollbar as terminal_scrollbar;
-use super::surface::{terminal_edge_backgrounds, tui_surface_background};
+use super::surface::{terminal_edge_backgrounds, tui_paints_grid_border, tui_surface_background};
 use super::*;
 use crate::ui::scrollbar::{self as ui_scrollbar, ScrollbarPaintStyle};
 use gpui_kit::prelude::FluentBuilder;
-use gpui_kit::{ElementInputHandler, ObjectFit, StyledImage, canvas};
+use gpui_kit::{ObjectFit, StyledImage, canvas};
 use std::sync::Arc;
 use std::time::Instant;
 #[cfg(debug_assertions)]
@@ -181,6 +181,13 @@ const COMMAND_PALETTE_BACKDROP_STRENGTH: f32 = 1.0;
 const TERMINAL_PROGRESS_LOADER_HEIGHT: f32 = 2.0;
 const TERMINAL_PROGRESS_INDETERMINATE_WIDTH: f32 = 0.22;
 const TERMINAL_PROGRESS_INDETERMINATE_CYCLE_MS: u128 = 3_400;
+
+/// Frame interval of the indeterminate progress bar. Each frame renders the
+/// whole view for a 2 px bar that can stay up for the length of a build, so
+/// it animates at 30 fps, and at 10 fps while the window is in the background.
+fn terminal_progress_indeterminate_frame(window_active: bool) -> Duration {
+    Duration::from_millis(if window_active { 33 } else { 100 })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct TerminalProgressLoaderFill {
@@ -372,17 +379,6 @@ fn pane_cache_update_strategy(
     }
 }
 
-fn finalized_cache_update_strategy(
-    planned: PaneCacheUpdateStrategy,
-    did_full_rebuild: bool,
-) -> PaneCacheUpdateStrategy {
-    if planned == PaneCacheUpdateStrategy::Partial && did_full_rebuild {
-        PaneCacheUpdateStrategy::Full
-    } else {
-        planned
-    }
-}
-
 thread_local! {
     static DIRTY_SPAN_RANGES: std::cell::RefCell<Vec<(usize, usize, usize)>> =
         std::cell::RefCell::new(Vec::with_capacity(128));
@@ -510,6 +506,7 @@ struct ResolvedCellColors {
     fg: gpui_kit::Rgba,
     bg: gpui_kit::Rgba,
     uses_terminal_default_bg: bool,
+    bg_matches_theme: bool,
 }
 
 fn resolve_core_color(
@@ -583,6 +580,16 @@ fn resolve_cell_colors<'a>(
         bg_source,
         termy_core::TerminalRenderColor::DefaultBackground
     );
+    let theme_bg = resolve_core_color(
+        termy_core::TerminalRenderColor::DefaultBackground,
+        context.colors,
+        context.core_palette,
+    );
+    let same_channel = |a: f32, b: f32| (a - b).abs() <= 0.5 / 255.0;
+    let bg_matches_theme = uses_terminal_default_bg
+        || (same_channel(bg.r, theme_bg.r)
+            && same_channel(bg.g, theme_bg.g)
+            && same_channel(bg.b, theme_bg.b));
     let dim = cell.dim;
     let character = cell.text.chars().next().unwrap_or('\0');
 
@@ -612,6 +619,7 @@ fn resolve_cell_colors<'a>(
         fg,
         bg,
         uses_terminal_default_bg,
+        bg_matches_theme,
     }
 }
 
@@ -687,6 +695,37 @@ fn cursor_state_with_preview(
 }
 
 type PaneRenderCells = TerminalGridRows;
+
+/// Re-mark `selected` on the cached rows that a selection change enters or
+/// leaves, without rebuilding their colors, and return those rows.
+fn restyle_selection_rows(
+    rows: &mut [TerminalGridRow],
+    previous: Option<(SelectionPos, SelectionPos)>,
+    current: Option<(SelectionPos, SelectionPos)>,
+    display_offset: usize,
+) -> Vec<usize> {
+    let spans_line = |range: Option<(SelectionPos, SelectionPos)>, line: i32| {
+        range.is_some_and(|(start, end)| (start.line..=end.line).contains(&line))
+    };
+    let mut changed = Vec::new();
+    for (row, cells) in rows.iter_mut().enumerate() {
+        let Some(line) = i32::try_from(row as i64 - display_offset as i64).ok() else {
+            continue;
+        };
+        if !spans_line(previous, line) && !spans_line(current, line) {
+            continue;
+        }
+        let selected = |col| selection_range_contains(current, col, line);
+        if cells.iter().all(|cell| cell.selected == selected(cell.col)) {
+            continue;
+        }
+        for cell in Arc::make_mut(cells) {
+            cell.selected = selected(cell.col);
+        }
+        changed.push(row);
+    }
+    changed
+}
 
 fn pane_render_cells_match_dimensions(cells: &PaneRenderCells, cols: usize, rows: usize) -> bool {
     cells.len() == rows && cells.iter().all(|row_cells| row_cells.len() == cols)
@@ -834,23 +873,20 @@ impl Focusable for TerminalView {
 impl TerminalView {
     fn update_banner_layout_for(
         show_update_banner: bool,
-        show_tab_strip_chrome: bool,
+        titlebar_height: f32,
     ) -> Option<UpdateBannerLayout> {
         if !show_update_banner {
             return None;
         }
 
         Some(UpdateBannerLayout {
-            overlay_top: Self::window_titlebar_height_for(false, show_tab_strip_chrome) + 10.0,
+            overlay_top: titlebar_height + 10.0,
             overlay_left: 0.0,
         })
     }
 
     fn update_banner_layout(&self) -> Option<UpdateBannerLayout> {
-        Self::update_banner_layout_for(
-            self.update_banner_visible(),
-            self.should_render_tab_strip_chrome(),
-        )
+        Self::update_banner_layout_for(self.update_banner_visible(), self.window_titlebar_height())
     }
     fn pane_render_cache_key(
         &self,
@@ -914,6 +950,7 @@ impl TerminalView {
             fg: resolved_colors.fg.into(),
             bg: resolved_colors.bg.into(),
             uses_terminal_default_bg: resolved_colors.uses_terminal_default_bg,
+            bg_matches_theme: resolved_colors.bg_matches_theme,
             bold: text_attributes.bold,
             italic: text_attributes.italic,
             underline,
@@ -1007,6 +1044,7 @@ impl TerminalView {
             fg: default_fg.into(),
             bg: default_bg.into(),
             uses_terminal_default_bg: true,
+            bg_matches_theme: true,
             bold: false,
             italic: false,
             underline: None,
@@ -1047,64 +1085,52 @@ impl TerminalView {
         Arc::new(rows_cache.into_iter().map(Arc::new).collect())
     }
 
+    /// Patch dirty spans with cells read under the damage lock. `None` means
+    /// the cache must be rebuilt instead.
     #[allow(clippy::too_many_arguments)]
     fn patch_pane_render_cache(
         &self,
-        terminal: &Terminal,
+        damage_cells: &mut termy_core::TerminalDamageCells<'_>,
         cols: usize,
         rows: usize,
         display_offset: usize,
         cells: &mut PaneRenderCells,
         spans: &[TerminalDirtySpan],
-        generation: Option<u64>,
         context: PaneCellBuildContext<'_>,
-    ) -> (usize, bool) {
+    ) -> Option<usize> {
         if !pane_render_cells_match_dimensions(cells, cols, rows) {
-            *cells = self.rebuild_pane_render_cache(terminal, cols, rows, display_offset, context);
-            return (0, true);
+            return None;
         }
-
-        let Some((min_line, max_line)) = terminal.line_bounds() else {
-            *cells = self.rebuild_pane_render_cache(terminal, cols, rows, display_offset, context);
-            return (0, true);
-        };
+        let (min_line, max_line) = damage_cells.line_bounds();
         let mut patched_cell_count = 0usize;
-        let visited = {
-            // Clone the outer row table at most once for this partial update. Each
-            // dirty row is then made mutable once before all cells in its span are
-            // patched, instead of checking both Arcs for every individual cell.
-            let rows_cache: &mut Vec<_> = Arc::make_mut(cells);
-            for span in spans {
-                if span.row < rows {
-                    let _ = Arc::make_mut(&mut rows_cache[span.row]);
-                }
+        // Clone the outer row table at most once for this partial update. Each
+        // dirty row is then made mutable once before all cells in its span are
+        // patched, instead of checking both Arcs for every individual cell.
+        let rows_cache: &mut Vec<_> = Arc::make_mut(cells);
+        for span in spans {
+            if span.row < rows {
+                let _ = Arc::make_mut(&mut rows_cache[span.row]);
             }
-            terminal.for_each_damage_cell(
-                spans,
-                generation,
-                |row, cell_offset, term_line, col, cell| {
-                    if row >= rows
-                        || col >= cols
-                        || cell_offset != display_offset
-                        || term_line < min_line
-                        || term_line > max_line
-                    {
-                        return;
-                    }
-                    Arc::make_mut(&mut rows_cache[row])[col] =
-                        self.build_cell_render_info(col, term_line, cell, context);
-                    patched_cell_count = patched_cell_count.saturating_add(1);
-                },
-            )
-        };
-        if !visited {
-            *cells = self.rebuild_pane_render_cache(terminal, cols, rows, display_offset, context);
-            return (0, true);
         }
-
-        (patched_cell_count, false)
+        let visited = damage_cells.visit(spans, |row, cell_offset, term_line, col, cell| {
+            if row >= rows
+                || col >= cols
+                || cell_offset != display_offset
+                || term_line < min_line
+                || term_line > max_line
+            {
+                return;
+            }
+            Arc::make_mut(&mut rows_cache[row])[col] =
+                self.build_cell_render_info(col, term_line, TerminalCellRef(cell), context);
+            patched_cell_count = patched_cell_count.saturating_add(1);
+        });
+        visited.then_some(patched_cell_count)
     }
 
+    /// Bring the pane cache up to date. Damage and the cells it names are read
+    /// under one core lock, so output arriving between them cannot force a
+    /// full rebuild; a planned or fallback full rebuild runs after the lock.
     #[allow(clippy::too_many_arguments)]
     fn update_pane_render_cache(
         &self,
@@ -1112,7 +1138,6 @@ impl TerminalView {
         cols: usize,
         rows: usize,
         display_offset: usize,
-        damage: TerminalRenderDamageSnapshot,
         cache: &mut TerminalPaneRenderCache,
         cache_key: TerminalPaneRenderCacheKey,
         context: PaneCellBuildContext<'_>,
@@ -1122,110 +1147,108 @@ impl TerminalView {
         PaneCacheUpdateStrategy,
         TerminalGridPaintDamage,
     ) {
-        let palette_matches =
-            render_damage_palette_matches(damage.palette_revision, cache_key.palette_revision);
-        let mut strategy = pane_cache_update_strategy(
-            !cache.cells.is_empty(),
-            cache.cols == cols && cache.rows == rows,
-            cache.display_offset == display_offset,
-            cache.key.as_ref() == Some(&cache_key),
-            &damage.damage,
-        );
-        if !palette_matches {
-            strategy = PaneCacheUpdateStrategy::Full;
-        } else if strategy == PaneCacheUpdateStrategy::Reuse && !damage.scrolls.is_empty() {
-            strategy = PaneCacheUpdateStrategy::Partial;
-        }
-        if strategy == PaneCacheUpdateStrategy::Partial
-            && !damage.scrolls.is_empty()
-            && (cache_key.selection_range.is_some() || cache_key.search_results_revision.is_some())
-        {
-            strategy = PaneCacheUpdateStrategy::Full;
-        }
-        if strategy == PaneCacheUpdateStrategy::Partial
-            && let TerminalDamageSnapshot::Partial(spans) = &damage.damage
-            && partial_damage_should_rebuild_full(spans, rows, cols)
-        {
-            strategy = PaneCacheUpdateStrategy::Full;
-        }
-        let mut paint_damage = match strategy {
-            PaneCacheUpdateStrategy::Reuse => TerminalGridPaintDamage::None,
-            PaneCacheUpdateStrategy::Full => TerminalGridPaintDamage::Full,
-            PaneCacheUpdateStrategy::Partial => match &damage.damage {
-                TerminalDamageSnapshot::Partial(spans) => {
-                    paint_damage_from_scrolls_and_spans(&damage.scrolls, spans, rows)
-                }
-                TerminalDamageSnapshot::Full => TerminalGridPaintDamage::Full,
-            },
-        };
-
-        match strategy {
-            PaneCacheUpdateStrategy::Reuse => {}
-            PaneCacheUpdateStrategy::Full => {
-                cache.cells =
-                    self.rebuild_pane_render_cache(terminal, cols, rows, display_offset, context);
+        let planned = terminal.with_render_damage(|damage, mut damage_cells| {
+            let palette_matches =
+                render_damage_palette_matches(damage.palette_revision, cache_key.palette_revision);
+            // A selection change alone (a drag, say) restyles only the rows
+            // it enters or leaves, unless output also changed the pane.
+            let previous_selection = cache.key.as_ref().map(|key| key.selection_range);
+            let selection_only_change = cache.key.as_ref().is_some_and(|key| {
+                key.selection_range != cache_key.selection_range
+                    && TerminalPaneRenderCacheKey {
+                        selection_range: cache_key.selection_range,
+                        ..*key
+                    } == cache_key
+            });
+            let mut strategy = pane_cache_update_strategy(
+                !cache.cells.is_empty(),
+                cache.cols == cols && cache.rows == rows,
+                cache.display_offset == display_offset,
+                cache.key.as_ref() == Some(&cache_key) || selection_only_change,
+                &damage.damage,
+            );
+            if !palette_matches {
+                strategy = PaneCacheUpdateStrategy::Full;
+            } else if strategy == PaneCacheUpdateStrategy::Reuse && !damage.scrolls.is_empty() {
+                strategy = PaneCacheUpdateStrategy::Partial;
             }
-            PaneCacheUpdateStrategy::Partial => {
-                let TerminalRenderDamageSnapshot {
-                    damage: TerminalDamageSnapshot::Partial(spans),
-                    scrolls,
-                    generation,
-                    palette_revision: _,
-                } = damage
-                else {
-                    cache.cells = self.rebuild_pane_render_cache(
-                        terminal,
-                        cols,
-                        rows,
-                        display_offset,
-                        context,
-                    );
-                    cache.cols = cols;
-                    cache.rows = rows;
-                    cache.display_offset = display_offset;
-                    cache.key = Some(cache_key);
-                    return (
-                        cache.cells.clone(),
-                        PaneCacheUpdateStrategy::Full,
-                        TerminalGridPaintDamage::Full,
-                    );
+            if selection_only_change {
+                if strategy != PaneCacheUpdateStrategy::Reuse {
+                    return (PaneCacheUpdateStrategy::Full, TerminalGridPaintDamage::Full);
+                }
+                let rows = restyle_selection_rows(
+                    Arc::make_mut(&mut cache.cells).as_mut_slice(),
+                    previous_selection.flatten(),
+                    cache_key.selection_range,
+                    display_offset,
+                );
+                return (
+                    PaneCacheUpdateStrategy::Partial,
+                    TerminalGridPaintDamage::Rows(rows.into()),
+                );
+            }
+            if strategy == PaneCacheUpdateStrategy::Partial
+                && !damage.scrolls.is_empty()
+                && (cache_key.selection_range.is_some()
+                    || cache_key.search_results_revision.is_some())
+            {
+                strategy = PaneCacheUpdateStrategy::Full;
+            }
+            if strategy == PaneCacheUpdateStrategy::Partial
+                && let TerminalDamageSnapshot::Partial(spans) = &damage.damage
+                && partial_damage_should_rebuild_full(spans, rows, cols)
+            {
+                strategy = PaneCacheUpdateStrategy::Full;
+            }
+            if strategy != PaneCacheUpdateStrategy::Partial {
+                let paint_damage = match strategy {
+                    PaneCacheUpdateStrategy::Reuse => TerminalGridPaintDamage::None,
+                    _ => TerminalGridPaintDamage::Full,
                 };
-                #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-                let rows_cache: &mut Vec<_> = Arc::make_mut(&mut cache.cells);
-                #[cfg_attr(not(debug_assertions), allow(unused_variables))]
-                let (patched_cell_count, did_full_rebuild) =
-                    if replay_viewport_scrolls(rows_cache.as_mut_slice(), &scrolls) {
-                        self.patch_pane_render_cache(
-                            terminal,
-                            cols,
-                            rows,
-                            display_offset,
-                            &mut cache.cells,
-                            &spans,
-                            generation,
-                            context,
-                        )
-                    } else {
-                        cache.cells = self.rebuild_pane_render_cache(
-                            terminal,
-                            cols,
-                            rows,
-                            display_offset,
-                            context,
-                        );
-                        (0, true)
-                    };
-                strategy = finalized_cache_update_strategy(strategy, did_full_rebuild);
-                if strategy == PaneCacheUpdateStrategy::Full {
-                    paint_damage = TerminalGridPaintDamage::Full;
-                } else {
-                    #[cfg(debug_assertions)]
-                    if patched_cell_count > 0 {
-                        render_pass_cache_counts
-                            .record_partial_work(spans.len(), patched_cell_count);
-                    }
-                }
+                return (strategy, paint_damage);
             }
+            let TerminalRenderDamageSnapshot {
+                damage: TerminalDamageSnapshot::Partial(spans),
+                scrolls,
+                ..
+            } = damage
+            else {
+                return (PaneCacheUpdateStrategy::Full, TerminalGridPaintDamage::Full);
+            };
+            let patched = if damage_cells.display_offset() == display_offset
+                && replay_viewport_scrolls(Arc::make_mut(&mut cache.cells).as_mut_slice(), &scrolls)
+            {
+                self.patch_pane_render_cache(
+                    &mut damage_cells,
+                    cols,
+                    rows,
+                    display_offset,
+                    &mut cache.cells,
+                    &spans,
+                    context,
+                )
+            } else {
+                None
+            };
+            let Some(patched_cell_count) = patched else {
+                return (PaneCacheUpdateStrategy::Full, TerminalGridPaintDamage::Full);
+            };
+            #[cfg(debug_assertions)]
+            if patched_cell_count > 0 {
+                render_pass_cache_counts.record_partial_work(spans.len(), patched_cell_count);
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = patched_cell_count;
+            (
+                strategy,
+                paint_damage_from_scrolls_and_spans(&scrolls, &spans, rows),
+            )
+        });
+        let (strategy, paint_damage) =
+            planned.unwrap_or((PaneCacheUpdateStrategy::Full, TerminalGridPaintDamage::Full));
+        if strategy == PaneCacheUpdateStrategy::Full {
+            cache.cells =
+                self.rebuild_pane_render_cache(terminal, cols, rows, display_offset, context);
         }
 
         cache.cols = cols;
@@ -1643,11 +1666,20 @@ impl TerminalView {
                                                 MouseButton::Left,
                                                 cx.listener(move |this, _event, _window, cx| {
                                                     if !this.cancel_plugin_invocation(toast_id, cx) {
-                                                        crate::config::execute_fix_for_toast(
-                                                            toast_id,
-                                                        );
+                                                        let fixed =
+                                                            crate::config::execute_fix_for_toast(
+                                                                toast_id,
+                                                            );
                                                         crate::ui::toast::dismiss_toast(toast_id);
-                                                        crate::ui::toast::success("Config fixed");
+                                                        if fixed {
+                                                            crate::ui::toast::success(
+                                                                "Config fixed",
+                                                            );
+                                                        } else {
+                                                            crate::ui::toast::error(
+                                                                "Could not fix config",
+                                                            );
+                                                        }
                                                     }
                                                     this.notify_overlay(cx);
                                                     cx.stop_propagation();
@@ -1810,16 +1842,14 @@ impl TerminalView {
         ))
     }
 
-    fn schedule_progress_indicator_animation(&mut self, cx: &mut Context<Self>) {
+    fn schedule_progress_indicator_animation(&mut self, frame: Duration, cx: &mut Context<Self>) {
         if self.progress_indicator_animation_scheduled {
             return;
         }
 
         self.progress_indicator_animation_scheduled = true;
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
-            cx.background_executor()
-                .timer(Duration::from_millis(16))
-                .await;
+            cx.background_executor().timer(frame).await;
             let _ = cx.update(|cx| {
                 this.update(cx, |view, cx| {
                     view.progress_indicator_animation_scheduled = false;
@@ -2635,7 +2665,7 @@ impl TerminalView {
             None
         };
         let plugin_ui_overlay = self.modal_plugin_ui(cx);
-        let search_overlay = if self.search_open {
+        let search_overlay = if self.search_open && !self.uses_native_search_bar() {
             Some(self.render_search_bar(cx))
         } else {
             None
@@ -2821,6 +2851,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let frame_now = Instant::now();
+        self.schedule_native_window_tab_split(cx);
         if !self.launch_probe_scheduled
             && self
                 .session
@@ -2855,6 +2886,8 @@ impl Render for TerminalView {
         let ui_font_family = self.ui_font_family.clone();
         let font_size = self.font_size;
         self.sync_window_background_appearance(window);
+        self.native_titlebar.sync(&self.colors);
+        self.sync_native_window_title(window);
         let effective_background_opacity = self.background_opacity_factor();
         let mut terminal_surface_bg = colors.background;
         terminal_surface_bg.a = self.scaled_background_alpha(terminal_surface_bg.a);
@@ -2916,7 +2949,8 @@ impl Render for TerminalView {
         }
 
         if self.progress_indicator_enabled && self.active_tab_has_indeterminate_progress() {
-            self.schedule_progress_indicator_animation(cx);
+            let frame = terminal_progress_indeterminate_frame(window.is_window_active());
+            self.schedule_progress_indicator_animation(frame, cx);
         }
 
         if let Some(active_tab) = self.session.tabs.get(self.session.active_tab)
@@ -2945,6 +2979,12 @@ impl Render for TerminalView {
                 if cols == 0 || rows == 0 {
                     continue;
                 }
+                // Skip before the render cache consumes the pane's damage, so
+                // the rows it names repaint once the pane can be laid out.
+                let Some(pane_layout) = self.terminal_pane_layout(active_tab, pane, content_bounds)
+                else {
+                    continue;
+                };
                 let is_active_pane = active_pane_id.as_deref() == Some(pane.id.as_str());
                 let (pane_inactive_focus, pane_active_focus) =
                     pane_focus_factors(is_active_pane, pane_focus_enabled);
@@ -2979,8 +3019,6 @@ impl Render for TerminalView {
                 // the start of the render pass, avoiding another nested pair
                 // of terminal locks here.
                 let alternate_screen_mode = pane.last_alternate_screen.get();
-                let damage = terminal.take_render_damage_snapshot();
-                let terminal_generation = damage.generation;
                 let core_palette = terminal.core_palette();
                 let palette_revision = core_palette.as_ref().map(|palette| palette.revision);
                 let pane_cache_key = self.pane_render_cache_key(
@@ -3008,7 +3046,6 @@ impl Render for TerminalView {
                     selection_range: pane_cache_key.selection_range,
                     pane_search_results,
                 };
-                #[cfg_attr(not(debug_assertions), allow(unused_variables))]
                 let (pane_cells, cache_strategy, paint_damage, paint_cache) = {
                     let mut pane_render_cache = pane.render_cache.borrow_mut();
                     let paint_cache = pane_render_cache.paint_cache.clone();
@@ -3017,7 +3054,6 @@ impl Render for TerminalView {
                         cols,
                         rows,
                         pane_display_offset,
-                        damage,
                         &mut pane_render_cache,
                         pane_cache_key.clone(),
                         pane_build_context,
@@ -3033,18 +3069,53 @@ impl Render for TerminalView {
                     terminal_display_offset = pane_display_offset;
                 }
 
-                let fullscreen_tui = !multi_pane && alternate_screen_mode;
-                let pane_surface_bg = tui_surface_background(
-                    fullscreen_tui,
-                    pane_cells
-                        .iter()
-                        .flat_map(|row| row.iter().map(|cell| cell.bg)),
-                    terminal_surface_bg,
-                );
-                if fullscreen_tui && pane_surface_bg != terminal_surface_bg {
+                let tui_paints_border = !multi_pane
+                    && alternate_screen_mode
+                    && tui_paints_grid_border(
+                        Size {
+                            width: cols,
+                            height: rows,
+                        },
+                        // Claude Code paints its blank cells with the queried
+                        // theme color. Those must not count as a TUI-owned
+                        // border, or a large diff wins the padding vote.
+                        |row, col| {
+                            pane_cells
+                                .get(row)
+                                .and_then(|cells| cells.get(col))
+                                .is_some_and(|cell| !cell.bg_matches_theme)
+                        },
+                    );
+                // Voting scans every cell twice, so reuse the result until the
+                // cells or its other inputs change.
+                let pane_surface_bg = {
+                    let mut pane_render_cache = pane.render_cache.borrow_mut();
+                    match pane_render_cache.surface_background {
+                        Some((border, configured, background))
+                            if cache_strategy == PaneCacheUpdateStrategy::Reuse
+                                && border == tui_paints_border
+                                && configured == terminal_surface_bg =>
+                        {
+                            background
+                        }
+                        _ => {
+                            let background = tui_surface_background(
+                                tui_paints_border,
+                                pane_cells
+                                    .iter()
+                                    .flat_map(|row| row.iter().map(|cell| cell.bg)),
+                                terminal_surface_bg,
+                            );
+                            pane_render_cache.surface_background =
+                                Some((tui_paints_border, terminal_surface_bg, background));
+                            background
+                        }
+                    }
+                };
+                if pane_surface_bg != terminal_surface_bg {
                     terminal_area_background = Some(pane_surface_bg);
                 }
-                let edge_cells = fullscreen_tui.then(|| Arc::clone(&pane_cells));
+                let edge_cells = tui_paints_border.then(|| Arc::clone(&pane_cells));
 
                 let hovered_link_range = if is_active_pane {
                     self.hovered_link
@@ -3106,9 +3177,11 @@ impl Render for TerminalView {
                 let (kitty_below_background, kitty_below_text, kitty_above_text) = {
                     let mut pane_render_cache = pane.render_cache.borrow_mut();
                     let graphics_revision = terminal.kitty_graphics_revision().unwrap_or(0);
+                    // The engine bumps the graphics revision for every scroll,
+                    // view or placeholder edit that moves an image, so ordinary
+                    // text output does not force a fresh snapshot each frame.
                     let mut graphics_cache_key = KittyGraphicsRenderCacheKey {
                         graphics_revision,
-                        terminal_generation,
                         cols,
                         rows,
                         display_offset: pane_display_offset,
@@ -3167,10 +3240,6 @@ impl Render for TerminalView {
                         .into_any_element()
                 });
 
-                let Some(pane_layout) = self.terminal_pane_layout(active_tab, pane, content_bounds)
-                else {
-                    continue;
-                };
                 let pane_frame_left = pane_layout.frame.origin_x;
                 let pane_frame_top = pane_layout.frame.origin_y;
                 let pane_frame_width = pane_layout.frame.width;
@@ -3252,9 +3321,24 @@ impl Render for TerminalView {
                         .children(kitty_below_text)
                         .child(terminal_grid)
                         .children(kitty_above_text)
-                        .children(pane_progress_loader)
                         .into_any_element(),
                 );
+                // Span the pane's full surface, like the scrollbar: the content
+                // box (and a lone pane's frame) is inset by terminal padding,
+                // which left a gap before the track.
+                if let Some(loader) = pane_progress_loader {
+                    let surface = pane_layout.scrollbar_surface;
+                    pane_layers.push(
+                        div()
+                            .absolute()
+                            .left(px(surface.origin_x))
+                            .top(px(surface.origin_y))
+                            .w(px(surface.width))
+                            .h(px(TERMINAL_PROGRESS_LOADER_HEIGHT))
+                            .child(loader)
+                            .into_any_element(),
+                    );
+                }
 
                 if multi_pane && pane_active_border_alpha > f32::EPSILON {
                     let mut border = blend_rgb_only(colors.cursor, colors.foreground, 0.32);
@@ -3604,13 +3688,25 @@ impl Render for TerminalView {
 
         let focus_handle = self.focus_handle.clone();
         let tabbar_bg = terminal_surface_bg;
+        // Windows 11 tab style: the titlebar row gets its own chrome fill (or
+        // shows the Mica backdrop) and only the content below it paints the
+        // terminal surface, which the selected tab continues into the row.
+        let windows_tab_chrome_bg = self
+            .windows_tab_chrome_active()
+            .then(|| self.windows_tab_chrome_background_for(&colors));
         let show_tab_strip_chrome = self.should_render_tab_strip_chrome();
-        let titlebar_height = Self::window_titlebar_height_for(false, show_tab_strip_chrome);
+        let titlebar_height = self.window_titlebar_height();
         let vertical_tabs = self.tab_strip_orientation()
             == crate::terminal_view::tab_strip::state::TabStripOrientation::Vertical;
         let show_horizontal_tabbar = show_tab_strip_chrome && !vertical_tabs;
         let tabs_row = show_horizontal_tabbar
             .then(|| self.render_tab_strip(window, &colors, &ui_font_family, tabbar_bg, cx));
+        // The WinUI strip is its own window; hide it whenever the row it
+        // covers is not drawn in the Windows 11 style.
+        #[cfg(target_os = "windows")]
+        if !show_horizontal_tabbar || !self.horizontal_tab_style().is_windows_11() {
+            self.hide_winui_tab_strip();
+        }
         let tab_sidebar = (vertical_tabs && show_tab_strip_chrome)
             .then(|| self.render_tab_sidebar(window, &colors, &ui_font_family, tabbar_bg, cx));
         let workspace_sidebar = self
@@ -3622,12 +3718,13 @@ impl Render for TerminalView {
         let workspace_sidebar_edge_peek = self
             .workspace_sidebar_edge_peek_enabled()
             .then(|| self.render_workspace_sidebar_edge_peek_target(cx));
-        let hidden_titlebar_branding = Self::should_render_hidden_titlebar_branding(
-            self.auto_hide_tabbar,
-            self.session.tabs.len(),
-            self.effective_tab_bar_visibility(),
-            self.show_termy_in_titlebar,
-        )
+        let hidden_titlebar_branding = (!self.native_window_tabs
+            && Self::should_render_hidden_titlebar_branding(
+                self.auto_hide_tabbar,
+                self.session.tabs.len(),
+                self.effective_tab_bar_visibility(),
+                self.show_termy_in_titlebar,
+            ))
         .then(|| {
             self.render_titlebar_branding(window, &colors, &ui_font_family, tabbar_bg, false, cx)
         })
@@ -3672,7 +3769,7 @@ impl Render for TerminalView {
                 if !has_active_inline {
                     window.handle_input(
                         &ime_focus_handle,
-                        ElementInputHandler::new(bounds, ime_view.clone()),
+                        super::inline_input::TerminalInputHandler::new(bounds, ime_view.clone()),
                         cx,
                     );
                 }
@@ -3713,6 +3810,11 @@ impl Render for TerminalView {
         } else {
             "Terminal"
         };
+        // Vertical-tab and hidden-strip layouts still need caption buttons and a
+        // drag area on Windows, where Termy draws its own titlebar.
+        let windows_titlebar_controls = (!show_horizontal_tabbar)
+            .then(|| self.render_windows_titlebar_controls(window, &colors))
+            .flatten();
         let titlebar_element: Option<AnyElement> = (titlebar_height > 0.0).then(|| {
             // The root already paints the shared translucent window background.
             // Repainting that same fill on the titlebar darkens the top strip
@@ -3725,6 +3827,9 @@ impl Render for TerminalView {
                 .relative()
                 .flex()
                 .items_center()
+                .when_some(windows_tab_chrome_bg, |titlebar, chrome_bg| {
+                    titlebar.bg(chrome_bg)
+                })
                 .on_mouse_move(cx.listener(Self::handle_titlebar_tab_strip_mouse_move));
 
             titlebar_container
@@ -3750,6 +3855,7 @@ impl Render for TerminalView {
                         .children(tabs_row)
                         .children(hidden_titlebar_branding),
                 )
+                .children(windows_titlebar_controls)
                 .into_any()
         });
         // Keep the existing long GPUI listener chain stable when adding actions.
@@ -3759,7 +3865,7 @@ impl Render for TerminalView {
             .flex()
             .flex_col()
             .size_full()
-            .bg(terminal_surface_bg)
+            .when(windows_tab_chrome_bg.is_none(), |root| root.bg(terminal_surface_bg))
             .font_family(ui_font_family)
             .capture_any_mouse_up(cx.listener(|this, event: &MouseUpEvent, window, cx| {
                 if this.finish_window_tab_drag(event, window, cx) {
@@ -3806,6 +3912,9 @@ impl Render for TerminalView {
             .child(
                 div()
                     .id("terminal")
+                    .when(windows_tab_chrome_bg.is_some(), |terminal| {
+                        terminal.bg(terminal_surface_bg)
+                    })
                     .track_focus(&focus_handle)
                     .key_context(key_context)
                     .on_action(cx.listener(Self::handle_toggle_command_palette_action))
@@ -3817,6 +3926,7 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::handle_rename_tab_action))
                     .on_action(cx.listener(Self::handle_check_for_updates_action))
                     .on_action(cx.listener(Self::handle_view_release_notes_action))
+                    .on_action(cx.listener(Self::handle_reopen_detached_window_action))
                     .on_action(cx.listener(Self::handle_browse_release_notes_action))
                     .on_action(cx.listener(Self::handle_toggle_workspace_sidebar_action))
                     .on_action(cx.listener(Self::handle_new_tab_action))
@@ -3913,6 +4023,10 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::handle_inline_delete_action))
                     .on_action(cx.listener(Self::handle_inline_move_left_action))
                     .on_action(cx.listener(Self::handle_inline_move_right_action))
+                    .on_action(cx.listener(Self::handle_inline_move_up_action))
+                    .on_action(cx.listener(Self::handle_inline_move_down_action))
+                    .on_action(cx.listener(Self::handle_inline_select_up_action))
+                    .on_action(cx.listener(Self::handle_inline_select_down_action))
                     .on_action(cx.listener(Self::handle_inline_select_left_action))
                     .on_action(cx.listener(Self::handle_inline_select_right_action))
                     .on_action(cx.listener(Self::handle_inline_select_all_action))
@@ -4119,7 +4233,10 @@ mod tests {
     #[test]
     fn update_dialog_layout_floats_below_titlebar_without_reserving_space() {
         assert_eq!(
-            TerminalView::update_banner_layout_for(true, true),
+            TerminalView::update_banner_layout_for(
+                true,
+                TerminalView::window_titlebar_height_for(false, true)
+            ),
             Some(UpdateBannerLayout {
                 overlay_top: TerminalView::titlebar_height() + 10.0,
                 overlay_left: 0.0,
@@ -4135,6 +4252,7 @@ mod tests {
             fg: gpui_kit::Hsla::transparent_black(),
             bg: gpui_kit::Hsla::transparent_black(),
             uses_terminal_default_bg: false,
+            bg_matches_theme: false,
             bold: false,
             italic: false,
             underline: None,
@@ -4359,6 +4477,7 @@ mod tests {
             degraded: false,
             tmux_mouse_mode: None,
             progress_state: ProgressState::default(),
+            program_status: Vec::new(),
             terminal: Terminal::new_tmux(
                 size,
                 TerminalOptions {
@@ -4645,20 +4764,19 @@ mod tests {
             b"\x1b[2S\x1b[1T",
         ] {
             terminal.feed_output(output);
-            let update =
-                TerminalRenderDamageSnapshot::from_core(terminal.take_render_damage_snapshot());
-            match update.damage {
-                TerminalDamageSnapshot::Full => incremental = snapshot_rows(&terminal),
+            let full = terminal.with_render_damage(|update, mut cells| match update.damage {
+                TerminalDamageSnapshot::Full => true,
                 TerminalDamageSnapshot::Partial(spans) => {
                     replayed_scrolls = replayed_scrolls.saturating_add(update.scrolls.len());
                     assert!(replay_viewport_scrolls(&mut incremental, &update.scrolls));
-                    let generation = update.generation.expect("core render generation");
-                    assert!(terminal.visit_viewport_ranges_at_generation(
-                        generation,
-                        &spans,
-                        |row, _, _, col, cell| incremental[row][col] = cell.clone(),
-                    ));
+                    assert!(cells.visit(&spans, |row, _, _, col, cell| {
+                        incremental[row][col] = cell.clone();
+                    }));
+                    false
                 }
+            });
+            if full {
+                incremental = snapshot_rows(&terminal);
             }
             assert_eq!(incremental, snapshot_rows(&terminal), "output {output:?}");
         }
@@ -4841,7 +4959,27 @@ mod tests {
             context,
         );
         assert!(!rgb_background.uses_terminal_default_bg);
+        assert!(!rgb_background.bg_matches_theme);
         assert!((rgb_background.bg.a - 1.0).abs() <= f32::EPSILON);
+
+        // An explicit color equal to the theme background (an app painting
+        // back its OSC 11 reply) still reads as the theme for padding.
+        let theme = context.colors.background;
+        let channel = |value: f32| (value * 255.0).round() as u8;
+        let queried_theme_background = resolve_cell_colors(
+            &test_term_cell(
+                termy_core::TerminalRenderColor::DefaultForeground,
+                termy_core::TerminalRenderColor::Rgb(TerminalColor {
+                    r: channel(theme.r),
+                    g: channel(theme.g),
+                    b: channel(theme.b),
+                }),
+                termy_core::TerminalRenderCell::default(),
+            ),
+            context,
+        );
+        assert!(!queried_theme_background.uses_terminal_default_bg);
+        assert!(queried_theme_background.bg_matches_theme);
     }
 
     #[test]
@@ -5168,6 +5306,43 @@ mod tests {
     }
 
     #[test]
+    fn selection_change_restyles_only_rows_it_enters_or_leaves() {
+        let mut rows: Vec<TerminalGridRow> = (0..4)
+            .map(|_| Arc::new((0..3).map(|col| test_render_cell(col, 'x')).collect()))
+            .collect();
+        let untouched = Arc::clone(&rows[0]);
+        let pos = |line, col| SelectionPos { col, line };
+        // Scrolled one line into history: viewport row 1 is terminal line 0.
+        let first = Some((pos(0, 1), pos(1, 0)));
+        assert_eq!(restyle_selection_rows(&mut rows, None, first, 1), [1, 2]);
+        let selected = |rows: &[TerminalGridRow], row: usize| {
+            rows[row]
+                .iter()
+                .map(|cell| cell.selected)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(selected(&rows, 1), [false, true, true]);
+        assert_eq!(selected(&rows, 2), [true, false, false]);
+
+        // Dragging the head down one row leaves row 1 as it was.
+        let second = Some((pos(0, 1), pos(2, 1)));
+        assert_eq!(restyle_selection_rows(&mut rows, first, second, 1), [2, 3]);
+        assert_eq!(selected(&rows, 1), [false, true, true]);
+        assert_eq!(selected(&rows, 2), [true, true, true]);
+        assert_eq!(selected(&rows, 3), [true, true, false]);
+
+        assert_eq!(
+            restyle_selection_rows(&mut rows, second, None, 1),
+            [1, 2, 3]
+        );
+        assert!((0..4).all(|row| selected(&rows, row) == [false; 3]));
+        assert!(
+            Arc::ptr_eq(&rows[0], &untouched),
+            "rows outside both selections are shared"
+        );
+    }
+
+    #[test]
     fn pane_cache_strategy_forces_full_rebuild_when_cache_key_changes_with_empty_damage() {
         let strategy = pane_cache_update_strategy(
             true,
@@ -5258,28 +5433,6 @@ mod tests {
             }]),
         );
         assert_eq!(strategy, PaneCacheUpdateStrategy::Full);
-    }
-
-    #[test]
-    fn finalized_cache_update_strategy_upgrades_partial_when_fallback_rebuilds() {
-        let strategy = finalized_cache_update_strategy(PaneCacheUpdateStrategy::Partial, true);
-        assert_eq!(strategy, PaneCacheUpdateStrategy::Full);
-    }
-
-    #[test]
-    fn finalized_cache_update_strategy_keeps_planned_strategy_without_fallback() {
-        assert_eq!(
-            finalized_cache_update_strategy(PaneCacheUpdateStrategy::Reuse, false),
-            PaneCacheUpdateStrategy::Reuse
-        );
-        assert_eq!(
-            finalized_cache_update_strategy(PaneCacheUpdateStrategy::Partial, false),
-            PaneCacheUpdateStrategy::Partial
-        );
-        assert_eq!(
-            finalized_cache_update_strategy(PaneCacheUpdateStrategy::Full, true),
-            PaneCacheUpdateStrategy::Full
-        );
     }
 
     #[test]

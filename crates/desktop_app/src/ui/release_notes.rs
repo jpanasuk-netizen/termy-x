@@ -187,13 +187,28 @@ fn truncate_message(message: &str) -> String {
     if message.len() <= LIMIT {
         message.to_string()
     } else {
-        format!("{}…", &message[..LIMIT])
+        // Cut at a char boundary; slicing mid-character would panic.
+        let mut end = LIMIT;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…", &message[..end])
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_message_respects_char_boundaries() {
+        // Byte 240 falls inside a two-byte character.
+        let message = format!("a{}", "é".repeat(200));
+        let truncated = truncate_message(&message);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() <= 240 + '…'.len_utf8());
+        assert_eq!(truncate_message("short"), "short");
+    }
 
     #[test]
     fn first_launch_seeds_without_opening() {

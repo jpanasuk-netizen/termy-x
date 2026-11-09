@@ -330,7 +330,6 @@ impl SettingsWindow {
         self.active_input = None;
         self.plugin_setting_input = None;
         self.blur_sidebar_search();
-        self.theme_store_search_active = false;
         self.ssh_input = Some(ActiveSshInput::new(field, value));
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -398,24 +397,12 @@ impl SettingsWindow {
                 }
                 self.sync_active_ssh_input();
             }
-            "left" => {
+            "left" | "right" | "up" | "down" | "home" | "end" => {
                 if let Some(input) = self.ssh_input.as_mut() {
-                    input.state.move_left();
-                }
-            }
-            "right" => {
-                if let Some(input) = self.ssh_input.as_mut() {
-                    input.state.move_right();
-                }
-            }
-            "home" => {
-                if let Some(input) = self.ssh_input.as_mut() {
-                    input.state.move_to_start();
-                }
-            }
-            "end" => {
-                if let Some(input) = self.ssh_input.as_mut() {
-                    input.state.move_to_end();
+                    input.state.apply_navigation_key(
+                        event.keystroke.key.as_str(),
+                        event.keystroke.modifiers.shift,
+                    );
                 }
             }
             _ => {}
@@ -510,30 +497,26 @@ impl SettingsWindow {
 
         let content: AnyElement = if is_active {
             if secret {
-                let mut hidden_text = text_color;
-                hidden_text.a = 0.0;
-                let mut hidden_selection = self.accent_with_alpha(0.3);
-                hidden_selection.a = 0.0;
-                let masked = self.ssh_input.as_ref().map_or_else(String::new, |input| {
-                    if input.state.text().is_empty() {
-                        String::new()
-                    } else {
-                        "••••••••".to_string()
-                    }
-                });
+                // Bullets are painted by TextInputElement via masks_text(), one
+                // per grapheme, with the caret on that bullet. The secret is
+                // not drawn. Placeholder shows only while the field is empty.
+                let show_placeholder = self
+                    .ssh_input
+                    .as_ref()
+                    .is_none_or(|input| input.state.text().is_empty());
                 div()
                     .relative()
                     .size_full()
                     .child(TextInputElement::new(
                         cx.entity(),
                         self.focus_handle.clone(),
-                        font,
+                        font.clone(),
                         px(SETTINGS_INPUT_TEXT_SIZE),
-                        hidden_text.into(),
-                        hidden_selection.into(),
+                        text_color.into(),
+                        self.accent_with_alpha(0.3).into(),
                         TextInputAlignment::Left,
                     ))
-                    .child(
+                    .children(show_placeholder.then(|| {
                         div()
                             .absolute()
                             .left_0()
@@ -542,13 +525,9 @@ impl SettingsWindow {
                             .flex()
                             .items_center()
                             .text_size(px(SETTINGS_INPUT_TEXT_SIZE))
-                            .text_color(if masked.is_empty() { muted } else { text_color })
-                            .child(if masked.is_empty() {
-                                placeholder.to_string()
-                            } else {
-                                masked
-                            }),
-                    )
+                            .text_color(muted)
+                            .child(placeholder.to_string())
+                    }))
                     .into_any_element()
             } else {
                 TextInputElement::new(
@@ -566,7 +545,7 @@ impl SettingsWindow {
             let display = if value.is_empty() {
                 placeholder.to_string()
             } else if secret {
-                "••••••••".to_string()
+                termy_x::draft_edit::MaskMap::new(&value).display()
             } else {
                 value
             };

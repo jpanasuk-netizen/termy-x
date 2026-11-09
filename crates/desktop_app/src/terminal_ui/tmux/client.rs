@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, anyhow};
 use flume::{Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::io::{Read, Write};
 #[cfg(test)]
@@ -14,7 +14,7 @@ use termy_core::tmux_control_core::command::{
     tmux_control_command_line,
 };
 use termy_core::tmux_control_core::control::{
-    ControlRequest, NotificationCoalescer, try_enqueue_control_request,
+    ControlCommandResult, ControlRequest, NotificationCoalescer, try_enqueue_control_request,
 };
 
 #[cfg(unix)]
@@ -37,12 +37,16 @@ use termy_core::tmux_control_core::control::{
     spawn_control_threads,
 };
 use termy_core::tmux_control_core::payload::{
-    capture_full_pane_args, capture_pane_range_args, sanitize_tmux_payload, unescape_tmux_payload,
+    capture_full_pane_args, sanitize_tmux_payload, unescape_tmux_payload,
 };
 use termy_core::tmux_control_core::types::{
     TmuxControlError, TmuxLaunchTarget, TmuxNotification, TmuxPaneMouseMode, TmuxRuntimeConfig,
     TmuxSessionSummary, TmuxShutdownMode, TmuxSnapshot, TmuxSocketTarget,
 };
+
+const CONTROL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+
+type ControlResponse = std::result::Result<ControlCommandResult, TmuxControlError>;
 
 pub struct TmuxClient {
     tmux_binary: String,
@@ -234,6 +238,7 @@ impl TmuxClient {
     /// commands issued outside the control channel. Because there is no local
     /// child process, shutdown is always downgraded to detach-only regardless
     /// of the requested mode.
+    #[cfg(test)]
     pub fn from_streams<W, R>(
         stdin: W,
         stdout: R,
@@ -303,6 +308,7 @@ impl TmuxClient {
             .map(|result| result.output)
     }
 
+    #[cfg(test)]
     pub fn send_command_async(&self, command: &str) -> Result<()> {
         self.send_control_command_async(command)
     }
@@ -690,30 +696,47 @@ impl TmuxClient {
     }
 
     pub fn capture_pane(&self, pane_id: &str, max_rows: usize) -> Result<Vec<u8>> {
-        // Hydration capture must stay bounded to avoid expensive full-history
-        // scans that can time out during reattach on large tmux histories.
-        let start_row = format!("-{}", max_rows.max(1));
-        let args = capture_full_pane_args(pane_id, start_row.as_str());
-        let out = self.run_control_capture_args(&args)?;
-        Ok(finalize_capture_payload(&out, true))
+        self.capture_panes(&[(pane_id, max_rows)])
+            .pop()
+            .unwrap_or_else(|| Err(anyhow!("tmux capture returned no result for {pane_id}")))
     }
 
-    /// Capture a bounded scrollback range of a pane with caller-chosen end line
-    /// and wrap handling. `start_row`/`end_row` are tmux `capture-pane -S/-E`
-    /// line specifiers (negative = history, `0` = top of the visible screen,
-    /// `-` = the extreme). With `join_wraps` off, every captured line maps 1:1
-    /// to a grid row, so a caller can splice captured history against a live
-    /// grid line-exact. Unlike `capture_pane`, this does not assume `-E -`.
-    pub fn capture_pane_range(
+    /// Capture `(pane_id, max_rows)` panes for hydration. Every request is
+    /// queued before waiting and they share one deadline, so an unresponsive
+    /// tmux stalls the caller once rather than once per pane.
+    pub fn capture_panes(&self, panes: &[(&str, usize)]) -> Vec<Result<Vec<u8>>> {
+        self.capture_panes_within(panes, CONTROL_CAPTURE_TIMEOUT)
+    }
+
+    fn capture_panes_within(
         &self,
-        pane_id: &str,
-        start_row: &str,
-        end_row: &str,
-        join_wraps: bool,
-    ) -> Result<Vec<u8>> {
-        let args = capture_pane_range_args(pane_id, start_row, end_row, join_wraps);
-        let out = self.run_control_capture_args(&args)?;
-        Ok(finalize_capture_payload(&out, false))
+        panes: &[(&str, usize)],
+        timeout: Duration,
+    ) -> Vec<Result<Vec<u8>>> {
+        let pending = panes
+            .iter()
+            .map(|&(pane_id, max_rows)| {
+                // Hydration capture must stay bounded to avoid expensive full-history
+                // scans that can time out during reattach on large tmux histories.
+                let start_row = format!("-{}", max_rows.max(1));
+                let command =
+                    Self::capture_command(&capture_full_pane_args(pane_id, start_row.as_str()))?;
+                let response_rx = self.enqueue_waited_control_command(&command);
+                Ok((command, response_rx))
+            })
+            .collect::<Vec<Result<_>>>();
+        let deadline = Instant::now() + timeout;
+        pending
+            .into_iter()
+            .map(|pending| {
+                let (command, response_rx) = pending?;
+                let response = response_rx.and_then(|response_rx| {
+                    Self::wait_control_response(&command, &response_rx, deadline, timeout)
+                });
+                let out = Self::finish_capture(&command, response)?;
+                Ok(finalize_capture_payload(&out, true))
+            })
+            .collect()
     }
 
     pub fn verify_tmux_version(
@@ -770,19 +793,25 @@ impl TmuxClient {
         })
     }
 
-    fn send_control_command_wait_with_timeout(
-        &self,
-        command: &str,
-        timeout: Duration,
-    ) -> Result<termy_core::tmux_control_core::control::ControlCommandResult> {
+    fn enqueue_waited_control_command(&self, command: &str) -> Result<Receiver<ControlResponse>> {
         let (response_tx, response_rx) = flume::bounded(1);
         self.enqueue_control_request(ControlRequest {
             command: command.to_string(),
             completion_token: next_control_completion_token(),
             response_tx: Some(response_tx),
         })?;
+        Ok(response_rx)
+    }
 
-        let response = match response_rx.recv_timeout(timeout) {
+    /// Wait until `deadline` for the response to `command`, which was queued
+    /// with a `timeout` budget (named in the error).
+    fn wait_control_response(
+        command: &str,
+        response_rx: &Receiver<ControlResponse>,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<ControlCommandResult> {
+        let response = match response_rx.recv_deadline(deadline) {
             Ok(response) => response,
             Err(RecvTimeoutError::Timeout) => {
                 return Err(anyhow!(TmuxControlError::channel(format!(
@@ -798,24 +827,39 @@ impl TmuxClient {
         response.map_err(anyhow::Error::new)
     }
 
-    fn send_control_command_wait(
+    fn send_control_command_wait_with_timeout(
         &self,
         command: &str,
-    ) -> Result<termy_core::tmux_control_core::control::ControlCommandResult> {
+        timeout: Duration,
+    ) -> Result<ControlCommandResult> {
+        let deadline = Instant::now() + timeout;
+        let response_rx = self.enqueue_waited_control_command(command)?;
+        Self::wait_control_response(command, &response_rx, deadline, timeout)
+    }
+
+    fn send_control_command_wait(&self, command: &str) -> Result<ControlCommandResult> {
         const CONTROL_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
         self.send_control_command_wait_with_timeout(command, CONTROL_COMMAND_TIMEOUT)
     }
 
-    fn run_control_capture_args(&self, args: &[&str]) -> Result<String> {
-        const CONTROL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
-        let command = tmux_control_command_line(args).map_err(|error| {
+    fn capture_command(args: &[&str]) -> Result<String> {
+        tmux_control_command_line(args).map_err(|error| {
             anyhow!(TmuxControlError::protocol(format!(
                 "refusing unsafe tmux capture command: {error}"
             )))
-        })?;
-        let response = self
-            .send_control_command_wait_with_timeout(command.as_str(), CONTROL_CAPTURE_TIMEOUT)
-            .with_context(|| format!("tmux capture command failed: {command}"))?;
+        })
+    }
+
+    fn run_control_capture_args(&self, args: &[&str]) -> Result<String> {
+        let command = Self::capture_command(args)?;
+        let response =
+            self.send_control_command_wait_with_timeout(command.as_str(), CONTROL_CAPTURE_TIMEOUT);
+        Self::finish_capture(&command, response)
+    }
+
+    fn finish_capture(command: &str, response: Result<ControlCommandResult>) -> Result<String> {
+        let response =
+            response.with_context(|| format!("tmux capture command failed: {command}"))?;
         let unescaped = unescape_tmux_payload(response.output.as_bytes());
         String::from_utf8(unescaped)
             .with_context(|| format!("tmux capture response is not valid UTF-8: {command}"))
@@ -954,6 +998,13 @@ mod tests {
 
     fn test_tmux_client(shutdown_mode_on_drop: TmuxShutdownMode) -> TmuxClient {
         let (request_tx, _request_rx) = flume::bounded::<ControlRequest>(1);
+        test_tmux_client_with_requests(shutdown_mode_on_drop, request_tx)
+    }
+
+    fn test_tmux_client_with_requests(
+        shutdown_mode_on_drop: TmuxShutdownMode,
+        request_tx: Sender<ControlRequest>,
+    ) -> TmuxClient {
         let (_notifications_tx, notifications_rx) = flume::bounded::<TmuxNotification>(1);
         let (_fatal_exit_tx, fatal_exit_rx) = flume::bounded::<Option<String>>(1);
         TmuxClient {
@@ -971,6 +1022,32 @@ mod tests {
             notifications_rx,
             fatal_exit_rx,
         }
+    }
+
+    #[test]
+    fn pane_captures_are_queued_together_and_share_one_deadline() {
+        let (request_tx, request_rx) = flume::bounded::<ControlRequest>(8);
+        let client = test_tmux_client_with_requests(TmuxShutdownMode::DetachOnly, request_tx);
+        // Nothing answers: the requests stay queued, so every wait times out.
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let captures = client.capture_panes_within(&[("%1", 10), ("%2", 10), ("%3", 10)], timeout);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            request_rx.len(),
+            3,
+            "all captures are queued before waiting"
+        );
+        assert_eq!(captures.len(), 3);
+        for capture in captures {
+            let error = format!("{:#}", capture.expect_err("unanswered capture fails"));
+            assert!(error.contains("timed out"), "{error}");
+        }
+        // One timeout per pane would take three times as long.
+        assert!(elapsed < timeout * 2, "took {elapsed:?}");
+        // Disconnect first, so dropping the client does not wait on a detach.
+        drop(request_rx);
     }
 
     #[test]
@@ -1278,7 +1355,7 @@ mod tests {
 
     #[cfg(not(unix))]
     #[test]
-    fn new_reports_unsupported_platform_on_non_unix() {
+    fn new_requires_command_prefix_on_non_unix() {
         let result = TmuxClient::new(
             TmuxRuntimeConfig::default(),
             120,
@@ -1287,12 +1364,8 @@ mod tests {
             None::<flume::Sender<()>>,
         );
         let Err(error) = result else {
-            panic!("non-unix targets must reject tmux runtime startup");
+            panic!("non-unix targets must require a tmux command prefix");
         };
-        assert!(
-            error
-                .to_string()
-                .contains("tmux control mode is only supported on unix targets")
-        );
+        assert!(error.to_string().contains("requires tmux_command_prefix"));
     }
 }

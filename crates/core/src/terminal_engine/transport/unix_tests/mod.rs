@@ -1,5 +1,5 @@
 use super::*;
-use std::os::fd::IntoRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
 use std::{sync::atomic::AtomicUsize, time::Duration};

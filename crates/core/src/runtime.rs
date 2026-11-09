@@ -12,9 +12,13 @@ use crate::protocol::{TerminalClipboardLocation, TerminalQueryColors, TerminalRe
 use crate::search::{TermySearchMatch, TermySearchOptions, TermySharedSearchMatch};
 use crate::shell_integration::ProgressState;
 use flume::Sender;
-#[cfg(not(target_os = "windows"))]
-use std::path::Path;
-use std::{collections::HashMap, env, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct TabTitleShellIntegration {
@@ -27,6 +31,18 @@ const DEFAULT_COLORTERM: &str = "truecolor";
 const TERMY_TERM_PROGRAM: &str = "termy";
 const GHOSTTY_COMPAT_TERM_PROGRAM: &str = "ghostty";
 const GHOSTTY_COMPAT_TERM_PROGRAM_VERSION: &str = "1.2.0";
+
+/// Value advertised to child processes through `TERM_PROGRAM`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TermProgram {
+    Termy,
+    /// Claude Code and similar CLIs gate terminal progress escape sequences on
+    /// known terminal identities. Termy supports Ghostty's OSC progress
+    /// protocol, so this advertises that compatibility while keeping TERM
+    /// conservative for terminfo.
+    #[default]
+    Ghostty,
+}
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkingDirFallback {
@@ -71,11 +87,15 @@ const MAX_TERMINAL_ROWS: u16 = 4096;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WindowsShell {
-    #[default]
     Cmd,
     PowerShell,
     PowerShellCore,
     GitBash,
+    /// PowerShell 7 (`pwsh.exe`) when it is installed, else Windows
+    /// PowerShell, else the `COMSPEC` command processor. Declared last so
+    /// serialized indices of the explicit presets stay stable.
+    #[default]
+    Auto,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +132,8 @@ pub struct TerminalRuntimeConfig {
     pub windows_shell: WindowsShell,
     pub term: String,
     pub colorterm: Option<String>,
+    #[serde(default)]
+    pub term_program: TermProgram,
     pub environment: HashMap<String, String>,
     pub query_colors: TerminalQueryColors,
     pub working_dir_fallback: WorkingDirFallback,
@@ -137,6 +159,7 @@ impl Default for TerminalRuntimeConfig {
             windows_shell: WindowsShell::default(),
             term: DEFAULT_TERM.to_string(),
             colorterm: Some(DEFAULT_COLORTERM.to_string()),
+            term_program: TermProgram::default(),
             environment: HashMap::new(),
             query_colors: TerminalQueryColors::default(),
             working_dir_fallback: WorkingDirFallback::default(),
@@ -216,42 +239,93 @@ pub struct ResolvedTerminalLaunch {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_cmd_path() -> String {
-    if let Ok(comspec) = env::var("COMSPEC")
-        && !comspec.trim().is_empty()
-    {
-        return comspec;
-    }
-    "C:\\Windows\\System32\\cmd.exe".to_string()
+mod windows_shell;
+#[cfg(all(target_os = "windows", test))]
+use windows_shell::{
+    WindowsShellFamily, inherited_prompt_is_custom, windows_cmd_path, windows_git_bash_path,
+};
+#[cfg(target_os = "windows")]
+use windows_shell::{
+    apply_windows_shell_integration, warn_cmd_unc_working_directory, windows_shell_family,
+    windows_shell_launch, windows_startup_command_launch, windows_startup_command_shell,
+};
+
+/// Where a terminal child's inherited variables come from. Launch decisions
+/// that read the environment (the default shell, PATH, the locale) read the
+/// same source, so a child never mixes two environments.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ChildEnvironment<'a> {
+    /// This process's own environment.
+    Process,
+    /// Given variables instead, for example a multiplexer client's.
+    Explicit(&'a [(String, String)]),
 }
 
-#[cfg(target_os = "windows")]
-fn windows_git_bash_path() -> String {
-    let mut candidates = Vec::new();
-    if let Ok(program_files) = env::var("ProgramFiles")
-        && !program_files.trim().is_empty()
-    {
-        candidates.push(PathBuf::from(program_files).join("Git\\bin\\bash.exe"));
-    }
-    if let Ok(program_files_x86) = env::var("ProgramFiles(x86)")
-        && !program_files_x86.trim().is_empty()
-    {
-        candidates.push(PathBuf::from(program_files_x86).join("Git\\bin\\bash.exe"));
-    }
-    if let Ok(local_app_data) = env::var("LOCALAPPDATA")
-        && !local_app_data.trim().is_empty()
-    {
-        candidates.push(PathBuf::from(local_app_data).join("Programs\\Git\\bin\\bash.exe"));
+impl ChildEnvironment<'_> {
+    pub(crate) fn var_os(self, name: &str) -> Option<OsString> {
+        match self {
+            Self::Process => env::var_os(name),
+            // The last entry wins, as when the variables are applied.
+            Self::Explicit(variables) => variables
+                .iter()
+                .rev()
+                .find(|(key, _)| environment_names_match(key, name))
+                .map(|(_, value)| OsString::from(value)),
+        }
     }
 
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .map_or_else(|| "bash.exe".to_string(), |path| path.display().to_string())
+    #[cfg(unix)]
+    fn var(self, name: &str) -> Option<String> {
+        self.var_os(name)?.into_string().ok()
+    }
+}
+
+/// Windows environment names are case-insensitive.
+fn environment_names_match(left: &str, right: &str) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+/// The whole environment of a child that starts from `base` instead of this
+/// process's environment: `base` without the variables of the terminal that
+/// launched it, then `overrides`. Entries no child environment can hold
+/// (Windows' per-drive `=C:` entries) are left out.
+pub(crate) fn explicit_child_environment(
+    base: &[(String, String)],
+    overrides: HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut environment: Vec<(String, String)> = Vec::with_capacity(base.len() + overrides.len());
+    // Walk backwards so a repeated name keeps its last value, as
+    // `ChildEnvironment::var_os` reads it.
+    for (name, value) in base.iter().rev() {
+        let usable = !name.is_empty()
+            && !name.contains(['=', '\0'])
+            && !value.contains('\0')
+            && !crate::terminal_engine::transport::belongs_to_parent_terminal(name.as_ref());
+        let replaced = overrides
+            .keys()
+            .chain(environment.iter().map(|(known, _)| known))
+            .any(|known| environment_names_match(known, name));
+        if usable && !replaced {
+            environment.push((name.clone(), value.clone()));
+        }
+    }
+    environment.extend(overrides);
+    // A stable order keeps the child environment block reproducible.
+    environment.sort_unstable();
+    environment
+}
+
+#[cfg(test)]
+fn resolve_shell_path(configured_shell: Option<&str>) -> String {
+    resolve_shell_path_in(configured_shell, ChildEnvironment::Process)
 }
 
 #[cfg(any(not(target_os = "windows"), test))]
-fn resolve_shell_path(configured_shell: Option<&str>) -> String {
+fn resolve_shell_path_in(configured_shell: Option<&str>, source: ChildEnvironment) -> String {
     if let Some(shell) = configured_shell
         .map(str::trim)
         .filter(|shell| !shell.is_empty())
@@ -259,7 +333,9 @@ fn resolve_shell_path(configured_shell: Option<&str>) -> String {
         return shell.to_string();
     }
 
-    if let Ok(shell) = env::var("SHELL")
+    if let Some(shell) = source
+        .var_os("SHELL")
+        .and_then(|shell| shell.into_string().ok())
         && !shell.trim().is_empty()
     {
         return shell;
@@ -281,67 +357,6 @@ fn resolve_shell_path(configured_shell: Option<&str>) -> String {
     }
 }
 
-#[cfg(target_os = "windows")]
-fn windows_shell_launch(windows_shell: WindowsShell) -> ResolvedTerminalLaunch {
-    match windows_shell {
-        WindowsShell::Cmd => ResolvedTerminalLaunch {
-            program: windows_cmd_path(),
-            args: Vec::new(),
-        },
-        WindowsShell::PowerShell => ResolvedTerminalLaunch {
-            program: "powershell.exe".to_string(),
-            args: vec!["-NoLogo".to_string()],
-        },
-        WindowsShell::PowerShellCore => ResolvedTerminalLaunch {
-            program: "pwsh.exe".to_string(),
-            args: vec!["-NoLogo".to_string()],
-        },
-        WindowsShell::GitBash => ResolvedTerminalLaunch {
-            program: windows_git_bash_path(),
-            args: vec!["--login".to_string(), "-i".to_string()],
-        },
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn windows_startup_command_shell(
-    windows_shell: WindowsShell,
-    command: &str,
-) -> ResolvedTerminalLaunch {
-    match windows_shell {
-        WindowsShell::Cmd => ResolvedTerminalLaunch {
-            program: windows_cmd_path(),
-            args: vec!["/C".to_string(), command.to_string()],
-        },
-        WindowsShell::PowerShell => ResolvedTerminalLaunch {
-            program: "powershell.exe".to_string(),
-            args: vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-Command".to_string(),
-                command.to_string(),
-            ],
-        },
-        WindowsShell::PowerShellCore => ResolvedTerminalLaunch {
-            program: "pwsh.exe".to_string(),
-            args: vec![
-                "-NoLogo".to_string(),
-                "-NoProfile".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-Command".to_string(),
-                command.to_string(),
-            ],
-        },
-        WindowsShell::GitBash => ResolvedTerminalLaunch {
-            program: windows_git_bash_path(),
-            args: vec!["-lc".to_string(), command.to_string()],
-        },
-    }
-}
-
 fn configured_shell_launch(configured_shell: Option<&str>) -> Option<ResolvedTerminalLaunch> {
     let shell_path = configured_shell
         .map(str::trim)
@@ -353,18 +368,25 @@ fn configured_shell_launch(configured_shell: Option<&str>) -> Option<ResolvedTer
 }
 
 fn default_shell_launch(runtime_config: &TerminalRuntimeConfig) -> ResolvedTerminalLaunch {
+    default_shell_launch_in(runtime_config, ChildEnvironment::Process)
+}
+
+fn default_shell_launch_in(
+    runtime_config: &TerminalRuntimeConfig,
+    source: ChildEnvironment,
+) -> ResolvedTerminalLaunch {
     if let Some(launch) = configured_shell_launch(runtime_config.shell.as_deref()) {
         return launch;
     }
 
     #[cfg(target_os = "windows")]
     {
-        windows_shell_launch(runtime_config.windows_shell)
+        windows_shell_launch(runtime_config.windows_shell, source)
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        let shell_path = resolve_shell_path(None);
+        let shell_path = resolve_shell_path_in(None, source);
         ResolvedTerminalLaunch {
             program: shell_path.clone(),
             args: login_shell_args(&shell_path),
@@ -375,6 +397,15 @@ fn default_shell_launch(runtime_config: &TerminalRuntimeConfig) -> ResolvedTermi
 pub fn resolve_terminal_launch(
     runtime_config: &TerminalRuntimeConfig,
     launch: Option<&TerminalLaunch>,
+) -> anyhow::Result<ResolvedTerminalLaunch> {
+    resolve_terminal_launch_in(runtime_config, launch, ChildEnvironment::Process)
+}
+
+/// [`resolve_terminal_launch`] for a child whose environment is `source`.
+pub(crate) fn resolve_terminal_launch_in(
+    runtime_config: &TerminalRuntimeConfig,
+    launch: Option<&TerminalLaunch>,
+    source: ChildEnvironment,
 ) -> anyhow::Result<ResolvedTerminalLaunch> {
     if let Some(TerminalLaunch::Program { program, args }) = launch {
         anyhow::ensure!(
@@ -407,26 +438,31 @@ pub fn resolve_terminal_launch(
 
         #[cfg(target_os = "windows")]
         {
-            if runtime_config
+            // A configured shell runs the command itself when it takes a
+            // known command flag; other shells fall back to COMSPEC.
+            if let Some(shell) = runtime_config
                 .shell
                 .as_deref()
                 .map(str::trim)
-                .is_some_and(|shell| !shell.is_empty())
+                .filter(|shell| !shell.is_empty())
             {
-                return Ok(ResolvedTerminalLaunch {
-                    program: "cmd.exe".to_string(),
-                    args: vec!["/C".to_string(), command.to_string()],
-                });
+                return Ok(windows_startup_command_launch(
+                    windows_shell_family(shell),
+                    shell.to_string(),
+                    command,
+                    source,
+                ));
             }
 
             return Ok(windows_startup_command_shell(
                 runtime_config.windows_shell,
                 command,
+                source,
             ));
         }
     }
 
-    Ok(default_shell_launch(runtime_config))
+    Ok(default_shell_launch_in(runtime_config, source))
 }
 
 fn user_home_dir() -> Option<PathBuf> {
@@ -464,11 +500,21 @@ pub fn terminal_environment_overrides(
     shell_integration: Option<&TabTitleShellIntegration>,
     runtime_config: &TerminalRuntimeConfig,
 ) -> HashMap<String, String> {
+    terminal_environment_overrides_in(shell_integration, runtime_config, ChildEnvironment::Process)
+}
+
+/// [`terminal_environment_overrides`] for a child whose environment is `source`.
+pub(crate) fn terminal_environment_overrides_in(
+    shell_integration: Option<&TabTitleShellIntegration>,
+    runtime_config: &TerminalRuntimeConfig,
+    source: ChildEnvironment,
+) -> HashMap<String, String> {
     let mut env_overrides = HashMap::new();
 
     if let Some(path) = normalized_path_env(
-        env::var_os("PATH")
-            .or_else(|| env::var_os("Path"))
+        source
+            .var_os("PATH")
+            .or_else(|| source.var_os("Path"))
             .as_deref(),
     ) {
         env_overrides.insert("PATH".to_string(), path);
@@ -487,28 +533,41 @@ pub fn terminal_environment_overrides(
         env_overrides.insert("COLORTERM".to_string(), colorterm.to_string());
     }
 
-    // Claude Code and similar CLIs gate terminal progress escape sequences on
-    // known terminal identities. Termy supports Ghostty's OSC progress
-    // protocol, so advertise that compatibility to child processes while
-    // keeping TERM conservative for terminfo.
-    env_overrides.insert(
-        "TERM_PROGRAM".to_string(),
-        GHOSTTY_COMPAT_TERM_PROGRAM.to_string(),
-    );
-    env_overrides.insert(
-        "TERM_PROGRAM_VERSION".to_string(),
-        GHOSTTY_COMPAT_TERM_PROGRAM_VERSION.to_string(),
-    );
+    match runtime_config.term_program {
+        TermProgram::Ghostty => {
+            env_overrides.insert(
+                "TERM_PROGRAM".to_string(),
+                GHOSTTY_COMPAT_TERM_PROGRAM.to_string(),
+            );
+            env_overrides.insert(
+                "TERM_PROGRAM_VERSION".to_string(),
+                GHOSTTY_COMPAT_TERM_PROGRAM_VERSION.to_string(),
+            );
+        }
+        // No TERM_PROGRAM_VERSION: the engine only knows its own crate
+        // version, not the app's, and an inherited one is scrubbed.
+        TermProgram::Termy => {
+            env_overrides.insert("TERM_PROGRAM".to_string(), TERMY_TERM_PROGRAM.to_string());
+        }
+    }
     env_overrides.insert(
         "TERMY_TERM_PROGRAM".to_string(),
         TERMY_TERM_PROGRAM.to_string(),
     );
 
-    for (key, value) in &runtime_config.environment {
+    // Sorted so that names colliding case-insensitively on Windows (`PATH`
+    // and `Path`) resolve the same way on every launch.
+    let mut user_environment = runtime_config.environment.iter().collect::<Vec<_>>();
+    user_environment.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (key, value) in user_environment {
         let key = key.trim();
         if key.is_empty() {
             continue;
         }
+        // Windows names are case-insensitive: a user `Path` replaces the
+        // normalized `PATH` instead of racing it into the child block.
+        #[cfg(target_os = "windows")]
+        env_overrides.retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         env_overrides.insert(key.to_string(), value.clone());
     }
 
@@ -517,7 +576,7 @@ pub fn terminal_environment_overrides(
     // (`cmd.exe`/PowerShell) do not use this locale contract.
     #[cfg(unix)]
     {
-        apply_utf8_locale_overrides(&mut env_overrides);
+        apply_utf8_locale_overrides(&mut env_overrides, source);
     }
 
     let shell_integration_enabled = shell_integration.is_some_and(|cfg| cfg.enabled);
@@ -540,10 +599,13 @@ pub fn terminal_environment_overrides(
 }
 
 #[cfg(unix)]
-fn apply_utf8_locale_overrides(env_overrides: &mut HashMap<String, String>) {
-    let lc_all = env::var("LC_ALL").ok();
-    let lc_ctype = env::var("LC_CTYPE").ok();
-    let lang = env::var("LANG").ok();
+fn apply_utf8_locale_overrides(
+    env_overrides: &mut HashMap<String, String>,
+    source: ChildEnvironment,
+) {
+    let lc_all = source.var("LC_ALL");
+    let lc_ctype = source.var("LC_CTYPE");
+    let lang = source.var("LANG");
     let target_utf8_locale =
         preferred_utf8_locale(lc_all.as_deref(), lc_ctype.as_deref(), lang.as_deref());
 
@@ -563,7 +625,14 @@ fn apply_utf8_locale_overrides(env_overrides: &mut HashMap<String, String>) {
 }
 
 pub fn resolve_working_directory_path(configured: Option<&str>) -> Option<std::path::PathBuf> {
-    let configured = configured?.trim();
+    let configured = configured?;
+    // An absolute directory is taken as it is, so a name with surrounding
+    // spaces that a client already resolved survives (`termy mux create`).
+    let path = Path::new(configured);
+    if path.is_absolute() && path.is_dir() {
+        return Some(path.to_owned());
+    }
+    let configured = configured.trim();
     if configured.is_empty() {
         return None;
     }
@@ -619,7 +688,6 @@ pub enum TerminalEvent {
     /// Terminal content has changed, needs redraw
     Wakeup,
     /// Terminal title changed
-    #[allow(dead_code)]
     Title(String),
     /// Terminal title reset
     ResetTitle,
@@ -627,6 +695,9 @@ pub enum TerminalEvent {
     Bell,
     /// Terminal exited
     Exit,
+    /// Keys or a paste were dropped: the program isn't reading its input and
+    /// the write backlog is full. Coalesced to one event per drain.
+    InputDropped,
     /// OSC 52 clipboard store request
     ClipboardStore(String),
 
@@ -647,6 +718,9 @@ pub enum TerminalEvent {
     // Working directory (OSC 7)
     /// Working directory changed
     WorkingDirectory(String),
+
+    /// Coalesced OSC 7501 snapshot, with inherited apps resolved.
+    ProgramStatus(Vec<crate::ProgramStatusRecord>),
 }
 
 /// Host-provided callback used to schedule terminal event draining.
@@ -684,25 +758,51 @@ pub enum TerminalDamageSnapshot {
     Partial(Vec<TerminalDirtySpan>),
 }
 
-/// Terminal dimensions in cells and pixels
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq)]
-pub struct TerminalSize {
-    pub cols: u16,
-    pub rows: u16,
-    pub cell_width: f32,
-    pub cell_height: f32,
+/// Visits viewport cells as `(row, display_offset, line, col, cell)`.
+pub(crate) type DamageCellVisitor<'v> =
+    dyn FnMut(usize, usize, i32, usize, &crate::TerminalRenderCell) + 'v;
+
+/// Viewport cells read under the lock that took their damage; see
+/// [`Terminal::with_render_damage`].
+pub struct TerminalDamageCells<'a> {
+    display_offset: usize,
+    line_bounds: (i32, i32),
+    visit: &'a mut dyn FnMut(&[TerminalDirtySpan], &mut DamageCellVisitor<'_>) -> bool,
 }
 
-impl Default for TerminalSize {
-    fn default() -> Self {
+impl<'a> TerminalDamageCells<'a> {
+    pub(crate) fn new(
+        display_offset: usize,
+        line_bounds: (i32, i32),
+        visit: &'a mut dyn FnMut(&[TerminalDirtySpan], &mut DamageCellVisitor<'_>) -> bool,
+    ) -> Self {
         Self {
-            cols: 80,
-            rows: 24,
-            cell_width: 9.0,
-            cell_height: 18.0,
+            display_offset,
+            line_bounds,
+            visit,
         }
     }
+
+    pub fn display_offset(&self) -> usize {
+        self.display_offset
+    }
+
+    pub fn line_bounds(&self) -> (i32, i32) {
+        self.line_bounds
+    }
+
+    /// Visit the cells covered by `spans`, span by span. Returns false,
+    /// without visiting, when a span lies outside the viewport.
+    pub fn visit(
+        &mut self,
+        spans: &[TerminalDirtySpan],
+        mut visitor: impl FnMut(usize, usize, i32, usize, &crate::TerminalRenderCell),
+    ) -> bool {
+        (self.visit)(spans, &mut visitor)
+    }
 }
+
+pub use crate::terminal_types::TerminalSize;
 
 impl TerminalSize {
     /// Clamp the cell dimensions into the supported range. Applied at every
@@ -711,7 +811,7 @@ impl TerminalSize {
     /// enough to exhaust memory. The pixel cell metrics are left untouched.
     /// Columns/rows are floored at 1 so downstream grid math never sees a zero
     /// dimension.
-    fn clamped(self) -> Self {
+    pub(crate) fn clamped(self) -> Self {
         let cols = self.cols.clamp(1, MAX_TERMINAL_COLS);
         let rows = usize::from(self.rows.clamp(1, MAX_TERMINAL_ROWS))
             .min(crate::terminal_engine::Size::MAX_CELLS / usize::from(cols))
@@ -800,6 +900,60 @@ impl Terminal {
             tab_title_shell_integration,
             runtime_config,
             launch,
+            None,
+            ChildEnvironment::Process,
+        )
+        .map(|backend| Self { backend })
+    }
+
+    /// Like [`Self::new_with_launch_and_wakeup_notifier`], but the child starts
+    /// from `environment` instead of this process's environment. Termy's own
+    /// terminal variables and the configured ones still apply on top, and the
+    /// default shell, PATH and locale are read from `environment`.
+    pub fn new_with_launch_in_environment(
+        size: TerminalSize,
+        configured_working_dir: Option<&str>,
+        wakeup_notifier: Option<TerminalWakeupNotifier>,
+        tab_title_shell_integration: Option<&TabTitleShellIntegration>,
+        runtime_config: Option<&TerminalRuntimeConfig>,
+        launch: Option<&TerminalLaunch>,
+        environment: &[(String, String)],
+    ) -> anyhow::Result<Self> {
+        engine_backend::Backend::new_with_launch_and_wakeup_notifier(
+            size,
+            configured_working_dir,
+            wakeup_notifier,
+            tab_title_shell_integration,
+            runtime_config,
+            launch,
+            None,
+            ChildEnvironment::Explicit(environment),
+        )
+        .map(|backend| Self { backend })
+    }
+
+    /// Like [`Self::new_with_launch_and_wakeup_notifier`], replaying a saved
+    /// buffer before the child starts. Unlike [`Self::hydrate_output`] after
+    /// spawning, the restored text can't interleave with the new session's
+    /// first output or swallow its replies.
+    pub fn new_with_launch_restoring_output(
+        size: TerminalSize,
+        configured_working_dir: Option<&str>,
+        wakeup_notifier: Option<TerminalWakeupNotifier>,
+        tab_title_shell_integration: Option<&TabTitleShellIntegration>,
+        runtime_config: Option<&TerminalRuntimeConfig>,
+        launch: Option<&TerminalLaunch>,
+        restored_output: &[u8],
+    ) -> anyhow::Result<Self> {
+        engine_backend::Backend::new_with_launch_and_wakeup_notifier(
+            size,
+            configured_working_dir,
+            wakeup_notifier,
+            tab_title_shell_integration,
+            runtime_config,
+            launch,
+            Some(restored_output),
+            ChildEnvironment::Process,
         )
         .map(|backend| Self { backend })
     }
@@ -830,10 +984,48 @@ impl Terminal {
         self.backend.feed_output(bytes);
     }
 
+    /// For display terminals: feed output and return the protocol replies
+    /// queued so far, in order, instead of waiting for `drain_events`.
+    pub fn feed_output_with_replies(&self, bytes: &[u8]) -> Vec<u8> {
+        self.backend.feed_output_with_replies(bytes)
+    }
+
+    /// Disable protocol replies for a display terminal that mirrors another
+    /// terminal's output (which already answered): queries are parsed and
+    /// change no state, and replies are dropped.
+    pub fn set_protocol_replies_enabled(&self, enabled: bool) {
+        self.backend.set_protocol_replies_enabled(enabled);
+    }
+
+    /// The engine's full state; see `terminal_engine::Engine::encode_snapshot`.
+    /// `None` for multiplexer-backed terminals.
+    pub fn encode_snapshot(&self) -> Option<Vec<u8>> {
+        self.backend.encode_snapshot()
+    }
+
+    /// Replace the engine state with a snapshot, keeping this terminal's
+    /// configured colors, cursor style and cell size. `None` for
+    /// multiplexer-backed terminals.
+    pub fn restore_snapshot(
+        &self,
+        bytes: &[u8],
+    ) -> Option<Result<(), crate::terminal_engine::SnapshotError>> {
+        self.backend.restore_snapshot(bytes)
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         self.backend.child_pid()
     }
 
+    /// Ends the child and waits for it, where dropping the terminal would
+    /// leave a program that ignores SIGHUP to a timer: for a process about to
+    /// exit. Remote and display terminals have no child here.
+    pub(crate) fn terminate_and_wait(&self) {
+        self.backend.terminate_and_wait();
+    }
+
+    /// Suspends render wakeups for a hidden terminal. Title changes and OSC 7501
+    /// program status still wake the host so tab chrome can follow them.
     pub fn set_wakeup_enabled(&self, enabled: bool) {
         self.backend.set_wakeup_enabled(enabled);
     }
@@ -846,13 +1038,30 @@ impl Terminal {
         self.backend.write_owned(input);
     }
 
-    pub fn hydrate_output(&self, bytes: &[u8]) {
-        self.backend.hydrate_output(bytes);
+    /// [`Self::write_owned`], returning whether the input was queued for the
+    /// program: `WouldBlock` when the input backlog is full, `BrokenPipe`
+    /// once the PTY is closed. Input that does not fit is reported to views
+    /// as [`TerminalEvent::InputDropped`] either way. A session-host client
+    /// only queues the input for the host and reports success.
+    pub(crate) fn try_write_owned(&self, input: Vec<u8>) -> std::io::Result<()> {
+        self.backend.try_write_owned(input)
     }
 
-    #[allow(dead_code)]
-    pub fn write_str(&self, input: &str) {
-        self.backend.write_str(input);
+    /// The cursor's line, numbered from the first line output ever scrolled
+    /// into history; see [`crate::remote::RemoteReply::Written`].
+    pub(crate) fn input_anchor(&self) -> u64 {
+        self.backend.input_anchor()
+    }
+
+    /// Write a mouse-motion report. Motion may fill only half of the input
+    /// backlog, so a program that stops reading cannot starve later keys;
+    /// excess reports are dropped and the next one carries the newer position.
+    pub fn write_mouse_motion(&self, input: Vec<u8>) {
+        self.backend.write_mouse_motion(input);
+    }
+
+    pub fn hydrate_output(&self, bytes: &[u8]) {
+        self.backend.hydrate_output(bytes);
     }
 
     pub fn resize(&mut self, new_size: TerminalSize) {
@@ -865,6 +1074,37 @@ impl Terminal {
 
     pub fn size(&self) -> TerminalSize {
         self.backend.size()
+    }
+
+    /// The size the latest `resize` asked for. Local terminals apply it
+    /// immediately; a session-host terminal reports its previous size from
+    /// `size` until the host publishes a frame at the new size. Compare
+    /// against this when deciding whether a resize is still needed.
+    pub fn requested_size(&self) -> TerminalSize {
+        self.backend.requested_size()
+    }
+
+    /// `true` when another client resized this session-host pane after a
+    /// frame showed the size this terminal last asked for, or the size it was
+    /// created or attached at. `requested_size` then follows the host again.
+    /// Always `false` for local terminals.
+    pub fn host_size_overridden(&self) -> bool {
+        self.backend.host_size_overridden()
+    }
+
+    /// `true` once the session host confirmed that it stopped sending frames
+    /// to this terminal after `set_wakeup_enabled(false)`; it sends events
+    /// only until render wakeups are enabled again. Always `false` for local
+    /// terminals.
+    pub fn frames_paused(&self) -> bool {
+        self.backend.frames_paused()
+    }
+
+    /// `true` once the session host that ran this pane is gone: the pane
+    /// ended with it, though its program did not exit, and it takes no more
+    /// input. Always `false` for local terminals.
+    pub fn session_host_lost(&self) -> bool {
+        self.backend.session_host_lost()
     }
 
     pub fn kitty_graphics_placements(&self) -> Vec<KittyGraphicsRenderPlacement> {
@@ -908,6 +1148,19 @@ impl Terminal {
         self.backend.drain_events(host)
     }
 
+    /// Answers a clipboard request the reply host deferred (see
+    /// [`TerminalReplyHost::defer_clipboard_request`]) and sends the program
+    /// every reply now due, in request order. Unknown ids are ignored.
+    pub fn complete_clipboard_request(&self, id: u64, reply: crate::TerminalClipboardReply) {
+        self.backend.complete_clipboard_request(id, Some(reply));
+    }
+
+    /// Denies a deferred clipboard request, for a host that will not answer
+    /// it: the program gets the same reply as for a refused request.
+    pub fn deny_clipboard_request(&self, id: u64) {
+        self.backend.complete_clipboard_request(id, None);
+    }
+
     pub fn set_query_colors(&mut self, query_colors: TerminalQueryColors) {
         self.backend.set_query_colors(query_colors);
     }
@@ -928,8 +1181,18 @@ impl Terminal {
         self.backend.take_render_damage_snapshot()
     }
 
-    pub(crate) fn render_read_with_screen(&self, force_full: bool) -> (TerminalRenderRead, bool) {
-        self.backend.render_read_with_screen(force_full)
+    /// Take render damage and read its dirty cells under one backend lock.
+    ///
+    /// Taking damage and then calling
+    /// [`Self::visit_viewport_ranges_locked_at_generation`] fails whenever
+    /// output lands in between, which forces a full read. Here output waits
+    /// until `read` returns. `read` runs under the backend lock and must not
+    /// call back into this terminal.
+    pub fn with_render_damage<R>(
+        &self,
+        read: impl FnOnce(TerminalRenderDamageSnapshot, TerminalDamageCells<'_>) -> R,
+    ) -> R {
+        self.backend.with_render_damage(read)
     }
 
     pub fn render_read(&self, force_full: bool) -> TerminalRenderRead {
@@ -1030,6 +1293,38 @@ impl Terminal {
         self.backend.link_at(row, col)
     }
 
+    /// [`Self::hyperlink_at`] for a row of the frame `view` describes, which
+    /// output may have moved since (audit L19).
+    pub(crate) fn hyperlink_at_view(
+        &self,
+        row: usize,
+        col: usize,
+        view: crate::remote::ViewportAnchor,
+    ) -> Option<crate::links::DetectedLink> {
+        self.backend.hyperlink_at_view(row, col, view)
+    }
+
+    /// [`Self::link_at`] for a row of the frame `view` describes.
+    pub(crate) fn link_at_view(
+        &self,
+        row: usize,
+        col: usize,
+        view: crate::remote::ViewportAnchor,
+    ) -> Option<crate::links::DetectedViewportLink> {
+        self.backend.link_at_view(row, col, view)
+    }
+
+    /// Buffer lines as text; see [`crate::remote::RemoteCommand::LineTexts`].
+    pub(crate) fn line_texts(
+        &self,
+        first: i32,
+        last: i32,
+        anchor: Option<u64>,
+        max_bytes: usize,
+    ) -> crate::remote::LineTexts {
+        self.backend.line_texts(first, last, anchor, max_bytes)
+    }
+
     pub fn take_damage_snapshot(&self) -> TerminalDamageSnapshot {
         self.backend.take_damage_snapshot()
     }
@@ -1058,7 +1353,6 @@ impl Terminal {
         self.backend.cursor_position()
     }
 
-    #[allow(dead_code)]
     pub fn has_pending_events(&self) -> bool {
         self.backend.has_pending_events()
     }
@@ -1085,6 +1379,11 @@ impl Terminal {
 
     pub fn alternate_screen_mode(&self) -> bool {
         self.backend.alternate_screen_mode()
+    }
+
+    /// The state a session host publishes, read in one consistent pass.
+    pub(crate) fn remote_state(&self) -> crate::remote::RemoteState {
+        self.backend.remote_state()
     }
 }
 

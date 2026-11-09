@@ -4,7 +4,7 @@ use std::{
     ffi::{OsStr, OsString, c_void},
     io::{self, ErrorKind},
     mem,
-    os::windows::ffi::OsStrExt,
+    os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Component, Path, PathBuf, Prefix},
     ptr,
     sync::{
@@ -13,11 +13,7 @@ use std::{
         mpsc,
     },
     thread,
-    time::Duration,
 };
-
-#[cfg(test)]
-use std::os::windows::ffi::OsStringExt;
 
 use super::limits::{
     MAX_PROTOCOL_REPLY_BACKLOG_BYTES as MAX_PENDING_PROTOCOL_REPLY_BYTES,
@@ -26,7 +22,7 @@ use super::limits::{
     MAX_WRITE_BACKLOG_ENTRIES as MAX_PENDING_WRITE_ENTRIES,
     MAX_WRITE_CHUNK_BYTES as MAX_WRITER_WRITE_CHUNK,
 };
-use super::{PtySize, SpawnConfig};
+use super::{ChildExit, PtySize, SpawnConfig};
 
 type Bool = i32;
 type Dword = u32;
@@ -50,9 +46,17 @@ const ERROR_OPERATION_ABORTED: i32 = 995;
 const INVALID_HANDLE_VALUE: Handle = -1_isize as Handle;
 const EXTENDED_STARTUPINFO_PRESENT: Dword = 0x0008_0000;
 const CREATE_UNICODE_ENVIRONMENT: Dword = 0x0000_0400;
+const CREATE_SUSPENDED: Dword = 0x0000_0004;
+/// ConPTY asks the terminal for the cursor position (DSR 6n) at startup and
+/// waits for the reply, so it continues below existing output.
+const PSEUDOCONSOLE_INHERIT_CURSOR: Dword = 0x1;
+/// The terminal reflows its own buffer on resize, so ConPTY must not
+/// repaint it. Older ConPTY builds ignore the flag.
+const PSEUDOCONSOLE_RESIZE_QUIRK: Dword = 0x2;
+const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: Dword = 0x0000_0100;
+const LOAD_LIBRARY_SEARCH_SYSTEM32: Dword = 0x0000_0800;
 const STARTF_USESTDHANDLES: Dword = 0x0000_0100;
 const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize = 0x0002_0016;
-const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_COMMAND_LINE_UNITS: usize = 32_767;
 const WRITER_CHANNEL_CAPACITY: usize = MAX_PENDING_WRITE_ENTRIES + 1;
 
@@ -174,6 +178,69 @@ struct ConPtyApi {
 
 impl ConPtyApi {
     fn load_uncached() -> Option<Self> {
+        Self::load_bundled().or_else(Self::load_system)
+    }
+
+    /// A `conpty.dll` shipped beside the executable, with the
+    /// `OpenConsole.exe` it starts, is newer than the inbox ConPTY of most
+    /// Windows releases. It is loaded by absolute path only, never through
+    /// the DLL search order.
+    fn load_bundled() -> Option<Self> {
+        let executable = std::env::current_exe().ok()?;
+        let directory = executable.parent()?;
+        let library = directory.join("conpty.dll");
+        if !library.is_file() || !directory.join("OpenConsole.exe").is_file() {
+            return None;
+        }
+        let library_name = wide_nul(library.as_os_str(), "bundled ConPTY path").ok()?;
+        // SAFETY: `library_name` is an absolute, NUL-terminated path. The
+        // search flags confine dependency resolution to the DLL's own
+        // directory and System32.
+        let module = unsafe {
+            LoadLibraryExW(
+                library_name.as_ptr(),
+                ptr::null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            log::warn!(
+                "failed to load bundled {}: {}",
+                library.display(),
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        let api = Self::from_module(module);
+        if api.is_some() {
+            log::debug!("using bundled ConPTY from {}", library.display());
+        } else {
+            log::warn!("bundled {} lacks the ConPTY exports", library.display());
+            // SAFETY: the module was loaded above and no symbol from it
+            // has been retained.
+            unsafe {
+                let _ = FreeLibrary(module);
+            }
+        }
+        // A loaded module stays loaded for the process lifetime: the cached
+        // function pointers refer into it.
+        api
+    }
+
+    fn from_module(module: HModule) -> Option<Self> {
+        // Microsoft's redistributable conpty.dll exports the kernel32 names;
+        // some builds export only the `Conpty`-prefixed implementations.
+        Some(Self {
+            create: load_symbol(module, b"CreatePseudoConsole\0")
+                .or_else(|| load_symbol(module, b"ConptyCreatePseudoConsole\0"))?,
+            resize: load_symbol(module, b"ResizePseudoConsole\0")
+                .or_else(|| load_symbol(module, b"ConptyResizePseudoConsole\0"))?,
+            close: load_symbol(module, b"ClosePseudoConsole\0")
+                .or_else(|| load_symbol(module, b"ConptyClosePseudoConsole\0"))?,
+        })
+    }
+
+    fn load_system() -> Option<Self> {
         const KERNEL32: [u16; 13] = [
             b'k' as u16,
             b'e' as u16,
@@ -211,15 +278,17 @@ fn conpty_api() -> Option<ConPtyApi> {
 }
 
 fn load_symbol<T: Copy>(module: HModule, name: &'static [u8]) -> Option<T> {
-    // SAFETY: `module` came from GetModuleHandleW and `name` is a static,
-    // NUL-terminated ASCII export name. The caller supplies the documented ABI.
+    // SAFETY: `module` came from GetModuleHandleW or LoadLibraryExW and stays
+    // loaded; `name` is a static, NUL-terminated ASCII export name. The caller
+    // supplies the documented ABI.
     let symbol = unsafe { GetProcAddress(module, name.as_ptr()) };
     if symbol.is_null() || mem::size_of::<T>() != mem::size_of::<*mut c_void>() {
         return None;
     }
-    // SAFETY: all three callers instantiate `T` with the exact documented
-    // `extern "system"` signature of the named kernel32 ConPTY export. Windows
-    // function pointers have the same representation as GetProcAddress output.
+    // SAFETY: all callers instantiate `T` with the exact documented
+    // `extern "system"` signature of the named ConPTY export, which kernel32
+    // and the redistributable conpty.dll share. Windows function pointers
+    // have the same representation as GetProcAddress output.
     Some(unsafe { mem::transmute_copy::<*mut c_void, T>(&symbol) })
 }
 
@@ -280,12 +349,33 @@ struct WakeReservation {
 
 #[derive(Clone)]
 struct ControlHandle {
-    sender: mpsc::SyncSender<ControlCommand>,
+    wake: Arc<ControlEvent>,
     state: Arc<ControlState>,
 }
 
-enum ControlCommand {
-    Wake,
+struct ControlEvent(OwnedHandle);
+
+// SAFETY: Event signaling and waiting are thread-safe Windows kernel operations.
+// The last Arc owns CloseHandle, so concurrent waiters retain a live handle.
+unsafe impl Sync for ControlEvent {}
+
+impl ControlEvent {
+    fn new() -> io::Result<Self> {
+        // SAFETY: No name or security attributes, initially clear and auto-reset.
+        let event = unsafe { CreateEventW(ptr::null_mut(), FALSE, FALSE, ptr::null()) };
+        OwnedHandle::new(event)
+            .map(Self)
+            .ok_or_else(io::Error::last_os_error)
+    }
+
+    fn signal(&self) -> io::Result<()> {
+        // SAFETY: This object owns a live event handle for the entire call.
+        if unsafe { SetEvent(self.0.raw()) } == FALSE {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Default)]
@@ -331,24 +421,24 @@ impl ControlState {
 }
 
 impl ControlHandle {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            wake: Arc::new(ControlEvent::new()?),
+            state: Arc::new(ControlState::default()),
+        })
+    }
+
     fn request_resize(&self, size: Coord) -> io::Result<()> {
         if !self.state.request_resize(size) {
             return Err(pty_closed_error());
         }
-        match self.sender.try_send(ControlCommand::Wake) {
-            Ok(()) | Err(mpsc::TrySendError::Full(_)) => Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                self.state.request_close();
-                Err(pty_closed_error())
-            }
-        }
+        self.wake.signal()
     }
 
     fn close(&self) {
         self.state.request_close();
-        // A full one-slot channel already contains the only notification the
-        // watcher needs. Close itself is sticky in shared state.
-        let _ = self.sender.try_send(ControlCommand::Wake);
+        // Repeated signals coalesce; close itself remains sticky in shared state.
+        let _ = self.wake.signal();
     }
 }
 
@@ -398,6 +488,19 @@ impl WriterHandle {
         }
         let Some(reservation) = self.reserve_write(bytes.capacity())? else {
             return Ok(());
+        };
+        self.enqueue_reserved(bytes, reservation)
+    }
+
+    fn write_motion_owned(&self, bytes: Vec<u8>) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if self.control.state.is_closed() {
+            return Err(pty_closed_error());
+        }
+        let Some(reservation) = self.budget.reserve_motion(bytes.capacity()) else {
+            return Err(writer_full_error());
         };
         self.enqueue_reserved(bytes, reservation)
     }
@@ -533,18 +636,33 @@ impl WriteBudget {
     }
 
     fn reserve(self: &Arc<Self>, bytes: usize) -> Option<WriteReservation> {
-        if bytes == 0 || bytes > self.max_bytes {
+        self.reserve_within(bytes, self.max_bytes, self.max_entries)
+    }
+
+    /// Mouse motion may fill only half of the budget, so reports to a stalled
+    /// program leave room for keys and pastes.
+    fn reserve_motion(self: &Arc<Self>, bytes: usize) -> Option<WriteReservation> {
+        self.reserve_within(bytes, self.max_bytes / 2, self.max_entries / 2)
+    }
+
+    fn reserve_within(
+        self: &Arc<Self>,
+        bytes: usize,
+        max_bytes: usize,
+        max_entries: usize,
+    ) -> Option<WriteReservation> {
+        if bytes == 0 || bytes > max_bytes {
             return None;
         }
         self.entries
             .try_update(Ordering::AcqRel, Ordering::Acquire, |entries| {
-                (entries < self.max_entries).then_some(entries + 1)
+                (entries < max_entries).then_some(entries + 1)
             })
             .ok()?;
         if self
             .bytes
             .try_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
-                (reserved <= self.max_bytes - bytes).then_some(reserved + bytes)
+                (reserved <= max_bytes - bytes).then_some(reserved + bytes)
             })
             .is_err()
         {
@@ -703,11 +821,66 @@ impl StartGate {
 }
 
 impl Transport {
+    // Hosts that answer terminal queries use `spawn_answering_queries`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn(
         config: SpawnConfig,
         size: PtySize,
-        mut on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
         on_exit: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_with_exit(config, size, true, on_output, move |_| on_exit())
+    }
+
+    /// Spawn like [`Self::spawn`] for a host whose `on_output` answers
+    /// terminal queries. The pseudoconsole then inherits the host's cursor
+    /// position instead of assuming the top-left cell, so restored output is
+    /// not overdrawn. ConPTY blocks until its startup DSR 6n is answered,
+    /// which is why hosts that do not reply must use [`Self::spawn`]. Without
+    /// `inherit_environment`, the child sees only `config.environment`.
+    pub(crate) fn spawn_answering_queries(
+        config: SpawnConfig,
+        size: PtySize,
+        inherit_environment: bool,
+        on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        on_exit: impl FnOnce() + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(
+            config,
+            size,
+            inherit_environment,
+            PSEUDOCONSOLE_RESIZE_QUIRK | PSEUDOCONSOLE_INHERIT_CURSOR,
+            on_output,
+            move |_| on_exit(),
+        )
+    }
+
+    /// Spawn like [`Self::spawn`], reporting the child's exit code. Without
+    /// `inherit_environment`, the child sees only `config.environment`.
+    pub(crate) fn spawn_with_exit(
+        config: SpawnConfig,
+        size: PtySize,
+        inherit_environment: bool,
+        on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        on_exit: impl FnOnce(ChildExit) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn_inner(
+            config,
+            size,
+            inherit_environment,
+            PSEUDOCONSOLE_RESIZE_QUIRK,
+            on_output,
+            on_exit,
+        )
+    }
+
+    fn spawn_inner(
+        config: SpawnConfig,
+        size: PtySize,
+        inherit_environment: bool,
+        pseudo_console_flags: Dword,
+        mut on_output: impl FnMut(&[u8]) -> Vec<u8> + Send + 'static,
+        on_exit: impl FnOnce(ChildExit) + Send + 'static,
     ) -> io::Result<Self> {
         let api = conpty_api().ok_or_else(|| {
             io::Error::new(
@@ -716,6 +889,9 @@ impl Transport {
             )
         })?;
         let coord = Coord::try_from(size)?;
+        // Create the wake handle before launching a child, so allocation failure
+        // cannot leave a process without its control worker.
+        let control = ControlHandle::new()?;
         let working_directory = normalize_working_directory(config.working_directory.as_deref())?;
         let lookup_directory = working_directory
             .clone()
@@ -723,7 +899,11 @@ impl Transport {
         let launch = resolve_launch_command(&config, &lookup_directory)?;
         let application = wide_nul(launch.application.as_os_str(), "terminal program")?;
         let mut command_line = launch.command_line;
-        let mut environment = child_environment(&config.environment, working_directory.as_deref())?;
+        let mut environment = child_environment(
+            &config.environment,
+            working_directory.as_deref(),
+            inherit_environment,
+        )?;
         let current_directory = working_directory
             .as_deref()
             .map(|path| wide_nul(path.as_os_str(), "working directory"))
@@ -731,7 +911,13 @@ impl Transport {
 
         let (pseudo_input, input_writer) = create_pipe()?;
         let (output_reader, pseudo_output) = create_pipe()?;
-        let pseudo_console = PseudoConsole::create(api, coord, &pseudo_input, &pseudo_output)?;
+        let pseudo_console = PseudoConsole::create(
+            api,
+            coord,
+            &pseudo_input,
+            &pseudo_output,
+            pseudo_console_flags,
+        )?;
 
         let mut attributes = AttributeList::new(1)?;
         attributes.set_pseudo_console(pseudo_console.raw())?;
@@ -753,7 +939,8 @@ impl Transport {
         // SAFETY: all pointers reference writable or immutable buffers that
         // outlive CreateProcessW. `command_line` is mutable and NUL-terminated,
         // `environment` is a double-NUL-terminated UTF-16 environment block,
-        // and startup carries one initialized pseudoconsole attribute.
+        // and startup carries one initialized pseudoconsole attribute. The
+        // child starts suspended so it joins its job before it can spawn.
         let created = unsafe {
             CreateProcessW(
                 application.as_ptr(),
@@ -761,7 +948,7 @@ impl Transport {
                 ptr::null_mut(),
                 ptr::null_mut(),
                 FALSE,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                 environment.as_mut_ptr().cast::<c_void>(),
                 current_directory_ptr,
                 &mut startup.startup_info,
@@ -787,25 +974,62 @@ impl Transport {
             ));
         };
         let process_thread = OwnedHandle::new(process_info.thread);
+        // The job records what the shell starts, so closing the tab can end
+        // its console programs too. Without one (for example under a parent
+        // job that forbids nesting) only the shell itself is terminated.
+        let job = JobObject::new()
+            .and_then(|job| job.assign(&process).map(|()| job))
+            .map_err(|error| log::warn!("terminal child runs without a job object: {error}"))
+            .ok();
+        let resumed = match &process_thread {
+            // SAFETY: the primary thread handle comes from the successful
+            // CreateProcessW above and is still open.
+            Some(thread) => (unsafe { ResumeThread(thread.raw()) }) != Dword::MAX,
+            None => false,
+        };
+        if !resumed {
+            let error = io::Error::last_os_error();
+            // SAFETY: the suspended child never ran; this wrapper owns its handle.
+            unsafe {
+                let _ = TerminateProcess(process.raw(), FORCED_EXIT_CODE);
+            }
+            drop(job);
+            drop(process_thread);
+            drop(process);
+            drop(output_reader);
+            drop(input_writer);
+            drop(pseudo_input);
+            drop(pseudo_output);
+            drop(pseudo_console);
+            return Err(error);
+        }
         drop(process_thread);
         drop(pseudo_input);
         drop(pseudo_output);
         drop(attributes);
 
-        let state = Arc::new(ControlState::default());
-        let (control_sender, control_receiver) = mpsc::sync_channel(1);
-        let control = ControlHandle {
-            sender: control_sender,
-            state: state.clone(),
-        };
+        let state = control.state.clone();
+        let control_wake = control.wake.clone();
         let (writer, writer_receiver) = WriterHandle::channel(control.clone());
         let gate = Arc::new(StartGate::new());
         let (control_finished_sender, control_finished_receiver) = mpsc::channel();
         let resources = Arc::new(Mutex::new(Some(ChildResources::new(
             process,
+            process_info.process_id,
             pseudo_console,
+            job,
         ))));
 
+        let exit_status = Arc::new(Mutex::new(None::<ChildExit>));
+        let reader_exit_status = exit_status.clone();
+        let on_exit = move || {
+            let exit = reader_exit_status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default();
+            on_exit(exit);
+        };
         let reader_gate = gate.clone();
         let reader_writer = writer.clone();
         let reader_thread = thread::Builder::new()
@@ -870,7 +1094,7 @@ impl Transport {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .take();
                 if let Some(resources) = resources {
-                    run_control(resources, control_receiver, control_state);
+                    run_control(resources, control_wake, control_state, &exit_status);
                 }
                 let _ = control_finished_sender.send(());
             });
@@ -898,9 +1122,14 @@ impl Transport {
         self.writer.write_owned(input)
     }
 
+    pub(crate) fn write_motion_owned(&self, input: Vec<u8>) -> io::Result<()> {
+        self.writer.write_motion_owned(input)
+    }
+
     pub(crate) fn write_protocol_reply_owned(&self, input: Vec<u8>) -> io::Result<()> {
         match self.writer.write_protocol_reply_owned(input) {
             Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Err(error),
             Err(error) => {
                 self.writer.close();
                 Err(error)
@@ -914,6 +1143,25 @@ impl Transport {
 
     pub(crate) fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    /// The Unix transport waits here for its child to end. Closing a
+    /// pseudoconsole ends the shell and the job's console programs without a
+    /// timer, so dropping the transport is enough.
+    pub(crate) fn terminate_and_wait(&self) {}
+
+    /// Name of the newest process the shell has started, following
+    /// descendants down, such as `vim.exe`; the shell's own name when it runs
+    /// nothing. Windows has no foreground process group, so this is a best
+    /// guess.
+    pub(crate) fn foreground_process_name(&self) -> Option<String> {
+        foreground_descendant_name(self.child_pid)
+    }
+
+    /// Terminate the child. Windows has no signals; the control thread ends
+    /// the process and closes its pseudoconsole.
+    pub(crate) fn terminate(&self) {
+        self.writer.close();
     }
 }
 
@@ -946,9 +1194,10 @@ fn run_reader(
             Ok(0) => break,
             Ok(read) => {
                 let reply = on_output(&buffer[..read]);
-                if !queue_reader_protocol_reply(&writer, reply) {
-                    break;
-                }
+                // A rejected reply starts shutdown, or the child has already
+                // exited. Keep draining in either case: closing this pipe now
+                // would discard buffered output before ClosePseudoConsole ends.
+                let _ = queue_reader_protocol_reply(&writer, reply);
             }
             Err(error) if is_pipe_shutdown(&error) => break,
             Err(_) => break,
@@ -967,13 +1216,19 @@ fn queue_reader_protocol_reply(writer: &WriterHandle, reply: Vec<u8>) -> bool {
     if reply.is_empty() {
         return true;
     }
-    if writer.write_protocol_reply_owned(reply).is_ok() {
-        true
-    } else {
-        // The control thread terminates the child and closes the pseudoconsole;
-        // continuing without the reply could leave the child waiting forever.
-        writer.close();
-        false
+    match writer.write_protocol_reply_owned(reply) {
+        Ok(()) => true,
+        // A full backlog means the child is not reading its input, e.g. `cat`
+        // of a file full of queries. Drop the reply instead of the session.
+        Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            log::warn!("dropping terminal protocol reply: {error}");
+            true
+        }
+        Err(_) => {
+            // The control thread terminates the child and closes the pseudoconsole.
+            writer.close();
+            false
+        }
     }
 }
 
@@ -991,7 +1246,11 @@ fn run_writer(
     let mut current_write: Option<ReservedWrite> = None;
     let mut current_protocol_reply: Option<ReservedWrite> = None;
     while !control.state.is_closed() {
-        if current_protocol_reply.is_none() {
+        // Replies go between writes, never inside one: a write is a whole
+        // key sequence or bracketed paste that must reach the child intact.
+        if current_protocol_reply.is_none()
+            && current_write.as_ref().is_none_or(|write| write.offset == 0)
+        {
             current_protocol_reply = protocol_replies.pop();
         }
         if current_protocol_reply.is_none() && current_write.is_none() {
@@ -1006,7 +1265,9 @@ fn run_writer(
         }
 
         // The wake that released recv may correspond to a priority reply.
-        if current_protocol_reply.is_none() {
+        if current_protocol_reply.is_none()
+            && current_write.as_ref().is_none_or(|write| write.offset == 0)
+        {
             current_protocol_reply = protocol_replies.pop();
         }
         let writing_protocol_reply = current_protocol_reply.is_some();
@@ -1035,8 +1296,9 @@ fn run_writer(
 
 fn run_control(
     mut resources: ChildResources,
-    receiver: mpsc::Receiver<ControlCommand>,
+    wake: Arc<ControlEvent>,
     state: Arc<ControlState>,
+    exit_status: &Mutex<Option<ChildExit>>,
 ) {
     loop {
         match resources.process_signaled() {
@@ -1054,16 +1316,21 @@ fn run_control(
         if state.is_closed() {
             break;
         }
+        // A size the pseudoconsole rejects keeps the old one; the session
+        // goes on rather than closing.
         if let Some(size) = state.take_resize()
-            && resources.pseudo_console().resize(size).is_err()
+            && let Err(error) = resources.pseudo_console().resize(size)
         {
-            state.request_close();
-            break;
+            log::warn!("failed to resize the pseudoconsole: {error}");
         }
 
-        match receiver.recv_timeout(CONTROL_POLL_INTERVAL) {
-            Ok(ControlCommand::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+        match wait_for_control(resources.process(), &wake) {
+            Ok(true) => {
+                resources.process_exited = true;
+                break;
+            }
+            Ok(false) => {}
+            Err(_) => {
                 state.request_close();
                 break;
             }
@@ -1071,8 +1338,21 @@ fn run_control(
     }
 
     if !resources.process_exited {
+        // Closing the pseudoconsole sends its clients CTRL_CLOSE_EVENT, as
+        // closing a console window does, so a shell can save its history
+        // before the fallback termination (Unix allows the same after SIGHUP).
+        resources.close_pseudo_console();
+        resources.wait_for_exit(CLOSE_GRACE_MS);
+        resources.terminate_console_descendants();
         let _ = resources.terminate_and_wait();
     }
+    *exit_status
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+        resources.exit_code().map(|code| ChildExit {
+            code: Some(code as i32),
+            signal: None,
+        });
     state.request_close();
     // ClosePseudoConsole intentionally runs on this control thread while the
     // dedicated reader keeps draining. Older Windows releases can block here
@@ -1080,170 +1360,25 @@ fn run_control(
     resources.close_pseudo_console();
 }
 
-fn read_handle(handle: &OwnedHandle, buffer: &mut [u8]) -> io::Result<usize> {
-    let requested = buffer.len().min(Dword::MAX as usize) as Dword;
-    let mut read = 0;
-    // SAFETY: `handle` owns a synchronous pipe handle and `buffer` is writable
-    // for `requested` bytes. A null OVERLAPPED pointer selects synchronous IO.
-    let succeeded = unsafe {
-        ReadFile(
-            handle.raw(),
-            buffer.as_mut_ptr().cast::<c_void>(),
-            requested,
-            &mut read,
-            ptr::null_mut(),
-        )
-    };
-    if succeeded == FALSE {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(read as usize)
-}
-
-fn write_handle(handle: &OwnedHandle, bytes: &[u8]) -> io::Result<usize> {
-    let requested = bytes.len().min(Dword::MAX as usize) as Dword;
-    let mut written = 0;
-    // SAFETY: `handle` owns a synchronous pipe handle and `bytes` is readable
-    // for `requested` bytes. The written count is valid for the duration.
-    let succeeded = unsafe {
-        WriteFile(
-            handle.raw(),
-            bytes.as_ptr().cast::<c_void>(),
-            requested,
-            &mut written,
-            ptr::null_mut(),
-        )
-    };
-    if succeeded == FALSE {
-        return Err(io::Error::last_os_error());
-    }
-    if written == 0 {
-        return Err(io::Error::new(
-            ErrorKind::WriteZero,
-            "ConPTY input pipe accepted zero bytes",
-        ));
-    }
-    Ok(written as usize)
-}
-
-fn is_pipe_shutdown(error: &io::Error) -> bool {
-    matches!(
-        error.raw_os_error(),
-        Some(ERROR_BROKEN_PIPE | ERROR_NO_DATA | ERROR_OPERATION_ABORTED)
-    )
-}
-
-struct OwnedHandle(Handle);
-
-// SAFETY: Windows kernel handles are process-wide opaque values. Ownership is
-// transferred to exactly one worker thread and CloseHandle remains valid there.
-unsafe impl Send for OwnedHandle {}
-
-impl OwnedHandle {
-    fn new(handle: Handle) -> Option<Self> {
-        (!handle.is_null() && handle as isize != -1).then_some(Self(handle))
-    }
-
-    fn raw(&self) -> Handle {
-        self.0
+/// Sleep until the child exits or a resize/close request signals the event.
+/// An auto-reset event preserves requests published before this wait starts.
+fn wait_for_control(process: &OwnedHandle, wake: &ControlEvent) -> io::Result<bool> {
+    let handles = [process.raw(), wake.0.raw()];
+    // SAFETY: Both owned handles remain live throughout this blocking wait.
+    // The process comes first so simultaneous child exit takes precedence.
+    match unsafe {
+        WaitForMultipleObjects(handles.len() as Dword, handles.as_ptr(), FALSE, INFINITE)
+    } {
+        WAIT_OBJECT_0 => Ok(true),
+        value if value == WAIT_OBJECT_0 + 1 => Ok(false),
+        WAIT_FAILED => Err(io::Error::last_os_error()),
+        value => Err(io::Error::other(format!(
+            "WaitForMultipleObjects returned unexpected status 0x{value:08X}"
+        ))),
     }
 }
 
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        close_raw_handle(self.0);
-    }
-}
-
-fn close_raw_handle(handle: Handle) {
-    if !handle.is_null() && handle as isize != -1 {
-        // SAFETY: callers pass an owned Win32 HANDLE exactly once. Return value
-        // cannot be acted on during Drop and does not change ownership.
-        unsafe {
-            let _ = CloseHandle(handle);
-        }
-    }
-}
-
-fn create_pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
-    let mut read = ptr::null_mut();
-    let mut write = ptr::null_mut();
-    // SAFETY: both output pointers are valid. Null security attributes produce
-    // non-inheritable synchronous anonymous-pipe handles as required here.
-    if unsafe { CreatePipe(&mut read, &mut write, ptr::null_mut(), 0) } == FALSE {
-        return Err(io::Error::last_os_error());
-    }
-    let Some(read) = OwnedHandle::new(read) else {
-        close_raw_handle(write);
-        return Err(io::Error::other(
-            "CreatePipe returned an invalid read handle",
-        ));
-    };
-    let Some(write) = OwnedHandle::new(write) else {
-        return Err(io::Error::other(
-            "CreatePipe returned an invalid write handle",
-        ));
-    };
-    Ok((read, write))
-}
-
-struct PseudoConsole {
-    handle: HpCon,
-    api: ConPtyApi,
-}
-
-// SAFETY: HPCON is an opaque process-wide kernel object. This wrapper transfers
-// its sole ClosePseudoConsole responsibility to the control thread.
-unsafe impl Send for PseudoConsole {}
-
-impl PseudoConsole {
-    fn create(
-        api: ConPtyApi,
-        size: Coord,
-        input: &OwnedHandle,
-        output: &OwnedHandle,
-    ) -> io::Result<Self> {
-        let mut handle = ptr::null_mut();
-        // SAFETY: both pipe handles remain live through this call and `handle`
-        // is valid output storage. The dynamically loaded function has the
-        // documented CreatePseudoConsole system ABI.
-        let result = unsafe { (api.create)(size, input.raw(), output.raw(), 0, &mut handle) };
-        if result < 0 {
-            return Err(hresult_error("CreatePseudoConsole", result));
-        }
-        if handle.is_null() {
-            return Err(io::Error::other(
-                "CreatePseudoConsole returned a null HPCON",
-            ));
-        }
-        Ok(Self { handle, api })
-    }
-
-    fn raw(&self) -> HpCon {
-        self.handle
-    }
-
-    fn resize(&self, size: Coord) -> io::Result<()> {
-        // SAFETY: this wrapper owns a live HPCON, the control thread serializes
-        // resize with close, and the function pointer has the documented ABI.
-        let result = unsafe { (self.api.resize)(self.handle, size) };
-        if result < 0 {
-            return Err(hresult_error("ResizePseudoConsole", result));
-        }
-        Ok(())
-    }
-}
-
-impl Drop for PseudoConsole {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            // SAFETY: this is the unique owner of a live HPCON. Close is called
-            // exactly once and the handle is cleared before Drop can finish.
-            unsafe { (self.api.close)(self.handle) };
-            self.handle = ptr::null_mut();
-        }
-    }
-}
+include!("windows/handles.rs");
 
 fn hresult_error(operation: &str, result: HResult) -> io::Error {
     let facility = ((result as u32) >> 16) & 0x1fff;
@@ -1260,87 +1395,8 @@ fn hresult_error(operation: &str, result: HResult) -> io::Error {
     ))
 }
 
-struct ChildResources {
-    process: Option<OwnedHandle>,
-    pseudo_console: Option<PseudoConsole>,
-    process_exited: bool,
-}
-
-impl ChildResources {
-    fn new(process: OwnedHandle, pseudo_console: PseudoConsole) -> Self {
-        Self {
-            process: Some(process),
-            pseudo_console: Some(pseudo_console),
-            process_exited: false,
-        }
-    }
-
-    fn process(&self) -> &OwnedHandle {
-        self.process
-            .as_ref()
-            .expect("child process handle remains owned until cleanup")
-    }
-
-    fn pseudo_console(&self) -> &PseudoConsole {
-        self.pseudo_console
-            .as_ref()
-            .expect("pseudoconsole remains owned until control cleanup")
-    }
-
-    fn process_signaled(&self) -> io::Result<bool> {
-        // SAFETY: the control thread owns this live process handle. A zero
-        // timeout only observes signal state and does not consume the handle.
-        match unsafe { WaitForSingleObject(self.process().raw(), 0) } {
-            WAIT_OBJECT_0 => Ok(true),
-            WAIT_TIMEOUT => Ok(false),
-            WAIT_FAILED => Err(io::Error::last_os_error()),
-            value => Err(io::Error::other(format!(
-                "WaitForSingleObject returned unexpected status 0x{value:08X}"
-            ))),
-        }
-    }
-
-    fn terminate_and_wait(&mut self) -> io::Result<()> {
-        if self.process_exited {
-            return Ok(());
-        }
-        // SAFETY: this wrapper owns the exact process created for the terminal.
-        // TerminateProcess is the Windows shutdown fallback when its HPCON
-        // session owner is dropped before the client exits naturally.
-        let terminated = unsafe { TerminateProcess(self.process().raw(), 1) };
-        if terminated == FALSE && !self.process_signaled().unwrap_or(false) {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: the exact child process handle remains live. After successful
-        // termination, waiting without a timeout completes process teardown.
-        let waited = unsafe { WaitForSingleObject(self.process().raw(), INFINITE) };
-        if waited != WAIT_OBJECT_0 {
-            return Err(if waited == WAIT_FAILED {
-                io::Error::last_os_error()
-            } else {
-                io::Error::other(format!(
-                    "WaitForSingleObject returned unexpected status 0x{waited:08X}"
-                ))
-            });
-        }
-        self.process_exited = true;
-        Ok(())
-    }
-
-    fn close_pseudo_console(&mut self) {
-        drop(self.pseudo_console.take());
-    }
-}
-
-impl Drop for ChildResources {
-    fn drop(&mut self) {
-        if !self.process_exited {
-            let _ = self.terminate_and_wait();
-        }
-        self.close_pseudo_console();
-        drop(self.process.take());
-    }
-}
+include!("windows/resources.rs");
+include!("windows/process_tree.rs");
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default)]
@@ -1425,3 +1481,8 @@ include!("windows/launch.rs");
 #[cfg(test)]
 #[path = "windows_tests.rs"]
 mod tests;
+
+/// Foreground program of the console tree rooted at `pid` (for Ask here).
+pub(crate) fn foreground_name_of_pid(pid: u32) -> Option<String> {
+    foreground_descendant_name(pid)
+}

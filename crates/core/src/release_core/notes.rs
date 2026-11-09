@@ -6,6 +6,10 @@ use crate::release_core::DEFAULT_GITHUB_REPO;
 const GITHUB_USER_AGENT: &str = "Termy-Updater/1.0";
 const RELEASE_LIST_PAGE_SIZE: u8 = 30;
 
+/// Returned when every tag candidate answered 404: there is simply no
+/// release for this version. Callers treat it as up to date / no notes.
+pub const RELEASE_NOT_PUBLISHED: &str = "No GitHub release is published for this version.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReleaseNotes {
     pub tag: String,
@@ -66,18 +70,30 @@ pub(crate) fn fetch_release_notes_with(
     mut get: impl FnMut(&str) -> Result<String>,
 ) -> Result<ReleaseNotes> {
     let mut last_error = anyhow::anyhow!("GitHub could not load this release.");
+    let mut all_missing = true;
     for tag in release_tag_candidates(version) {
         let url = format!("https://api.github.com/repos/{repo}/releases/tags/{tag}");
         match get(&url) {
             Ok(body) => return parse_release_json(&body, &tag),
-            Err(error) => last_error = error,
+            Err(error) => {
+                if !format!("{error:#}").contains("404") {
+                    all_missing = false;
+                }
+                last_error = error;
+            }
         }
+    }
+    if all_missing {
+        // No release is published for this build's tag (e.g. a fork whose
+        // GitHub releases lag its version). Not an error for the user.
+        return Err(anyhow::anyhow!(RELEASE_NOT_PUBLISHED));
     }
     Err(last_error)
 }
 
 fn github_get(url: &str) -> Result<String> {
-    let response = ureq::get(url)
+    let response = super::transport::http_agent()
+        .get(url)
         .set("User-Agent", GITHUB_USER_AGENT)
         .set("Accept", "application/vnd.github+json")
         .set("X-GitHub-Api-Version", "2022-11-28")
@@ -270,5 +286,23 @@ mod tests {
             urls,
             vec!["https://api.github.com/repos/lassejlv/termy/releases?per_page=30".to_string()]
         );
+    }
+
+    #[test]
+    fn all_404_tags_mean_not_published() {
+        let err = fetch_release_notes_with("jpanasuk-netizen/termy-x", "1.0.0-rc.10", |url| {
+            Err(anyhow::anyhow!("{url}: status code 404"))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), super::RELEASE_NOT_PUBLISHED);
+    }
+
+    #[test]
+    fn network_errors_are_still_reported() {
+        let err = fetch_release_notes_with("jpanasuk-netizen/termy-x", "1.0.0", |_| {
+            Err(anyhow::anyhow!("connection refused"))
+        })
+        .unwrap_err();
+        assert_ne!(err.to_string(), super::RELEASE_NOT_PUBLISHED);
     }
 }

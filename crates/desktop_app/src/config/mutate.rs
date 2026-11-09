@@ -12,10 +12,11 @@ use std::cell::RefCell;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, de::IgnoredAny};
 use termy_core::config_core::{
-    AppConfig, ColorSettingId, ColorSettingUpdate, Rgb8, RootSettingId, SHELL_DECIDE_THEME_ID,
-    TaskConfig, apply_color_updates, color_setting_from_key, color_setting_spec, parse_theme_id,
-    prettify_config_contents, remove_raw_root_key as remove_raw_root_key_entry,
-    remove_root_setting as remove_root_setting_entry, replace_keybind_lines, upsert_root_setting,
+    ColorSettingId, ColorSettingUpdate, Rgb8, RootSettingId, TaskConfig, apply_color_updates,
+    color_setting_from_key, color_setting_spec, parse_theme_id, prettify_config_contents,
+    remove_raw_root_key as remove_raw_root_key_entry,
+    remove_root_setting as remove_root_setting_entry, replace_keybind_lines, root_setting_from_key,
+    upsert_root_setting,
 };
 
 use super::ConfigIoError;
@@ -24,13 +25,6 @@ use super::DEFAULT_CONFIG;
 use super::io::{ensure_config_file, notify_config_changed, write_atomic};
 
 static CONFIG_UPDATE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ResetThemeReferences {
-    pub theme: bool,
-    pub theme_light: bool,
-    pub theme_dark: bool,
-}
 
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -145,33 +139,66 @@ pub fn remove_raw_root_key_from_config(key: &str) -> Result<(), String> {
     update_config_contents(move |existing| Ok((remove_raw_root_key_entry(existing, &key), ())))
 }
 
+pub fn remove_duplicate_root_key_from_config(key: &str) -> Result<(), String> {
+    let key = key.to_string();
+    update_config_contents(move |existing| {
+        Ok((remove_duplicate_root_key_entries(existing, &key), ()))
+    })
+}
+
+/// Removes every occurrence of a non-repeatable root setting except the last
+/// one. The parser lets the last occurrence win, so this keeps the effective
+/// value. Like the parser, root settings inside `[colors]` are counted too.
+fn remove_duplicate_root_key_entries(contents: &str, key: &str) -> String {
+    let Some(target) = root_setting_from_key(key) else {
+        return contents.to_string();
+    };
+
+    let mut in_root_like_section = true;
+    let mut occurrences = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_root_like_section = trimmed[1..trimmed.len() - 1]
+                .trim()
+                .eq_ignore_ascii_case("colors");
+            continue;
+        }
+        if in_root_like_section
+            && let Some((raw_key, _)) = trimmed.split_once('=')
+            && root_setting_from_key(raw_key.trim()) == Some(target)
+        {
+            occurrences.push(index);
+        }
+    }
+
+    let Some((_, overridden)) = occurrences.split_last() else {
+        return contents.to_string();
+    };
+    if overridden.is_empty() {
+        return contents.to_string();
+    }
+
+    let mut out = contents
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| !overridden.contains(index))
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if contents.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn set_theme_in_config(theme_id: &str) -> Result<String, String> {
     let theme = parse_theme_id(theme_id).ok_or_else(|| "Invalid theme id".to_string())?;
     set_root_setting(RootSettingId::Theme, &theme)?;
     Ok(format!("Theme set to {theme}"))
-}
-
-pub fn reset_theme_references_in_config(theme_id: &str) -> Result<ResetThemeReferences, String> {
-    let theme_id = parse_theme_id(theme_id).ok_or_else(|| "Invalid theme id".to_string())?;
-    update_config_contents(move |existing| {
-        let config = AppConfig::from_contents(existing);
-        let reset = ResetThemeReferences {
-            theme: config.theme.eq_ignore_ascii_case(&theme_id),
-            theme_light: config.theme_light.eq_ignore_ascii_case(&theme_id),
-            theme_dark: config.theme_dark.eq_ignore_ascii_case(&theme_id),
-        };
-        let mut updated = existing.to_string();
-        if reset.theme {
-            updated = upsert_root_setting(&updated, RootSettingId::Theme, SHELL_DECIDE_THEME_ID);
-        }
-        if reset.theme_light {
-            updated = upsert_root_setting(&updated, RootSettingId::ThemeLight, "termy-light");
-        }
-        if reset.theme_dark {
-            updated = upsert_root_setting(&updated, RootSettingId::ThemeDark, "termy");
-        }
-        Ok((updated, reset))
-    })
 }
 
 pub fn set_color_setting(color: ColorSettingId, value: Option<&str>) -> Result<(), String> {
@@ -347,7 +374,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{TEST_CONFIG_PATH_OVERRIDE, write_atomic};
-    use super::{import_colors_from_json, reset_theme_references_in_config, upsert_task_lines};
+    use super::{import_colors_from_json, remove_duplicate_root_key_entries, upsert_task_lines};
     use crate::config::TaskConfig;
 
     struct ConfigPathOverrideGuard {
@@ -448,38 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn reset_theme_references_updates_all_system_slots_in_one_write() {
-        with_temp_config_file_inner(
-            Some(
-                "theme = catppuccin-macchiato\n\
-                 theme_mode = system\n\
-                 theme_light = catppuccin-macchiato\n\
-                 theme_dark = catppuccin-macchiato\n\
-                 font_size = 15\n",
-            ),
-            |_, config_path| {
-                let reset = reset_theme_references_in_config("catppuccin-macchiato")
-                    .expect("reset theme references");
-                assert_eq!(
-                    reset,
-                    super::ResetThemeReferences {
-                        theme: true,
-                        theme_light: true,
-                        theme_dark: true,
-                    }
-                );
-
-                let contents = std::fs::read_to_string(config_path).expect("read config");
-                let config = termy_core::config_core::AppConfig::from_contents(&contents);
-                assert_eq!(config.theme, "shell-decide");
-                assert_eq!(config.theme_light, "termy-light");
-                assert_eq!(config.theme_dark, "termy");
-                assert_eq!(config.font_size, 15.0);
-            },
-        );
-    }
-
-    #[test]
     fn upsert_task_lines_replaces_existing_task_block() {
         let input = "theme = termy\ntask.build.command = cargo test\ntask.build.layout = app\n[colors]\nforeground = #fff\n";
         let output = upsert_task_lines(
@@ -501,5 +496,25 @@ mod tests {
         assert!(output.contains("task.build.keybind = secondary-shift-b\n"));
         assert!(!output.contains("cargo test"));
         assert!(output.contains("[colors]\nforeground = #fff\n"));
+    }
+
+    #[test]
+    fn remove_duplicate_root_key_keeps_last_effective_occurrence() {
+        let input = "# header\nfont_size = 12\ntheme = termy\nfont_size = 14\n[colors]\nfont_size = 16\nforeground = #ffffff\n";
+        let output = remove_duplicate_root_key_entries(input, "font_size");
+        assert_eq!(
+            output,
+            "# header\ntheme = termy\n[colors]\nfont_size = 16\nforeground = #ffffff\n"
+        );
+        let report = termy_core::config_core::AppConfig::from_contents_with_report(&output);
+        assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+        assert_eq!(report.config.font_size, 16.0);
+    }
+
+    #[test]
+    fn remove_duplicate_root_key_leaves_single_occurrence_untouched() {
+        let input = "font_size = 12\ntheme = termy";
+        assert_eq!(remove_duplicate_root_key_entries(input, "font_size"), input);
+        assert_eq!(remove_duplicate_root_key_entries(input, "unknown"), input);
     }
 }

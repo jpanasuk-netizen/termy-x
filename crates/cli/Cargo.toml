@@ -1,6 +1,6 @@
 [package]
 name = "termy_cli"
-version = "0.2.81"
+version = "1.0.0-rc.10"
 edition = "2024"
 default-run = "termy-cli"
 
@@ -17,6 +17,7 @@ path = "src/xtask/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+dunce = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 notify = "8"
 ratatui = "0.29"
@@ -38,4 +39,3 @@ termy_x = { path = "../x_core" }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 core-text = "=21.0.0"
-core-foundation = "0.10"

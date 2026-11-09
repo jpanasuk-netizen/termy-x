@@ -64,8 +64,8 @@ impl Handler for Recorder {
         self.events.push(Event::Dcs(bytes.to_vec()));
     }
 
-    fn apc(&mut self, bytes: &[u8]) {
-        self.events.push(Event::Apc(bytes.to_vec()));
+    fn apc(&mut self, bytes: &mut Vec<u8>) {
+        self.events.push(Event::Apc(bytes.clone()));
     }
 }
 
@@ -146,7 +146,8 @@ fn utf8_validation_matches_lossy_decoding_including_reconsumption() {
         b"\xc2!",
         b"\xe2\xc2\xa3!",
         b"\xf0\x9f\xe2\x82\xac!",
-        "\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}!".as_bytes(),
+        // U+0080 to U+009F are C1 controls, not text.
+        "\u{a0}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}\u{10000}\u{10ffff}!".as_bytes(),
     ];
     for &bytes in samples {
         let expected = String::from_utf8_lossy(bytes);
@@ -472,7 +473,7 @@ fn oversized_strings_discard_embedded_escapes_until_termination() {
         parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES + 1]);
         parser.advance(
             &mut recorder,
-            b"\x1b[31mhidden\x1b\nmore hidden\x1b\x1b\\OK",
+            b"\x1b]hidden\x1bP\x1b\nmore hidden\x1b\x1b\\OK",
         );
         assert_eq!(recorder.events, vec![Event::Print('O'), Event::Print('K')]);
     }
@@ -483,8 +484,8 @@ fn configured_apc_limit_does_not_expand_osc_or_dcs_limits() {
     for introducer in *b"]P_" {
         let mut parser = Parser::with_apc_limit(MAX_STRING_BYTES * 2);
         let mut recorder = Recorder::default();
-        parser.advance(&mut recorder, &[0x1b, introducer]);
-        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES + 1]);
+        parser.advance(&mut recorder, &[0x1b, introducer, b'G']);
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
         parser.advance(&mut recorder, b"\x1b\\");
         if introducer == b'_' {
             assert!(
@@ -495,4 +496,282 @@ fn configured_apc_limit_does_not_expand_osc_or_dcs_limits() {
         }
     }
     assert_eq!(Parser::with_apc_limit(usize::MAX).apc_limit, MAX_APC_BYTES);
+}
+
+#[test]
+fn clipboard_osc_has_its_own_larger_limit() {
+    let data = vec![b'Q'; MAX_STRING_BYTES * 2];
+    for scanner in [false, true] {
+        let mut parser = if scanner {
+            Parser::scanner(MAX_STRING_BYTES)
+        } else {
+            Parser::default()
+        };
+        let mut recorder = Recorder::default();
+        // The selecting prefix may arrive split across reads.
+        parser.advance(&mut recorder, b"\x1b]5");
+        parser.advance(&mut recorder, b"2;c;");
+        for chunk in data.chunks(3000) {
+            parser.advance(&mut recorder, chunk);
+        }
+        assert!(!parser.discarded);
+        parser.advance(&mut recorder, b"\x07");
+        if !scanner {
+            assert!(
+                matches!(recorder.events.as_slice(), [Event::Osc(bytes)] if bytes.len() == data.len() + 5)
+            );
+            assert_eq!(parser.string.capacity(), 0);
+        }
+    }
+
+    let mut parser = Parser::default();
+    let mut recorder = Recorder::default();
+    parser.advance(&mut recorder, b"\x1b]52;c;");
+    parser.advance(&mut recorder, &vec![b'Q'; MAX_CLIPBOARD_OSC_BYTES]);
+    assert!(parser.discarded);
+    parser.advance(&mut recorder, b"\x07OK");
+    assert_eq!(printed(&recorder.events), "OK");
+
+    // Other OSCs keep the generic bound.
+    let mut parser = Parser::default();
+    parser.advance(&mut recorder, b"\x1b]2;");
+    parser.advance(&mut recorder, &data);
+    assert!(parser.discarded);
+}
+
+#[test]
+fn large_apc_storage_is_released_after_completion_or_interruption() {
+    for ending in [b"\x1b\\".as_slice(), b"\x18", b"\x1a", b"\x1b[2J", b"\x1bc"] {
+        let mut parser = Parser::with_apc_limit(MAX_STRING_BYTES * 2);
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, b"\x1b_G");
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
+        assert!(parser.string.capacity() > MAX_STRING_BYTES);
+        parser.advance(&mut recorder, ending);
+        assert_eq!(parser.string.capacity(), 0, "ending {ending:?}");
+        parser.advance(&mut recorder, b"OK");
+        assert_eq!(printed(&recorder.events), "OK");
+    }
+}
+
+#[test]
+fn large_apc_storage_is_released_on_overflow_and_parser_reset() {
+    for overflow in [false, true] {
+        let mut parser = Parser::with_apc_limit(MAX_STRING_BYTES * 2);
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, b"\x1b_G");
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
+        assert!(parser.string.capacity() > MAX_STRING_BYTES);
+        if overflow {
+            parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
+            assert!(parser.discarded);
+            assert_eq!(parser.string.capacity(), 0);
+            parser.advance(&mut recorder, b"\x1b\\");
+        } else {
+            parser.reset();
+        }
+        assert_eq!(parser.string.capacity(), 0);
+        parser.advance(&mut recorder, b"OK");
+        assert_eq!(recorder.events, vec![Event::Print('O'), Event::Print('K')]);
+    }
+}
+
+#[test]
+fn scanner_tracks_large_string_limits_without_allocating_payloads() {
+    for introducer in *b"]P_" {
+        let mut parser = Parser::scanner(MAX_STRING_BYTES * 2);
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, &[0x1b, introducer, b'G']);
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
+        assert_eq!(parser.string.capacity(), 0);
+        // The APC fits the larger limit; oversized OSC/DCS recover at CSI.
+        parser.advance(&mut recorder, b"\x1b[?2026lEND");
+        assert_eq!(printed(&recorder.events), "END");
+    }
+}
+
+#[test]
+fn only_graphics_apcs_use_the_larger_apc_limit() {
+    for (introducer, delivered) in [(b'G', true), (b'Z', false)] {
+        let mut parser = Parser::with_apc_limit(MAX_APC_BYTES);
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, &[0x1b, b'_', introducer]);
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES]);
+        assert_eq!(parser.string.capacity() > MAX_STRING_BYTES, delivered);
+        parser.advance(&mut recorder, b"\x1b\\");
+        assert_eq!(
+            matches!(recorder.events.as_slice(), [Event::Apc(bytes)] if bytes.len() == MAX_STRING_BYTES + 1),
+            delivered
+        );
+    }
+}
+
+#[test]
+fn escape_followed_by_non_ascii_text_prints_the_text() {
+    for input in ["A\x1bé!BC", "A\x1b(é!BC"] {
+        assert_eq!(printed(&parse(input.as_bytes())), "Aé!BC", "{input:?}");
+        // Fragmented input reaches the same state.
+        let mut parser = Parser::default();
+        let mut recorder = Recorder::default();
+        for byte in input.as_bytes() {
+            parser.advance(&mut recorder, std::slice::from_ref(byte));
+        }
+        assert_eq!(printed(&recorder.events), "Aé!BC", "{input:?}");
+    }
+}
+
+#[test]
+fn csi_recovers_from_an_oversized_string() {
+    for introducer in *b"]P_" {
+        let mut parser = Parser::default();
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, &[0x1b, introducer]);
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES + 1]);
+        parser.advance(&mut recorder, b"hidden\x1b[mOK");
+        assert_eq!(recorder.events[1..], [Event::Print('O'), Event::Print('K')]);
+        assert!(matches!(recorder.events[0], Event::Csi(_, None, _, b'm')));
+    }
+}
+
+#[test]
+fn full_reset_recovers_from_an_oversized_string() {
+    for introducer in *b"]P_" {
+        let mut parser = Parser::default();
+        let mut recorder = Recorder::default();
+        parser.advance(&mut recorder, &[0x1b, introducer]);
+        parser.advance(&mut recorder, &vec![b'x'; MAX_STRING_BYTES + 1]);
+        parser.advance(&mut recorder, b"\x1b]hidden\x1bcOK");
+        assert_eq!(
+            recorder.events,
+            vec![
+                Event::Escape(Vec::new(), b'c'),
+                Event::Print('O'),
+                Event::Print('K')
+            ]
+        );
+    }
+}
+
+#[test]
+fn printable_ascii_scan_stops_at_every_other_byte_in_every_position() {
+    for byte in 0..=u8::MAX {
+        let printable = (0x20..=0x7e).contains(&byte);
+        for len in 0..=40 {
+            for position in 0..len {
+                let mut bytes = vec![b'a'; len];
+                bytes[position] = byte;
+                let expected = if printable { len } else { position };
+                assert_eq!(
+                    printable_ascii_len(&bytes),
+                    expected,
+                    "byte {byte:#04x} at {position} of {len}"
+                );
+            }
+        }
+    }
+}
+
+// The text fast path decodes with `complete_utf8`, so it must accept exactly
+// the scalars `str::from_utf8` accepts as a prefix, for every lead byte.
+#[test]
+fn complete_utf8_matches_std_for_every_two_and_three_byte_sequence() {
+    let expect = |bytes: &[u8]| {
+        let valid = match std::str::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap(),
+        };
+        valid
+            .chars()
+            .next()
+            .filter(|character| !character.is_ascii())
+            .map(|character| (character, character.len_utf8()))
+    };
+    for first in 0x80..=0xffu8 {
+        for second in 0..=0xffu8 {
+            assert_eq!(complete_utf8(&[first, second]), expect(&[first, second]));
+            for third in 0..=0xffu8 {
+                let bytes = [first, second, third];
+                assert_eq!(complete_utf8(&bytes), expect(&bytes), "{bytes:02x?}");
+            }
+        }
+    }
+    for first in 0xf0..=0xffu8 {
+        for second in 0..=0xffu8 {
+            for fourth in [0x00, 0x7f, 0x80, 0xbf, 0xc0] {
+                for third in [0x00, 0x7f, 0x80, 0xa5, 0xbf, 0xc0] {
+                    let bytes = [first, second, third, fourth];
+                    assert_eq!(complete_utf8(&bytes), expect(&bytes), "{bytes:02x?}");
+                }
+            }
+        }
+    }
+}
+
+// Line endings execute their line feed together with the carriage return
+// when both are in one chunk; parsed whole or a byte at a time, text with
+// line endings, lone controls and escapes yields the same events.
+#[test]
+fn line_endings_parse_alike_whole_and_bytewise() {
+    let pieces: [&[u8]; 8] = [
+        b"\r\n",
+        b"\r",
+        b"\n",
+        b"ab",
+        b"\x1b[2J",
+        b"\t",
+        "é".as_bytes(),
+        b"\r\r\n",
+    ];
+    let mut seed = 0x9e37_79b9_u32;
+    let mut next = |bound: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize % bound
+    };
+    for _ in 0..500 {
+        let mut bytes = Vec::new();
+        for _ in 0..next(12) {
+            bytes.extend_from_slice(pieces[next(pieces.len())]);
+        }
+        let mut bytewise = Recorder::default();
+        let mut parser = Parser::default();
+        for byte in &bytes {
+            parser.advance(&mut bytewise, std::slice::from_ref(byte));
+        }
+        assert_eq!(parse(&bytes), bytewise.events, "{bytes:02x?}");
+    }
+}
+
+#[test]
+fn utf8_encoded_c1_controls_act_as_their_seven_bit_forms() {
+    // U+009B is CSI, U+009D OSC (ended by BEL), U+0084 IND and U+0090 DCS.
+    let stream = "a\u{9b}31mb\u{9d}0;title\x07\u{84}\u{90}q\x1b\\c".as_bytes();
+    let expected = vec![
+        Event::Print('a'),
+        Event::Csi(vec![vec![Some(31)]], None, vec![], b'm'),
+        Event::Print('b'),
+        Event::Osc(b"0;title".to_vec()),
+        Event::Escape(vec![], b'D'),
+        Event::Dcs(b"q".to_vec()),
+        Event::Print('c'),
+    ];
+    assert_eq!(parse(stream), expected);
+    // The same, one byte at a time through the streaming decoder.
+    let mut recorder = Recorder::default();
+    let mut parser = Parser::default();
+    for byte in stream {
+        parser.advance(&mut recorder, std::slice::from_ref(byte));
+    }
+    assert_eq!(recorder.events, expected);
+    // Raw 8-bit C1 bytes are not UTF-8.
+    assert_eq!(
+        parse(b"\x9b31m"),
+        vec![
+            Event::Print(char::REPLACEMENT_CHARACTER),
+            Event::Print('3'),
+            Event::Print('1'),
+            Event::Print('m'),
+        ]
+    );
 }

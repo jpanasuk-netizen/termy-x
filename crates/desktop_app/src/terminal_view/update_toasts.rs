@@ -1,5 +1,5 @@
-use super::TerminalView;
-use crate::auto_update::UpdateState;
+use crate::auto_update::{AutoUpdater, UpdateState};
+use gpui_kit::{App, Entity, Global};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UpdateToastEffect {
@@ -56,22 +56,50 @@ fn installed_update_toast_message(version: &str) -> String {
     {
         format!("v{version} installed \u{2014} reopen from /Applications")
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     {
-        format!("v{} installed \u{2014} restart to apply", version)
-    }
-    #[cfg(target_os = "linux")]
-    {
-        format!("v{version} installed to ~/.local/bin \u{2014} restart to apply")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        format!("v{} installed \u{2014} restart to apply", version)
+        format!("v{version} installed \u{2014} restart to apply")
     }
 }
 
-impl TerminalView {
-    pub(super) fn sync_update_toasts(&mut self, state: Option<&UpdateState>) {
+/// Update toasts for the app-wide updater. The toast queue is global too, so
+/// one app-level observer emits them; per-window observers would repeat
+/// every toast once per open window.
+#[derive(Default)]
+pub(super) struct UpdateToasts {
+    last_notified_update_state: Option<UpdateState>,
+    update_check_toast_id: Option<u64>,
+}
+
+impl Global for UpdateToasts {}
+
+impl UpdateToasts {
+    /// Start emitting toasts for `updater`; later calls (from other windows)
+    /// do nothing.
+    pub(super) fn observe(updater: &Entity<AutoUpdater>, cx: &mut App) {
+        if cx.has_global::<Self>() {
+            return;
+        }
+        cx.set_global(Self::default());
+        cx.observe(updater, |updater, cx| {
+            let state = updater.read(cx).state.clone();
+            cx.global_mut::<Self>().sync(Some(&state));
+        })
+        .detach();
+    }
+
+    /// Show a "checking" toast for a manual check, unless an update toast is
+    /// already in progress (another window may have started the check).
+    /// macOS checks go through Sparkle's own UI.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    pub(super) fn show_checking(cx: &mut App) {
+        let toasts = cx.default_global::<Self>();
+        if toasts.update_check_toast_id.is_none() {
+            toasts.update_check_toast_id = Some(crate::ui::toast::loading("Checking for updates"));
+        }
+    }
+
+    fn sync(&mut self, state: Option<&UpdateState>) {
         let changed = self.last_notified_update_state.as_ref() != state;
         if !changed {
             return;

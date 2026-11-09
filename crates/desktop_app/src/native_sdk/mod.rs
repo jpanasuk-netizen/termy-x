@@ -1,7 +1,10 @@
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod file_manager;
+#[cfg(target_os = "windows")]
+pub mod win32_window;
+#[cfg(target_os = "windows")]
+pub mod winui_tab_strip;
 
-pub use file_manager::{OPEN_TAB_HERE_LABEL, register_open_tab_here};
+pub use file_manager::{OPEN_TAB_HERE_LABEL, register_open_tab_here, unregister_open_tab_here};
 
 #[cfg(target_os = "macos")]
 use dispatch2::run_on_main;
@@ -27,15 +30,70 @@ use std::process::Command;
 #[cfg(target_os = "windows")]
 use windows::Win32::Foundation::{HWND, POINT};
 #[cfg(target_os = "windows")]
+use windows::Win32::UI::Controls::{
+    TASKDIALOG_BUTTON, TASKDIALOGCONFIG, TASKDIALOGCONFIG_0, TD_WARNING_ICON,
+    TDF_ALLOW_DIALOG_CANCELLATION, TDF_POSITION_RELATIVE_TO_WINDOW, TaskDialogIndirect,
+};
+#[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, IDNO, IDYES,
-    MB_ICONINFORMATION, MB_OK, MB_YESNO, MB_YESNOCANCEL, MF_GRAYED, MF_SEPARATOR, MF_STRING,
-    MessageBoxW, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, GetWindowInfo,
+    IDYES, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_YESNO,
+    MESSAGEBOX_STYLE, MF_GRAYED, MF_SEPARATOR, MF_STRING, MessageBoxW, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, TrackPopupMenu, WINDOWINFO,
 };
 
 #[cfg(target_os = "windows")]
 fn wide_string(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `MessageBoxW` owned by the active Termy window, so it is modal to it and
+/// cannot fall behind it.
+#[cfg(target_os = "windows")]
+fn owned_message_box(
+    title: &str,
+    message: &str,
+    style: MESSAGEBOX_STYLE,
+) -> windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_RESULT {
+    let wide_title = wide_string(title);
+    let wide_message = wide_string(message);
+    unsafe {
+        MessageBoxW(
+            win32_window::dialog_owner(),
+            windows::core::PCWSTR(wide_message.as_ptr()),
+            windows::core::PCWSTR(wide_title.as_ptr()),
+            style,
+        )
+    }
+}
+
+/// Screen position for a context menu: the anchor (an HWND plus client-area
+/// coordinates in physical pixels) when given, otherwise the cursor.
+#[cfg(target_os = "windows")]
+fn context_menu_screen_position(anchor: Option<NativeContextMenuAnchor>) -> Option<(POINT, HWND)> {
+    if let Some(anchor) = anchor {
+        let hwnd = HWND(anchor.native_view as *mut core::ffi::c_void);
+        let mut info = WINDOWINFO {
+            cbSize: std::mem::size_of::<WINDOWINFO>() as u32,
+            ..Default::default()
+        };
+        if !hwnd.is_invalid() && unsafe { GetWindowInfo(hwnd, &mut info) }.is_ok() {
+            let client = info.rcClient;
+            let width = f64::from((client.right - client.left).max(0));
+            let height = f64::from((client.bottom - client.top).max(0));
+            let point = POINT {
+                x: client.left + anchor.x.clamp(0.0, width).round() as i32,
+                y: client.top + anchor.y.clamp(0.0, height).round() as i32,
+            };
+            return Some((point, hwnd));
+        }
+    }
+
+    let mut cursor = POINT::default();
+    unsafe {
+        GetCursorPos(&mut cursor).ok()?;
+    }
+    Some((cursor, unsafe { GetForegroundWindow() }))
 }
 
 #[cfg(target_os = "windows")]
@@ -72,6 +130,9 @@ pub enum ClipboardPermission {
     AllowAlways,
 }
 
+/// Where a native context menu opens. On macOS `native_view` is the `NSView`
+/// and `x`/`y` are view points; on Windows it is the window's `HWND` and
+/// `x`/`y` are client-area physical pixels (GPUI position times scale factor).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct NativeContextMenuAnchor {
     pub native_view: usize,
@@ -79,18 +140,28 @@ pub struct NativeContextMenuAnchor {
     pub y: f64,
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CONTEXT_MENU_COPY_ID: i32 = 1;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CONTEXT_MENU_PASTE_ID: i32 = 2;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CONTEXT_MENU_OPEN_SEARCH_ID: i32 = 3;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CONTEXT_MENU_COPY_BUFFER_POSITION_ID: i32 = 4;
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 const CONTEXT_MENU_COPY_IMAGE_ID: i32 = 5;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TAB_CONTEXT_MENU_PIN_ID: i32 = 101;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TAB_CONTEXT_MENU_UNPIN_ID: i32 = 102;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TAB_CONTEXT_MENU_RENAME_ID: i32 = 103;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const TAB_CONTEXT_MENU_CLOSE_ID: i32 = 104;
 #[cfg(target_os = "macos")]
 static CONTEXT_MENU_SELECTION: AtomicI32 = AtomicI32::new(0);
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn context_menu_action_for_id(action_id: i32) -> Option<ContextMenuAction> {
     match action_id {
         CONTEXT_MENU_COPY_ID => Some(ContextMenuAction::Copy),
@@ -174,38 +245,6 @@ fn has_command(cmd: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
-}
-
-/// Read the system icon for any file or app bundle as PNG bytes.
-/// Returns `None` on non-macOS or if icon retrieval fails.
-///
-/// # Safety
-/// Must be called from the main thread.
-pub fn app_icon_png_for_path(path: &str, size_px: f64) -> Option<Vec<u8>> {
-    #[cfg(target_os = "macos")]
-    {
-        use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep, NSWorkspace};
-        use objc2_foundation::{NSDictionary, NSSize};
-
-        let _ = unsafe { MainThreadMarker::new_unchecked() };
-        let ns_path = NSString::from_str(path);
-        let workspace = NSWorkspace::sharedWorkspace();
-        let image = workspace.iconForFile(&ns_path);
-        image.setSize(NSSize::new(size_px, size_px));
-        let tiff_data = image.TIFFRepresentation()?;
-        let bitmap_rep = NSBitmapImageRep::imageRepWithData(&tiff_data)?;
-        let properties = NSDictionary::new();
-        let png_data = unsafe {
-            bitmap_rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &properties)
-        }?;
-        let bytes = unsafe { png_data.as_bytes_unchecked() };
-        Some(bytes.to_vec())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, size_px);
-        None
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -306,22 +345,19 @@ pub fn clear_current_app_bundle_file_icon() -> bool {
     }
 }
 
-/// Whether macOS "Reduce transparency" (System Settings → Accessibility →
-/// Display) is enabled. When it is on, AppKit flattens `NSVisualEffectView`
-/// vibrancy, so window-background blur cannot render and callers should fall
-/// back to plain transparency. Always `false` on non-macOS platforms.
-pub fn macos_reduce_transparency() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        objc2_app_kit::NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceTransparency()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
+pub fn show_alert(title: &str, message: &str) {
+    show_alert_with_level(title, message, false);
 }
 
-pub fn show_alert(title: &str, message: &str) {
+/// Like [`show_alert`], but flagged as an error (Windows shows the error icon).
+pub fn show_error_alert(title: &str, message: &str) {
+    show_alert_with_level(title, message, true);
+}
+
+fn show_alert_with_level(title: &str, message: &str, is_error: bool) {
+    #[cfg(not(target_os = "windows"))]
+    let _ = is_error;
+
     #[cfg(target_os = "macos")]
     {
         run_on_main(|mtm| {
@@ -354,16 +390,12 @@ pub fn show_alert(title: &str, message: &str) {
 
     #[cfg(target_os = "windows")]
     {
-        let wide_title = wide_string(title);
-        let wide_message = wide_string(message);
-        unsafe {
-            MessageBoxW(
-                None,
-                windows::core::PCWSTR(wide_message.as_ptr()),
-                windows::core::PCWSTR(wide_title.as_ptr()),
-                MB_OK | MB_ICONINFORMATION,
-            );
-        }
+        let icon = if is_error {
+            MB_ICONERROR
+        } else {
+            MB_ICONINFORMATION
+        };
+        owned_message_box(title, message, MB_OK | icon);
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -473,7 +505,6 @@ pub fn show_copy_paste_context_menu(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = anchor;
         let menu = unsafe { CreatePopupMenu().ok()? };
         let _menu_guard = MenuGuard(menu);
 
@@ -552,17 +583,13 @@ pub fn show_copy_paste_context_menu(
             .ok()?;
         }
 
-        let mut cursor = POINT::default();
-        unsafe {
-            GetCursorPos(&mut cursor).ok()?;
-        }
-        let owner: HWND = unsafe { GetForegroundWindow() };
+        let (position, owner) = context_menu_screen_position(anchor)?;
         let result = unsafe {
             TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                cursor.x,
-                cursor.y,
+                position.x,
+                position.y,
                 Some(0),
                 owner,
                 None,
@@ -570,7 +597,7 @@ pub fn show_copy_paste_context_menu(
             .0
         };
 
-        return context_menu_action_for_id(result);
+        context_menu_action_for_id(result)
     }
 
     #[cfg(any(
@@ -658,7 +685,6 @@ pub fn show_tab_context_menu(
 
     #[cfg(target_os = "windows")]
     {
-        let _ = anchor;
         let menu = unsafe { CreatePopupMenu().ok()? };
         let _menu_guard = MenuGuard(menu);
 
@@ -707,17 +733,13 @@ pub fn show_tab_context_menu(
             .ok()?;
         }
 
-        let mut cursor = POINT::default();
-        unsafe {
-            GetCursorPos(&mut cursor).ok()?;
-        }
-        let owner: HWND = unsafe { GetForegroundWindow() };
+        let (position, owner) = context_menu_screen_position(anchor)?;
         let result = unsafe {
             TrackPopupMenu(
                 menu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                cursor.x,
-                cursor.y,
+                position.x,
+                position.y,
                 Some(0),
                 owner,
                 None,
@@ -725,13 +747,13 @@ pub fn show_tab_context_menu(
             .0
         };
 
-        return match result {
+        match result {
             TAB_CONTEXT_MENU_RENAME_ID => Some(TabContextMenuAction::Rename),
             TAB_CONTEXT_MENU_PIN_ID => Some(TabContextMenuAction::Pin),
             TAB_CONTEXT_MENU_UNPIN_ID => Some(TabContextMenuAction::Unpin),
             TAB_CONTEXT_MENU_CLOSE_ID => Some(TabContextMenuAction::Close),
             _ => None,
-        };
+        }
     }
 
     #[cfg(any(
@@ -784,17 +806,7 @@ pub fn confirm(title: &str, message: &str) -> bool {
 
     #[cfg(target_os = "windows")]
     {
-        let wide_title = wide_string(title);
-        let wide_message = wide_string(message);
-        let result = unsafe {
-            MessageBoxW(
-                None,
-                windows::core::PCWSTR(wide_message.as_ptr()),
-                windows::core::PCWSTR(wide_title.as_ptr()),
-                MB_YESNO | MB_ICONINFORMATION,
-            )
-        };
-        result == IDYES
+        owned_message_box(title, message, MB_YESNO | MB_ICONINFORMATION) == IDYES
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
@@ -895,27 +907,18 @@ pub fn request_clipboard_permission(
 
     #[cfg(target_os = "windows")]
     {
-        let message = if can_remember {
-            format!("{message}\n\nYes: Allow Once\nNo: Always Allow\nCancel: Deny")
-        } else {
-            format!("{message}\n\nYes: Allow Once\nNo: Deny")
-        };
-        let result = unsafe {
-            MessageBoxW(
-                None,
-                windows::core::PCWSTR(wide_string(&message).as_ptr()),
-                windows::core::PCWSTR(wide_string(title).as_ptr()),
-                if can_remember {
-                    MB_YESNOCANCEL | MB_ICONINFORMATION
-                } else {
-                    MB_YESNO | MB_ICONINFORMATION
-                },
-            )
-        };
-        if result == IDYES {
+        let owner = win32_window::dialog_owner();
+        if let Some(permission) =
+            clipboard_permission_task_dialog(owner, title, message, can_remember)
+        {
+            return permission;
+        }
+        // Task dialogs need Common Controls v6 (GPUI's manifest requests it).
+        // Without them, ask a plain yes/no question that can never grant
+        // permanent access, defaulting to Deny.
+        let message = format!("{message}\n\nYes: Allow Once\nNo: Deny");
+        if owned_message_box(title, &message, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES {
             ClipboardPermission::AllowOnce
-        } else if can_remember && result == IDNO {
-            ClipboardPermission::AllowAlways
         } else {
             ClipboardPermission::Deny
         }
@@ -928,9 +931,126 @@ pub fn request_clipboard_permission(
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
+const CLIPBOARD_DIALOG_ALLOW_ONCE_ID: i32 = 100;
+#[cfg(any(target_os = "windows", test))]
+const CLIPBOARD_DIALOG_ALWAYS_ALLOW_ID: i32 = 101;
+#[cfg(any(target_os = "windows", test))]
+const CLIPBOARD_DIALOG_DENY_ID: i32 = 102;
+
+/// Maps a pressed task dialog button to a permission. Anything unexpected,
+/// including the cancel result of Esc or the close box, denies.
+#[cfg(any(target_os = "windows", test))]
+fn clipboard_permission_for_dialog_button(
+    button_id: i32,
+    can_remember: bool,
+) -> ClipboardPermission {
+    match button_id {
+        CLIPBOARD_DIALOG_ALLOW_ONCE_ID => ClipboardPermission::AllowOnce,
+        CLIPBOARD_DIALOG_ALWAYS_ALLOW_ID if can_remember => ClipboardPermission::AllowAlways,
+        _ => ClipboardPermission::Deny,
+    }
+}
+
+/// Clipboard permission prompt with explicitly labelled buttons. Returns
+/// `None` when the task dialog cannot be shown.
+#[cfg(target_os = "windows")]
+fn clipboard_permission_task_dialog(
+    owner: Option<HWND>,
+    title: &str,
+    message: &str,
+    can_remember: bool,
+) -> Option<ClipboardPermission> {
+    let window_title = wide_string("Termy");
+    let instruction = wide_string(title);
+    let content = wide_string(message);
+    let allow_once = wide_string("Allow Once");
+    let always_allow = wide_string("Always Allow");
+    let deny = wide_string("Deny");
+
+    let mut buttons = vec![TASKDIALOG_BUTTON {
+        nButtonID: CLIPBOARD_DIALOG_ALLOW_ONCE_ID,
+        pszButtonText: windows::core::PCWSTR(allow_once.as_ptr()),
+    }];
+    if can_remember {
+        buttons.push(TASKDIALOG_BUTTON {
+            nButtonID: CLIPBOARD_DIALOG_ALWAYS_ALLOW_ID,
+            pszButtonText: windows::core::PCWSTR(always_allow.as_ptr()),
+        });
+    }
+    buttons.push(TASKDIALOG_BUTTON {
+        nButtonID: CLIPBOARD_DIALOG_DENY_ID,
+        pszButtonText: windows::core::PCWSTR(deny.as_ptr()),
+    });
+
+    let config = TASKDIALOGCONFIG {
+        cbSize: std::mem::size_of::<TASKDIALOGCONFIG>() as u32,
+        hwndParent: owner.unwrap_or_default(),
+        dwFlags: TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW,
+        pszWindowTitle: windows::core::PCWSTR(window_title.as_ptr()),
+        Anonymous1: TASKDIALOGCONFIG_0 {
+            pszMainIcon: TD_WARNING_ICON,
+        },
+        pszMainInstruction: windows::core::PCWSTR(instruction.as_ptr()),
+        pszContent: windows::core::PCWSTR(content.as_ptr()),
+        cButtons: buttons.len() as u32,
+        pButtons: buttons.as_ptr(),
+        // Enter must never grant access by accident.
+        nDefaultButton: CLIPBOARD_DIALOG_DENY_ID,
+        ..Default::default()
+    };
+
+    let mut pressed = 0i32;
+    if let Err(error) = unsafe { TaskDialogIndirect(&config, Some(&mut pressed), None, None) } {
+        log::warn!("Clipboard permission task dialog failed: {error}");
+        return None;
+    }
+    Some(clipboard_permission_for_dialog_button(
+        pressed,
+        can_remember,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_dialog_buttons_map_to_permissions() {
+        assert_eq!(
+            clipboard_permission_for_dialog_button(CLIPBOARD_DIALOG_ALLOW_ONCE_ID, true),
+            ClipboardPermission::AllowOnce
+        );
+        assert_eq!(
+            clipboard_permission_for_dialog_button(CLIPBOARD_DIALOG_ALWAYS_ALLOW_ID, true),
+            ClipboardPermission::AllowAlways
+        );
+        assert_eq!(
+            clipboard_permission_for_dialog_button(CLIPBOARD_DIALOG_DENY_ID, true),
+            ClipboardPermission::Deny
+        );
+    }
+
+    #[test]
+    fn clipboard_dialog_never_grants_always_when_it_cannot_be_remembered() {
+        assert_eq!(
+            clipboard_permission_for_dialog_button(CLIPBOARD_DIALOG_ALWAYS_ALLOW_ID, false),
+            ClipboardPermission::Deny
+        );
+    }
+
+    #[test]
+    fn clipboard_dialog_cancel_denies() {
+        // IDCANCEL, returned for Esc and the close box.
+        assert_eq!(
+            clipboard_permission_for_dialog_button(2, true),
+            ClipboardPermission::Deny
+        );
+        assert_eq!(
+            clipboard_permission_for_dialog_button(0, true),
+            ClipboardPermission::Deny
+        );
+    }
 
     #[test]
     fn context_menu_ids_dispatch_to_their_actions() {

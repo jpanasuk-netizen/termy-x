@@ -11,7 +11,6 @@ pub(crate) enum DeepLinkRoute {
     NewWindow,
     Settings,
     OpenConfig,
-    ThemeInstall,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +22,6 @@ pub(crate) struct NewTabDeepLink {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DeepLinkArgument {
     NewTab(NewTabDeepLink),
-    Value(String),
 }
 
 impl DeepLinkRoute {
@@ -62,6 +60,8 @@ impl DeepLinkRoute {
                 let command = None;
                 let dir = parse_query_value(&url, "dir")
                     .map(|value| validate_deeplink_text(value, "dir", MAX_DEEPLINK_DIR_LEN))
+                    .transpose()?
+                    .map(validate_deeplink_dir)
                     .transpose()?;
                 let argument = if command.is_none() && dir.is_none() {
                     None
@@ -77,18 +77,6 @@ impl DeepLinkRoute {
             }
             ["settings"] => Ok((Self::Settings, None)),
             ["open", "config"] => Ok((Self::OpenConfig, None)),
-            ["store", "theme-install"] => {
-                let slug = url
-                    .query_pairs()
-                    .find_map(|(key, value)| {
-                        (key.eq_ignore_ascii_case("slug") && !value.trim().is_empty())
-                            .then(|| value.into_owned())
-                    })
-                    .ok_or_else(|| {
-                        "Theme install deeplink requires ?slug=<theme-slug>".to_string()
-                    })?;
-                Ok((Self::ThemeInstall, Some(DeepLinkArgument::Value(slug))))
-            }
             _ => Err(format!(
                 "Unsupported Termy deeplink route: {}",
                 segments.join("/")
@@ -163,6 +151,31 @@ fn validate_deeplink_text(value: String, name: &str, max_len: usize) -> Result<S
         ));
     }
     Ok(value)
+}
+
+fn validate_deeplink_dir(dir: String) -> Result<String, String> {
+    // A web page can launch termy:// links. Opening a directory on a network
+    // share would make Windows authenticate to that host with the user's
+    // NTLM credentials, so only local directories are accepted there.
+    if cfg!(windows) && is_network_path(&dir) {
+        return Err("Termy deeplink dir must be a local directory".to_string());
+    }
+    Ok(dir)
+}
+
+/// Whether `value` names a Windows network or device path: UNC (`\\host\share`,
+/// `//host/share`), `\\?\UNC\...`, or `\\.\...`. Verbatim drive paths
+/// (`\\?\C:\...`) stay local.
+pub(crate) fn is_network_path(value: &str) -> bool {
+    let normalized = value.trim_start().replace('/', "\\");
+    let Some(rest) = normalized.strip_prefix(r"\\") else {
+        return false;
+    };
+    let Some(verbatim) = rest.strip_prefix(r"?\") else {
+        return true;
+    };
+    let bytes = verbatim.as_bytes();
+    !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 #[cfg(test)]
@@ -240,6 +253,49 @@ mod tests {
     }
 
     #[test]
+    fn network_paths_are_recognized() {
+        for path in [
+            r"\\attacker\share",
+            "//attacker/share",
+            r"\\?\UNC\attacker\share",
+            r"\\.\pipe\name",
+            r"  \\attacker\share",
+        ] {
+            assert!(super::is_network_path(path), "{path}");
+        }
+        for path in [
+            r"C:\Users\me",
+            "C:/Users/me",
+            r"\\?\C:\Users\me",
+            "/tmp/demo",
+            "~",
+        ] {
+            assert!(!super::is_network_path(path), "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_network_dir_values() {
+        for dir in [
+            "%5C%5Cattacker%5Cshare",
+            "%2F%2Fattacker%2Fshare",
+            "%5C%5C%3F%5CUNC%5Cattacker%5Cshare",
+            "%5C%5C.%5Cpipe%5Cname",
+        ] {
+            assert!(
+                DeepLinkRoute::parse(&format!("termy://new?dir={dir}")).is_err(),
+                "{dir}"
+            );
+            assert!(
+                DeepLinkRoute::parse(&format!("termy://window?dir={dir}")).is_err(),
+                "{dir}"
+            );
+        }
+        assert!(DeepLinkRoute::parse("termy://new?dir=C%3A%5CUsers").is_ok());
+    }
+
+    #[test]
     fn rejects_new_tab_control_characters() {
         assert!(DeepLinkRoute::parse("termy://new?dir=%2Ftmp%2Fdemo%0D").is_err());
     }
@@ -258,24 +314,6 @@ mod tests {
             DeepLinkRoute::parse("termy://open/config?source=browser#top"),
             Ok((OpenConfig, None))
         );
-    }
-
-    #[test]
-    fn parses_theme_install_route() {
-        assert_eq!(
-            DeepLinkRoute::parse("termy://store/theme-install?slug=catppuccin-mocha"),
-            Ok((
-                ThemeInstall,
-                Some(DeepLinkArgument::Value("catppuccin-mocha".to_string()))
-            ))
-        );
-    }
-
-    #[test]
-    fn rejects_theme_install_without_slug() {
-        let error = DeepLinkRoute::parse("termy://store/theme-install")
-            .expect_err("theme install without slug should be rejected");
-        assert!(error.contains("requires ?slug"));
     }
 
     #[test]

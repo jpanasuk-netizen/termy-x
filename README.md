@@ -1,12 +1,5 @@
 <p align="center">
-  <img alt="Termy-X logo" src="./assets/termyx-logo.png" width="640" />
-</p>
-
-> **Tip:** Press **Ctrl+Shift+X** to open Termy X.
-
-
-<p align="center">
-  <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero.png" width="900" />
+  <img alt="Termy — The terminal, at full speed" src="./assets/termy-readme-hero-v2.png" width="900" />
 </p>
 
 <p align="center">
@@ -35,25 +28,27 @@ Termy is a fast, native terminal for macOS, Linux, and Windows. It combines GPU-
 The public repository is [github.com/jpanasuk-netizen/termy-x](https://github.com/jpanasuk-netizen/termy-x).
 Anyone can clone it, download the source archive, and fork it.
 
-```sh
+`sh
 git clone https://github.com/jpanasuk-netizen/termy-x.git
-```
+`
 
-The validated `1.0.0-rc.10` source, including the release workflow that passed
-CI, is `371f0d80db04b7f97ee3344452cb8ce4f6c8cc65` on branch
-`ci/release-workflow-371f0d80`. Tag `v1.0.0-rc.10` is
-`e21ecf156b2158b696f56cf4392e1b8417d7bcc0` and does not include those later
-workflow commits. Source archives:
+The validated app tree landed on main is 7154b8a56cecedb2b12b1e24bfd7bc8292948c98
+(ci/action-acks-371f0d80), including the release-workflow fix from
+371f0d80db04b7f97ee3344452cb8ce4f6c8cc65. Tag 1.0.0-rc.11 marks this release.
+Tag 1.0.0-rc.10 remains e21ecf156b2158b696f56cf4392e1b8417d7bcc0 and is not moved.
+Source archives:
 
-- https://github.com/jpanasuk-netizen/termy-x/archive/refs/heads/ci/release-workflow-371f0d80.tar.gz
+- https://github.com/jpanasuk-netizen/termy-x/archive/refs/heads/main.tar.gz
+- https://github.com/jpanasuk-netizen/termy-x/archive/refs/heads/ci/action-acks-371f0d80.tar.gz
+- https://github.com/jpanasuk-netizen/termy-x/archive/refs/tags/v1.0.0-rc.11.tar.gz
 - https://github.com/jpanasuk-netizen/termy-x/archive/refs/tags/v1.0.0-rc.10.tar.gz
 
-The source license is the MIT license in [`LICENSE`](./LICENSE), copyright 2026 Lasse Vestergaard.
+The source license is the MIT license in [LICENSE](./LICENSE), copyright 2026 Lasse Vestergaard.
 That copyright and license are unchanged.
 
 A Windows x64 package may also contain the official VLC 3.0.24 win64 runtime.
 VLC, FFmpeg, x264, and those plugins are not MIT. Their notices are shipped
-with the runtime (`COPYING.txt`, `COPYING`, `COPYING.LIB`) and described in
+with the runtime (COPYING.txt, COPYING, COPYING.LIB) and described in
 [release packaging](docs/architecture/release-packaging.md). Windows ARM64
 Setup is not offered.
 
@@ -64,6 +59,59 @@ Download the latest build from **[termy.sh/download](https://termy.sh/download)*
 macOS DMGs from v0.2.75 onward are signed and notarized. Open the DMG and drag
 Termy to `/Applications`. See [macOS troubleshooting](https://termy.sh/docs/getting-started/troubleshooting)
 if the app still does not open.
+
+On Windows, run `Termy-<version>-windows-x64-Setup.exe` (or the `arm64` one on
+ARM64 PCs). It installs for the current user without an administrator prompt;
+pass `/ALLUSERS` or pick **Install for all users** to install under Program
+Files. See the [installation guide](https://termy.sh/docs/getting-started/installation#windows)
+for SmartScreen and winget notes.
+
+### Video on Windows
+
+Video inside Termy uses libVLC 3 from a `vlc` folder next to `termy.exe`. That
+folder is not in git and Termy does not install VLC. The tested runtime is
+official VideoLAN **3.0.24** for 64-bit Windows, not whatever the download page
+lists as current:
+
+[vlc-3.0.24-win64.zip](https://download.videolan.org/pub/videolan/vlc/3.0.24/win64/vlc-3.0.24-win64.zip)
+`sha256 fcf30850371ad10c9373cc4f0f4501e7dee49e3e9ae9f20c72fb2661a1ca6323`
+
+`scripts/windows/stage-libvlc.ps1` copies `libvlc.dll`, `libvlccore.dll`, and
+the playback plugins into that folder. It does not copy `vlc.exe`, and it does
+not change a VLC install already on the PC. Photos do not need it. If the
+folder is missing or incomplete, video shows an error and does not open VLC or
+mpv. A 32-bit tree is refused. When `vlc\libvlc.dll` sits beside Termy, that
+copy is used even if VLC is also installed under `C:\Program Files\VideoLAN\VLC`.
+
+The stage step also copies
+[vlc-3.0.24.tar.xz](https://download.videolan.org/pub/videolan/vlc/3.0.24/vlc-3.0.24.tar.xz)
+(`sha256 e7cab503d1d7d5849b89d2cf0e1ee60d0ef6d012407791b644b9cfc0cc225fdf`)
+into `vlc\source`, plus `COPYING` and `COPYING.LIB` from that tree.
+`COPYING.txt` in the binary archive is GPL-2.0. `COPYING.LIB` is LGPL-2.1.
+libVLC's header is LGPL-2.1-or-later. `modules/codec/avcodec` is LGPL-2.1-or-later
+and links FFmpeg. The stage step also copies `ffmpeg-8.1.2.tar.xz` from
+VideoLAN's 3.0.24 win64 build artifacts after its sha512 matches
+`contrib/src/ffmpeg/SHA512SUMS` in the VLC source, and the x264 snapshot
+`e067ab0b530395f90b578f6d05ab0a225e2efdf9` named by `contrib/src/x264/rules.mak`.
+`modules/codec/x264.c` and
+`modules/control/dummy.c` are GPL-2.0-or-later. The x264/x265 encoder plugins
+are left out. `libdummy_plugin.dll` stays because playback asks for
+`--intf=dummy`. The stager also still copies other GPL-2.0-or-later plugins
+(DirectShow, hotkeys, lua, and the rest listed in
+`docs/architecture/release-packaging.md`). FFmpeg's own configure flags inside
+`libavcodec_plugin.dll` were not recovered, so that plugin is not labeled GPL
+here and is not labeled LGPL-only. The VLC source, the matching FFmpeg 8.1.2
+archive, and the matching x264 snapshot are in `vlc\source`. Other contrib
+archives are not, and nothing in this repo rebuilds the DLLs from those
+archives. That is a legal review, not a failed build. Termy's license is
+unchanged. `termy.exe` imports `msvcp140.dll`, `vcruntime140.dll`, and `vcruntime140_1.dll`.
+The stage step places Microsoft's official x64 installer
+`VC_redist.x64.exe` (file version 14.51.36247, sha256
+`843068991daaa1f73ad9f6239bce4d0f6a07a51f18c37ea2a867e9beca71295c`)
+in `prereqs` beside `termy.exe`. It does not run that installer and it does
+not copy those DLLs out of System32. A machine that does not already have
+them needs that executable run once. libVLC itself imports `msvcrt.dll`,
+which is a Windows system DLL and is a different runtime.
 
 ### Build from source
 
@@ -136,9 +184,6 @@ x splash
 x doctor
 x timeline
 x search "gpui" --recent --limit 10
-x feed --topic "generator sizing" --hot
-x feed --upcoming
-x feed --dry-run --keys "j;r;type:hello from the terminal;p;y"
 x lookup @termy
 x thread 1001
 x trends --place worldwide
@@ -152,66 +197,12 @@ x research "gpui terminals"
 termy x doctor                   # same commands through the Termy CLI
 ```
 
-
-`x feed` is the hot / upcoming list. With no topic it loads the home timeline on the free OpenCLI session (`twitter timeline`), or `twitter search` when you pass `--topic` or type `/subject`. `--hot` ranks by engagement then recency. `--upcoming` (the default) ranks by recency then engagement. The same list accepts a reply:
-
-| Key | Action |
-| --- | --- |
-| `j` / `k` | Next / previous tweet |
-| `h` / `u` | Re-rank the current list hot / upcoming. No extra request. |
-| `/subject` | Topic search into the same list. One OpenCLI search. |
-| `r` | Open the reply box for the selected tweet |
-| a line of text, or `type:text` | Set the reply draft. Does not post. |
-| `p` | Preview the exact reply |
-| `y` | Post that preview as the logged-in account. Ignored until `p`. |
-| `esc` | Close the reply box. Nothing is posted. |
-| `q` | Quit |
-
-`y` calls `opencli twitter reply` through the existing confirm path. `--dry-run` prints the plan and does not post. There is no auto-reply and no bulk reply. The status bar shows `quota: N remaining` only when that session response already includes a remaining count. Otherwise it says `quota: not reported`. It does not call the paid X API to ask.
-
 `--json` prints machine-readable output. `--provider mock` forces fixtures (what the tests use). Tones for `x draft` are `punchy`, `informative`, `thread`, and `reply`.
 
 `x` and `x splash` print an original Unicode bird (blue and cyan, pink heart). `NO_COLOR` turns the ANSI colors off.
 
 `x post` and `x publish` never post until you type `yes`. They print the exact text of every part first, with the weighted count of each part (twitter-text v3, limit 280). `--dry-run` prints the same plan, including which provider would be used, and does not ask and does not post. A thread sent through the web intent opens one intent at a time: each part is copied to the clipboard, then the CLI waits for `next`.
 
-### Quickstart (60 seconds, no config)
-
-```bash
-cargo build --release -p termy_x_cli   # builds ./target/release/x
-./target/release/x doctor              # what is connected? (free, read-only)
-./target/release/x --provider mock timeline   # try it instantly on fixture data
-./target/release/x post --dry-run "hello world"  # preview a post — never posts
-```
-
-No account yet? That is fine — the commands above work with zero setup.
-Connect yours when you are ready (next section).
-
-### Connect your own X account
-
-Run `x connect` for these steps inside the tool, and `x connect --check`
-to prove which of *your* accounts is connected (read-only, never posts).
-
-
-Termy X has no built-in account. It never ships a token, cookie, or default handle, and it always acts as whoever is signed in on your own machine:
-
-- **OpenCLI (recommended):** install OpenCLI 2.0.0 (`npm install -g @jackwener/opencli`, [releases](https://github.com/jackwener/OpenCLI/releases/tag/v2.0.0)) and its Browser Bridge extension, then log into https://x.com in your own Chrome. Termy X reads and posts through that session. OpenCLI 1.8.8 also works; 2.0.0 changed its JSON to an `{ok, data}` envelope, which Termy X parses.
-- **twitter-cli:** install [twitter-cli](https://github.com/public-clis/twitter-cli) and sign in with it (or set your own `TWITTER_AUTH_TOKEN` and `TWITTER_CT0` from your browser's x.com cookies). These stay on your machine.
-- **Official X API (optional, off by default):** use your own app's client id via `TERMY_X_CLIENT_ID`; the token is stored in your OS keyring. If your app gives you a bearer token, set `TERMY_X_BEARER_TOKEN` in your shell only (never in a file) and run `x connect --check` — it calls `GET /2/users/me` and prints your `@handle`, never the token. Note: an app-only bearer token cannot identify a personal account, so OpenCLI is the reliable personal path.
-
-Run `x doctor` to see which providers are working. If nothing is signed in, the panel and CLI say so in plain words and tell you the next step — they do not sit on silent empty tabs.
-
-**In the panel (easiest):** press `Ctrl+Shift+X`. If you are not connected, a **Connect your X** card sits at the top:
-
-1. Open Chrome.
-2. Go to x.com and log in as yourself.
-3. Press **Connect my X**.
-
-You should see **Connected as @yourname**. Your timeline, search, and trends then fill in as *your* account. **Disconnect / switch account** (next to Connected) forgets this machine's saved key and remembered account; log in to X in Chrome as the other account and press **Connect my X** again to switch. Termy X never asks for your X password.
-
-**Your own developer key instead:** press **Use my own developer key instead** in that card and paste your key (stored in your OS keychain, or a private `0600` file — never in `x.toml`, never shown), or from a terminal run `x connect --save-token`, then `x connect --check`. `x connect --disconnect` forgets it. The key is always *yours* — Termy X ships with no account, token, or default handle.
-
-Your config lives in your own config folder (`%APPDATA%\termy` on Windows, `~/.config/termy` on Linux, `~/Library/Application Support/termy` on macOS).
 ### Free providers
 
 Reads try, in order:
@@ -228,7 +219,7 @@ Publishing tries, in order, and still requires you to type `yes`:
 2. `twitter post` / `twitter post --reply-to`, only when `twitter --help` lists `post`
 3. An X web intent: `https://x.com/intent/post?text=...` (and `in_reply_to` on the first part). One intent per part. Termy X copies the part and opens the intent; you click Post.
 
-`x doctor` reports each free provider as `working`, `missing`, or `not logged in`, plus the AI endpoint. It says **No X API credits are needed.** It never posts and never logs in. Cookie and browser-session providers are labeled "uses your own logged-in session". On Windows, command shims resolve in PATHEXT order (`opencli.cmd` ahead of the extensionless shell script, then `.ps1`) and run with `CREATE_NO_WINDOW` so a console does not flash.
+`termy-xcli doctor` reports each free provider as `working`, `missing`, or `not logged in`, plus the AI endpoint. It says **No X API credits are needed.** It never posts and never logs in. Cookie and browser-session providers are labeled "uses your own logged-in session". On Windows, command shims resolve in PATHEXT order (`opencli.cmd` ahead of the extensionless shell script, then `.ps1`) and run with `CREATE_NO_WINDOW` so a console does not flash.
 
 ### Optional official API
 

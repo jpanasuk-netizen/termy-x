@@ -144,6 +144,17 @@ while IFS= read -r manifest; do
   require_crate_readme_metadata "$crate_dir"
 done < <(find crates -mindepth 2 -maxdepth 2 -name Cargo.toml | sort)
 
+# The @termysh/pty addon ships only termy_core's PTY layer.
+for forbidden_dep in gpui keyring ureq fontdb termy; do
+  check_forbidden_all_target_dep termy_pty "$forbidden_dep"
+done
+
+# libtermy_engine is the engine alone: no PTY transport, config, keyring,
+# fonts, network, plugins or multiplexer.
+for forbidden_dep in gpui keyring ureq fontdb flume polling dirs uuid termy; do
+  check_forbidden_all_target_dep termy_engine_ffi "$forbidden_dep"
+done
+
 require_pattern './scripts/build-dmg-signed\.sh' \
   ".github/workflows/release.yml" \
   "release workflow must call scripts/build-dmg-signed.sh"
@@ -242,6 +253,9 @@ require_pattern 'scripts/aur/\$\{APP_NAME_LOWER\}\.desktop' \
 require_pattern 'ensure_folder_document_type' \
   "scripts/build-dmg.sh" \
   "macOS DMG packaging must register folders for Open With"
+require_pattern 'NSLocalNetworkUsageDescription' \
+  "scripts/build-dmg.sh" \
+  "macOS DMG packaging must declare local network usage permission"
 require_pattern 'public.folder' \
   "scripts/build-dmg.sh" \
   "macOS DMG packaging must declare public.folder document support"
