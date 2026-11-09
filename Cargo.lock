@@ -7670,7 +7670,7 @@ dependencies = [
 
 [[package]]
 name = "termy"
-version = "1.0.0-rc.12"
+version = "1.0.0-rc.13"
 dependencies = [
  "anyhow",
  "bincode",
@@ -7720,7 +7720,7 @@ dependencies = [
 
 [[package]]
 name = "termy_cli"
-version = "1.0.0-rc.12"
+version = "1.0.0-rc.13"
 dependencies = [
  "anyhow",
  "base64",

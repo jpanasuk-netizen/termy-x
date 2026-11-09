@@ -12,6 +12,7 @@ live under `website/content/`.
 - [1.0.0-rc.10 release notes](releases/1.0.0-rc.10.md): candidate changes, including a link-safety fix.
 - [1.0.0-rc.11 release notes](releases/1.0.0-rc.11.md): action-acks live suite, quote menu fix, like/follow CLI.
 - [1.0.0-rc.12 release notes](releases/1.0.0-rc.12.md): optional account sync.
+- [1.0.0-rc.13 release notes](releases/1.0.0-rc.13.md): rc.12 plus clippy fix for Supabase default-key guard.
 
 ## Architecture
 
