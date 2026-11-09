@@ -341,6 +341,10 @@ pub enum GuiWrite {
         media: Vec<PathBuf>,
     },
     Repost { target_id: String },
+    Like { target_id: String },
+    Unlike { target_id: String },
+    Follow { handle: String },
+    Unfollow { handle: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,6 +466,113 @@ pub fn run_gui_write(
                 },
             }
         }
+        PreparedKind::Engage { action, url, target_id } => {
+            let verb = action.opencli_verb();
+            log_action(verb, "start", &[("ack", "pending"), ("new_id", "none")]);
+            let toggle = match action {
+                EngageAction::Like | EngageAction::Unlike => crate::action_state::ToggleKind::Like,
+                _ => crate::action_state::ToggleKind::Repost,
+            };
+            let now_active = matches!(action, EngageAction::Like | EngageAction::Retweet);
+            db.begin_toggle(&request.account, toggle, &target_id, now_active, seq, now);
+            match publisher.engage(action, &url, None, &[]) {
+                Ok(receipt) => {
+                    if let Err(error) = prove_engage(action, &receipt, None) {
+                        let _ = db.finish_toggle(
+                            &request.account,
+                            toggle,
+                            &target_id,
+                            seq,
+                            false,
+                            Some(&error),
+                            now,
+                        );
+                        log_action(verb, "ack", &[("ack", "rejected"), ("new_id", "none")]);
+                        return GuiWriteOutcome::Rejected { message: error };
+                    }
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        toggle,
+                        &target_id,
+                        seq,
+                        true,
+                        None,
+                        now,
+                    );
+                    db.note_opencli_contract(&request.account, toggle, &target_id);
+                    log_action(verb, "ack", &[("ack", "confirmed"), ("new_id", &target_id)]);
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
+                    }
+                }
+                Err(error) => {
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        toggle,
+                        &target_id,
+                        seq,
+                        false,
+                        Some(&error),
+                        now,
+                    );
+                    log_action(verb, "ack", &[("ack", "rejected"), ("new_id", "none")]);
+                    GuiWriteOutcome::Rejected {
+                        message: format!("{error} Nothing was retried."),
+                    }
+                }
+            }
+        }
+        PreparedKind::Follow { handle, follow } => {
+            let verb = if follow { "follow" } else { "unfollow" };
+            log_action(verb, "start", &[("ack", "pending"), ("new_id", "none")]);
+            db.begin_toggle(
+                &request.account,
+                crate::action_state::ToggleKind::Follow,
+                &handle,
+                follow,
+                seq,
+                now,
+            );
+            match publisher.set_follow(&handle, follow) {
+                Ok(receipt) => {
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        crate::action_state::ToggleKind::Follow,
+                        &handle,
+                        seq,
+                        true,
+                        None,
+                        now,
+                    );
+                    db.note_opencli_contract(
+                        &request.account,
+                        crate::action_state::ToggleKind::Follow,
+                        &handle,
+                    );
+                    log_action(verb, "ack", &[("ack", "confirmed"), ("new_id", "none")]);
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
+                    }
+                }
+                Err(error) => {
+                    let _ = db.finish_toggle(
+                        &request.account,
+                        crate::action_state::ToggleKind::Follow,
+                        &handle,
+                        seq,
+                        false,
+                        Some(&error),
+                        now,
+                    );
+                    log_action(verb, "ack", &[("ack", "rejected"), ("new_id", "none")]);
+                    GuiWriteOutcome::Rejected {
+                        message: format!("{error} Nothing was retried."),
+                    }
+                }
+            }
+        }
         PreparedKind::Repost { url, target_id } => {
             db.begin_toggle(
                 &request.account,
@@ -531,6 +642,12 @@ enum PreparedKind {
         media: Vec<PathBuf>,
     },
     Repost { url: String, target_id: String },
+    Engage {
+        action: EngageAction,
+        url: String,
+        target_id: String,
+    },
+    Follow { handle: String, follow: bool },
 }
 
 struct PreparedWrite {
@@ -558,6 +675,18 @@ impl PreparedWrite {
                 provider.as_str(),
                 target_id,
                 url
+            ),
+            PreparedKind::Engage { action, url, target_id } => format!(
+                "provider {} · {} {} · url {}",
+                provider.as_str(),
+                action.opencli_verb(),
+                target_id,
+                url
+            ),
+            PreparedKind::Follow { handle, follow } => format!(
+                "provider {} · {} @{handle}",
+                provider.as_str(),
+                if *follow { "follow" } else { "unfollow" }
             ),
         }
     }
@@ -612,6 +741,36 @@ fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
             let url = crate::model::post_url("", &target_id);
             Ok(PreparedWrite {
                 kind: PreparedKind::Repost { url, target_id },
+                text: String::new(),
+            })
+        }
+        GuiWrite::Like { target_id } | GuiWrite::Unlike { target_id } => {
+            let target_id = require_status_id(target_id)?;
+            let action = if matches!(write, GuiWrite::Like { .. }) {
+                EngageAction::Like
+            } else {
+                EngageAction::Unlike
+            };
+            let url = crate::model::post_url("", &target_id);
+            Ok(PreparedWrite {
+                kind: PreparedKind::Engage {
+                    action,
+                    url,
+                    target_id,
+                },
+                text: String::new(),
+            })
+        }
+        GuiWrite::Follow { handle } | GuiWrite::Unfollow { handle } => {
+            let handle = crate::model::strip_handle(handle).to_string();
+            if handle.is_empty() {
+                return Err("No account to follow. Nothing was changed.".into());
+            }
+            Ok(PreparedWrite {
+                kind: PreparedKind::Follow {
+                    handle,
+                    follow: matches!(write, GuiWrite::Follow { .. }),
+                },
                 text: String::new(),
             })
         }
@@ -2251,14 +2410,18 @@ pub fn quote_page_script(target_id: &str, commentary: Option<&str>, inspect: boo
   for (let i = 0; i < 20; i++) {{
     menu = document.querySelector('[role="menu"], [data-testid="Dropdown"]');
     const root = menu || null;
-    const items = root ? Array.from(root.querySelectorAll('[role="menuitem"]')) : [];
+    const items = root ? Array.from(root.querySelectorAll('[role="menuitem"], [data-testid="quote"], [data-testid="tweetQuote"]')) : [];
     quoteItem = items.find((el) => {{
       const tid = el.getAttribute("data-testid") || "";
       if (tid === "retweetConfirm" || tid === "unretweetConfirm" || tid === "reply") return false;
-      const label = (el.innerText || "").trim().split("\\n")[0].trim();
-      return /^quote$/i.test(label);
+      const aria = (el.getAttribute("aria-label") || "").replace(/\\s+/g, " ").trim();
+      const label = (el.innerText || "").replace(/\\u00a0/g, " ").trim().split("\\n")[0].trim();
+      if (tid === "quote" || tid === "tweetQuote") return true;
+      if (/^quote$/i.test(label) || /^quote$/i.test(aria)) return true;
+      return /^quote\\b/i.test(aria) && !/repost/i.test(aria);
     }});
     if (quoteItem) break;
+    if (i === 7 || i === 14) opener.click();
     await sleep(250);
   }}
   if (menu) {{
@@ -2492,12 +2655,17 @@ pub fn quote_menu_read_script(target_id: &str) -> String {
   let menu = null;
   for (let i = 0; i < 20; i++) {{
     menu = document.querySelector('[role="menu"], [data-testid="Dropdown"]');
-    const items = menu ? Array.from(menu.querySelectorAll('[role="menuitem"]')) : [];
+    const items = menu ? Array.from(menu.querySelectorAll('[role="menuitem"], [data-testid="quote"], [data-testid="tweetQuote"], a[href*="/compose/post"]')) : [];
     quoteItem = items.find((el) => {{
       const tid = el.getAttribute("data-testid") || "";
       if (tid === "retweetConfirm" || tid === "unretweetConfirm" || tid === "reply") return false;
-      const label = (el.innerText || "").trim().split("\n")[0].trim();
-      return /^quote$/i.test(label);
+      const aria = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
+      const label = (el.innerText || "").replace(/\u00a0/g, " ").trim().split("\n")[0].trim();
+      if (tid === "quote" || tid === "tweetQuote") return true;
+      if (/^quote$/i.test(label) || /^quote$/i.test(aria)) return true;
+      if (/^quote\b/i.test(aria) && !/repost/i.test(aria)) return true;
+      const href = el.getAttribute("href") || "";
+      return href.indexOf("/compose/post") >= 0 && /^quote$/i.test(label);
     }});
     if (quoteItem) break;
     await sleep(250);
@@ -3255,6 +3423,11 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
         if report.attach.is_empty() { "-" } else { &report.attach },
         report.message
     )
+}
+
+/// The menu read recorded a Quote row. The repost confirm is not this row.
+pub fn quote_row_recorded(message: &str) -> bool {
+    message.contains("Quote row recorded") && !message.contains("Refused the repost confirm")
 }
 
 /// Post is allowed only for a quote attachment of this exact status.
@@ -4613,6 +4786,12 @@ mod tests {
         assert!(!menu.contains(".click("));
         assert!(menu.contains("Quote row recorded"));
         assert!(menu.contains("retweetConfirm"));
+        assert!(menu.contains("aria-label"));
+        assert!(menu.contains("tweetQuote"));
+        assert!(menu.contains("data-testid=\"quote\""));
+        assert!(crate::publish::quote_row_recorded("Quote row recorded. Post was not clicked."));
+        assert!(!crate::publish::quote_row_recorded("Quote menu item did not appear. Post was not clicked."));
+        assert!(!crate::publish::quote_row_recorded("Refused the repost confirm. Post was not clicked."));
         let opener = crate::publish::quote_opener_click_args(
             browser_cli_from_help(""),
             "termyx-quote",

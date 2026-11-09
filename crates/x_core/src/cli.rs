@@ -256,6 +256,26 @@ enum WriteOp {
         #[arg(long)]
         to: String,
     },
+    /// Like one status. Same path as the panel Like button.
+    Like {
+        #[arg(long)]
+        to: String,
+    },
+    /// Remove a like. Same path as the panel Unlike button.
+    Unlike {
+        #[arg(long)]
+        to: String,
+    },
+    /// Follow one handle. Same path as the panel Follow button.
+    Follow {
+        #[arg(long)]
+        to: String,
+    },
+    /// Unfollow one handle. Same path as the panel Unfollow button.
+    Unfollow {
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -395,6 +415,10 @@ fn print_help_guide() {
     println!("  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post");
     println!("  termy-xcli write quote --to ID \"text\"         Dry-run a Q-tweet");
     println!("  termy-xcli write repost --to ID                Dry-run a repost");
+    println!("  termy-xcli write like --to ID                  Dry-run a like");
+    println!("  termy-xcli write unlike --to ID                Dry-run an unlike");
+    println!("  termy-xcli write follow --to HANDLE            Dry-run a follow");
+    println!("  termy-xcli write unfollow --to HANDLE          Dry-run an unfollow");
     println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
     println!("  termy-xcli post \"text\"");
     println!("  termy-xcli post --dry-run \"text\"          Plan only - never posts");
@@ -1509,6 +1533,10 @@ fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -
             }
         }
         WriteOp::Repost { to } => GuiWrite::Repost { target_id: to },
+        WriteOp::Like { to } => GuiWrite::Like { target_id: to },
+        WriteOp::Unlike { to } => GuiWrite::Unlike { target_id: to },
+        WriteOp::Follow { to } => GuiWrite::Follow { handle: to },
+        WriteOp::Unfollow { to } => GuiWrite::Unfollow { handle: to },
     };
     let approved = confirm.as_deref() == Some("yes");
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
@@ -2072,6 +2100,98 @@ mod tests {
             0
         );
         assert!(runner.calls.lock().expect("calls").is_empty());
+        assert_eq!(
+            execute(
+                &["write".into(), "like".into(), "--help".into()],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert_eq!(
+            execute(
+                &[
+                    "write".into(),
+                    "follow".into(),
+                    "--to".into(),
+                    "moosaswrld".into()
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert!(runner.calls.lock().expect("calls").is_empty());
+    }
+
+    #[test]
+    fn write_like_and_follow_use_the_panel_path_and_a_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(ScriptedRunner::new());
+        runner.script(
+            "opencli-like",
+            &["twitter", "--help"],
+            "post <text>\nlike\nunlike\nfollow\nunfollow\nretweet\n",
+        );
+        runner.script(
+            "opencli-like",
+            &["twitter", "like"],
+            r#"[{"status":"success","message":"clicked","unconfirmed":true}]"#,
+        );
+        runner.script(
+            "opencli-like",
+            &["twitter", "timeline"],
+            r#"[{"id":"2119746741364981888","favorited":true}]"#,
+        );
+        runner.script(
+            "opencli-like",
+            &["twitter", "follow"],
+            r#"[{"status":"success","message":"clicked","unconfirmed":true}]"#,
+        );
+        runner.script(
+            "opencli-like",
+            &["twitter", "user"],
+            r#"{"screen_name":"moosaswrld","following":false}"#,
+        );
+        let mut io = test_io(dir.path());
+        io.config.opencli_bin = "opencli-like".into();
+        io.config.provider = Some(ProviderId::OpenCli);
+        io.runner = runner.clone();
+        crate::connect::save_connected_handle(&io.config, "jasper_black").unwrap();
+        assert_eq!(
+            execute(
+                &[
+                    "write".into(),
+                    "like".into(),
+                    "--to".into(),
+                    "2119746741364981888".into(),
+                    "--confirm".into(),
+                    "yes".into()
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("like")));
+        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline")));
+        assert_ne!(
+            execute(
+                &[
+                    "write".into(),
+                    "follow".into(),
+                    "--to".into(),
+                    "moosaswrld".into(),
+                    "--confirm".into(),
+                    "yes".into()
+                ],
+                &mut io,
+                false
+            ),
+            0
+        );
+        assert!(!runner.calls.lock().unwrap().iter().any(|(_, args)| args.iter().any(|arg| arg == "x.exe")));
     }
 
     #[test]

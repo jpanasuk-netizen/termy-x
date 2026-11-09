@@ -2122,10 +2122,11 @@ fn open_visible_quote_page(
             _ => std::thread::sleep(Duration::from_millis(200)),
         }
     }
+    let focus_note = focus_quote_window(bin, runner, status_id);
     let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
     let echoed = crate::publish::quote_landed_query(&opened.stdout, status_id);
     let trace = format!(
-        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {echoed} · visibility after open {} · select {select_public} {select_note} · {eval_location} · visibility after select {}",
+        "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {echoed} · visibility after open {} · select {select_public} {select_note} · {eval_location} · {focus_note} · visibility after select {}",
         after_open.summary, after_select.summary
     );
     if !after_select.ready {
@@ -2208,8 +2209,69 @@ fn quote_owned_leftover(bin: &str, runner: &dyn crate::io::CommandRunner) -> Str
     )
 }
 
-/// Read-only Chrome facts for the status tab. `windows.update` is not called:
-/// OpenCLI 2.0.2 rejects it for the owned group with managed_resource_conflict.
+/// One restore of the owned quote window when Chrome says it is minimized
+/// or unfocused. A rejected update is reported and not retried. This does
+/// not click Post.
+fn focus_quote_window(
+    bin: &str,
+    runner: &dyn crate::io::CommandRunner,
+    status_id: &str,
+) -> String {
+    let listed = quote_run(
+        bin,
+        runner,
+        &chrome_call_args("tabs.query", "[{}]"),
+        Duration::from_secs(20),
+    );
+    let Ok(listed) = listed else {
+        return "window focus unread".into();
+    };
+    if listed.status != 0 {
+        return "window focus unread".into();
+    }
+    let tabs = crate::publish::quote_status_tabs(&listed.stdout, status_id);
+    if tabs.len() != 1 {
+        return format!("window focus unread match {}", tabs.len());
+    }
+    let window_id = tabs[0].window_id;
+    let window = quote_run(
+        bin,
+        runner,
+        &chrome_call_args("windows.get", &format!("[{window_id}]")),
+        Duration::from_secs(20),
+    );
+    let Ok(window) = window else {
+        return "window focus unread".into();
+    };
+    if window.status != 0 {
+        return "window focus unread".into();
+    }
+    let Some((state, focused)) = crate::publish::quote_window_state(&window.stdout) else {
+        return "window focus unread".into();
+    };
+    if state != "minimized" && focused {
+        return "window already focused".into();
+    }
+    let update = quote_run(
+        bin,
+        runner,
+        &chrome_call_args(
+            "windows.update",
+            &format!(r#"[{window_id},{{"focused":true,"state":"normal"}}]"#),
+        ),
+        Duration::from_secs(20),
+    );
+    match update {
+        Ok(output) if output.status == 0 && !output.stdout.contains("\"ok\":false") => {
+            "window focus updated".into()
+        }
+        Ok(_) => "windows.update rejected".into(),
+        Err(_) => "windows.update rejected".into(),
+    }
+}
+
+/// Read-only Chrome facts for the status tab. A focus restore, when needed,
+/// already ran. This note does not call `windows.update` again.
 fn quote_container_note(
     bin: &str,
     runner: &dyn crate::io::CommandRunner,
@@ -2424,32 +2486,44 @@ fn run_quote_attachment_epoch(
         Ok(_) => (String::new(), String::new(), "source missing".into()),
         Err(_) => (String::new(), String::new(), "source unread".into()),
     };
-    let opener = match quote_native_opener(bin, runner, cli, surface.target.as_deref(), target_id) {
-        Ok(note) => note,
-        Err(note) => {
-            let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
-            let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
-            let leftover = quote_owned_leftover(bin, runner);
-            return Err(format!(
-                "stage menu · {view} · {note} · {shot} · {close_note} · {leftover} · Post was not clicked"
-            ));
-        }
-    };
     let menu_js = crate::publish::quote_menu_read_script(target_id);
-    let menu_note = match browser_page_json(
-        bin,
-        runner,
-        cli,
-        QUOTE_SESSION,
-        None,
-        &menu_js,
-        "qx",
-        true,
-        false,
-    ) {
-        Ok(report) => report.message,
-        Err(error) => error,
-    };
+    let mut opener = String::new();
+    let mut menu_note = String::new();
+    for _attempt in 0..3 {
+        match quote_native_opener(bin, runner, cli, surface.target.as_deref(), target_id) {
+            Ok(note) => opener = note,
+            Err(note) => {
+                opener = note;
+                menu_note = "Quote menu item did not appear. Post was not clicked.".into();
+                continue;
+            }
+        }
+        menu_note = match browser_page_json(
+            bin,
+            runner,
+            cli,
+            QUOTE_SESSION,
+            None,
+            &menu_js,
+            "qx",
+            true,
+            false,
+        ) {
+            Ok(report) => report.message,
+            Err(error) => error,
+        };
+        if crate::publish::quote_row_recorded(&menu_note) {
+            break;
+        }
+    }
+    if !crate::publish::quote_row_recorded(&menu_note) {
+        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
+        let leftover = quote_owned_leftover(bin, runner);
+        return Err(format!(
+            "stage menu · {view} · {opener} · menu {menu_note} · {shot} · {close_note} · {leftover} · Post was not clicked"
+        ));
+    }
     let quote_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
     let quote_click = quote_run(bin, runner, &quote_args, Duration::from_secs(20));
     let quote_note = match &quote_click {
@@ -5466,6 +5540,90 @@ mod tests {
     }
 
     #[test]
+    fn quote_menu_retries_the_opener_once_and_clicks_quote_once() {
+        use crate::io::{CommandOutput, CommandRunner};
+        use crate::publish::EngageAction;
+        struct RetryRunner {
+            menu_reads: Mutex<usize>,
+            opener_clicks: Mutex<usize>,
+            quote_clicks: Mutex<usize>,
+            posts: Mutex<usize>,
+        }
+        impl CommandRunner for RetryRunner {
+            fn exists(&self, _: &str) -> bool {
+                true
+            }
+            fn run(&self, _: &str, args: &[String]) -> Result<CommandOutput, String> {
+                let joined = args.join(" ");
+                if args.get(1).map(String::as_str) == Some("--help") {
+                    return Ok(CommandOutput {
+                        status: 0,
+                        stdout: "Usage: opencli browser <session> <command>\n--window background\n".into(),
+                        stderr: String::new(),
+                    });
+                }
+                if joined.contains("windows.update") || joined.contains("tabs.query") {
+                    return Err("focus unread".into());
+                }
+                if args.iter().any(|arg| arg == "click") && args.iter().any(|arg| arg == "Quote") {
+                    *self.quote_clicks.lock().unwrap() += 1;
+                } else if args.iter().any(|arg| arg.contains("data-testid=\\\"retweet\\\""))
+                    || args.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]"))
+                {
+                    *self.opener_clicks.lock().unwrap() += 1;
+                }
+                if joined.contains("__qxPost") {
+                    *self.posts.lock().unwrap() += 1;
+                }
+                let stdout = if joined.contains("tab") && joined.contains("list") {
+                    r#"{"ok":true,"data":[]}"#.to_string()
+                } else if args.iter().any(|arg| arg == "open") {
+                    r#"{"ok":true,"data":{"url":"https://x.com/i/status/20","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#.to_string()
+                } else if args.iter().any(|arg| arg == "select") {
+                    r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#.to_string()
+                } else if joined.contains("document.visibilityState") {
+                    r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#.to_string()
+                } else if joined.contains("location.href") {
+                    "https://x.com/i/status/20".to_string()
+                } else if joined.contains("__qxSnap") {
+                    r#"{"stage":"composer","path":"/i/status/20","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"message":"No quote attachment for 20. Post was not clicked."}"#.to_string()
+                } else if joined.contains("eval(atob(window.__qx))") && !joined.contains("__qxSnap") {
+                    let mut reads = self.menu_reads.lock().unwrap();
+                    *reads += 1;
+                    if *reads == 1 {
+                        r#"{"stage":"menu","message":"Quote menu item did not appear. Post was not clicked.","clicked_post":false,"card":false}"#.to_string()
+                    } else {
+                        r#"{"stage":"menu","selected_label":"Quote","message":"Quote row recorded. Post was not clicked.","clicked_post":false,"card":false,"quote_testids":0}"#.to_string()
+                    }
+                } else if args.iter().any(|arg| arg == "click") {
+                    r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#.to_string()
+                } else if joined.contains("__qxSource") {
+                    r#"{"stage":"source","source_screen":"ada","source_text":"hi","card":false,"clicked_post":false,"message":"source ready"}"#.to_string()
+                } else {
+                    "ok".to_string()
+                };
+                Ok(CommandOutput { status: 0, stdout, stderr: String::new() })
+            }
+        }
+        let runner = Arc::new(RetryRunner {
+            menu_reads: Mutex::new(0),
+            opener_clicks: Mutex::new(0),
+            quote_clicks: Mutex::new(0),
+            posts: Mutex::new(0),
+        });
+        let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
+        let err = publisher
+            .engage(EngageAction::Quote, "https://x.com/i/status/20", Some("my words"), &[])
+            .unwrap_err();
+        assert!(err.contains("Post was not clicked"), "{err}");
+        assert!(err.contains("No quote attachment"), "{err}");
+        assert_eq!(*runner.menu_reads.lock().unwrap(), 2);
+        assert_eq!(*runner.opener_clicks.lock().unwrap(), 2);
+        assert_eq!(*runner.quote_clicks.lock().unwrap(), 1);
+        assert_eq!(*runner.posts.lock().unwrap(), 0);
+    }
+
+    #[test]
     fn quote_write_failure_keeps_the_card_counts_and_cleans_up() {
         use crate::publish::EngageAction;
         let ready = r#"{"stage":"inspect","path":"/cryptoXRPwhale/status/2118971448614334959","composer":true,"composer_kind":"quote","card":true,"quote_testids":2,"quoted_status_id":"2118971448614334959","clicked_post":false,"clicked_repost_confirm":false,"attach":"card-bind article text-equal yes","message":"Quote attachment is visible. Post was not clicked."}"#;
@@ -5580,6 +5738,11 @@ mod tests {
             r#"{"ok":true,"data":[{"page":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},{"page":"B94452EA22F530887AF90E615F8D7031"}]}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/compose/post");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
+            r#"{"stage":"menu","selected_label":"Quote","message":"Quote row recorded. Post was not clicked.","clicked_post":false,"card":false,"quote_testids":0}"#,
+        );
         let vis = crate::publish::quote_visibility_expr("20");
         runner.script(
             "opencli",
@@ -5719,7 +5882,7 @@ mod tests {
         assert!(err.contains("group OpenCLI Browser"), "{err}");
         assert!(err.contains("window state minimized"), "{err}");
         assert!(err.contains("focused no"), "{err}");
-        assert!(err.contains("windows.update not called"), "{err}");
+        assert!(err.contains("windows.update rejected") || err.contains("window focus"), "{err}");
         assert!(err.contains("ok selected absent"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
@@ -5734,7 +5897,7 @@ mod tests {
                 && args.iter().any(|arg| arg.contains("document.visibilityState"))
         }));
         assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update")));
+        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update")));
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
