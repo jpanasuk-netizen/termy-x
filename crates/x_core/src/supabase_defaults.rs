@@ -26,9 +26,12 @@ pub fn builtin_anon_key() -> Option<&'static str> {
 
 fn usable(key: &str) -> Option<&str> {
     let key = key.trim();
-    if key.is_empty() || key == ANON_KEY_PLACEHOLDER || key.starts_with("REPLACE_") {
-        None
-    } else if key.contains("service_role") {
+    // Reject empty/placeholder keys and any service-role key (never ship one).
+    if key.is_empty()
+        || key == ANON_KEY_PLACEHOLDER
+        || key.starts_with("REPLACE_")
+        || key.contains("service_role")
+    {
         None
     } else {
         Some(key)
