@@ -10,6 +10,7 @@ live under `website/content/`.
 - [Testing](engineering/testing.md): the test pyramid and smallest useful validation commands.
 - [Release packaging](architecture/release-packaging.md): artifact and packaging ownership.
 - [1.0.0-rc.10 release notes](releases/1.0.0-rc.10.md): candidate changes, including a link-safety fix.
+- [1.0.0-rc.11 release notes](releases/1.0.0-rc.11.md): action-acks live suite, quote menu fix, like/follow CLI.
 
 ## Architecture
 
