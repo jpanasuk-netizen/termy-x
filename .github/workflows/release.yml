@@ -354,6 +354,12 @@ jobs:
           RELEASE_BODY: ${{ github.event.release.body }}
           TAG: ${{ github.event.release.tag_name }}
         run: |
+          shopt -s nullglob
+          records=(dist/sparkle-*.json)
+          if ((${#records[@]} == 0)); then
+            echo "No Sparkle sign records (unsigned macOS builds); skipping appcasts"
+            exit 0
+          fi
           notes_args=()
           if [[ -n "${RELEASE_BODY//[[:space:]]/}" ]]; then
             gh api markdown -f text="$RELEASE_BODY" -f mode=gfm -f context="$GITHUB_REPOSITORY" > "$RUNNER_TEMP/release-notes.html"
@@ -361,7 +367,7 @@ jobs:
           fi
           python3 scripts/sparkle-appcast.py feed \
             --repo "$GITHUB_REPOSITORY" --tag "$TAG" "${notes_args[@]}" \
-            --out-dir dist dist/sparkle-*.json
+            --out-dir dist "${records[@]}"
 
       - name: Generate SHA256 checksums
         shell: bash
@@ -372,11 +378,15 @@ jobs:
             | xargs -0 sha256sum > checksums.txt
 
       - name: Attach artifacts to release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
-        with:
-          tag_name: ${{ github.event.release.tag_name }}
-          prerelease: ${{ github.event.release.prerelease }}
-          files: |
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Prefer gh upload --clobber so a prior manual attach (or re-run) does not fail
+          # the job on "already exists". Skip unmatched globs (e.g. no appcast when
+          # macOS builds were unsigned). contents:write is already granted on this job.
+          shopt -s nullglob
+          files=(
             dist/*.dmg
             dist/*.exe
             dist/*.tar.gz
@@ -385,5 +395,10 @@ jobs:
             dist/*.rpm
             dist/checksums.txt
             dist/appcast-*.xml
-          fail_on_unmatched_files: true
-          overwrite_files: true
+          )
+          if ((${#files[@]} == 0)); then
+            echo "No release files found under dist/" >&2
+            exit 1
+          fi
+          printf 'Uploading %s\n' "${files[@]}"
+          gh release upload "$TAG" --clobber "${files[@]}"
