@@ -38,6 +38,25 @@ pub enum ToggleKind {
     Follow,
 }
 
+impl ToggleKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Like => "like",
+            Self::Repost => "repost",
+            Self::Follow => "follow",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "like" => Some(Self::Like),
+            "repost" => Some(Self::Repost),
+            "follow" => Some(Self::Follow),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptKind {
@@ -46,11 +65,72 @@ pub enum ReceiptKind {
     Post,
 }
 
+impl ReceiptKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reply => "reply",
+            Self::QTweet => "q_tweet",
+            Self::Post => "post",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "reply" => Some(Self::Reply),
+            "q_tweet" => Some(Self::QTweet),
+            "post" => Some(Self::Post),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordSource {
     LocalWrite,
     LiveRead,
+}
+
+impl RecordSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalWrite => "local_write",
+            Self::LiveRead => "live_read",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "local_write" => Some(Self::LocalWrite),
+            "live_read" => Some(Self::LiveRead),
+            _ => None,
+        }
+    }
+}
+
+/// One toggle row that can move to an optional remote store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudToggle {
+    pub account: String,
+    pub kind: ToggleKind,
+    pub key: String,
+    pub confirmed: Option<bool>,
+    pub source: Option<RecordSource>,
+    pub verified_at_ms: u64,
+    pub seq: u64,
+    pub proof: Option<String>,
+    pub pending: bool,
+}
+
+/// One receipt row that can move to an optional remote store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CloudReceipt {
+    pub account: String,
+    pub kind: ReceiptKind,
+    pub tweet_id: String,
+    pub text: String,
+    pub seq: u64,
+    pub at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,6 +725,97 @@ impl ActionDb {
         }
     }
 
+    pub fn cloud_toggles(&self) -> Vec<CloudToggle> {
+        let mut rows = Vec::new();
+        for (account, bucket) in &self.accounts {
+            for (kind, map) in [
+                (ToggleKind::Like, &bucket.likes),
+                (ToggleKind::Repost, &bucket.reposts),
+                (ToggleKind::Follow, &bucket.follows),
+            ] {
+                for (key, toggle) in map {
+                    rows.push(CloudToggle {
+                        account: account.clone(),
+                        kind,
+                        key: key.clone(),
+                        confirmed: toggle.confirmed,
+                        source: toggle.source,
+                        verified_at_ms: toggle.verified_at_ms,
+                        seq: toggle.seq,
+                        proof: toggle.proof.clone(),
+                        pending: toggle.pending.is_some(),
+                    });
+                }
+            }
+        }
+        rows
+    }
+
+    pub fn cloud_receipts(&self) -> Vec<CloudReceipt> {
+        let mut rows = Vec::new();
+        for (account, bucket) in &self.accounts {
+            for receipt in &bucket.receipts {
+                rows.push(CloudReceipt {
+                    account: account.clone(),
+                    kind: receipt.kind,
+                    tweet_id: receipt.tweet_id.clone(),
+                    text: receipt.text.clone(),
+                    seq: receipt.seq,
+                    at_ms: receipt.at_ms,
+                });
+            }
+        }
+        rows
+    }
+
+    /// Apply a remote toggle when it is newer than the local row.
+    /// A local pending write is left alone. Returns whether the local row changed.
+    pub fn merge_cloud_toggle(&mut self, row: &CloudToggle) -> bool {
+        if row.account.is_empty() || row.key.is_empty() {
+            return false;
+        }
+        if let Some(local) = self.toggle_ref(&row.account, row.kind, &row.key) {
+            if local.pending.is_some() || row.verified_at_ms <= local.verified_at_ms {
+                return false;
+            }
+        }
+        let toggle = self.toggle_mut(&row.account, row.kind, &row.key);
+        toggle.confirmed = row.confirmed;
+        toggle.source = row.source;
+        toggle.verified_at_ms = row.verified_at_ms;
+        toggle.seq = row.seq;
+        toggle.proof = row.proof.clone();
+        toggle.pending = None;
+        toggle.last_error = None;
+        true
+    }
+
+    /// Apply a remote receipt when that seq is new or newer. Returns whether it was stored.
+    pub fn merge_cloud_receipt(&mut self, row: &CloudReceipt) -> bool {
+        if row.account.is_empty() {
+            return false;
+        }
+        let bucket = self.bucket(&row.account);
+        if let Some(existing) = bucket.receipts.iter_mut().find(|receipt| {
+            receipt.kind == row.kind && receipt.tweet_id == row.tweet_id && receipt.seq == row.seq
+        }) {
+            if row.at_ms <= existing.at_ms {
+                return false;
+            }
+            existing.text = row.text.clone();
+            existing.at_ms = row.at_ms;
+            return true;
+        }
+        bucket.receipts.push(Receipt {
+            kind: row.kind,
+            tweet_id: row.tweet_id.clone(),
+            text: row.text.clone(),
+            seq: row.seq,
+            at_ms: row.at_ms,
+        });
+        true
+    }
+
     pub fn record_receipt(
         &mut self,
         account: &str,
@@ -1121,37 +1292,19 @@ fn write_toggles(
 }
 
 fn toggle_kind_str(kind: ToggleKind) -> &'static str {
-    match kind {
-        ToggleKind::Like => "like",
-        ToggleKind::Repost => "repost",
-        ToggleKind::Follow => "follow",
-    }
+    kind.as_str()
 }
 
 fn toggle_kind(value: &str) -> Option<ToggleKind> {
-    match value {
-        "like" => Some(ToggleKind::Like),
-        "repost" => Some(ToggleKind::Repost),
-        "follow" => Some(ToggleKind::Follow),
-        _ => None,
-    }
+    ToggleKind::parse(value)
 }
 
 fn receipt_kind_str(kind: ReceiptKind) -> &'static str {
-    match kind {
-        ReceiptKind::Reply => "reply",
-        ReceiptKind::QTweet => "q_tweet",
-        ReceiptKind::Post => "post",
-    }
+    kind.as_str()
 }
 
 fn receipt_kind(value: &str) -> Option<ReceiptKind> {
-    match value {
-        "reply" => Some(ReceiptKind::Reply),
-        "q_tweet" => Some(ReceiptKind::QTweet),
-        "post" => Some(ReceiptKind::Post),
-        _ => None,
-    }
+    ReceiptKind::parse(value)
 }
 
 fn source_str(source: RecordSource) -> &'static str {

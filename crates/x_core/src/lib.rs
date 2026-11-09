@@ -34,6 +34,7 @@ pub mod reply_guy;
 pub mod reply_guy_multi;
 pub mod sort;
 pub mod splash;
+pub mod supabase_sync;
 pub mod stats;
 pub mod text;
 pub mod thread;

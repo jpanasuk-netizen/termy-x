@@ -226,6 +226,27 @@ enum Cmd {
         #[arg(long, default_value_t = 80)]
         limit: usize,
     },
+    /// Optional Supabase sync for the local action database. Off until configured.
+    Supabase {
+        #[command(subcommand)]
+        action: SupabaseAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SupabaseAction {
+    /// Show whether sync is off, syncing, synced, or in error. Prints no keys.
+    Status,
+    /// Save the project URL. The anon key is read from TERMY_X_SUPABASE_ANON_KEY when set.
+    Configure {
+        #[arg(long)]
+        url: String,
+    },
+    /// Email/password sign-in. The password is read from TERMY_X_SUPABASE_PASSWORD and not stored.
+    SignIn {
+        #[arg(long)]
+        email: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -419,6 +440,7 @@ fn print_help_guide() {
     println!("  termy-xcli write unlike --to ID                Dry-run an unlike");
     println!("  termy-xcli write follow --to HANDLE            Dry-run a follow");
     println!("  termy-xcli write unfollow --to HANDLE          Dry-run an unfollow");
+    println!("  termy-xcli supabase status                     Optional sync status. Prints no keys");
     println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
     println!("  termy-xcli post \"text\"");
     println!("  termy-xcli post --dry-run \"text\"          Plan only - never posts");
@@ -809,7 +831,72 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             days,
             limit,
         } => cmd_analyze(handle, days, limit, json, io),
+        Cmd::Supabase { action } => cmd_supabase(action, io),
         Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth | Cmd::Connect { .. } => 0,
+    }
+}
+
+fn cmd_supabase(action: SupabaseAction, io: &mut CliIo) -> i32 {
+    match action {
+        SupabaseAction::Status => {
+            println!("{}", crate::supabase_sync::settings_summary(&io.config));
+            0
+        }
+        SupabaseAction::Configure { url } => {
+            if let Err(error) = crate::supabase_sync::save_url(&io.config, &url) {
+                eprintln!("{error}");
+                return 1;
+            }
+            io.config.supabase_url = url.trim().trim_end_matches('/').to_string();
+            match std::env::var("TERMY_X_SUPABASE_ANON_KEY") {
+                Ok(key) if !key.trim().is_empty() => {
+                    if let Err(error) = crate::supabase_sync::store_anon_key(&io.config, &key) {
+                        eprintln!("{error}");
+                        return 1;
+                    }
+                    println!("Supabase URL saved. Anon key saved in the local secret store. It was not printed.");
+                }
+                _ => {
+                    println!("Supabase URL saved. Set TERMY_X_SUPABASE_ANON_KEY and run this again to store the anon key. The key is not written to x.toml.");
+                }
+            }
+            0
+        }
+        SupabaseAction::SignIn { email } => {
+            let anon = match std::env::var("TERMY_X_SUPABASE_ANON_KEY") {
+                Ok(key) if !key.trim().is_empty() => key,
+                _ => {
+                    eprintln!("Set TERMY_X_SUPABASE_ANON_KEY for this sign-in. It is not read from x.toml.");
+                    return 1;
+                }
+            };
+            let password = match std::env::var("TERMY_X_SUPABASE_PASSWORD") {
+                Ok(password) if !password.is_empty() => password,
+                _ => {
+                    eprintln!("Set TERMY_X_SUPABASE_PASSWORD for this sign-in. The password is not stored and not printed.");
+                    return 1;
+                }
+            };
+            let url = io.config.supabase_url.clone();
+            match crate::supabase_sync::sign_in(io.http.as_ref(), &url, &anon, &email, &password) {
+                Ok((access, refresh)) => {
+                    if let Err(error) = crate::supabase_sync::store_session(&io.config, &access, refresh.as_deref()) {
+                        eprintln!("{error}");
+                        return 1;
+                    }
+                    if let Err(error) = io.config.save_supabase_email(email.trim()) {
+                        eprintln!("{error}");
+                        return 1;
+                    }
+                    println!("Signed in with Supabase email auth. The session is in the local secret store. The password was not stored.");
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
     }
 }
 

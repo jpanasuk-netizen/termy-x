@@ -10,6 +10,28 @@ AI drafts use an OpenAI-compatible endpoint. `TERMY_X_AI_BASE_URL`, `TERMY_X_AI_
 
 On Windows the command runner follows PATHEXT and prefers `opencli.cmd` over the extensionless shell shim npm installs beside it. It still runs a `.ps1` shim when that is the match. Children start with `CREATE_NO_WINDOW` (`0x08000000`) and a 25 second timeout. Doctor and the adapters only invoke read commands unless you type `yes` on a publish.
 
+## Optional Supabase sync
+
+Action state (likes, reposts, follows, and post/reply/quote receipts) stays in the local SQLite file. Sync is off until three things are saved on that machine:
+
+- `supabase_url` in `x.toml` (the project URL only, not a key)
+- the anon/publishable key, stored in the OS keychain or a private `0600` file
+- a Supabase Auth email/password session
+
+The password is used once for `grant_type=password` and is not stored. The access token is stored in the same secret store. Neither value is written to `x.toml` or the action log.
+
+```sh
+termy-xcli supabase configure --url https://YOUR_PROJECT.supabase.co
+# with TERMY_X_SUPABASE_ANON_KEY set in the environment
+termy-xcli supabase sign-in --email you@example.com
+# with TERMY_X_SUPABASE_PASSWORD set in the environment
+termy-xcli supabase status
+```
+
+`status` prints off, syncing, synced at a time, or error. It does not print the key or the session. A failed push stays in a local outbox and is retried. The app keeps working when Supabase is not configured or unreachable. Sync never posts, likes, or follows on X.
+
+The SQL for the project is `supabase/migrations/20261109124500_x_action_state.sql`. Apply that file in the Supabase SQL editor or as a migration. It creates `x_action_toggles` and `x_action_receipts`, turns on row level security for both, and allows each signed-in user to read and upsert only their own rows.
+
 ## Owner
 
 This crate owns X read/search/publish planning for the `x` CLI and the desktop panel. It must stay free of GPUI so the desktop app can depend on it without pulling UI into the CLI. Official X API access is implemented here and is off unless `official_api.enabled` is set. Default reads are OpenCLI, then twitter-cli / Agent Reach, then the mock provider. Default publishing is OpenCLI, then twitter-cli, then an X web intent.

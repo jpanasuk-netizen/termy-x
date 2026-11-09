@@ -2466,6 +2466,7 @@ impl XPanel {
                             }
                         }
                         panel.bind_account(&handle);
+                        panel.schedule_supabase_pull(cx);
                         let next = panel.queued_section.take().unwrap_or(panel.section);
                         let next = if next == XSection::Compose {
                             XSection::Timeline
@@ -4628,6 +4629,41 @@ impl XPanel {
         }
         let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
         let _ = self.action_db.save(&config.action_state_path());
+        termy_x::supabase_sync::push_saved_in_background();
+    }
+
+    fn schedule_supabase_pull(&self, cx: &mut Context<Self>) {
+        if !self.live {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let http = termy_x::io::UreqHttp::default();
+                    let db = termy_x::action_state::ActionDb::load(&config.action_state_path()).ok();
+                    db.map(|db| termy_x::supabase_sync::sync(&config, &http, &db, true))
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if let Some(outcome) = outcome {
+                    let mut changed = false;
+                    for row in &outcome.toggles {
+                        changed |= panel.action_db.merge_cloud_toggle(row);
+                    }
+                    for row in &outcome.receipts {
+                        changed |= panel.action_db.merge_cloud_receipt(row);
+                    }
+                    if changed {
+                        panel.hydrate_actions();
+                        panel.persist_actions();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn next_action_seq(&mut self) -> u64 {
@@ -8061,6 +8097,12 @@ impl XPanel {
                 rows.push(card(
                     "Desk".into(),
                     "Inbox has Waiting/Done, AI draft, Reply (confirm), and Queue. Feeds filter by language, age, and mute. Followers snapshot is click-only. Analyze is a 14-day read of any handle.".into(),
+                ));
+                rows.push(card(
+                    "Supabase sync".into(),
+                    termy_x::supabase_sync::settings_summary(&termy_x::config::XConfig::load(
+                        &termy_x::config::default_config_dir(),
+                    )),
                 ));
                 rows.push(card(
                     "Stats".into(),
