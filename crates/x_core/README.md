@@ -10,6 +10,12 @@ AI drafts use an OpenAI-compatible endpoint. `TERMY_X_AI_BASE_URL`, `TERMY_X_AI_
 
 On Windows the command runner follows PATHEXT and prefers `opencli.cmd` over the extensionless shell shim npm installs beside it. It still runs a `.ps1` shim when that is the match. Children start with `CREATE_NO_WINDOW` (`0x08000000`) and a 25 second timeout. Doctor and the adapters only invoke read commands unless you type `yes` on a publish.
 
+## Sync across PCs
+
+Account sync is optional. Open the X panel, go to Help, and use **Account sync (optional)**. Type an email and a password, then choose Sign in or Create account. The status line reads off, syncing, synced at a time, or a short error. If the project asks you to confirm the address, the line says to check your email and then Sign in. Forgot password sends a reset email. Sign out forgets the session on this PC only. The password is not saved. Likes, follows, reposts, and receipts stay in the local database and copy to your other PCs after each of them is signed in.
+
+A release build includes the hosted project. Set `TERMY_X_SUPABASE_DEFAULT_ANON_KEY` when building a release so that key is compiled in. The placeholder `REPLACE_WITH_TERMY_X_SUPABASE_DEFAULT_ANON_KEY` is not a key; without a real one, sync stays off. Another project can be saved with `termy-xcli supabase configure --url https://YOUR_PROJECT.supabase.co`.
+
 ## Optional Supabase sync
 
 Action state (likes, reposts, follows, and post/reply/quote receipts) stays in the local SQLite file. Sync is off until three things are saved on that machine:

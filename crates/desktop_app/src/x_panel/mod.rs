@@ -745,6 +745,7 @@ pub struct XPanel {
     sync_snapshot_ms: u64,
     action_persist: bool,
     sync_line: String,
+    account_sync: account_sync::UiState,
     /// Inline quote composer state (quote = retweet with your own words).
     quote_post_id: Option<String>,
     quote_author: String,
@@ -1141,6 +1142,7 @@ impl XPanel {
             sync_snapshot_ms: 0,
             action_persist,
             sync_line: String::new(),
+            account_sync: account_sync::UiState::from_config(&config),
             quote_post_id: None,
             quote_author: String::new(),
             quote_text: String::new(),
@@ -1266,6 +1268,7 @@ impl XPanel {
             // silently empty (or on fixtures) with no profile behind them.
             panel.status = "Checking your X connection\u{2026}".into();
             panel.start_connection_check(cx);
+            panel.launch_account_sync(cx);
         }
         panel.caret = panel.compose.len();
         panel
@@ -3465,6 +3468,9 @@ impl XPanel {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.account_sync_key(event, cx) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
@@ -8098,12 +8104,7 @@ impl XPanel {
                     "Desk".into(),
                     "Inbox has Waiting/Done, AI draft, Reply (confirm), and Queue. Feeds filter by language, age, and mute. Followers snapshot is click-only. Analyze is a 14-day read of any handle.".into(),
                 ));
-                rows.push(card(
-                    "Supabase sync".into(),
-                    termy_x::supabase_sync::settings_summary(&termy_x::config::XConfig::load(
-                        &termy_x::config::default_config_dir(),
-                    )),
-                ));
+                rows.push(self.account_sync_section(cx));
                 rows.push(card(
                     "Stats".into(),
                     "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. The Stats tab compares per-day engagement vs the prior window with a best-hour heatmap. Follower count is the profile payload, never len() of a capped followers page.".into(),
@@ -12376,6 +12377,7 @@ mod edit_keys_tests {
     }
 }
 
+mod account_sync;
 mod reply_guy_ui;
 pub use reply_guy_ui::XAskEvent;
 

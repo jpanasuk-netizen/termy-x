@@ -46,7 +46,7 @@ impl SyncStatus {
                 if self.at_ms == 0 {
                     "synced".to_string()
                 } else {
-                    format!("synced at {}", rfc3339_from_ms(self.at_ms))
+                    format!("synced at {}", hhmm_utc(self.at_ms))
                 }
             }
             SyncPhase::Error => {
@@ -69,15 +69,13 @@ pub struct SyncOutcome {
 
 /// What Settings can show. The anon key and session are present or absent, never printed.
 pub fn settings_summary(config: &XConfig) -> String {
-    let url = if config.supabase_url.trim().is_empty() {
-        "not set".to_string()
-    } else {
-        safe_url_host(&config.supabase_url)
-    };
+    let url = crate::supabase_auth::project_url(config);
     let key = if load_secret(config, ANON_ACCOUNT).is_some() {
-        "saved"
+        "saved override"
+    } else if crate::supabase_defaults::builtin_anon_key().is_some() {
+        "built in"
     } else {
-        "not set"
+        "not in this build"
     };
     let session = if load_secret(config, ACCESS_ACCOUNT).is_some() {
         "signed in"
@@ -121,36 +119,7 @@ pub fn sign_in(
     email: &str,
     password: &str,
 ) -> Result<(String, Option<String>), String> {
-    let url = normalize_project_url(url)?;
-    let anon_key = anon_key.trim();
-    if anon_key.is_empty() || email.trim().is_empty() || password.is_empty() {
-        return Err("Supabase sign-in needs a project URL, anon key, email, and password.".into());
-    }
-    let body = json!({ "email": email.trim(), "password": password }).to_string();
-    let response = http
-        .request(HttpRequest {
-            method: "POST",
-            url: format!("{url}/auth/v1/token?grant_type=password"),
-            body: Some(body),
-            bearer: Some(anon_key.to_string()),
-            content_type: Some("application/json".into()),
-            headers: vec![("apikey".into(), anon_key.to_string())],
-        })
-        .map_err(|error| redact(&error, &[anon_key, password]))?;
-    let value: Value = serde_json::from_str(&response)
-        .map_err(|_| "Supabase sign-in did not return a session.".to_string())?;
-    let access = value
-        .get("access_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| "Supabase sign-in did not return a session.".to_string())?
-        .to_string();
-    let refresh = value
-        .get("refresh_token")
-        .and_then(Value::as_str)
-        .filter(|token| !token.is_empty())
-        .map(str::to_string);
-    Ok((access, refresh))
+    crate::supabase_auth::password_session(http, url, anon_key, email, password)
 }
 
 /// Push local rows and, when `pull` is set, merge newer remote rows.
@@ -274,14 +243,51 @@ fn configured(config: &XConfig) -> bool {
 }
 
 fn credentials(config: &XConfig) -> Option<Creds> {
-    let url = normalize_project_url(&config.supabase_url).ok()?;
-    let anon_key = load_secret(config, ANON_ACCOUNT)?;
+    let url = crate::supabase_auth::project_url(config);
+    let anon_key = crate::supabase_auth::anon_key(config)?;
     let access = load_secret(config, ACCESS_ACCOUNT)?;
     Some(Creds {
         url,
         anon_key,
         access,
     })
+}
+
+pub(crate) fn saved_access(config: &XConfig) -> Option<String> {
+    load_secret(config, ACCESS_ACCOUNT)
+}
+
+pub(crate) fn saved_refresh(config: &XConfig) -> Option<String> {
+    load_secret(config, REFRESH_ACCOUNT)
+}
+
+pub(crate) fn saved_anon(config: &XConfig) -> Option<String> {
+    load_secret(config, ANON_ACCOUNT)
+}
+
+pub fn clear_session(config: &XConfig) -> Result<(), String> {
+    for account in [ACCESS_ACCOUNT, REFRESH_ACCOUNT] {
+        if let Ok(entry) = keyring::Entry::new("termy-x", account) {
+            let _ = entry.delete_credential();
+        }
+    }
+    let mut map = read_secret_file(config);
+    let access_removed = map.remove(ACCESS_ACCOUNT).is_some();
+    let refresh_removed = map.remove(REFRESH_ACCOUNT).is_some();
+    let removed = access_removed || refresh_removed;
+    if removed || secrets_path(config).exists() {
+        crate::auth::write_private_file(&secrets_path(config), &Value::Object(map).to_string())?;
+    }
+    let status = SyncStatus {
+        phase: SyncPhase::Off,
+        at_ms: 0,
+        message: String::new(),
+    };
+    write_status(&status_path(config), &status)
+}
+
+pub fn record_status(config: &XConfig, status: &SyncStatus) {
+    let _ = write_status(&status_path(config), status);
 }
 
 fn pull_remote(
@@ -559,7 +565,7 @@ fn outbox_rows(config: &XConfig) -> (Vec<CloudToggle>, Vec<CloudReceipt>) {
     (toggles, receipts)
 }
 
-fn normalize_project_url(url: &str) -> Result<String, String> {
+pub(crate) fn normalize_project_url(url: &str) -> Result<String, String> {
     let url = url.trim().trim_end_matches('/');
     if url.is_empty() {
         return Err("Supabase URL is empty.".into());
@@ -574,8 +580,11 @@ fn normalize_project_url(url: &str) -> Result<String, String> {
     Ok(url.to_string())
 }
 
-fn safe_url_host(url: &str) -> String {
-    normalize_project_url(url).unwrap_or_else(|_| "not set".into())
+fn hhmm_utc(ms: u64) -> String {
+    let tod = (ms / 1000) % 86_400;
+    let hour = tod / 3600;
+    let minute = (tod % 3600) / 60;
+    format!("{hour:02}:{minute:02}")
 }
 
 pub fn redact(message: &str, secrets: &[&str]) -> String {

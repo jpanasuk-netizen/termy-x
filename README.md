@@ -255,9 +255,9 @@ cargo run -p termy --bin x_panel_preview -- --mock --width 1600 --height 1000
 cargo run -p termy --bin x_panel_preview -- --splash
 ```
 
-## Optional Supabase sync
+## Sync across PCs
 
-Termy X can optionally copy its local action database (likes, reposts, follows, and receipts) to Supabase. The local database remains the one the app uses when sync is off or the network is down. Setup, the email auth sign-in, and the migration path are in [crates/x_core/README.md](crates/x_core/README.md#optional-supabase-sync). No project URL or key is stored in this repository.
+In the X panel Help tab, **Account sync (optional)** takes an email and password. Sign in or Create account copies likes, follows, reposts, and receipts to your other signed-in PCs. The password is not saved. Sync stays off until you sign in, and this PC keeps working from its local database either way. Details are in [crates/x_core/README.md](crates/x_core/README.md#sync-across-pcs).
 
 ## Roadmap and contributing
 

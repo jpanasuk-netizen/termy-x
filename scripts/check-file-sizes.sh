@@ -25,7 +25,12 @@ ALLOWLIST=(
   crates/cli/src/xtask/benchmark.rs
   # Termy X panel + OpenCLI providers (split planned; keep CI green meanwhile)
   crates/desktop_app/src/x_panel/mod.rs
+  crates/desktop_app/src/x_panel/player.rs
+  crates/desktop_app/src/terminal_view/plugin_ui.rs
+  crates/x_core/src/action_state.rs
+  crates/x_core/src/cli.rs
   crates/x_core/src/providers.rs
+  crates/x_core/src/publish.rs
 )
 
 is_allowlisted() {

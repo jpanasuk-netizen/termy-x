@@ -247,6 +247,13 @@ enum SupabaseAction {
         #[arg(long)]
         email: String,
     },
+    /// Create an email account. The password is read from TERMY_X_SUPABASE_PASSWORD and not stored.
+    SignUp {
+        #[arg(long)]
+        email: String,
+    },
+    /// Forget the sync session on this PC.
+    SignOut,
 }
 
 #[derive(Subcommand, Debug)]
@@ -837,67 +844,14 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
 }
 
 fn cmd_supabase(action: SupabaseAction, io: &mut CliIo) -> i32 {
-    match action {
-        SupabaseAction::Status => {
-            println!("{}", crate::supabase_sync::settings_summary(&io.config));
-            0
-        }
-        SupabaseAction::Configure { url } => {
-            if let Err(error) = crate::supabase_sync::save_url(&io.config, &url) {
-                eprintln!("{error}");
-                return 1;
-            }
-            io.config.supabase_url = url.trim().trim_end_matches('/').to_string();
-            match std::env::var("TERMY_X_SUPABASE_ANON_KEY") {
-                Ok(key) if !key.trim().is_empty() => {
-                    if let Err(error) = crate::supabase_sync::store_anon_key(&io.config, &key) {
-                        eprintln!("{error}");
-                        return 1;
-                    }
-                    println!("Supabase URL saved. Anon key saved in the local secret store. It was not printed.");
-                }
-                _ => {
-                    println!("Supabase URL saved. Set TERMY_X_SUPABASE_ANON_KEY and run this again to store the anon key. The key is not written to x.toml.");
-                }
-            }
-            0
-        }
-        SupabaseAction::SignIn { email } => {
-            let anon = match std::env::var("TERMY_X_SUPABASE_ANON_KEY") {
-                Ok(key) if !key.trim().is_empty() => key,
-                _ => {
-                    eprintln!("Set TERMY_X_SUPABASE_ANON_KEY for this sign-in. It is not read from x.toml.");
-                    return 1;
-                }
-            };
-            let password = match std::env::var("TERMY_X_SUPABASE_PASSWORD") {
-                Ok(password) if !password.is_empty() => password,
-                _ => {
-                    eprintln!("Set TERMY_X_SUPABASE_PASSWORD for this sign-in. The password is not stored and not printed.");
-                    return 1;
-                }
-            };
-            let url = io.config.supabase_url.clone();
-            match crate::supabase_sync::sign_in(io.http.as_ref(), &url, &anon, &email, &password) {
-                Ok((access, refresh)) => {
-                    if let Err(error) = crate::supabase_sync::store_session(&io.config, &access, refresh.as_deref()) {
-                        eprintln!("{error}");
-                        return 1;
-                    }
-                    if let Err(error) = io.config.save_supabase_email(email.trim()) {
-                        eprintln!("{error}");
-                        return 1;
-                    }
-                    println!("Signed in with Supabase email auth. The session is in the local secret store. The password was not stored.");
-                    0
-                }
-                Err(error) => {
-                    eprintln!("{error}");
-                    1
-                }
-            }
-        }
-    }
+    let action = match action {
+        SupabaseAction::Status => crate::supabase_auth::CliAction::Status,
+        SupabaseAction::Configure { url } => crate::supabase_auth::CliAction::Configure { url },
+        SupabaseAction::SignIn { email } => crate::supabase_auth::CliAction::SignIn { email },
+        SupabaseAction::SignUp { email } => crate::supabase_auth::CliAction::SignUp { email },
+        SupabaseAction::SignOut => crate::supabase_auth::CliAction::SignOut,
+    };
+    crate::supabase_auth::cli(action, &mut io.config, io.http.as_ref())
 }
 
 fn resolve_handle(io: &CliIo, handle: Option<String>) -> Result<String, String> {
