@@ -1,4 +1,4 @@
-﻿//! Multi-source Treg fetch + quote-to-X helpers for Reply Guy.
+//! Multi-source Treg fetch + quote-to-X helpers for Reply Guy.
 //! Tool ids are catalog call-by-id only (see notes/treg-multi-source-tools.md).
 
 use crate::io::Http;
@@ -123,12 +123,7 @@ fn call_json(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     let url = format!("{TREG_BASE}/call/{tool_id}");
-    let response = http.request(treg_request(
-        "POST",
-        &url,
-        token,
-        Some(body.to_string()),
-    ))?;
+    let response = http.request(treg_request("POST", &url, token, Some(body.to_string())))?;
     let value: serde_json::Value =
         serde_json::from_str(&response).map_err(|e| format!("treg: bad response ({e})"))?;
     if let Some(error) = envelope_error_flex(&value) {
@@ -527,10 +522,7 @@ fn parse_instagram(
     Ok((posts, cost_of(value)))
 }
 
-fn parse_youtube(
-    value: &serde_json::Value,
-    key: &str,
-) -> Result<(Vec<Post>, Option<f64>), String> {
+fn parse_youtube(value: &serde_json::Value, key: &str) -> Result<(Vec<Post>, Option<f64>), String> {
     let items = value
         .pointer(&format!("/output/data/{key}"))
         .and_then(|v| v.as_array())
@@ -632,19 +624,11 @@ fn parse_facebook(value: &serde_json::Value) -> Result<(Vec<Post>, Option<f64>),
             }
             let text = {
                 let t = s(item, "text");
-                if t.is_empty() {
-                    s(item, "message")
-                } else {
-                    t
-                }
+                if t.is_empty() { s(item, "message") } else { t }
             };
             let author = {
                 let a = s(item, "authorName");
-                if a.is_empty() {
-                    s(item, "author")
-                } else {
-                    a
-                }
+                if a.is_empty() { s(item, "author") } else { a }
             };
             Some(Post {
                 id: format!("fb:{id}"),

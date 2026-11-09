@@ -6,8 +6,8 @@ use termy_x::feeds::{EngageFeed, FeedStore};
 use termy_x::followers::{FollowerDiff, FollowerLog};
 use termy_x::inbox::{InboxState, InboxStore};
 use termy_x::model::Post;
-use termy_x::reply_guy_multi::RgHit;
 use termy_x::queue::QueuedReply;
+use termy_x::reply_guy_multi::RgHit;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboxFilter {

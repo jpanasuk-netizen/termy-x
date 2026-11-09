@@ -359,7 +359,7 @@ fn only_edit_commands_use_os_edit_roles() {
 
 #[test]
 fn inline_input_keybindings_include_copy_binding() {
-    assert_eq!(inline_input_keybindings().len(), 18);
+    assert_eq!(inline_input_keybindings().len(), 22);
 }
 
 #[test]

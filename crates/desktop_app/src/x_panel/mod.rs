@@ -38,11 +38,7 @@ macro_rules! x_button {
             .py(px(4.0))
             .rounded(px(8.0))
             .border_1()
-            .border_color(if active {
-                rgb(0x0a84ff)
-            } else {
-                rgb(0x3a3a3c)
-            })
+            .border_color(if active { rgb(0x0a84ff) } else { rgb(0x3a3a3c) })
             .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
             .text_size(px(11.0))
             .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
@@ -76,11 +72,7 @@ macro_rules! x_action {
             .flex_shrink_0()
             .rounded(px(8.0))
             .border_1()
-            .border_color(if active {
-                rgb(0x0a84ff)
-            } else {
-                rgb(0x3a3a3c)
-            })
+            .border_color(if active { rgb(0x0a84ff) } else { rgb(0x3a3a3c) })
             .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
             .text_size(px(12.0))
             .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
@@ -111,11 +103,7 @@ macro_rules! x_cta {
             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .text_color(rgb(0xffffff))
             .cursor_pointer()
-            .hover(|style| {
-                style
-                    .bg(rgb(0x409cff))
-                    .border_color(rgb(0x409cff))
-            })
+            .hover(|style| style.bg(rgb(0x409cff)).border_color(rgb(0x409cff)))
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
     }};
@@ -352,7 +340,10 @@ pub enum FollowClick {
     InFlight,
     ConnectFirst,
     OwnAccount,
-    Confirm { handle: String, follow: bool },
+    Confirm {
+        handle: String,
+        follow: bool,
+    },
 }
 
 pub fn follow_click(
@@ -1572,8 +1563,7 @@ impl XPanel {
                     follow_handle: None,
                     label: "\u{2713} Posted",
                 });
-                self.notice =
-                    Some("Preview of the Posted note. Nothing was posted.".into());
+                self.notice = Some("Preview of the Posted note. Nothing was posted.".into());
             }
             "confirm" => {
                 self.open_section(XSection::Compose, cx);
@@ -2337,7 +2327,9 @@ impl XPanel {
                 let needs = post.retweeted.is_none()
                     && post.unavailable_original_url.is_none()
                     && (post.bare_repost_handle().is_some() || post.referenced_status_id.is_some());
-                if needs && !self.repost_cache.contains_key(&post.id) && !wanted.iter().any(|(id, _)| id == &post.id)
+                if needs
+                    && !self.repost_cache.contains_key(&post.id)
+                    && !wanted.iter().any(|(id, _)| id == &post.id)
                 {
                     let fetch = post
                         .original_fetch_id()
@@ -3649,7 +3641,10 @@ impl XPanel {
             }
             return;
         }
-        if self.input_target == InputTarget::NewTweet && self.new_tweet_open && self.section == XSection::Timeline {
+        if self.input_target == InputTarget::NewTweet
+            && self.new_tweet_open
+            && self.section == XSection::Timeline
+        {
             self.on_text_input_key(event, TextField::NewTweet, cx);
             return;
         }
@@ -4635,7 +4630,12 @@ impl XPanel {
         self.action_seq
     }
 
-    fn remember_receipt(&mut self, kind: termy_x::action_state::ReceiptKind, tweet_id: &str, text: &str) {
+    fn remember_receipt(
+        &mut self,
+        kind: termy_x::action_state::ReceiptKind,
+        tweet_id: &str,
+        text: &str,
+    ) {
         let seq = self.next_action_seq();
         self.action_db.record_receipt(
             &self.action_account(),
@@ -4693,14 +4693,9 @@ impl XPanel {
         } else {
             self.sync_snapshot_ms
         };
-        let finish = self.action_db.apply_sync_page(
-            &account,
-            generation,
-            posts,
-            failed,
-            snapshot,
-            now,
-        );
+        let finish = self
+            .action_db
+            .apply_sync_page(&account, generation, posts, failed, snapshot, now);
         if let termy_x::action_state::SyncFinish::Report(report) = finish {
             self.sync_line = report.summary;
             self.hydrate_actions();
@@ -4710,18 +4705,14 @@ impl XPanel {
 
     fn shown_follow(&self, handle: &str, payload: Option<bool>) -> (Option<bool>, bool) {
         let account = self.action_account();
-        let remembered = self.action_db.confirmed(
-            &account,
-            termy_x::action_state::ToggleKind::Follow,
-            handle,
-        );
+        let remembered =
+            self.action_db
+                .confirmed(&account, termy_x::action_state::ToggleKind::Follow, handle);
         let value = termy_x::action_state::remembered_or_payload(remembered, payload);
         let saved = remembered.is_some()
-            && self.action_db.is_saved(
-                &account,
-                termy_x::action_state::ToggleKind::Follow,
-                handle,
-            );
+            && self
+                .action_db
+                .is_saved(&account, termy_x::action_state::ToggleKind::Follow, handle);
         (value, saved)
     }
 
@@ -4840,8 +4831,7 @@ impl XPanel {
             }
             FollowClick::Confirm { handle, follow } => {
                 self.notice = None;
-                let already =
-                    self.follow_ask.is_some() || self.follow_pending.is_some();
+                let already = self.follow_ask.is_some() || self.follow_pending.is_some();
                 self.follow_ask = Some((handle, follow));
                 if !already {
                     self.follow_anim_seq = self.follow_anim_seq.wrapping_add(1);
@@ -5010,7 +5000,11 @@ impl XPanel {
             EngageAction::Unretweet => "unretweet",
             EngageAction::Quote => "quote",
         };
-        termy_x::publish::log_action(action_kind, "start", &[("ack", "pending"), ("new_id", "none")]);
+        termy_x::publish::log_action(
+            action_kind,
+            "start",
+            &[("ack", "pending"), ("new_id", "none")],
+        );
         cx.notify();
         let live = self.live;
         let mock = self.mock_writes.clone();
@@ -5044,8 +5038,16 @@ impl XPanel {
                 "engage {action:?} confirmed_ms={}",
                 engage_started.elapsed().as_millis()
             ));
-            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
-            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            let ack = if result.is_ok() {
+                "confirmed"
+            } else {
+                "rejected"
+            };
+            let new_id = result
+                .as_ref()
+                .ok()
+                .map(|receipt| termy_x::publish::action_new_id(receipt))
+                .unwrap_or_else(|| "none".into());
             termy_x::publish::log_action(action_kind, "ack", &[("ack", ack), ("new_id", &new_id)]);
             let applied = this.update(cx, |panel, cx| {
                 if panel.engage_seq.get(&id).copied() != Some(seq) {
@@ -5083,15 +5085,9 @@ impl XPanel {
                 };
                 match result {
                     Ok(_) => {
-                        let _ = panel.action_db.finish_toggle(
-                            &account,
-                            kind,
-                            &id,
-                            seq,
-                            true,
-                            None,
-                            now,
-                        );
+                        let _ = panel
+                            .action_db
+                            .finish_toggle(&account, kind, &id, seq, true, None, now);
                         if live {
                             panel.action_db.note_opencli_contract(&account, kind, &id);
                         }
@@ -5106,12 +5102,14 @@ impl XPanel {
                             termy_x::publish::EngageAction::Retweet => {
                                 termy_x::publish::success_note(termy_x::publish::UserWrite::Retweet)
                             }
-                            termy_x::publish::EngageAction::Unretweet => termy_x::publish::success_note(
-                                termy_x::publish::UserWrite::Unretweet,
-                            ),
-                            termy_x::publish::EngageAction::Quote => termy_x::publish::success_note(
-                                termy_x::publish::UserWrite::QTweet,
-                            ),
+                            termy_x::publish::EngageAction::Unretweet => {
+                                termy_x::publish::success_note(
+                                    termy_x::publish::UserWrite::Unretweet,
+                                )
+                            }
+                            termy_x::publish::EngageAction::Quote => {
+                                termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
+                            }
                         }
                         .to_string();
                         let _ = author;
@@ -5144,7 +5142,17 @@ impl XPanel {
             termy_x::publish::log_action(
                 action_kind,
                 "ui",
-                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+                &[
+                    (
+                        "ack",
+                        if applied.is_ok() {
+                            ack
+                        } else {
+                            "update-failed"
+                        },
+                    ),
+                    ("new_id", &new_id),
+                ],
             );
         })
         .detach();
@@ -5374,8 +5382,16 @@ impl XPanel {
                 "submit quote confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
-            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            let ack = if result.is_ok() {
+                "confirmed"
+            } else {
+                "rejected"
+            };
+            let new_id = result
+                .as_ref()
+                .ok()
+                .map(|receipt| termy_x::publish::action_new_id(receipt))
+                .unwrap_or_else(|| "none".into());
             termy_x::publish::log_action("quote", "ack", &[("ack", ack), ("new_id", &new_id)]);
             let applied = this.update(cx, |panel, cx| {
                 panel.quote_posting = false;
@@ -5390,10 +5406,9 @@ impl XPanel {
                             termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
                                 .to_string(),
                         );
-                        panel.status = termy_x::publish::success_note(
-                            termy_x::publish::UserWrite::QTweet,
-                        )
-                        .to_string();
+                        panel.status =
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
+                                .to_string();
                         panel.remember_receipt(
                             termy_x::action_state::ReceiptKind::QTweet,
                             &target_id,
@@ -5422,7 +5437,17 @@ impl XPanel {
             termy_x::publish::log_action(
                 "quote",
                 "ui",
-                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+                &[
+                    (
+                        "ack",
+                        if applied.is_ok() {
+                            ack
+                        } else {
+                            "update-failed"
+                        },
+                    ),
+                    ("new_id", &new_id),
+                ],
             );
         })
         .detach();
@@ -5519,8 +5544,16 @@ impl XPanel {
                 "submit reply confirmed_ms={}",
                 submit_started.elapsed().as_millis()
             ));
-            let ack = if result.is_ok() { "confirmed" } else { "rejected" };
-            let new_id = result.as_ref().ok().map(|receipt| termy_x::publish::action_new_id(receipt)).unwrap_or_else(|| "none".into());
+            let ack = if result.is_ok() {
+                "confirmed"
+            } else {
+                "rejected"
+            };
+            let new_id = result
+                .as_ref()
+                .ok()
+                .map(|receipt| termy_x::publish::action_new_id(receipt))
+                .unwrap_or_else(|| "none".into());
             termy_x::publish::log_action("reply", "ack", &[("ack", ack), ("new_id", &new_id)]);
             let applied = this.update(cx, |panel, cx| {
                 panel.reply_posting = false;
@@ -5564,7 +5597,17 @@ impl XPanel {
             termy_x::publish::log_action(
                 "reply",
                 "ui",
-                &[("ack", if applied.is_ok() { ack } else { "update-failed" }), ("new_id", &new_id)],
+                &[
+                    (
+                        "ack",
+                        if applied.is_ok() {
+                            ack
+                        } else {
+                            "update-failed"
+                        },
+                    ),
+                    ("new_id", &new_id),
+                ],
             );
         })
         .detach();
@@ -5631,7 +5674,9 @@ fn patch_repost_original(posts: &mut [Post], repost_id: &str, original: &Post) {
 
 fn patch_repost_unavailable(posts: &mut [Post], repost_id: &str) {
     for post in posts.iter_mut() {
-        if post.id == repost_id && post.retweeted.is_none() && post.unavailable_original_url.is_none()
+        if post.id == repost_id
+            && post.retweeted.is_none()
+            && post.unavailable_original_url.is_none()
         {
             post.unavailable_original_url = post.original_link();
         }
@@ -5719,10 +5764,7 @@ fn fetch_section(
                         }
                         return FetchPayload::Timeline {
                             posts: Vec::new(),
-                            status: format!(
-                                "could not load {} \u{2014} {error}",
-                                feed.label()
-                            ),
+                            status: format!("could not load {} \u{2014} {error}", feed.label()),
                             feed,
                             append,
                             requested: limit,
@@ -6729,16 +6771,8 @@ impl XPanel {
                     .text_size(px(11.0))
                     .cursor_pointer()
                     .border_1()
-                    .border_color(if active {
-                        rgb(0x0a84ff)
-                    } else {
-                        rgb(0x2c2c2e)
-                    })
-                    .bg(if active {
-                        rgb(0x1a2a44)
-                    } else {
-                        rgb(0x1c1c1e)
-                    })
+                    .border_color(if active { rgb(0x0a84ff) } else { rgb(0x2c2c2e) })
+                    .bg(if active { rgb(0x1a2a44) } else { rgb(0x1c1c1e) })
                     .text_color(if active { rgb(0xffffff) } else { rgb(0x8e8e93) })
                     .hover(|style| {
                         style
@@ -7808,10 +7842,7 @@ impl XPanel {
                         || self.status.contains("Not connected")
                         || self.status.contains("no provider")
                     {
-                        rows.push(empty_state(
-                            "Timeline did not load",
-                            self.status.clone(),
-                        ));
+                        rows.push(empty_state("Timeline did not load", self.status.clone()));
                     } else {
                         rows.push(empty_state(
                             "Timeline is quiet",
@@ -8165,7 +8196,9 @@ impl XPanel {
 
     fn enqueue_frame(&mut self, video: String) {
         let key = preview::frame_cache_key(&video);
-        if self.media_cache.contains_key(&key) || self.frame_queue.iter().any(|queued| queued == &video) {
+        if self.media_cache.contains_key(&key)
+            || self.frame_queue.iter().any(|queued| queued == &video)
+        {
             return;
         }
         self.media_cache.insert(key, MediaState::Loading);
@@ -8314,7 +8347,14 @@ impl XPanel {
         media.aspect()
     }
 
-    fn open_still(&mut self, url: String, poster: Option<String>, post_id: &str, notice: &str, cx: &mut Context<Self>) {
+    fn open_still(
+        &mut self,
+        url: String,
+        poster: Option<String>,
+        post_id: &str,
+        notice: &str,
+        cx: &mut Context<Self>,
+    ) {
         self.viewer = Some(Viewer {
             kind: MediaKind::Photo,
             url: url.clone(),
@@ -8581,16 +8621,23 @@ impl XPanel {
                                     .text_color(rgb(0x8e8e93))
                                     .child(note)
                             }))
-                            .children((!asking).then(|| follow_saved_mark(
-                                viewer == Some(true),
-                                saved,
-                                pending.is_some(),
-                            )).flatten().map(|mark| {
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(0x8e8e93))
-                                    .child(mark)
-                            })),
+                            .children(
+                                (!asking)
+                                    .then(|| {
+                                        follow_saved_mark(
+                                            viewer == Some(true),
+                                            saved,
+                                            pending.is_some(),
+                                        )
+                                    })
+                                    .flatten()
+                                    .map(|mark| {
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(0x8e8e93))
+                                            .child(mark)
+                                    }),
+                            ),
                     )
                     .children(self.follow_confirm_strip(&profile.handle, "profile", cx)),
             );
@@ -8799,10 +8846,8 @@ impl XPanel {
                                         .video_player
                                         .as_ref()
                                         .map_or((0.0, 0.0), |pl| pl.progress());
-                                    if let Some(err) = panel
-                                        .video_player
-                                        .as_mut()
-                                        .and_then(|pl| pl.take_failure())
+                                    if let Some(err) =
+                                        panel.video_player.as_mut().and_then(|pl| pl.take_failure())
                                     {
                                         panel.player_error = Some(err.to_string());
                                         panel.stop_video_player();
@@ -9826,7 +9871,8 @@ impl XPanel {
             ConnState::Connected { handle, .. } => Some(handle.as_str()),
             _ => None,
         };
-        let show_follow = !post.author_handle.is_empty() && !is_own_profile(&post.author_handle, own);
+        let show_follow =
+            !post.author_handle.is_empty() && !is_own_profile(&post.author_handle, own);
         let mut row = div()
             .mt(px(6.0))
             .w_full()
@@ -10068,10 +10114,7 @@ impl XPanel {
                 div()
                     .text_size(px(11.0))
                     .text_color(rgb(0x7af6ff))
-                    .child(format!(
-                        "Q-tweet @{}",
-                        post.author_handle
-                    )),
+                    .child(format!("Q-tweet @{}", post.author_handle)),
             )
             .child(focus_glow(
                 "glow-quote",
@@ -10174,22 +10217,18 @@ impl XPanel {
             }
             _ => "Connect X before posting. Nothing will be sent.".into(),
         };
-        let mut column = div()
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(x_action!(
-                "x-new-tweet",
-                "New tweet",
-                cx.listener(|this, _, _, cx| {
-                    this.new_tweet_open = true;
-                    this.input_target = InputTarget::NewTweet;
-                    this.pending_focus = true;
-                    this.status = "New tweet. Post sends it. Nothing is sent until then.".into();
-                    cx.stop_propagation();
-                    cx.notify();
-                })
-            ));
+        let mut column = div().flex().flex_col().gap(px(6.0)).child(x_action!(
+            "x-new-tweet",
+            "New tweet",
+            cx.listener(|this, _, _, cx| {
+                this.new_tweet_open = true;
+                this.input_target = InputTarget::NewTweet;
+                this.pending_focus = true;
+                this.status = "New tweet. Post sends it. Nothing is sent until then.".into();
+                cx.stop_propagation();
+                cx.notify();
+            })
+        ));
         if self.new_tweet_open {
             let char_limit = self.char_limit;
             let count = weighted_len_limited(&self.new_tweet_text, char_limit);
@@ -10383,10 +10422,9 @@ impl XPanel {
                             "",
                             &receipt,
                         );
-                        panel.status = termy_x::publish::success_note(
-                            termy_x::publish::UserWrite::Post,
-                        )
-                        .to_string();
+                        panel.status =
+                            termy_x::publish::success_note(termy_x::publish::UserWrite::Post)
+                                .to_string();
                     }
                     Err(error) => {
                         panel.notice = Some(format!(
@@ -11845,13 +11883,12 @@ fn tint(color: u32, alpha: u8) -> gpui_kit::Rgba {
 mod edit_keys_tests {
     use super::next_timeline_limit;
     use super::{
-        BURST_MS, FetchPayload, FollowStep, TIMELINE_INITIAL, TIMELINE_MAX, TIMELINE_PAGE,
-        FollowClick, FOLLOW_DOT_MS, XSection, burst_style_at, caret_visual_line, fetch_section,
+        BURST_MS, FOLLOW_DOT_MS, FetchPayload, FollowClick, FollowStep, TIMELINE_INITIAL,
+        TIMELINE_MAX, TIMELINE_PAGE, XSection, burst_style_at, caret_visual_line, fetch_section,
         follow_awaiting_note, follow_button_label, follow_click, follow_click_status,
-        follow_confirm_on_card, follow_confirm_prompt, follow_dots_keep_going, follow_pending_label,
-        follow_saved_mark, follow_step, follow_wait_label, is_own_profile,
-        like_button_label,
-        soft_wrap_ranges,
+        follow_confirm_on_card, follow_confirm_prompt, follow_dots_keep_going,
+        follow_pending_label, follow_saved_mark, follow_step, follow_wait_label, is_own_profile,
+        like_button_label, soft_wrap_ranges,
     };
     use termy_x::providers::TimelineFeed;
 
@@ -11862,8 +11899,14 @@ mod edit_keys_tests {
         assert!(note.contains("new post"));
         assert!(note.contains("Nothing was posted"));
         assert!(note.contains("Post was not clicked"));
-        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet));
-        assert_ne!(note, termy_x::publish::success_note(termy_x::publish::UserWrite::Post));
+        assert_ne!(
+            note,
+            termy_x::publish::success_note(termy_x::publish::UserWrite::QTweet)
+        );
+        assert_ne!(
+            note,
+            termy_x::publish::success_note(termy_x::publish::UserWrite::Post)
+        );
     }
 
     #[test]
@@ -11880,8 +11923,14 @@ mod edit_keys_tests {
         assert_eq!(like_button_label(true, true, true), "\u{2026}");
         assert_eq!(like_button_label(true, false, false), "Liked");
         // In flight: progress label wins; the click guard ignores clicks.
-        assert_eq!(follow_button_label(None, Some(true), false, 1), "Following..");
-        assert_eq!(follow_button_label(Some(true), Some(false), false, 0), "Unfollowing.");
+        assert_eq!(
+            follow_button_label(None, Some(true), false, 1),
+            "Following.."
+        );
+        assert_eq!(
+            follow_button_label(Some(true), Some(false), false, 0),
+            "Unfollowing."
+        );
     }
 
     #[test]
@@ -11896,8 +11945,14 @@ mod edit_keys_tests {
         assert_eq!(follow_wait_label(2), "...");
         assert_eq!(follow_pending_label(true, 2), "Following...");
         assert_eq!(follow_button_label(None, None, true, 2), "...");
-        assert_eq!(follow_button_label(None, Some(true), true, 2), "Following...");
-        assert_eq!(follow_awaiting_note(true, false), Some("Awaiting confirmation"));
+        assert_eq!(
+            follow_button_label(None, Some(true), true, 2),
+            "Following..."
+        );
+        assert_eq!(
+            follow_awaiting_note(true, false),
+            Some("Awaiting confirmation")
+        );
         assert_eq!(follow_awaiting_note(true, true), None);
         assert!(follow_dots_keep_going(true, true, false));
         assert!(follow_dots_keep_going(true, false, true));
@@ -11921,7 +11976,10 @@ mod edit_keys_tests {
             }
         );
         let status = follow_click_status(&ask);
-        assert_eq!(follow_confirm_prompt("Jack", true), "Do you want to follow @Jack");
+        assert_eq!(
+            follow_confirm_prompt("Jack", true),
+            "Do you want to follow @Jack"
+        );
         assert_eq!(
             follow_confirm_prompt("@Jack", false),
             "Do you want to unfollow @Jack"
@@ -11947,9 +12005,7 @@ mod edit_keys_tests {
             FollowClick::InFlight
         );
         assert!(follow_click_status(&FollowClick::InFlight).contains("already in progress"));
-        assert!(
-            follow_click_status(&FollowClick::ConnectFirst).contains("Nothing was changed")
-        );
+        assert!(follow_click_status(&FollowClick::ConnectFirst).contains("Nothing was changed"));
         assert!(follow_click_status(&FollowClick::OwnAccount).contains("Nothing was changed"));
         for click in [
             FollowClick::InFlight,
@@ -12149,10 +12205,7 @@ mod edit_keys_tests {
             TIMELINE_PAGE,
             None,
         );
-        let FetchPayload::Timeline {
-            posts, status, ..
-        } = payload
-        else {
+        let FetchPayload::Timeline { posts, status, .. } = payload else {
             panic!("timeline");
         };
         assert!(
@@ -12171,10 +12224,7 @@ mod edit_keys_tests {
             follow_step(false, false, false, "ada"),
             FollowStep::ConnectFirst
         );
-        assert_eq!(
-            follow_step(true, true, false, "me"),
-            FollowStep::OwnAccount
-        );
+        assert_eq!(follow_step(true, true, false, "me"), FollowStep::OwnAccount);
         assert_eq!(
             follow_step(true, false, false, "@ada"),
             FollowStep::Confirm {

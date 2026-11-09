@@ -365,10 +365,14 @@ impl Service {
                     continue;
                 }
                 fetches += 1;
-                let fetch_id = post.original_fetch_id().unwrap_or(post.id.as_str()).to_string();
-                let resolved = self.post_by_id(&fetch_id).ok().and_then(|served| {
-                    Post::adopt_fetched_original(&post.id, served.value)
-                });
+                let fetch_id = post
+                    .original_fetch_id()
+                    .unwrap_or(post.id.as_str())
+                    .to_string();
+                let resolved = self
+                    .post_by_id(&fetch_id)
+                    .ok()
+                    .and_then(|served| Post::adopt_fetched_original(&post.id, served.value));
                 if resolved.is_none() {
                     post.unavailable_original_url = post.original_link();
                 }
@@ -1682,7 +1686,9 @@ static QUOTE_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 static COMPOSER_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn composer_gate() -> std::sync::MutexGuard<'static, ()> {
-    COMPOSER_GATE.lock().unwrap_or_else(|poison| poison.into_inner())
+    COMPOSER_GATE
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn begin_quote_lease() -> u64 {
@@ -1694,7 +1700,11 @@ fn quote_cleanup_current(epoch: u64) -> bool {
 }
 
 fn sanitize_browser_note(raw: &str) -> String {
-    let collapsed = raw.split_whitespace().take(12).collect::<Vec<_>>().join(" ");
+    let collapsed = raw
+        .split_whitespace()
+        .take(12)
+        .collect::<Vec<_>>()
+        .join(" ");
     let lower = collapsed.to_ascii_lowercase();
     if lower.contains("token") || lower.contains("cookie") || lower.contains("authorization") {
         return "browser error omitted".into();
@@ -1831,43 +1841,43 @@ fn browser_page_json(
         }
     };
     if let Some(url) = url {
-    let open_args = if keep_window {
-        crate::publish::quote_browser_args(cli, session, &["open", url], None, true)
-    } else {
-        crate::publish::browser_command(cli, session, "open", Some(url))
-    };
-    let open_public = crate::publish::browser_argv_public(&open_args);
-    let opened = match run(&open_args, Duration::from_secs(60)) {
-        Ok(output) => output,
-        Err(error) => {
+        let open_args = if keep_window {
+            crate::publish::quote_browser_args(cli, session, &["open", url], None, true)
+        } else {
+            crate::publish::browser_command(cli, session, "open", Some(url))
+        };
+        let open_public = crate::publish::browser_argv_public(&open_args);
+        let opened = match run(&open_args, Duration::from_secs(60)) {
+            Ok(output) => output,
+            Err(error) => {
+                return Err(crate::publish::explain_opencli_failure(
+                    "navigation",
+                    &open_public,
+                    -1,
+                    "",
+                    &error,
+                ));
+            }
+        };
+        if opened.status != 0 {
+            close_quote_session(bin, runner, cli, session);
             return Err(crate::publish::explain_opencli_failure(
                 "navigation",
                 &open_public,
-                -1,
-                "",
-                &error,
+                opened.status,
+                &opened.stdout,
+                &opened.stderr,
             ));
         }
-    };
-    if opened.status != 0 {
-        close_quote_session(bin, runner, cli, session);
-        return Err(crate::publish::explain_opencli_failure(
-            "navigation",
-            &open_public,
-            opened.status,
-            &opened.stdout,
-            &opened.stderr,
-        ));
-    }
-    for _ in 0..8 {
-        match run(
-            &crate::publish::browser_command(cli, session, "eval", Some("location.href")),
-            Duration::from_secs(20),
-        ) {
-            Ok(probe) if probe.stdout.contains("https://x.com") => break,
-            _ => std::thread::sleep(Duration::from_millis(200)),
+        for _ in 0..8 {
+            match run(
+                &crate::publish::browser_command(cli, session, "eval", Some("location.href")),
+                Duration::from_secs(20),
+            ) {
+                Ok(probe) if probe.stdout.contains("https://x.com") => break,
+                _ => std::thread::sleep(Duration::from_millis(200)),
+            }
         }
-    }
     }
     let b64 = b64_encode(js.as_bytes());
     for (index, chunk) in b64.as_bytes().chunks(6000).enumerate() {
@@ -1889,13 +1899,12 @@ fn browser_page_json(
             );
         }
     }
-    let eval_args =
-        crate::publish::browser_command(
-            cli,
-            session,
-            "eval",
-            Some(&format!("eval(atob(window.__{marker}))")),
-        );
+    let eval_args = crate::publish::browser_command(
+        cli,
+        session,
+        "eval",
+        Some(&format!("eval(atob(window.__{marker}))")),
+    );
     let eval_public = crate::publish::browser_argv_public(&eval_args);
     let evaluated = run(&eval_args, Duration::from_secs(90));
     let evaluated = match evaluated {
@@ -2039,7 +2048,9 @@ fn open_visible_quote_page(
             ));
         }
     };
-    if opened.status != 0 || opened.stdout.contains("\"ok\":false") || opened.stdout.contains("\"ok\": false")
+    if opened.status != 0
+        || opened.stdout.contains("\"ok\":false")
+        || opened.stdout.contains("\"ok\": false")
     {
         close_quote_session(bin, runner, cli, session);
         return Err(with_quote_view(
@@ -2086,7 +2097,11 @@ fn open_visible_quote_page(
         }
     };
     let ack = crate::publish::quote_select_ack(&selected.stdout);
-    let select_note = if selected.status != 0 { format!("exit {}", selected.status) } else { ack.note };
+    let select_note = if selected.status != 0 {
+        format!("exit {}", selected.status)
+    } else {
+        ack.note
+    };
     if selected.status != 0 || !ack.ok {
         close_quote_session(bin, runner, cli, session);
         return Err(format!(
@@ -2123,7 +2138,8 @@ fn open_visible_quote_page(
         }
     }
     let focus_note = focus_quote_window(bin, runner, status_id);
-    let after_select = read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
+    let after_select =
+        read_quote_visibility(bin, runner, cli, session, target.as_deref(), status_id);
     let echoed = crate::publish::quote_landed_query(&opened.stdout, status_id);
     let trace = format!(
         "tabs before {tabs_before} · open {open_public} ok page {target_label} field {target_field} · {echoed} · visibility after open {} · select {select_public} {select_note} · {eval_location} · {focus_note} · visibility after select {}",
@@ -2136,10 +2152,7 @@ fn open_visible_quote_page(
             "stage visibility · {trace} · {container} · native click was not sent · Post was not clicked"
         ));
     }
-    Ok(QuoteSurface {
-        target,
-        trace,
-    })
+    Ok(QuoteSurface { target, trace })
 }
 
 fn chrome_call_args(method: &str, json_args: &str) -> Vec<String> {
@@ -2165,7 +2178,8 @@ fn quote_inspect_screenshot(
     }
     let path = dir.join("quote-inspect.png");
     let path_text = path.to_string_lossy().to_string();
-    let args = crate::publish::quote_browser_args(cli, session, &["screenshot", &path_text], tab, true);
+    let args =
+        crate::publish::quote_browser_args(cli, session, &["screenshot", &path_text], tab, true);
     match quote_run(bin, runner, &args, Duration::from_secs(20)) {
         Ok(output) if output.status == 0 => format!("screenshot saved {path_text}"),
         _ => "screenshot unread".into(),
@@ -2212,11 +2226,7 @@ fn quote_owned_leftover(bin: &str, runner: &dyn crate::io::CommandRunner) -> Str
 /// One restore of the owned quote window when Chrome says it is minimized
 /// or unfocused. A rejected update is reported and not retried. This does
 /// not click Post.
-fn focus_quote_window(
-    bin: &str,
-    runner: &dyn crate::io::CommandRunner,
-    status_id: &str,
-) -> String {
+fn focus_quote_window(bin: &str, runner: &dyn crate::io::CommandRunner, status_id: &str) -> String {
     let listed = quote_run(
         bin,
         runner,
@@ -2392,12 +2402,19 @@ fn quote_native_opener(
 ) -> Result<String, String> {
     let mut notes = Vec::new();
     for testid in ["retweet", "unretweet"] {
-        let args = crate::publish::quote_opener_click_args(cli, QUOTE_SESSION, status_id, testid, tab);
+        let args =
+            crate::publish::quote_opener_click_args(cli, QUOTE_SESSION, status_id, testid, tab);
         match quote_run(bin, runner, &args, Duration::from_secs(20)) {
             Ok(output) if crate::publish::quote_click_trusted(&output.stdout) => {
-                return Ok(format!("opener {testid} {}", crate::publish::quote_click_note(&output.stdout)));
+                return Ok(format!(
+                    "opener {testid} {}",
+                    crate::publish::quote_click_note(&output.stdout)
+                ));
             }
-            Ok(output) => notes.push(format!("opener {testid} {}", crate::publish::quote_click_note(&output.stdout))),
+            Ok(output) => notes.push(format!(
+                "opener {testid} {}",
+                crate::publish::quote_click_note(&output.stdout)
+            )),
             Err(_) => notes.push(format!("opener {testid} click unread")),
         }
     }
@@ -2432,11 +2449,19 @@ fn run_quote_attachment(
         return Err(crate::publish::quote_image_unsupported().into());
     }
     let epoch = begin_quote_lease();
-    crate::publish::log_action("quote", "start", &[("ack", "pending"), ("epoch", &epoch.to_string())]);
+    crate::publish::log_action(
+        "quote",
+        "start",
+        &[("ack", "pending"), ("epoch", &epoch.to_string())],
+    );
     match run_quote_attachment_epoch(bin, runner, target_id, text, media, inspect, epoch) {
         Ok(report) => Ok((report, epoch)),
         Err(error) => {
-            crate::publish::log_action("quote", "ack", &[("ack", "rejected"), ("epoch", &epoch.to_string())]);
+            crate::publish::log_action(
+                "quote",
+                "ack",
+                &[("ack", "rejected"), ("epoch", &epoch.to_string())],
+            );
             Err(error)
         }
     }
@@ -2462,7 +2487,10 @@ fn run_quote_attachment_epoch(
         surface.target.as_deref(),
         target_id,
     );
-    let view = format!("{} · visibility before composer {}", surface.trace, click_visibility.summary);
+    let view = format!(
+        "{} · visibility before composer {}",
+        surface.trace, click_visibility.summary
+    );
     if !click_visibility.ready {
         close_quote_session(bin, runner, cli, QUOTE_SESSION);
         return Err(format!(
@@ -2481,7 +2509,11 @@ fn run_quote_attachment_epoch(
         Ok(report) if !report.source_screen.is_empty() && !report.source_text.is_empty() => (
             report.source_screen.clone(),
             report.source_text.clone(),
-            format!("source screen {} text yes chars {}", report.source_screen, report.source_text.chars().count()),
+            format!(
+                "source screen {} text yes chars {}",
+                report.source_screen,
+                report.source_text.chars().count()
+            ),
         ),
         Ok(_) => (String::new(), String::new(), "source missing".into()),
         Err(_) => (String::new(), String::new(), "source unread".into()),
@@ -2517,14 +2549,16 @@ fn run_quote_attachment_epoch(
         }
     }
     if !crate::publish::quote_row_recorded(&menu_note) {
-        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let shot =
+            quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         return Err(format!(
             "stage menu · {view} · {opener} · menu {menu_note} · {shot} · {close_note} · {leftover} · Post was not clicked"
         ));
     }
-    let quote_args = crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
+    let quote_args =
+        crate::publish::quote_native_click_args(cli, QUOTE_SESSION, surface.target.as_deref());
     let quote_click = quote_run(bin, runner, &quote_args, Duration::from_secs(20));
     let quote_note = match &quote_click {
         Ok(output) => crate::publish::quote_click_note(&output.stdout),
@@ -2571,21 +2605,19 @@ fn run_quote_attachment_epoch(
         return Err(crate::publish::quote_image_unsupported().into());
     }
     if !ready || inspect {
-        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let shot =
+            quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let line = format!(
             "{} · {source_note} · {opener} · menu {menu_note} · quote {quote_note} · {shot} · {close_note} · {leftover}",
             with_quote_view(crate::publish::quote_report_line(&after), &view)
         );
-        return if ready {
-            Ok(after)
-        } else {
-            Err(line)
-        };
+        return if ready { Ok(after) } else { Err(line) };
     }
     if inspect {
-        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let shot =
+            quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         let image = "image none".to_string();
@@ -2602,7 +2634,8 @@ fn run_quote_attachment_epoch(
             ..after
         });
     }
-    let post_script = crate::publish::quote_type_and_post_script_bound(target_id, text, &screen, &source_text);
+    let post_script =
+        crate::publish::quote_type_and_post_script_bound(target_id, text, &screen, &source_text);
     let posted = browser_page_json(
         bin,
         runner,
@@ -2616,7 +2649,8 @@ fn run_quote_attachment_epoch(
     )?;
     let report = posted;
     let write_failure = |report: &crate::publish::QuotePageReport| {
-        let shot = quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
+        let shot =
+            quote_inspect_screenshot(bin, runner, cli, QUOTE_SESSION, surface.target.as_deref());
         let close_note = close_quote_session(bin, runner, cli, QUOTE_SESSION);
         let leftover = quote_owned_leftover(bin, runner);
         format!(
@@ -2667,13 +2701,22 @@ fn release_quote_session_later(bin: String, runner: Arc<dyn crate::io::CommandRu
             crate::publish::log_action(
                 "quote",
                 "cleanup",
-                &[("ack", "confirmed"), ("cleanup", "skipped-newer-lease"), ("epoch", &epoch.to_string())],
+                &[
+                    ("ack", "confirmed"),
+                    ("cleanup", "skipped-newer-lease"),
+                    ("epoch", &epoch.to_string()),
+                ],
             );
             return;
         }
         let _composer = composer_gate();
         let cleanup = match browser_cli_for(&bin, runner.as_ref()) {
-            Ok(cli) => Ok(close_quote_session(&bin, runner.as_ref(), cli, QUOTE_SESSION)),
+            Ok(cli) => Ok(close_quote_session(
+                &bin,
+                runner.as_ref(),
+                cli,
+                QUOTE_SESSION,
+            )),
             Err(error) => Err(error),
         };
         let cleanup_note = match cleanup {
@@ -2683,7 +2726,11 @@ fn release_quote_session_later(bin: String, runner: Arc<dyn crate::io::CommandRu
         crate::publish::log_action(
             "quote",
             "cleanup",
-            &[("ack", "confirmed"), ("cleanup", &cleanup_note), ("epoch", &epoch.to_string())],
+            &[
+                ("ack", "confirmed"),
+                ("cleanup", &cleanup_note),
+                ("epoch", &epoch.to_string()),
+            ],
         );
     });
 }
@@ -2869,12 +2916,18 @@ impl Publisher for OpenCliPublisher {
             Ok(receipt) => {
                 write_perf_line("write post proof=confirmed");
                 let new_id = crate::publish::action_new_id(&last);
-                crate::publish::log_action(kind, "ack", &[("ack", "confirmed"), ("new_id", &new_id)]);
+                crate::publish::log_action(
+                    kind,
+                    "ack",
+                    &[("ack", "confirmed"), ("new_id", &new_id)],
+                );
                 Ok(format!("{receipt}{media_note}"))
             }
             Err(error) => {
                 if reply_to.is_none() {
-                    if let Some(id) = self.confirmed_post_on_timeline(parts.last().map(String::as_str).unwrap_or("")) {
+                    if let Some(id) = self
+                        .confirmed_post_on_timeline(parts.last().map(String::as_str).unwrap_or(""))
+                    {
                         write_perf_line("write post proof=reconciled");
                         crate::publish::log_action(
                             kind,
@@ -2940,7 +2993,11 @@ impl Publisher for OpenCliPublisher {
         if let Err(error) = crate::publish::prove_opencli_write(kind, &stdout, Some(handle)) {
             if follow && self.confirmed_following(handle) {
                 write_perf_line(&format!("write {verb} proof=reconciled"));
-                crate::publish::log_action(verb, "reconcile", &[("ack", "confirmed"), ("new_id", "none")]);
+                crate::publish::log_action(
+                    verb,
+                    "reconcile",
+                    &[("ack", "confirmed"), ("new_id", "none")],
+                );
                 return Ok(format!("Followed @{handle}"));
             }
             write_perf_line(&format!("write {verb} proof=rejected"));
@@ -3075,17 +3132,26 @@ impl OpenCliPublisher {
             .to_string();
             let new_id = crate::publish::action_new_id(&stdout);
             let proved = crate::publish::prove_quote(&stdout, &target_id);
-            let (result, _) = crate::publish::settle_confirmed(proved.map(|_| stdout.clone()), Ok(()));
+            let (result, _) =
+                crate::publish::settle_confirmed(proved.map(|_| stdout.clone()), Ok(()));
             match &result {
                 Ok(_) => crate::publish::log_action(
                     "quote",
                     "ack",
-                    &[("ack", "confirmed"), ("new_id", &new_id), ("epoch", &epoch.to_string())],
+                    &[
+                        ("ack", "confirmed"),
+                        ("new_id", &new_id),
+                        ("epoch", &epoch.to_string()),
+                    ],
                 ),
                 Err(_) => crate::publish::log_action(
                     "quote",
                     "ack",
-                    &[("ack", "rejected"), ("new_id", &new_id), ("epoch", &epoch.to_string())],
+                    &[
+                        ("ack", "rejected"),
+                        ("new_id", &new_id),
+                        ("epoch", &epoch.to_string()),
+                    ],
                 ),
             }
             release_quote_session_later(self.bin.clone(), self.runner.clone(), epoch);
@@ -3101,7 +3167,10 @@ impl OpenCliPublisher {
         let call_started = Instant::now();
         // Same visibility rule as post: do not minimize over a native click.
         let _composer = composer_gate();
-        let output = match self.runner.run_keeping_window(&self.bin, &args, ENGAGE_TIMEOUT) {
+        let output = match self
+            .runner
+            .run_keeping_window(&self.bin, &args, ENGAGE_TIMEOUT)
+        {
             Ok(output) => {
                 write_perf_line(&format!(
                     "write engage {} cli_ms={} status={}",
@@ -3123,11 +3192,11 @@ impl OpenCliPublisher {
         };
         let stdout = check_opencli_output(&output, "opencli engage")?;
         if let Err(error) = crate::publish::prove_engage(action, &stdout, None) {
-            write_perf_line(&format!(
-                "engage {} proof=rejected",
-                action.opencli_verb()
-            ));
-            if matches!(action, EngageAction::Retweet | EngageAction::Like | EngageAction::Unlike) {
+            write_perf_line(&format!("engage {} proof=rejected", action.opencli_verb()));
+            if matches!(
+                action,
+                EngageAction::Retweet | EngageAction::Like | EngageAction::Unlike
+            ) {
                 let flag = match action {
                     EngageAction::Retweet => "retweeted",
                     _ => "favorited",
@@ -3135,7 +3204,10 @@ impl OpenCliPublisher {
                 let target_id = crate::model::post_id_from_input(target_url);
                 let expected = !matches!(action, EngageAction::Unlike);
                 if self.timeline_shows_flag(&target_id, flag, expected) {
-                    write_perf_line(&format!("engage {} proof=reconciled", action.opencli_verb()));
+                    write_perf_line(&format!(
+                        "engage {} proof=reconciled",
+                        action.opencli_verb()
+                    ));
                     crate::publish::log_action(
                         action.opencli_verb(),
                         "reconcile",
@@ -3151,17 +3223,21 @@ impl OpenCliPublisher {
                     ));
                 }
             }
-            crate::publish::log_action(action.opencli_verb(), "ack", &[("ack", "rejected"), ("new_id", "none")]);
+            crate::publish::log_action(
+                action.opencli_verb(),
+                "ack",
+                &[("ack", "rejected"), ("new_id", "none")],
+            );
             return Err(error);
         }
-        write_perf_line(&format!(
-            "engage {} proof=confirmed",
-            action.opencli_verb()
-        ));
+        write_perf_line(&format!("engage {} proof=confirmed", action.opencli_verb()));
         crate::publish::log_action(
             action.opencli_verb(),
             "ack",
-            &[("ack", "confirmed"), ("new_id", &crate::publish::action_new_id(&stdout))],
+            &[
+                ("ack", "confirmed"),
+                ("new_id", &crate::publish::action_new_id(&stdout)),
+            ],
         );
         Ok(stdout)
     }
@@ -4088,7 +4164,9 @@ impl Publisher for OfficialPublisher {
             let id = serde_json::from_str::<Value>(&response)
                 .ok()
                 .and_then(|value| value["data"]["id"].as_str().map(str::to_string));
-            let Some(id) = id.filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit())) else {
+            let Some(id) =
+                id.filter(|id| !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()))
+            else {
                 return Err(
                     "Post was not confirmed. The X API response had no status id. Not marked Posted. Nothing was retried."
                         .into(),
@@ -4678,9 +4756,32 @@ fn post_from_value(item: &Value, users: &[(String, String, String)]) -> Option<P
         text,
         id,
         media: media_from_value(item),
-        retweeted: embedded_post(item, &["retweeted", "retweeted_status", "retweeted_tweet", "retweeted_status_result"]),
-        quoted: embedded_post(item, &["quoted", "quoted_status", "quoted_tweet", "quoted_status_result"]),
-        referenced_status_id: first_id(item, &["retweeted_status_id_str", "retweeted_status_id", "referenced_status_id"]),
+        retweeted: embedded_post(
+            item,
+            &[
+                "retweeted",
+                "retweeted_status",
+                "retweeted_tweet",
+                "retweeted_status_result",
+            ],
+        ),
+        quoted: embedded_post(
+            item,
+            &[
+                "quoted",
+                "quoted_status",
+                "quoted_tweet",
+                "quoted_status_result",
+            ],
+        ),
+        referenced_status_id: first_id(
+            item,
+            &[
+                "retweeted_status_id_str",
+                "retweeted_status_id",
+                "referenced_status_id",
+            ],
+        ),
         unavailable_original_url: tombstone_url(item),
         in_reply_to: in_reply_to_from(item),
         viewer_liked: viewer_liked_from(item),
@@ -5243,25 +5344,64 @@ mod tests {
             r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
-        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval"],
+            "https://x.com/i/status/2118971448614334959",
+        );
         let vis = crate::publish::quote_visibility_expr("2118971448614334959");
         runner.script(
             "opencli",
             &["browser", "termyx-quote", "eval", vis.as_str()],
             r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#,
         );
-        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"], quote_menu);
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
+            quote_menu,
+        );
         runner.script(
             "opencli",
             &["browser", "termyx-quote", "click"],
             r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#,
         );
-        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"], quote_snap);
-        runner.script("opencli", &["browser", "termyx-quote", "eval", "eval(atob(window.__qxPost))"], quote_page);
+        runner.script(
+            "opencli",
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxSnap))",
+            ],
+            quote_snap,
+        );
+        runner.script(
+            "opencli",
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxPost))",
+            ],
+            quote_page,
+        );
         runner.script("opencli", &["browser", "termyx-quote-read", "open"], "ok");
         runner.script("opencli", &["browser", "termyx-quote-read", "close"], "ok");
-        runner.script("opencli", &["browser", "termyx-quote-read", "eval"], "https://x.com/i/status/2119069999999999999");
-        runner.script("opencli", &["browser", "termyx-quote-read", "eval", "eval(atob(window.__qx))"], quote_read);
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote-read", "eval"],
+            "https://x.com/i/status/2119069999999999999",
+        );
+        runner.script(
+            "opencli",
+            &[
+                "browser",
+                "termyx-quote-read",
+                "eval",
+                "eval(atob(window.__qx))",
+            ],
+            quote_read,
+        );
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let mut db = ActionDb::default();
         let request = |write| GuiWriteRequest {
@@ -5306,7 +5446,9 @@ mod tests {
         {
             let calls = runner.calls.lock().unwrap();
             assert!(
-                !calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("termyx-quote-read"))),
+                !calls
+                    .iter()
+                    .any(|(_, args)| args.iter().any(|arg| arg.contains("termyx-quote-read"))),
                 "the confirmed quote must not wait on a second status read"
             );
         }
@@ -5334,21 +5476,42 @@ mod tests {
         assert_eq!(calls[0].1[2], "harness post");
         assert!(!calls[0].1.iter().any(|arg| arg == "reply"));
         assert_eq!(calls[1].1[1], "reply");
-        assert!(calls[1].1.iter().any(|arg| arg.contains("2118971448614334959")));
+        assert!(
+            calls[1]
+                .1
+                .iter()
+                .any(|arg| arg.contains("2118971448614334959"))
+        );
         assert_eq!(calls[1].1[3], "harness reply");
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
+            args.iter()
+                .any(|arg| arg.contains("https://x.com/i/status/2118971448614334959"))
                 && args.iter().any(|arg| arg == "open")
         }));
-        assert!(calls.iter().any(|(_, args)| args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")));
-        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
+        assert!(calls.iter().any(|(_, args)| {
+            args.windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "Quote")
+        }));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("quote"))
+        );
         assert!(!calls.iter().any(|(_, args)| {
             args.get(1).map(String::as_str) == Some("post")
                 && args.iter().any(|arg| arg.contains("harness quote"))
         }));
-        let retweet = calls.iter().find(|(_, args)| args.get(1).map(String::as_str) == Some("retweet"));
+        let retweet = calls
+            .iter()
+            .find(|(_, args)| args.get(1).map(String::as_str) == Some("retweet"));
         assert!(retweet.is_some(), "{calls:?}");
-        assert!(retweet.unwrap().1.iter().any(|arg| arg.contains("2118971448614334959")));
+        assert!(
+            retweet
+                .unwrap()
+                .1
+                .iter()
+                .any(|arg| arg.contains("2118971448614334959"))
+        );
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x-action-state.db");
         db.save(&path).unwrap();
@@ -5357,11 +5520,18 @@ mod tests {
         assert!(exported.contains("2118971448614334959"), "{exported}");
         assert!(exported.contains("Posted 42"), "{exported}");
         assert!(exported.contains("q_tweet"), "{exported}");
-        assert!(exported.contains("Quoted 2118971448614334959"), "{exported}");
+        assert!(
+            exported.contains("Quoted 2118971448614334959"),
+            "{exported}"
+        );
         assert!(exported.contains("Reply sent"), "{exported}");
 
         let bad = Arc::new(ScriptedRunner::new());
-        bad.script("opencli", &["twitter", "retweet"], r#"{"ok":true,"id":"2118971448614334959"}"#);
+        bad.script(
+            "opencli",
+            &["twitter", "retweet"],
+            r#"{"ok":true,"id":"2118971448614334959"}"#,
+        );
         bad.script("opencli", &["twitter", "post"], r#"{"ok":true}"#);
         let publisher = OpenCliPublisher::new(&quiet_config(), bad.clone());
         let mut db = ActionDb::default();
@@ -5374,7 +5544,10 @@ mod tests {
             24,
             5,
         );
-        assert!(matches!(rejected, GuiWriteOutcome::Rejected { .. }), "{rejected:?}");
+        assert!(
+            matches!(rejected, GuiWriteOutcome::Rejected { .. }),
+            "{rejected:?}"
+        );
         assert!(db.receipt_ids("jasper_black", ReceiptKind::Post).is_empty());
         let rejected = run_gui_write(
             &publisher,
@@ -5385,7 +5558,10 @@ mod tests {
             25,
             6,
         );
-        assert!(matches!(rejected, GuiWriteOutcome::Rejected { .. }), "{rejected:?}");
+        assert!(
+            matches!(rejected, GuiWriteOutcome::Rejected { .. }),
+            "{rejected:?}"
+        );
         assert_ne!(
             db.confirmed("Jasper_Black", ToggleKind::Repost, "2118971448614334959"),
             Some(true)
@@ -5440,8 +5616,9 @@ mod tests {
                 if args.get(1).map(String::as_str) == Some("--help") {
                     return Ok(CommandOutput {
                         status: 0,
-                        stdout: "opencli browser open <url> --session <name>\n--window background\n"
-                            .into(),
+                        stdout:
+                            "opencli browser open <url> --session <name>\n--window background\n"
+                                .into(),
                         stderr: String::new(),
                     });
                 }
@@ -5481,7 +5658,11 @@ mod tests {
             r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
-        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/20");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval"],
+            "https://x.com/i/status/20",
+        );
         let vis = crate::publish::quote_visibility_expr("20");
         runner.script(
             "opencli",
@@ -5500,7 +5681,12 @@ mod tests {
         );
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxSnap))",
+            ],
             missing,
         );
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
@@ -5516,26 +5702,49 @@ mod tests {
         assert!(err.contains("No quote attachment"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("https://x.com/i/status/20") && arg.contains("/status/20"))
+            args.iter()
+                .any(|arg| arg.contains("https://x.com/i/status/20") && arg.contains("/status/20"))
                 && args.iter().any(|arg| arg == "open")
         }));
         assert!(calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+            args.windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "foreground")
         }));
         assert!(!calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
+            args.windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
         assert!(calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote")
+            args.windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "Quote")
         }));
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]"))
+            args.iter()
+                .any(|arg| arg.contains("[data-testid=\"retweet\"]"))
         }));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("retweetConfirm") || arg.contains("unretweetConfirm"))));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("qxPost"))));
-        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("post")));
-        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("quote")));
-        assert!(!calls.iter().any(|(_, args)| args.first().map(String::as_str) == Some("browser") && args.get(1).map(String::as_str) == Some("termyx-quote-read")));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.iter()
+                .any(|arg| arg.contains("retweetConfirm") || arg.contains("unretweetConfirm"))
+        }));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg.contains("qxPost")))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("post"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("quote"))
+        );
+        assert!(!calls.iter().any(
+            |(_, args)| args.first().map(String::as_str) == Some("browser")
+                && args.get(1).map(String::as_str) == Some("termyx-quote-read")
+        ));
         let _ = calls;
     }
 
@@ -5558,7 +5767,8 @@ mod tests {
                 if args.get(1).map(String::as_str) == Some("--help") {
                     return Ok(CommandOutput {
                         status: 0,
-                        stdout: "Usage: opencli browser <session> <command>\n--window background\n".into(),
+                        stdout: "Usage: opencli browser <session> <command>\n--window background\n"
+                            .into(),
                         stderr: String::new(),
                     });
                 }
@@ -5567,8 +5777,12 @@ mod tests {
                 }
                 if args.iter().any(|arg| arg == "click") && args.iter().any(|arg| arg == "Quote") {
                     *self.quote_clicks.lock().unwrap() += 1;
-                } else if args.iter().any(|arg| arg.contains("data-testid=\\\"retweet\\\""))
-                    || args.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]"))
+                } else if args
+                    .iter()
+                    .any(|arg| arg.contains("data-testid=\\\"retweet\\\""))
+                    || args
+                        .iter()
+                        .any(|arg| arg.contains("[data-testid=\"retweet\"]"))
                 {
                     *self.opener_clicks.lock().unwrap() += 1;
                 }
@@ -5580,14 +5794,16 @@ mod tests {
                 } else if args.iter().any(|arg| arg == "open") {
                     r#"{"ok":true,"data":{"url":"https://x.com/i/status/20","page":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#.to_string()
                 } else if args.iter().any(|arg| arg == "select") {
-                    r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#.to_string()
+                    r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#
+                        .to_string()
                 } else if joined.contains("document.visibilityState") {
                     r#"{"ok":true,"data":"{\"v\":\"visible\",\"h\":false,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#.to_string()
                 } else if joined.contains("location.href") {
                     "https://x.com/i/status/20".to_string()
                 } else if joined.contains("__qxSnap") {
                     r#"{"stage":"composer","path":"/i/status/20","composer":true,"composer_kind":"unknown","card":false,"quote_testids":0,"clicked_post":false,"clicked_repost_confirm":false,"message":"No quote attachment for 20. Post was not clicked."}"#.to_string()
-                } else if joined.contains("eval(atob(window.__qx))") && !joined.contains("__qxSnap") {
+                } else if joined.contains("eval(atob(window.__qx))") && !joined.contains("__qxSnap")
+                {
                     let mut reads = self.menu_reads.lock().unwrap();
                     *reads += 1;
                     if *reads == 1 {
@@ -5602,7 +5818,11 @@ mod tests {
                 } else {
                     "ok".to_string()
                 };
-                Ok(CommandOutput { status: 0, stdout, stderr: String::new() })
+                Ok(CommandOutput {
+                    status: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
             }
         }
         let runner = Arc::new(RetryRunner {
@@ -5613,7 +5833,12 @@ mod tests {
         });
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let err = publisher
-            .engage(EngageAction::Quote, "https://x.com/i/status/20", Some("my words"), &[])
+            .engage(
+                EngageAction::Quote,
+                "https://x.com/i/status/20",
+                Some("my words"),
+                &[],
+            )
             .unwrap_err();
         assert!(err.contains("Post was not clicked"), "{err}");
         assert!(err.contains("No quote attachment"), "{err}");
@@ -5645,7 +5870,11 @@ mod tests {
             r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
         );
         runner.script("opencli", &["browser", "termyx-quote", "close"], "ok");
-        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/i/status/2118971448614334959");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval"],
+            "https://x.com/i/status/2118971448614334959",
+        );
         let vis = crate::publish::quote_visibility_expr("2118971448614334959");
         runner.script(
             "opencli",
@@ -5664,15 +5893,29 @@ mod tests {
         );
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxSnap))",
+            ],
             ready,
         );
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxPost))"],
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxPost))",
+            ],
             missed,
         );
-        runner.script("opencli", &["browser", "termyx-quote", "screenshot"], "Screenshot saved");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "screenshot"],
+            "Screenshot saved",
+        );
         runner.script(
             "opencli",
             &["browser", "chrome", "call", "tabGroups.query"],
@@ -5698,18 +5941,43 @@ mod tests {
         assert!(err.contains("screenshot saved"), "{err}");
         assert!(err.contains("quote-inspect.png"), "{err}");
         assert!(err.contains("session close acknowledged"), "{err}");
-        assert!(err.contains("owned group OpenCLI Browser groups 0 tabs 0"), "{err}");
+        assert!(
+            err.contains("owned group OpenCLI Browser groups 0 tabs 0"),
+            "{err}"
+        );
         let calls = runner.calls.lock().unwrap().clone();
         let posts = calls
             .iter()
             .filter(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxPost))"))
             .count();
         assert_eq!(posts, 1);
-        let shot_at = calls.iter().position(|(_, args)| args.iter().any(|arg| arg == "screenshot")).expect("screenshot");
-        let close_at = calls.iter().rposition(|(_, args)| args.windows(2).any(|pair| pair[0] == "termyx-quote" && pair[1] == "close")).expect("close");
-        assert!(shot_at < close_at, "screenshot must run before session close");
-        assert!(!calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("termyx-quote-read")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove" || arg == "tabs.remove")));
+        let shot_at = calls
+            .iter()
+            .position(|(_, args)| args.iter().any(|arg| arg == "screenshot"))
+            .expect("screenshot");
+        let close_at = calls
+            .iter()
+            .rposition(|(_, args)| {
+                args.windows(2)
+                    .any(|pair| pair[0] == "termyx-quote" && pair[1] == "close")
+            })
+            .expect("close");
+        assert!(
+            shot_at < close_at,
+            "screenshot must run before session close"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("termyx-quote-read"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "windows.update"
+                    || arg == "windows.remove"
+                    || arg == "tabs.remove"))
+        );
     }
 
     #[test]
@@ -5737,7 +6005,11 @@ mod tests {
             &["browser", "termyx-quote", "tab", "list"],
             r#"{"ok":true,"data":[{"page":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},{"page":"B94452EA22F530887AF90E615F8D7031"}]}"#,
         );
-        runner.script("opencli", &["browser", "termyx-quote", "eval"], "https://x.com/compose/post");
+        runner.script(
+            "opencli",
+            &["browser", "termyx-quote", "eval"],
+            "https://x.com/compose/post",
+        );
         runner.script(
             "opencli",
             &["browser", "termyx-quote", "eval", "eval(atob(window.__qx))"],
@@ -5756,7 +6028,12 @@ mod tests {
         );
         runner.script(
             "opencli",
-            &["browser", "termyx-quote", "eval", "eval(atob(window.__qxSnap))"],
+            &[
+                "browser",
+                "termyx-quote",
+                "eval",
+                "eval(atob(window.__qxSnap))",
+            ],
             missing,
         );
         runner.script(
@@ -5782,7 +6059,10 @@ mod tests {
         assert!(err.contains("in-dialog-textareas 0"), "{err}");
         assert!(err.contains("target-links 0"), "{err}");
         assert!(!err.contains("card yes"), "{err}");
-        assert!(err.contains("owned group OpenCLI Browser groups 1 tabs 1"), "{err}");
+        assert!(
+            err.contains("owned group OpenCLI Browser groups 1 tabs 1"),
+            "{err}"
+        );
         assert!(err.contains("session list is not chrome clean"), "{err}");
         assert!(err.contains("session close acknowledged"), "{err}");
         assert!(err.contains("open echo url-key no"), "{err}");
@@ -5791,18 +6071,38 @@ mod tests {
         let calls = runner.calls.lock().unwrap().clone();
         let encoded = b64_encode(crate::publish::quote_snap_script("20").as_bytes());
         assert!(calls.iter().any(|(_, args)| {
-            args.iter().any(|arg| arg.starts_with("window.__qxSnap='") && encoded.starts_with(arg.trim_start_matches("window.__qxSnap='").trim_end_matches('\'')))
+            args.iter().any(|arg| {
+                arg.starts_with("window.__qxSnap='")
+                    && encoded.starts_with(
+                        arg.trim_start_matches("window.__qxSnap='")
+                            .trim_end_matches('\''),
+                    )
+            })
         }));
-        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxSnap))")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update" || arg == "windows.remove" || arg == "tabs.remove")));
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "eval(atob(window.__qxSnap))"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "windows.update"
+                    || arg == "windows.remove"
+                    || arg == "tabs.remove"))
+        );
         assert!(calls.iter().any(|(_, args)| {
             args.windows(3).any(|triple| {
-                triple[0] == "tab" && triple[1] == "close" && triple[2] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                triple[0] == "tab"
+                    && triple[1] == "close"
+                    && triple[2] == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
             })
         }));
         assert!(!calls.iter().any(|(_, args)| {
             args.windows(3).any(|triple| {
-                triple[0] == "tab" && triple[1] == "close" && triple[2] == "B94452EA22F530887AF90E615F8D7031"
+                triple[0] == "tab"
+                    && triple[1] == "close"
+                    && triple[2] == "B94452EA22F530887AF90E615F8D7031"
             })
         }));
         let shot_at = calls
@@ -5811,9 +6111,15 @@ mod tests {
             .expect("screenshot");
         let close_at = calls
             .iter()
-            .rposition(|(_, args)| args.windows(2).any(|pair| pair[0] == "termyx-quote" && pair[1] == "close"))
+            .rposition(|(_, args)| {
+                args.windows(2)
+                    .any(|pair| pair[0] == "termyx-quote" && pair[1] == "close")
+            })
             .expect("session close");
-        assert!(shot_at < close_at, "screenshot must run before session close");
+        assert!(
+            shot_at < close_at,
+            "screenshot must run before session close"
+        );
     }
 
     #[test]
@@ -5862,13 +6168,8 @@ mod tests {
             r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false,"type":"normal","left":120,"top":80,"width":1280,"height":900}}"#,
         );
         runner.script("opencli", &["browser", "close"], "ok");
-        let err = inspect_quote_attachment(
-            "opencli",
-            runner.as_ref(),
-            "2118971448614334959",
-            &[],
-        )
-        .unwrap_err();
+        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[])
+            .unwrap_err();
         assert!(err.contains("stage visibility"), "{err}");
         assert!(err.contains("window foreground"), "{err}");
         assert!(err.contains("tabs before 0"), "{err}");
@@ -5882,24 +6183,44 @@ mod tests {
         assert!(err.contains("group OpenCLI Browser"), "{err}");
         assert!(err.contains("window state minimized"), "{err}");
         assert!(err.contains("focused no"), "{err}");
-        assert!(err.contains("windows.update rejected") || err.contains("window focus"), "{err}");
+        assert!(
+            err.contains("windows.update rejected") || err.contains("window focus"),
+            "{err}"
+        );
         assert!(err.contains("ok selected absent"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
         assert!(calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+            args.windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "foreground")
                 && args.iter().any(|arg| arg == "open")
         }));
-        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "select"))
+        );
         assert!(calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")
-                && args.iter().any(|arg| arg.contains("document.visibilityState"))
+            args.windows(2)
+                .any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")
+                && args
+                    .iter()
+                    .any(|arg| arg.contains("document.visibilityState"))
         }));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
-        assert!(calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "windows.update")));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "click"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "windows.update"))
+        );
         assert!(!calls.iter().any(|(_, args)| {
-            args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background")
+            args.windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "background")
         }));
     }
 
@@ -5911,14 +6232,19 @@ mod tests {
             &["browser", "--help"],
             "Usage: opencli browser open <url> --session <name>\n--window <mode>\n",
         );
-        runner.script("opencli", &["browser", "tab", "list"], r#"{"ok":true,"data":[]}"#);
+        runner.script(
+            "opencli",
+            &["browser", "tab", "list"],
+            r#"{"ok":true,"data":[]}"#,
+        );
         runner.script(
             "opencli",
             &["browser", "open"],
             r#"{"ok":true,"data":{"url":"https://x.com/i/status/2118971448614334959"}}"#,
         );
         runner.script("opencli", &["browser", "close"], "ok");
-        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[]).unwrap_err();
+        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[])
+            .unwrap_err();
         assert!(err.contains("stage open"), "{err}");
         assert!(err.contains("target none"), "{err}");
         assert!(err.contains("target field absent"), "{err}");
@@ -5926,9 +6252,20 @@ mod tests {
         assert!(err.contains("visibility open not-read"), "{err}");
         assert!(err.contains("native click was not sent"), "{err}");
         let calls = runner.calls.lock().unwrap().clone();
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg.contains("document.visibilityState"))));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "click")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "select")));
+        assert!(!calls.iter().any(|(_, args)| {
+            args.iter()
+                .any(|arg| arg.contains("document.visibilityState"))
+        }));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "click"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "select"))
+        );
     }
 
     #[test]
@@ -6468,24 +6805,50 @@ mod tests {
     fn referenced_original_hydrates_and_deleted_original_stays_a_link() {
         struct ById;
         impl XProvider for ById {
-            fn id(&self) -> ProviderId { ProviderId::Mock }
-            fn available(&self) -> bool { true }
-            fn lookup(&self, _: &str) -> Result<Served<Profile>, String> { Err("stub".into()) }
-            fn thread(&self, _: &str) -> Result<Served<Thread>, String> { Err("stub".into()) }
-            fn search(&self, _: &str, _: bool, _: usize) -> Result<Served<Vec<Post>>, String> { Err("stub".into()) }
-            fn timeline(&self, _: usize) -> Result<Served<Vec<Post>>, String> { Err("stub".into()) }
-            fn trends(&self, _: Option<&str>, _: usize) -> Result<Served<Vec<Trend>>, String> { Err("stub".into()) }
+            fn id(&self) -> ProviderId {
+                ProviderId::Mock
+            }
+            fn available(&self) -> bool {
+                true
+            }
+            fn lookup(&self, _: &str) -> Result<Served<Profile>, String> {
+                Err("stub".into())
+            }
+            fn thread(&self, _: &str) -> Result<Served<Thread>, String> {
+                Err("stub".into())
+            }
+            fn search(&self, _: &str, _: bool, _: usize) -> Result<Served<Vec<Post>>, String> {
+                Err("stub".into())
+            }
+            fn timeline(&self, _: usize) -> Result<Served<Vec<Post>>, String> {
+                Err("stub".into())
+            }
+            fn trends(&self, _: Option<&str>, _: usize) -> Result<Served<Vec<Trend>>, String> {
+                Err("stub".into())
+            }
             fn post_by_id(&self, id: &str) -> Result<Served<Post>, String> {
                 if id == "40" {
                     return Ok(served(
-                        post("40", "orig", "Orig", "full original with a photo", 4, 0, 0, 0),
+                        post(
+                            "40",
+                            "orig",
+                            "Orig",
+                            "full original with a photo",
+                            4,
+                            0,
+                            0,
+                            0,
+                        ),
                         "by original id",
                     ));
                 }
                 Err(format!("unavailable {id}"))
             }
         }
-        let service = Service { readers: vec![Box::new(ById)], publishers: Vec::new() };
+        let service = Service {
+            readers: vec![Box::new(ById)],
+            publishers: Vec::new(),
+        };
         let live = post_from_value(
             &serde_json::json!({
                 "id": "50",
@@ -6494,7 +6857,8 @@ mod tests {
                 "referenced_status_id": "40"
             }),
             &[],
-        ).unwrap();
+        )
+        .unwrap();
         assert!(live.retweeted.is_none());
         let mut posts = vec![live.clone()];
         let mut cache = std::collections::HashMap::new();
@@ -6513,15 +6877,28 @@ mod tests {
                 "retweeted_status_result": {"__typename": "TweetUnavailable", "rest_id": "99"}
             }),
             &[],
-        ).unwrap();
-        assert!(gone.retweeted.is_none(), "tombstone is not a fabricated tweet");
-        assert_eq!(gone.unavailable_original_url.as_deref(), Some("https://x.com/i/status/99"));
+        )
+        .unwrap();
+        assert!(
+            gone.retweeted.is_none(),
+            "tombstone is not a fabricated tweet"
+        );
+        assert_eq!(
+            gone.unavailable_original_url.as_deref(),
+            Some("https://x.com/i/status/99")
+        );
         assert_eq!(gone.card_text(), "");
         let mut missing = vec![gone.clone()];
         let mut missing_cache = std::collections::HashMap::new();
-        assert_eq!(service.resolve_bare_reposts(&mut missing, &mut missing_cache, 4), 0);
+        assert_eq!(
+            service.resolve_bare_reposts(&mut missing, &mut missing_cache, 4),
+            0
+        );
         assert!(missing[0].retweeted.is_none());
-        assert_eq!(missing[0].unavailable_original_url.as_deref(), Some("https://x.com/i/status/99"));
+        assert_eq!(
+            missing[0].unavailable_original_url.as_deref(),
+            Some("https://x.com/i/status/99")
+        );
         assert!(missing[0].card_text().is_empty());
         let _ = live;
         let _ = gone;
@@ -6897,15 +7274,28 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let calls = runner.calls.lock().unwrap().clone();
-        let post = calls.iter().find(|(_, args)| args.get(1).map(String::as_str) == Some("post")).expect("post");
-        let images = post.1.windows(2).find(|pair| pair[0] == "--images").expect("images");
+        let post = calls
+            .iter()
+            .find(|(_, args)| args.get(1).map(String::as_str) == Some("post"))
+            .expect("post");
+        let images = post
+            .1
+            .windows(2)
+            .find(|pair| pair[0] == "--images")
+            .expect("images");
         assert!(images[1].contains("marked-post.png"), "{images:?}");
         assert!(images[1].contains("marked-post.jpg"), "{images:?}");
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "upload" || arg == "x.exe")));
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "upload" || arg == "x.exe"))
+        );
 
         let bad = dir.path().join("note.txt");
         std::fs::write(&bad, b"nope").unwrap();
-        let err = publisher.publish(&["photo hello".into()], None, &[bad]).unwrap_err();
+        let err = publisher
+            .publish(&["photo hello".into()], None, &[bad])
+            .unwrap_err();
         assert!(err.contains("webp") || err.contains("jpg"), "{err}");
     }
 
@@ -6933,8 +7323,16 @@ mod tests {
             .expect("reconciled retweet");
         assert!(receipt.contains("retweeted"), "{receipt}");
         let calls = runner.calls.lock().unwrap().clone();
-        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline")));
-        assert!(!calls.iter().any(|(_, args)| args.iter().any(|arg| arg == "x.exe")));
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline"))
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "x.exe"))
+        );
     }
 
     #[test]
@@ -6952,13 +7350,18 @@ mod tests {
         );
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let err = publisher.set_follow("moosaswrld", true).unwrap_err();
-        assert!(err.contains("not confirmed") || err.contains("Not marked"), "{err}");
+        assert!(
+            err.contains("not confirmed") || err.contains("Not marked"),
+            "{err}"
+        );
         runner.script(
             "opencli",
             &["twitter", "user"],
             r#"{"screen_name":"moosaswrld","following":true}"#,
         );
-        let ok = publisher.set_follow("moosaswrld", true).expect("reconciled");
+        let ok = publisher
+            .set_follow("moosaswrld", true)
+            .expect("reconciled");
         assert!(ok.contains("Followed @moosaswrld"), "{ok}");
     }
 
@@ -7020,11 +7423,17 @@ mod tests {
             }
             other => panic!("post was not confirmed: {other:?}"),
         }
-        assert_eq!(runner.mode.lock().expect("mode").as_deref(), Some("visible"));
+        assert_eq!(
+            runner.mode.lock().expect("mode").as_deref(),
+            Some("visible")
+        );
         let calls = runner.calls.lock().expect("calls").clone();
         let args = calls.last().expect("post call");
         assert_eq!(args[1], "post");
-        assert!(args.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "background"));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "background")
+        );
         assert!(!args.iter().any(|arg| arg == "foreground"));
     }
 
@@ -7042,7 +7451,8 @@ mod tests {
             fn run(&self, _: &str, _: &[String]) -> Result<CommandOutput, String> {
                 Ok(CommandOutput {
                     status: 0,
-                    stdout: r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into(),
+                    stdout: r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#
+                        .into(),
                     stderr: String::new(),
                 })
             }
@@ -7078,7 +7488,10 @@ mod tests {
             )
             .expect("retweet receipt");
         assert!(receipt.contains("Tweet successfully retweeted"));
-        assert_eq!(runner.mode.lock().expect("mode").as_deref(), Some("visible"));
+        assert_eq!(
+            runner.mode.lock().expect("mode").as_deref(),
+            Some("visible")
+        );
     }
 
     #[test]
@@ -7088,10 +7501,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("marked-quote-probe.png");
         std::fs::write(&image, b"png").unwrap();
-        let err = inspect_quote_attachment("opencli", runner.as_ref(), "2118971448614334959", &[image.clone()]).unwrap_err();
+        let err = inspect_quote_attachment(
+            "opencli",
+            runner.as_ref(),
+            "2118971448614334959",
+            &[image.clone()],
+        )
+        .unwrap_err();
         assert!(err.contains("cannot attach an image"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
-        assert!(runner.calls.lock().unwrap().is_empty(), "inspect must not open the browser");
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "inspect must not open the browser"
+        );
         let publisher = OpenCliPublisher::new(&quiet_config(), runner.clone());
         let err = publisher
             .engage(
@@ -7103,7 +7525,10 @@ mod tests {
             .unwrap_err();
         assert!(err.contains("cannot attach an image"), "{err}");
         assert!(err.contains("Nothing was posted"), "{err}");
-        assert!(runner.calls.lock().unwrap().is_empty(), "quote must not open the browser");
+        assert!(
+            runner.calls.lock().unwrap().is_empty(),
+            "quote must not open the browser"
+        );
     }
 
     #[test]

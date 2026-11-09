@@ -16,9 +16,9 @@
 //! embedded controls work. Other non-Windows builds stay inert.
 
 use std::path::{Path, PathBuf};
-use termy_x::model::MediaKind;
 #[cfg(any(windows, target_os = "linux"))]
 use std::process::{Child, Command, Stdio};
+use termy_x::model::MediaKind;
 
 /// Logical rect (x, y, w, h) in the parent window's client area.
 pub type Rect = (f32, f32, f32, f32);
@@ -459,7 +459,8 @@ pub const DLL_LOAD_FLAGS: u32 = 0x0000_0100 | 0x0000_0800;
 
 pub const WS_CHILD: u32 = 0x4000_0000;
 
-pub const NO_PLAYABLE_MEDIA: &str = "No playable video or audio file was attached. The image stays in Termy. VLC was not opened.";
+pub const NO_PLAYABLE_MEDIA: &str =
+    "No playable video or audio file was attached. The image stays in Termy. VLC was not opened.";
 
 pub const VLC_OPEN_NOTICE: &str = "Playing inside Termy with VLC's engine. Esc or \u{2715} stops it. Volume and seek here are Termy's controls. VLC's own window is not opened.";
 
@@ -534,11 +535,13 @@ pub fn engine_files_plan(
         return EnginePlan::Refuse(VLC_ENGINE_MISSING);
     }
     if libvlc != Some(IMAGE_FILE_MACHINE_AMD64) || core != Some(IMAGE_FILE_MACHINE_AMD64) {
-        return EnginePlan::Refuse(if core.is_none() && libvlc == Some(IMAGE_FILE_MACHINE_AMD64) {
-            VLC_ENGINE_MISSING
-        } else {
-            VLC_WRONG_ARCH
-        });
+        return EnginePlan::Refuse(
+            if core.is_none() && libvlc == Some(IMAGE_FILE_MACHINE_AMD64) {
+                VLC_ENGINE_MISSING
+            } else {
+                VLC_WRONG_ARCH
+            },
+        );
     }
     if plugins == 0 {
         return EnginePlan::Refuse(VLC_PLUGINS_MISSING);
@@ -808,8 +811,14 @@ pub fn vlc_candidates(
     out
 }
 
-pub fn select_vlc<'a>(candidates: &'a [PathBuf], exists: impl Fn(&Path) -> bool) -> Option<&'a Path> {
-    candidates.iter().find(|path| exists(path)).map(PathBuf::as_path)
+pub fn select_vlc<'a>(
+    candidates: &'a [PathBuf],
+    exists: impl Fn(&Path) -> bool,
+) -> Option<&'a Path> {
+    candidates
+        .iter()
+        .find(|path| exists(path))
+        .map(PathBuf::as_path)
 }
 
 /// Portable runtime copied next to `termy.exe`. Not Program Files.
@@ -893,7 +902,13 @@ pub fn locate_vlc_root(
             };
         }
     }
-    let candidates = vlc_candidates(canonical, program_files, program_files_x86, exe_dir, path_env);
+    let candidates = vlc_candidates(
+        canonical,
+        program_files,
+        program_files_x86,
+        exe_dir,
+        path_env,
+    );
     select_vlc(&candidates, Path::is_file)
         .and_then(Path::parent)
         .map(Path::to_path_buf)
@@ -1027,7 +1042,7 @@ impl VideoPlayer {
         }
         #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = (parent_hwnd, scale, rect, url);
+            let _ = (parent_hwnd, scale, rect, url, volume);
             Err("in-app video is Windows-only in this build".into())
         }
     }
@@ -1123,9 +1138,9 @@ impl VideoPlayer {
 #[cfg(windows)]
 mod vlc_embed {
     use super::{
-        client_pixels, engine_files_plan, find_vlc_root, host_child_style, libvlc_instance_args,
-        media_url_class, pe_machine, EnginePlan, MediaUrlClass, Rect, DLL_LOAD_FLAGS,
-        IMAGE_FILE_MACHINE_AMD64, LIBVLC_EVENT_END, LIBVLC_EVENT_ERROR,
+        DLL_LOAD_FLAGS, EnginePlan, IMAGE_FILE_MACHINE_AMD64, LIBVLC_EVENT_END, LIBVLC_EVENT_ERROR,
+        MediaUrlClass, Rect, client_pixels, engine_files_plan, find_vlc_root, host_child_style,
+        libvlc_instance_args, media_url_class, pe_machine,
     };
     use std::ffi::CString;
     use std::os::windows::ffi::OsStrExt;
@@ -1171,8 +1186,18 @@ mod vlc_embed {
     unsafe extern "system" {
         fn RegisterClassExW(c: *const WndClass) -> u16;
         fn CreateWindowExW(
-            ex: u32, class: *const u16, name: *const u16, style: u32, x: i32, y: i32, w: i32,
-            h: i32, parent: Hwnd, menu: Hwnd, inst: Hwnd, param: *mut core::ffi::c_void,
+            ex: u32,
+            class: *const u16,
+            name: *const u16,
+            style: u32,
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            parent: Hwnd,
+            menu: Hwnd,
+            inst: Hwnd,
+            param: *mut core::ffi::c_void,
         ) -> Hwnd;
         fn DestroyWindow(h: Hwnd) -> i32;
         fn ShowWindow(h: Hwnd, cmd: i32) -> i32;
@@ -1190,7 +1215,8 @@ mod vlc_embed {
     struct Api {
         new: unsafe extern "system" fn(i32, *const *const i8) -> *mut core::ffi::c_void,
         release: unsafe extern "system" fn(*mut core::ffi::c_void),
-        media_new: unsafe extern "system" fn(*mut core::ffi::c_void, *const i8) -> *mut core::ffi::c_void,
+        media_new:
+            unsafe extern "system" fn(*mut core::ffi::c_void, *const i8) -> *mut core::ffi::c_void,
         media_release: unsafe extern "system" fn(*mut core::ffi::c_void),
         player_new: unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
         player_release: unsafe extern "system" fn(*mut core::ffi::c_void),
@@ -1208,8 +1234,14 @@ mod vlc_embed {
         set_mouse: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
         set_key: unsafe extern "system" fn(*mut core::ffi::c_void, u32),
         event_manager: unsafe extern "system" fn(*mut core::ffi::c_void) -> *mut core::ffi::c_void,
-        event_attach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void) -> i32,
-        event_detach: unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void),
+        event_attach: unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            i32,
+            Cb,
+            *mut core::ffi::c_void,
+        ) -> i32,
+        event_detach:
+            unsafe extern "system" fn(*mut core::ffi::c_void, i32, Cb, *mut core::ffi::c_void),
         get_state: unsafe extern "system" fn(*mut core::ffi::c_void) -> i32,
     }
 
@@ -1317,14 +1349,18 @@ mod vlc_embed {
         let mut all_64 = true;
         let mut stack = vec![dir.to_path_buf()];
         while let Some(dir) = stack.pop() {
-            let Ok(read) = std::fs::read_dir(&dir) else { continue };
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
             for entry in read.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     stack.push(path);
                     continue;
                 }
-                let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
                 if !name.ends_with("_plugin.dll") {
                     continue;
                 }
@@ -1359,14 +1395,16 @@ mod vlc_embed {
         validate_tree(dir)?;
         let core = dir.join("libvlccore.dll");
         let core_w = wide(core.as_os_str());
-        let core_module = unsafe { LoadLibraryExW(core_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
+        let core_module =
+            unsafe { LoadLibraryExW(core_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
         if core_module.is_null() {
             return Err(super::VLC_ENGINE_MISSING.into());
         }
         let _ = core_module;
         let dll = dir.join("libvlc.dll");
         let dll_w = wide(dll.as_os_str());
-        let module = unsafe { LoadLibraryExW(dll_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
+        let module =
+            unsafe { LoadLibraryExW(dll_w.as_ptr(), std::ptr::null_mut(), DLL_LOAD_FLAGS) };
         if module.is_null() {
             return Err(super::VLC_ENGINE_MISSING.into());
         }
@@ -1402,7 +1440,9 @@ mod vlc_embed {
     fn enqueue(job: Job) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            let _ = std::thread::Builder::new().name("termy-vlc".into()).spawn(worker_loop);
+            let _ = std::thread::Builder::new()
+                .name("termy-vlc".into())
+                .spawn(worker_loop);
         });
         let (lock, cv) = job_queue();
         if let Ok(mut queue) = lock.lock() {
@@ -1424,7 +1464,10 @@ mod vlc_embed {
             match job {
                 Job::Pause { generation, paused } => worker_pause(generation, paused),
                 Job::Seek { generation, ms } => worker_seek(generation, ms),
-                Job::Volume { generation, percent } => worker_volume(generation, percent),
+                Job::Volume {
+                    generation,
+                    percent,
+                } => worker_volume(generation, percent),
                 Job::Mute { generation, muted } => worker_mute(generation, muted),
                 Job::Query { generation } => worker_query(generation),
                 Job::Stop { generation, slot } => worker_stop(generation, slot),
@@ -1432,7 +1475,10 @@ mod vlc_embed {
         }
     }
 
-    fn with_player<T>(generation: u64, f: impl FnOnce(&Api, *mut core::ffi::c_void) -> T) -> Option<T> {
+    fn with_player<T>(
+        generation: u64,
+        f: impl FnOnce(&Api, *mut core::ffi::c_void) -> T,
+    ) -> Option<T> {
         let cur = current().lock().ok()?;
         let cur = cur.as_ref()?;
         if cur.generation != generation {
@@ -1445,7 +1491,9 @@ mod vlc_embed {
     fn ensure_clip_children(host: Hwnd) -> Result<(), String> {
         let current = unsafe { GetWindowLongW(host, GWL_STYLE) } as u32;
         let next = current | super::HOST_STYLE_CLIP_CHILDREN;
-        unsafe { SetWindowLongW(host, GWL_STYLE, next as i32); }
+        unsafe {
+            SetWindowLongW(host, GWL_STYLE, next as i32);
+        }
         let after = unsafe { GetWindowLongW(host, GWL_STYLE) } as u32;
         if super::start_would_abort_in_ucrt(false, after & super::HOST_STYLE_CLIP_CHILDREN != 0) {
             return Err("video surface is missing WS_CLIPCHILDREN, so VLC would abort. No window was opened.".into());
@@ -1455,8 +1503,16 @@ mod vlc_embed {
 
     /// Called on the window thread. Does not pump messages: the caller is
     /// inside a GPUI update, and `DispatchMessage` from here abort()s.
-    fn open_embedded(url: CString, volume: i32, hwnd: usize, generation: u64, slot: Arc<Slot>) -> Result<(), String> {
-        if !super::START_ON_WINDOW_THREAD || super::start_would_abort_in_ucrt(super::DISPATCH_DURING_START, true) {
+    fn open_embedded(
+        url: CString,
+        volume: i32,
+        hwnd: usize,
+        generation: u64,
+        slot: Arc<Slot>,
+    ) -> Result<(), String> {
+        if !super::START_ON_WINDOW_THREAD
+            || super::start_would_abort_in_ucrt(super::DISPATCH_DURING_START, true)
+        {
             return Err("video start would abort before playback. No window was opened.".into());
         }
         ensure_clip_children(hwnd as Hwnd)?;
@@ -1468,7 +1524,10 @@ mod vlc_embed {
         }
         let plugins = dir.join("plugins");
         let args = libvlc_instance_args(&plugins.to_string_lossy());
-        let c_args: Vec<CString> = args.iter().map(|arg| CString::new(arg.as_str()).unwrap_or_else(|_| CString::new("").unwrap())).collect();
+        let c_args: Vec<CString> = args
+            .iter()
+            .map(|arg| CString::new(arg.as_str()).unwrap_or_else(|_| CString::new("").unwrap()))
+            .collect();
         let mut ptrs: Vec<*const i8> = c_args.iter().map(|arg| arg.as_ptr()).collect();
         ptrs.push(std::ptr::null());
         let argc = super::libvlc_argc(c_args.len(), ptrs.last().is_some_and(|ptr| ptr.is_null()))
@@ -1605,7 +1664,10 @@ mod vlc_embed {
             let started = Instant::now();
             (api.set_pause)(player, 1);
             let ms = started.elapsed().as_millis() as u64;
-            handles.slot.audio_stop_ms.store(ms.max(1), Ordering::Release);
+            handles
+                .slot
+                .audio_stop_ms
+                .store(ms.max(1), Ordering::Release);
             (api.set_hwnd)(player, std::ptr::null_mut());
             (api.stop)(player);
             (api.player_release)(player);
@@ -1622,15 +1684,23 @@ mod vlc_embed {
     fn note_audio_stop(ms: u64) -> std::io::Result<()> {
         let line = format!("termy-video event=audio-stop ms={ms}");
         let path = std::env::temp_dir().join("termy-video-hwnd.log");
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
         use std::io::Write;
         writeln!(file, "{line}")
     }
 
     fn worker_stop(generation: u64, slot: Arc<Slot>) {
-        let api = super::find_vlc_root().ok().and_then(|dir| load_api(&dir).ok());
+        let api = super::find_vlc_root()
+            .ok()
+            .and_then(|dir| load_api(&dir).ok());
         let handles = current().lock().ok().and_then(|mut guard| {
-            if guard.as_ref().is_some_and(|cur| cur.generation == generation) {
+            if guard
+                .as_ref()
+                .is_some_and(|cur| cur.generation == generation)
+            {
                 guard.take()
             } else {
                 None
@@ -1656,7 +1726,13 @@ mod vlc_embed {
     unsafe impl Send for Player {}
 
     impl Player {
-        pub fn start(parent: isize, scale: f32, rect: Rect, url: &str, volume: u8) -> Result<Self, String> {
+        pub fn start(
+            parent: isize,
+            scale: f32,
+            rect: Rect,
+            url: &str,
+            volume: u8,
+        ) -> Result<Self, String> {
             reap_hosts();
             if parent == 0 {
                 return Err("Termy window is not ready. No window was opened.".into());
@@ -1664,7 +1740,8 @@ mod vlc_embed {
             if media_url_class(url) != MediaUrlClass::Playable {
                 return Err(super::NO_PLAYABLE_MEDIA.into());
             }
-            let location = CString::new(url.trim()).map_err(|_| super::NO_PLAYABLE_MEDIA.to_string())?;
+            let location =
+                CString::new(url.trim()).map_err(|_| super::NO_PLAYABLE_MEDIA.to_string())?;
             let (x, y, w, h) = client_pixels(scale, rect);
             let class = wide(std::ffi::OsStr::new("TermyXVlcHost"));
             let host = unsafe {
@@ -1688,7 +1765,10 @@ mod vlc_embed {
                     class.as_ptr(),
                     wide(std::ffi::OsStr::new("")).as_ptr(),
                     host_child_style(),
-                    x, y, w, h,
+                    x,
+                    y,
+                    w,
+                    h,
                     parent as Hwnd,
                     std::ptr::null_mut(),
                     GetModuleHandleW(std::ptr::null()),
@@ -1699,7 +1779,9 @@ mod vlc_embed {
                 return Err("Could not place the video inside Termy. No window was opened.".into());
             }
             let rude = wide(std::ffi::OsStr::new("NonRudeHWND"));
-            unsafe { SetPropW(host, rude.as_ptr(), 1 as *mut core::ffi::c_void); }
+            unsafe {
+                SetPropW(host, rude.as_ptr(), 1 as *mut core::ffi::c_void);
+            }
             static GEN: AtomicU64 = AtomicU64::new(1);
             let generation = GEN.fetch_add(1, Ordering::Relaxed);
             let slot = Arc::new(Slot {
@@ -1730,7 +1812,16 @@ mod vlc_embed {
                 return Err(err);
             }
             unsafe { ShowWindow(host, SW_SHOWNA) };
-            Ok(Self { host, parent: parent as Hwnd, scale, rect, generation, slot, paused: false, hidden: false })
+            Ok(Self {
+                host,
+                parent: parent as Hwnd,
+                scale,
+                rect,
+                generation,
+                slot,
+                paused: false,
+                hidden: false,
+            })
         }
 
         pub fn reposition(&mut self, scale: f32, rect: Rect) {
@@ -1741,13 +1832,24 @@ mod vlc_embed {
             }
             let (x, y, w, h) = client_pixels(scale, rect);
             unsafe {
-                SetWindowPos(self.host, std::ptr::null_mut(), x, y, w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+                SetWindowPos(
+                    self.host,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
             }
         }
 
         pub fn toggle_pause(&mut self) {
             self.paused = !self.paused;
-            enqueue(Job::Pause { generation: self.generation, paused: self.paused });
+            enqueue(Job::Pause {
+                generation: self.generation,
+                paused: self.paused,
+            });
         }
 
         pub fn seek_relative(&mut self, seconds: i32) {
@@ -1756,26 +1858,41 @@ mod vlc_embed {
         }
 
         pub fn seek_absolute(&mut self, seconds: f64) {
-            if !self.slot.seekable.load(Ordering::Acquire) && self.slot.time_ms.load(Ordering::Acquire) == 0 {
-                enqueue(Job::Query { generation: self.generation });
+            if !self.slot.seekable.load(Ordering::Acquire)
+                && self.slot.time_ms.load(Ordering::Acquire) == 0
+            {
+                enqueue(Job::Query {
+                    generation: self.generation,
+                });
             }
             let ms = (seconds.max(0.0) * 1000.0) as i64;
-            enqueue(Job::Seek { generation: self.generation, ms });
+            enqueue(Job::Seek {
+                generation: self.generation,
+                ms,
+            });
         }
 
         pub fn progress(&self) -> (f64, f64) {
-            enqueue(Job::Query { generation: self.generation });
+            enqueue(Job::Query {
+                generation: self.generation,
+            });
             let time = self.slot.time_ms.load(Ordering::Acquire);
             let length = self.slot.length_ms.load(Ordering::Acquire);
             (time as f64 / 1000.0, length as f64 / 1000.0)
         }
 
         pub fn set_volume(&mut self, percent: u8) {
-            enqueue(Job::Volume { generation: self.generation, percent: i32::from(percent.min(100)) });
+            enqueue(Job::Volume {
+                generation: self.generation,
+                percent: i32::from(percent.min(100)),
+            });
         }
 
         pub fn set_muted(&mut self, muted: bool) {
-            enqueue(Job::Mute { generation: self.generation, muted });
+            enqueue(Job::Mute {
+                generation: self.generation,
+                muted,
+            });
         }
 
         pub fn take_failure(&mut self) -> Option<&'static str> {
@@ -1788,7 +1905,11 @@ mod vlc_embed {
         }
 
         fn drain_events(&self) {
-            let queued = events().lock().ok().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
+            let queued = events()
+                .lock()
+                .ok()
+                .map(|mut q| std::mem::take(&mut *q))
+                .unwrap_or_default();
             let mut flags = super::EngineFlags::default();
             for (generation, kind) in queued {
                 super::apply_engine_callback(self.generation, generation, kind, &mut flags);
@@ -1803,7 +1924,9 @@ mod vlc_embed {
 
         pub fn is_alive(&mut self) -> bool {
             self.drain_events();
-            !self.hidden && !self.slot.ended.load(Ordering::Acquire) && !self.slot.failed.load(Ordering::Acquire)
+            !self.hidden
+                && !self.slot.ended.load(Ordering::Acquire)
+                && !self.slot.failed.load(Ordering::Acquire)
         }
 
         pub fn stop(&mut self) {
@@ -1815,17 +1938,25 @@ mod vlc_embed {
             if !self.host.is_null() {
                 unsafe { ShowWindow(self.host, SW_HIDE) };
                 if let Ok(mut guard) = reaps().lock() {
-                    guard.push(Reap { host: self.host as usize, slot: Arc::clone(&self.slot) });
+                    guard.push(Reap {
+                        host: self.host as usize,
+                        slot: Arc::clone(&self.slot),
+                    });
                 }
                 self.host = std::ptr::null_mut();
             }
-            enqueue(Job::Stop { generation: self.generation, slot: Arc::clone(&self.slot) });
+            enqueue(Job::Stop {
+                generation: self.generation,
+                slot: Arc::clone(&self.slot),
+            });
         }
     }
 
     pub fn reap_hosts() {
         let ready = {
-            let Ok(mut guard) = reaps().lock() else { return };
+            let Ok(mut guard) = reaps().lock() else {
+                return;
+            };
             let mut left = Vec::new();
             let mut ready = Vec::new();
             for reap in guard.drain(..) {
@@ -3219,22 +3350,22 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLOSE_BAND, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_VISIBLE, HostGate, HostPhase,
-        DLL_LOAD_FLAGS, EngineFlags, EnginePhase, EnginePlan, EngineStep, HOST_STYLE_POPUP,
-        MediaDispatch, NO_PLAYABLE_MEDIA, VLC_PLUGINS_MISSING, WS_CHILD,
-        PlayGen, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, VLC_ENGINE_MISSING, VLC_WRONG_ARCH,
-        TRACE_OTHER_CAP, VLC_BUNDLE_INCOMPLETE, VLC_CANONICAL_WINDOWS, VLC_NOT_FOUND, admit_trace_line,
-        app_bundle_decision, app_local_vlc_dir, begin_playback, locate_vlc_root,
-        callback_is_current, choose_variant_url, clamp_window_change, close_button_rect,
-        dismiss_playback, dispatch_media, embed_rect, event_name, format_obs_line,
-        host_create_style, host_style_starts_hidden, keep_main_window, live_size_differs_half,
-        marker_name, playback_args, pos_is_noop, rect_changed, rects_overlap, sanitize_token,
-        select_vlc, swp_names, vlc_candidates, vlc_playback_args, volume_commands, volume_percent,
-        apply_engine_callback, client_pixels, engine_files_plan, engine_plan, engine_step,
-        host_child_style, launches_external_vlc, libvlc_argc, libvlc_instance_args, pe_machine,
-        start_would_abort_in_ucrt, surface_style_for_libvlc, ENGINE_RELEASE_ORDER,
-        DISPATCH_DURING_START, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386, LIBVLC_EVENT_END,
-        LIBVLC_EVENT_ERROR, LIBVLC_START_ORDER, START_ON_WINDOW_THREAD,
+        CLOSE_BAND, DISPATCH_DURING_START, DLL_LOAD_FLAGS, ENGINE_RELEASE_ORDER, EngineFlags,
+        EnginePhase, EnginePlan, EngineStep, HOST_STYLE_CLIP_CHILDREN, HOST_STYLE_POPUP,
+        HOST_STYLE_VISIBLE, HostGate, HostPhase, IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_I386,
+        LIBVLC_EVENT_END, LIBVLC_EVENT_ERROR, LIBVLC_START_ORDER, MediaDispatch, NO_PLAYABLE_MEDIA,
+        PlayGen, START_ON_WINDOW_THREAD, SWP_NOMOVE, SWP_NOSIZE, TRACE_LINE_CAP, TRACE_OTHER_CAP,
+        VLC_BUNDLE_INCOMPLETE, VLC_CANONICAL_WINDOWS, VLC_ENGINE_MISSING, VLC_NOT_FOUND,
+        VLC_PLUGINS_MISSING, VLC_WRONG_ARCH, WS_CHILD, admit_trace_line, app_bundle_decision,
+        app_local_vlc_dir, apply_engine_callback, begin_playback, callback_is_current,
+        choose_variant_url, clamp_window_change, client_pixels, close_button_rect,
+        dismiss_playback, dispatch_media, embed_rect, engine_files_plan, engine_plan, engine_step,
+        event_name, format_obs_line, host_child_style, host_create_style, host_style_starts_hidden,
+        keep_main_window, launches_external_vlc, libvlc_argc, libvlc_instance_args,
+        live_size_differs_half, locate_vlc_root, marker_name, pe_machine, playback_args,
+        pos_is_noop, rect_changed, rects_overlap, sanitize_token, select_vlc,
+        start_would_abort_in_ucrt, surface_style_for_libvlc, swp_names, vlc_candidates,
+        vlc_playback_args, volume_commands, volume_percent,
     };
     use std::path::{Path, PathBuf};
     use termy_x::model::MediaKind;
@@ -3422,7 +3553,10 @@ mod tests {
             dispatch_media(MediaKind::Video, "https://x.com/someone/status/1"),
             MediaDispatch::Unplayable
         );
-        assert_eq!(dispatch_media(MediaKind::Video, ""), MediaDispatch::Unplayable);
+        assert_eq!(
+            dispatch_media(MediaKind::Video, ""),
+            MediaDispatch::Unplayable
+        );
         assert_eq!(
             dispatch_media(MediaKind::Video, "https://video.twimg.com/a.mp4\ncalc"),
             MediaDispatch::Unplayable
@@ -3491,12 +3625,18 @@ mod tests {
         pe[0x44] = (IMAGE_FILE_MACHINE_I386 & 0xff) as u8;
         pe[0x45] = (IMAGE_FILE_MACHINE_I386 >> 8) as u8;
         assert_eq!(pe_machine(&pe), Some(IMAGE_FILE_MACHINE_I386));
-        assert_eq!(engine_plan(Some(IMAGE_FILE_MACHINE_AMD64), true), EnginePlan::Embed);
+        assert_eq!(
+            engine_plan(Some(IMAGE_FILE_MACHINE_AMD64), true),
+            EnginePlan::Embed
+        );
         assert_eq!(
             engine_plan(Some(IMAGE_FILE_MACHINE_I386), true),
             EnginePlan::Refuse(VLC_WRONG_ARCH)
         );
-        assert_eq!(engine_plan(None, true), EnginePlan::Refuse(VLC_ENGINE_MISSING));
+        assert_eq!(
+            engine_plan(None, true),
+            EnginePlan::Refuse(VLC_ENGINE_MISSING)
+        );
         assert_eq!(
             engine_plan(Some(IMAGE_FILE_MACHINE_AMD64), false),
             EnginePlan::Refuse(NO_PLAYABLE_MEDIA)
@@ -3507,9 +3647,20 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--intf=dummy"));
         assert!(args.iter().any(|arg| arg == "--dummy-quiet"));
         assert!(args.iter().any(|arg| arg == "--ignore-config"));
-        assert!(args.iter().all(|arg| arg != "--fullscreen" && !arg.contains("http")));
-        assert_eq!(args.iter().filter(|arg| arg.starts_with("--plugin-path=")).count(), 1);
-        assert_eq!(engine_step(EnginePhase::Idle, EngineStep::Play), Err("play before the panel surface exists"));
+        assert!(
+            args.iter()
+                .all(|arg| arg != "--fullscreen" && !arg.contains("http"))
+        );
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.starts_with("--plugin-path="))
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine_step(EnginePhase::Idle, EngineStep::Play),
+            Err("play before the panel surface exists")
+        );
         assert_eq!(
             engine_step(EnginePhase::Idle, EngineStep::PlaceHost).unwrap(),
             EnginePhase::HostReady
@@ -3517,7 +3668,9 @@ mod tests {
         let playing = engine_step(EnginePhase::HostReady, EngineStep::Play).unwrap();
         assert_eq!(playing, EnginePhase::Playing);
         assert_eq!(
-            engine_step(playing, EngineStep::Stop).and_then(|phase| engine_step(phase, EngineStep::Release)).unwrap(),
+            engine_step(playing, EngineStep::Stop)
+                .and_then(|phase| engine_step(phase, EngineStep::Release))
+                .unwrap(),
             EnginePhase::Released
         );
         assert_eq!(
@@ -3539,24 +3692,51 @@ mod tests {
         assert_ne!(child & HOST_STYLE_CLIP_CHILDREN, 0);
         assert_eq!(child & HOST_STYLE_POPUP, 0);
         assert_eq!(child & HOST_STYLE_VISIBLE, 0);
-        assert_eq!(client_pixels(1.25, (0.0, 0.0, 480.0, 616.0)), (0, 0, 600, 770));
+        assert_eq!(
+            client_pixels(1.25, (0.0, 0.0, 480.0, 616.0)),
+            (0, 0, 600, 770)
+        );
         assert_eq!(DLL_LOAD_FLAGS, 0x0000_0100 | 0x0000_0800);
         assert_eq!(
-            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 4, true),
+            engine_files_plan(
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                4,
+                true
+            ),
             EnginePlan::Embed
         );
         assert_eq!(
-            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 0, true),
+            engine_files_plan(
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                0,
+                true
+            ),
             EnginePlan::Refuse(VLC_PLUGINS_MISSING)
         );
         assert_eq!(
-            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_I386), 4, true),
+            engine_files_plan(
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                Some(IMAGE_FILE_MACHINE_I386),
+                4,
+                true
+            ),
             EnginePlan::Refuse(VLC_WRONG_ARCH)
         );
         let flags_only = libvlc_instance_args(r"C:\Program Files\VideoLAN\VLC\plugins");
-        assert!(flags_only.iter().any(|arg| arg.starts_with("--plugin-path=")));
+        assert!(
+            flags_only
+                .iter()
+                .any(|arg| arg.starts_with("--plugin-path="))
+        );
         assert_ne!(
-            engine_files_plan(Some(IMAGE_FILE_MACHINE_AMD64), Some(IMAGE_FILE_MACHINE_AMD64), 0, true),
+            engine_files_plan(
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                Some(IMAGE_FILE_MACHINE_AMD64),
+                0,
+                true
+            ),
             EnginePlan::Embed
         );
     }
@@ -3583,7 +3763,10 @@ mod tests {
                 "show-host",
             ]
         );
-        let play_at = LIBVLC_START_ORDER.iter().position(|step| *step == "play").unwrap();
+        let play_at = LIBVLC_START_ORDER
+            .iter()
+            .position(|step| *step == "play")
+            .unwrap();
         let thread_at = LIBVLC_START_ORDER
             .iter()
             .position(|step| *step == "libvlc-new-on-window-thread")
@@ -3613,10 +3796,7 @@ mod tests {
 
     #[test]
     fn app_local_vlc_wins_and_a_broken_bundle_does_not_use_program_files() {
-        let root = std::env::temp_dir().join(format!(
-            "termy-vlc-locate-{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("termy-vlc-locate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let exe = root.join("Termy");
         let bundle = app_local_vlc_dir(&exe);
@@ -3626,7 +3806,14 @@ mod tests {
         let pe = amd64_pe();
         std::fs::write(bundle.join("libvlc.dll"), &pe).unwrap();
         std::fs::write(bundle.join("libvlccore.dll"), &pe).unwrap();
-        std::fs::write(bundle.join("plugins").join("codec").join("libavcodec_plugin.dll"), &pe).unwrap();
+        std::fs::write(
+            bundle
+                .join("plugins")
+                .join("codec")
+                .join("libavcodec_plugin.dll"),
+            &pe,
+        )
+        .unwrap();
         std::fs::write(system.join("vlc.exe"), b"system").unwrap();
         let other = root.join("otherpf").join("VideoLAN").join("VLC");
         std::fs::create_dir_all(&other).unwrap();

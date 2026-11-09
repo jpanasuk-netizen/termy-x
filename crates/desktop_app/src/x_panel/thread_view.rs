@@ -832,8 +832,7 @@ fn bulk_write(
                 publisher.engage(termy_x::publish::EngageAction::Like, &target.url, None, &[])
             }
             BulkKind::FollowRepliers => {
-                let Some(publisher) =
-                    termy_x::publish::first_that_follows(publishers.as_slice())
+                let Some(publisher) = termy_x::publish::first_that_follows(publishers.as_slice())
                 else {
                     return Err(
                         "No follow path. OpenCLI can follow and unfollow; this posting path cannot. Nothing was changed."

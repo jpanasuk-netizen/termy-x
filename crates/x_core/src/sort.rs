@@ -157,18 +157,8 @@ mod tests {
         // Raw text order is the opposite of time: "Mon..." < "Wed...",
         // and "99" > "100".
         let posts = vec![
-            post(
-                "old-twitter",
-                50,
-                0,
-                Some("Wed Oct 01 00:00:00 +0000 2020"),
-            ),
-            post(
-                "new-twitter",
-                1,
-                0,
-                Some("Mon Jan 15 00:00:00 +0000 2026"),
-            ),
+            post("old-twitter", 50, 0, Some("Wed Oct 01 00:00:00 +0000 2020")),
+            post("new-twitter", 1, 0, Some("Mon Jan 15 00:00:00 +0000 2026")),
             post("unix-small", 40, 0, Some("99")),
             post("unix-big", 2, 0, Some("100")),
         ];

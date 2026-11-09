@@ -133,6 +133,10 @@ jobs:
           Set-Content -Path (Join-Path $vlc "libvlc.dll") -Value "placeholder"
           Set-Content -Path (Join-Path $vlc "libvlccore.dll") -Value "placeholder"
           Set-Content -Path (Join-Path $vlc "plugins\placeholder.dll") -Value "placeholder"
+          # termy.iss also packages release\prereqs\* (VC++ redist etc).
+          $prereqs = Join-Path $release "prereqs"
+          New-Item -ItemType Directory -Force -Path $prereqs | Out-Null
+          Set-Content -Path (Join-Path $prereqs "placeholder.txt") -Value "placeholder"
           $iscc = Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"
           $output = Join-Path $env:RUNNER_TEMP "iscc-smoke"
           foreach ($arch in @("x64")) {

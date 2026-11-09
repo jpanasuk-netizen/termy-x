@@ -53,8 +53,8 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `secondary-g` -> `search_next`
 - `secondary-shift-g` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
-- `secondary-n` -> `new_window`
 - `secondary-shift-x` -> `toggle_x_panel`
+- `secondary-n` -> `new_window`
 - `secondary-k` -> `clear_screen`
 - `secondary-m` -> `minimize_window`
 - `secondary-c` -> `copy`
@@ -110,9 +110,9 @@ Termy keybindings use Ghostty-style trigger overrides via repeated `keybind` lin
 - `f3` -> `search_next`
 - `shift-f3` -> `search_previous`
 - `secondary-alt-i` -> `toggle_inspector`
+- `ctrl-shift-x` -> `toggle_x_panel`
 - `ctrl-shift-c` -> `copy`
 - `ctrl-insert` -> `copy`
-- `secondary-shift-x` -> `toggle_x_panel`
 - `secondary-c` -> `copy`
 - `ctrl-shift-v` -> `paste`
 - `shift-insert` -> `paste`

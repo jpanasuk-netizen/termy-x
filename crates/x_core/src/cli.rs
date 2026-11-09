@@ -399,20 +399,30 @@ fn print_help_guide() {
     println!("CLI  (from the termy-x folder: .\\target-vlc\\release\\termy-xcli.exe …)");
     #[cfg(not(windows))]
     println!("CLI  (from the termy-x folder: ./target/release/termy-xcli …)");
-    println!("  termy-xcli doctor              Session / OpenCLI / Premium limit check. Never posts.");
+    println!(
+        "  termy-xcli doctor              Session / OpenCLI / Premium limit check. Never posts."
+    );
     println!("  termy-xcli splash              Print the Termy X bird");
     println!("  termy-xcli search \"query\" [--recent|--newest|--top|--popular] [--limit N]");
-    println!("  termy-xcli feed [--topic \"subject\"] [--hot|--popular|--upcoming|--newest] [--limit N]");
+    println!(
+        "  termy-xcli feed [--topic \"subject\"] [--hot|--popular|--upcoming|--newest] [--limit N]"
+    );
     println!("    j/k move  s popular/newest  h popular  u newest  /subject search");
     println!("    r reply box  type a line  p preview  y post  esc cancel  q quit");
     println!("  termy-xcli feed --dry-run --keys \"r;type:hello;p;y\"   Preview only, never posts");
     println!("  termy-xcli timeline [--limit N]");
     println!("  termy-xcli trends [--place NAME] [--limit N]");
     println!("  termy-xcli lookup handle");
-    println!("  termy-xcli stats [handle]          Profile totals + tweet-window sums (n/a if missing)");
-    println!("  termy-xcli write post \"text\"                  Dry-run. Does not start the GUI or post.");
+    println!(
+        "  termy-xcli stats [handle]          Profile totals + tweet-window sums (n/a if missing)"
+    );
+    println!(
+        "  termy-xcli write post \"text\"                  Dry-run. Does not start the GUI or post."
+    );
     println!("  termy-xcli write reply --to ID \"text\"         Dry-run a reply");
-    println!("  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post");
+    println!(
+        "  termy-xcli write quote --to ID --inspect        Look at the quote card. Does not click Post"
+    );
     println!("  termy-xcli write quote --to ID \"text\"         Dry-run a Q-tweet");
     println!("  termy-xcli write repost --to ID                Dry-run a repost");
     println!("  termy-xcli write like --to ID                  Dry-run a like");
@@ -444,23 +454,22 @@ fn print_help_guide() {
 }
 
 pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
-    let cli =
-        match Cli::try_parse_from(
-            std::iter::once("termy-xcli".to_string()).chain(args.iter().cloned()),
-        ) {
-            Ok(cli) => cli,
-            Err(error) => {
-                if error.kind() == clap::error::ErrorKind::DisplayHelp
-                    || error.kind() == clap::error::ErrorKind::DisplayVersion
-                {
-                    // Keep --help/--version clean and script-friendly: no splash.
-                    let _ = write!(io_stdout(), "{error}");
-                    return 0;
-                }
-                let _ = writeln!(io_stderr(), "{error}");
-                return 2;
+    let cli = match Cli::try_parse_from(
+        std::iter::once("termy-xcli".to_string()).chain(args.iter().cloned()),
+    ) {
+        Ok(cli) => cli,
+        Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayHelp
+                || error.kind() == clap::error::ErrorKind::DisplayVersion
+            {
+                // Keep --help/--version clean and script-friendly: no splash.
+                let _ = write!(io_stdout(), "{error}");
+                return 0;
             }
-        };
+            let _ = writeln!(io_stderr(), "{error}");
+            return 2;
+        }
+    };
     if let Some(dir) = &cli.config_dir {
         io.config = XConfig::load(dir);
     }
@@ -1494,8 +1503,7 @@ fn inspect_quote(target: &str, media: Option<PathBuf>, io: &CliIo) -> i32 {
         io.runner.as_ref(),
         &id,
         &media_paths,
-    )
-    {
+    ) {
         Ok(line) => {
             println!("quote inspect — Post was not clicked");
             println!("{line}");
@@ -1518,7 +1526,12 @@ fn gui_write(op: WriteOp, confirm: Option<String>, json: bool, io: &mut CliIo) -
             target_id: to,
             text,
         },
-        WriteOp::Quote { to, text, inspect, media } => {
+        WriteOp::Quote {
+            to,
+            text,
+            inspect,
+            media,
+        } => {
             if media.is_some() {
                 eprintln!("{}", crate::publish::quote_image_unsupported());
                 return 1;
@@ -2065,7 +2078,11 @@ mod tests {
         io.runner = runner.clone();
         assert_eq!(
             execute(
-                &["write".into(), "post".into(), "hello from the harness".into()],
+                &[
+                    "write".into(),
+                    "post".into(),
+                    "hello from the harness".into()
+                ],
                 &mut io,
                 false
             ),
@@ -2095,10 +2112,7 @@ mod tests {
             execute(&["write".into(), "--help".into()], &mut io, false),
             0
         );
-        assert_eq!(
-            execute(&["--help".into()], &mut io, false),
-            0
-        );
+        assert_eq!(execute(&["--help".into()], &mut io, false), 0);
         assert!(runner.calls.lock().expect("calls").is_empty());
         assert_eq!(
             execute(
@@ -2174,8 +2188,16 @@ mod tests {
             0
         );
         let calls = runner.calls.lock().unwrap().clone();
-        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("like")));
-        assert!(calls.iter().any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline")));
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("like"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.get(1).map(String::as_str) == Some("timeline"))
+        );
         assert_ne!(
             execute(
                 &[
@@ -2191,7 +2213,14 @@ mod tests {
             ),
             0
         );
-        assert!(!runner.calls.lock().unwrap().iter().any(|(_, args)| args.iter().any(|arg| arg == "x.exe")));
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "x.exe"))
+        );
     }
 
     #[test]

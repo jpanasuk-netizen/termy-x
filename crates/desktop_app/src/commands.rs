@@ -1242,25 +1242,28 @@ define_commands!(
 
 termy_core::termy_command_catalog!(impl_command_action_id_mapping);
 
-actions!(termy_inline_input, [
-    InlineBackspace,
-    InlineDelete,
-    InlineMoveLeft,
-    InlineMoveRight,
-    InlineMoveUp,
-    InlineMoveDown,
-    InlineSelectLeft,
-    InlineSelectRight,
-    InlineSelectUp,
-    InlineSelectDown,
-    InlineSelectAll,
-    InlineMoveToStart,
-    InlineMoveToEnd,
-    InlineDeleteWordBackward,
-    InlineDeleteWordForward,
-    InlineDeleteToStart,
-    InlineDeleteToEnd,
-]);
+actions!(
+    termy_inline_input,
+    [
+        InlineBackspace,
+        InlineDelete,
+        InlineMoveLeft,
+        InlineMoveRight,
+        InlineMoveUp,
+        InlineMoveDown,
+        InlineSelectLeft,
+        InlineSelectRight,
+        InlineSelectUp,
+        InlineSelectDown,
+        InlineSelectAll,
+        InlineMoveToStart,
+        InlineMoveToEnd,
+        InlineDeleteWordBackward,
+        InlineDeleteWordForward,
+        InlineDeleteToStart,
+        InlineDeleteToEnd,
+    ]
+);
 
 pub fn inline_input_keybindings() -> Vec<KeyBinding> {
     vec![

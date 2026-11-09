@@ -828,19 +828,47 @@ mod tests {
 
     #[test]
     fn agent_alt_screen_does_not_block_close_but_vim_does() {
-        assert!(!TerminalView::pane_blocks_close(Some("grok.exe"), true, false));
+        assert!(!TerminalView::pane_blocks_close(
+            Some("grok.exe"),
+            true,
+            false
+        ));
         assert!(!TerminalView::pane_blocks_close(
             Some(r"C:\Windows\System32\cmd.exe"),
             true,
             true
         ));
-        assert!(!TerminalView::pane_blocks_close(Some("conhost.exe"), true, true));
-        assert!(!TerminalView::pane_blocks_close(Some("node.exe"), true, true));
+        assert!(!TerminalView::pane_blocks_close(
+            Some("conhost.exe"),
+            true,
+            true
+        ));
+        assert!(!TerminalView::pane_blocks_close(
+            Some("node.exe"),
+            true,
+            true
+        ));
         assert!(!TerminalView::pane_blocks_close(None, true, true));
-        assert!(!TerminalView::pane_blocks_close(Some("pwsh.exe"), false, false));
-        assert!(TerminalView::pane_blocks_close(Some("cmd.exe"), true, false));
-        assert!(TerminalView::pane_blocks_close(Some("vim.exe"), true, false));
-        assert!(TerminalView::pane_blocks_close(Some("cargo.exe"), false, false));
+        assert!(!TerminalView::pane_blocks_close(
+            Some("pwsh.exe"),
+            false,
+            false
+        ));
+        assert!(TerminalView::pane_blocks_close(
+            Some("cmd.exe"),
+            true,
+            false
+        ));
+        assert!(TerminalView::pane_blocks_close(
+            Some("vim.exe"),
+            true,
+            false
+        ));
+        assert!(TerminalView::pane_blocks_close(
+            Some("cargo.exe"),
+            false,
+            false
+        ));
         assert!(TerminalView::pane_blocks_close(None, true, false));
     }
 

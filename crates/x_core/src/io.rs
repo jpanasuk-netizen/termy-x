@@ -1035,13 +1035,18 @@ mod tests {
     fn cmd_quoting_keeps_percent_encoded_compose_urls() {
         let url = crate::publish::quote_composer_url("2118971448614334959");
         assert!(!url.contains('%'), "{url}");
-        assert!(url.contains("url=https://x.com/i/status/2118971448614334959"), "{url}");
-        let line = super::cmd_c_argument(std::path::Path::new("opencli.cmd"), &[
-            "browser".into(),
-            "open".into(),
-            url,
-        ]);
-        assert!(line.contains("url=https://x.com/i/status/2118971448614334959"), "{line}");
+        assert!(
+            url.contains("url=https://x.com/i/status/2118971448614334959"),
+            "{url}"
+        );
+        let line = super::cmd_c_argument(
+            std::path::Path::new("opencli.cmd"),
+            &["browser".into(), "open".into(), url],
+        );
+        assert!(
+            line.contains("url=https://x.com/i/status/2118971448614334959"),
+            "{line}"
+        );
         assert!(!line.contains('%'), "{line}");
     }
 

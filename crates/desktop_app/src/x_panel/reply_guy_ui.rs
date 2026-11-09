@@ -10,7 +10,6 @@ use termy_x::handoff::{self, Subject, Target};
 use termy_x::reply_guy::{self as rg, Secret, Sort};
 use termy_x::reply_guy_multi::{self as rgm, RgHit, Source};
 
-
 /// Compact secondary control (Apple calm neutrals).
 macro_rules! rg_button {
     ($id:expr, $label:expr, $handler:expr) => {
@@ -24,11 +23,7 @@ macro_rules! rg_button {
             .py(px(4.0))
             .rounded(px(8.0))
             .border_1()
-            .border_color(if active {
-                rgb(0x0a84ff)
-            } else {
-                rgb(0x3a3a3c)
-            })
+            .border_color(if active { rgb(0x0a84ff) } else { rgb(0x3a3a3c) })
             .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
             .text_size(px(11.0))
             .text_color(if active { rgb(0xffffff) } else { rgb(0xe5e5ea) })
@@ -59,11 +54,7 @@ macro_rules! rg_cta {
             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .text_color(rgb(0xffffff))
             .cursor_pointer()
-            .hover(|style| {
-                style
-                    .bg(rgb(0x409cff))
-                    .border_color(rgb(0x409cff))
-            })
+            .hover(|style| style.bg(rgb(0x409cff)).border_color(rgb(0x409cff)))
             .child($label)
             .on_mouse_down(MouseButton::Left, $handler)
     }};
@@ -934,7 +925,6 @@ impl XPanel {
         row.into_any_element()
     }
 
-
     fn rg_source_tabs(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let counts = {
             let mut map = std::collections::HashMap::<Source, usize>::new();
@@ -1032,12 +1022,13 @@ impl XPanel {
                     ))
                     .into_any_element(),
             );
-            rows.push(hint(format!("Paste {} then Save.", self.desk.rg.key_for.label())));
+            rows.push(hint(format!(
+                "Paste {} then Save.",
+                self.desk.rg.key_for.label()
+            )));
         }
         if self.desk.rg.treg_mask.is_none() {
-            rows.push(hint(
-            "Add a Treg key to turn this on.".into(),
-            ));
+            rows.push(hint("Add a Treg key to turn this on.".into()));
         }
         if let Some(test) = &self.desk.rg.test {
             rows.push(hint(test.clone()));
@@ -1100,9 +1091,13 @@ impl XPanel {
                         cx.stop_propagation();
                     })
                 ))
-                .child(hint(self.desk.rg.cost.clone().unwrap_or_else(|| {
-                    format!("cost {}", rgm::TREG_COST_VARIES)
-                })))
+                .child(hint(
+                    self.desk
+                        .rg
+                        .cost
+                        .clone()
+                        .unwrap_or_else(|| format!("cost {}", rgm::TREG_COST_VARIES)),
+                ))
                 .into_any_element(),
         );
         if !self.desk.rg.trends.is_empty() {
@@ -1153,10 +1148,7 @@ impl XPanel {
             )));
         }
         if self.desk.rg_hits.is_empty() && !self.desk.rg.busy && self.desk.rg.error.is_none() {
-            rows.push(empty_state(
-                "No posts yet",
-                "Enter a topic, then Fetch.",
-            ));
+            rows.push(empty_state("No posts yet", "Enter a topic, then Fetch."));
         }
         for hit in hits {
             let post = hit.post.clone();
@@ -1178,11 +1170,7 @@ impl XPanel {
             let post_prompt = post.clone();
             let hit_quote = hit.clone();
             let drafting = self.desk.rg.drafting.as_deref() == Some(post.id.as_str());
-            let mut actions = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(3.0));
+            let mut actions = div().flex().flex_wrap().items_center().gap(px(3.0));
             if hit.is_x() {
                 actions = actions.child(rg_button!(
                     SharedString::from(format!("x-rg-draft-{}", post.id)),
@@ -1250,14 +1238,10 @@ impl XPanel {
                                 cx.listener(move |this, _, _, cx| {
                                     this.compose = text_use.clone();
                                     this.caret = this.compose.len();
-                                    this.desk.rg.reply_to = if is_x {
-                                        Some(to_use.clone())
-                                    } else {
-                                        None
-                                    };
+                                    this.desk.rg.reply_to =
+                                        if is_x { Some(to_use.clone()) } else { None };
                                     this.notice = Some(
-                                        "Edit it, then Confirm shows before anything posts."
-                                            .into(),
+                                        "Edit it, then Confirm shows before anything posts.".into(),
                                     );
                                     this.open_section(XSection::Compose, cx);
                                     cx.stop_propagation();

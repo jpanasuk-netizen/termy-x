@@ -207,7 +207,11 @@ pub fn settle_confirmed(
 /// One privacy-safe lifecycle line. Kind and stage are short tokens.
 /// Values never keep authored text, tokens, or cookies.
 pub fn action_log_line(kind: &str, stage: &str, fields: &[(&str, &str)]) -> String {
-    let mut line = format!("action kind={} stage={}", action_token(kind), action_token(stage));
+    let mut line = format!(
+        "action kind={} stage={}",
+        action_token(kind),
+        action_token(stage)
+    );
     for (key, value) in fields {
         let key = action_token(key);
         if key == "text" || key == "body" || key == "commentary" || key == "secret" {
@@ -239,7 +243,10 @@ pub fn append_action_log(path: &std::path::Path, line: &str) -> std::io::Result<
         std::fs::create_dir_all(parent)?;
     }
     use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
     writeln!(file, "{line}")?;
     Ok(())
 }
@@ -279,7 +286,10 @@ pub fn action_new_id(receipt: &str) -> String {
         return "none".into();
     };
     let node = value.get("data").unwrap_or(&value);
-    let node = node.as_array().and_then(|rows| rows.first()).unwrap_or(node);
+    let node = node
+        .as_array()
+        .and_then(|rows| rows.first())
+        .unwrap_or(node);
     match node.get("id") {
         Some(serde_json::Value::String(id))
             if !id.is_empty() && id.chars().all(|ch| ch.is_ascii_digit()) =>
@@ -333,18 +343,33 @@ pub fn standalone_reply_to() -> Option<&'static str> {
 /// exactly `yes`. A confirmed run calls the publisher once and does not retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GuiWrite {
-    Post { text: String },
-    Reply { target_id: String, text: String },
+    Post {
+        text: String,
+    },
+    Reply {
+        target_id: String,
+        text: String,
+    },
     Quote {
         target_id: String,
         text: String,
         media: Vec<PathBuf>,
     },
-    Repost { target_id: String },
-    Like { target_id: String },
-    Unlike { target_id: String },
-    Follow { handle: String },
-    Unfollow { handle: String },
+    Repost {
+        target_id: String,
+    },
+    Like {
+        target_id: String,
+    },
+    Unlike {
+        target_id: String,
+    },
+    Follow {
+        handle: String,
+    },
+    Unfollow {
+        handle: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -432,41 +457,47 @@ pub fn run_gui_write(
                     }
                 }
                 GateOutcome::Rejected { plan } => GuiWriteOutcome::Rejected {
-                    message: plan.session.unwrap_or_else(|| {
-                        "The write was rejected. Nothing was retried.".into()
-                    }),
+                    message: plan
+                        .session
+                        .unwrap_or_else(|| "The write was rejected. Nothing was retried.".into()),
                 },
                 GateOutcome::DryRun { .. } => GuiWriteOutcome::Rejected {
                     message: "The write stayed a dry run. Nothing was sent.".into(),
                 },
             }
         }
-        PreparedKind::Quote { url, target_id, media } => {
-            match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &media) {
-                Ok(receipt) => match prove_quote(&receipt, &target_id) {
-                    Ok(()) => {
-                        let receipt = quote_saved_receipt(&target_id);
-                        db.record_receipt(
-                            &request.account,
-                            crate::action_state::ReceiptKind::QTweet,
-                            &target_id,
-                            &receipt,
-                            seq,
-                            now,
-                        );
-                        GuiWriteOutcome::Sent {
-                            provider: publisher.id(),
-                            receipt,
-                        }
+        PreparedKind::Quote {
+            url,
+            target_id,
+            media,
+        } => match publisher.engage(EngageAction::Quote, &url, Some(&prepared.text), &media) {
+            Ok(receipt) => match prove_quote(&receipt, &target_id) {
+                Ok(()) => {
+                    let receipt = quote_saved_receipt(&target_id);
+                    db.record_receipt(
+                        &request.account,
+                        crate::action_state::ReceiptKind::QTweet,
+                        &target_id,
+                        &receipt,
+                        seq,
+                        now,
+                    );
+                    GuiWriteOutcome::Sent {
+                        provider: publisher.id(),
+                        receipt,
                     }
-                    Err(error) => GuiWriteOutcome::Rejected { message: error },
-                },
-                Err(error) => GuiWriteOutcome::Rejected {
-                    message: format!("{error} Nothing was retried."),
-                },
-            }
-        }
-        PreparedKind::Engage { action, url, target_id } => {
+                }
+                Err(error) => GuiWriteOutcome::Rejected { message: error },
+            },
+            Err(error) => GuiWriteOutcome::Rejected {
+                message: format!("{error} Nothing was retried."),
+            },
+        },
+        PreparedKind::Engage {
+            action,
+            url,
+            target_id,
+        } => {
             let verb = action.opencli_verb();
             log_action(verb, "start", &[("ack", "pending"), ("new_id", "none")]);
             let toggle = match action {
@@ -635,19 +666,27 @@ pub fn run_gui_write(
 }
 
 enum PreparedKind {
-    Text { reply_to: Option<String> },
+    Text {
+        reply_to: Option<String>,
+    },
     Quote {
         url: String,
         target_id: String,
         media: Vec<PathBuf>,
     },
-    Repost { url: String, target_id: String },
+    Repost {
+        url: String,
+        target_id: String,
+    },
     Engage {
         action: EngageAction,
         url: String,
         target_id: String,
     },
-    Follow { handle: String, follow: bool },
+    Follow {
+        handle: String,
+        follow: bool,
+    },
 }
 
 struct PreparedWrite {
@@ -664,7 +703,11 @@ impl PreparedWrite {
                 reply_to.as_deref().unwrap_or("none"),
                 self.text
             ),
-            PreparedKind::Quote { url, target_id, media } => format!(
+            PreparedKind::Quote {
+                url,
+                target_id,
+                media,
+            } => format!(
                 "provider {} · quote menu on {url} · original {target_id} · image {} · commentary: {}",
                 provider.as_str(),
                 if media.is_empty() { "none" } else { "one" },
@@ -676,7 +719,11 @@ impl PreparedWrite {
                 target_id,
                 url
             ),
-            PreparedKind::Engage { action, url, target_id } => format!(
+            PreparedKind::Engage {
+                action,
+                url,
+                target_id,
+            } => format!(
                 "provider {} · {} {} · url {}",
                 provider.as_str(),
                 action.opencli_verb(),
@@ -717,7 +764,11 @@ fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
                 text: text.to_string(),
             })
         }
-        GuiWrite::Quote { target_id, text, media } => {
+        GuiWrite::Quote {
+            target_id,
+            text,
+            media,
+        } => {
             let target_id = require_status_id(target_id)?;
             let text = text.trim();
             if text.is_empty() {
@@ -780,9 +831,7 @@ fn prepare_gui_write(write: &GuiWrite) -> Result<PreparedWrite, String> {
 fn require_status_id(input: &str) -> Result<String, String> {
     let id = crate::model::post_id_from_input(input);
     if id.is_empty() || !id.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err(
-            "The target must be a status id or a status URL. Nothing was sent.".into(),
-        );
+        return Err("The target must be a status id or a status URL. Nothing was sent.".into());
     }
     Ok(id)
 }
@@ -856,7 +905,9 @@ pub fn live_flag_equals(stdout: &str, id: &str, flag: &str, expected: bool) -> b
 
 fn flag_on_id(value: &serde_json::Value, id: &str, flag: &str, expected: bool) -> bool {
     match value {
-        serde_json::Value::Array(rows) => rows.iter().any(|row| flag_on_id(row, id, flag, expected)),
+        serde_json::Value::Array(rows) => {
+            rows.iter().any(|row| flag_on_id(row, id, flag, expected))
+        }
         serde_json::Value::Object(map) => {
             let same = json_id(map).as_deref() == Some(id);
             let flags = if flag == "favorited" {
@@ -864,13 +915,14 @@ fn flag_on_id(value: &serde_json::Value, id: &str, flag: &str, expected: bool) -
             } else {
                 [flag, flag]
             };
-            let matched = flags.iter().any(|name| {
-                map.get(*name).and_then(serde_json::Value::as_bool) == Some(expected)
-            });
+            let matched = flags
+                .iter()
+                .any(|name| map.get(*name).and_then(serde_json::Value::as_bool) == Some(expected));
             if same && matched {
                 return true;
             }
-            map.values().any(|child| flag_on_id(child, id, flag, expected))
+            map.values()
+                .any(|child| flag_on_id(child, id, flag, expected))
         }
         _ => false,
     }
@@ -989,9 +1041,8 @@ pub fn prove_opencli_write(
     subject: Option<&str>,
 ) -> Result<(), String> {
     let label = kind.label();
-    let uncertain = format!(
-        "{label} was not confirmed. Not marked done. Check X. Nothing was retried."
-    );
+    let uncertain =
+        format!("{label} was not confirmed. Not marked done. Check X. Nothing was retried.");
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Err(uncertain);
@@ -1108,7 +1159,11 @@ fn message_handle(message: &str) -> Option<String> {
         .chars()
         .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
         .collect();
-    if handle.is_empty() { None } else { Some(handle) }
+    if handle.is_empty() {
+        None
+    } else {
+        Some(handle)
+    }
 }
 
 fn message_matches(kind: OpenCliWrite, message: &str) -> bool {
@@ -1201,13 +1256,25 @@ pub fn quote_x_record_confirms(
     let target_id = crate::model::post_id_from_input(target_id);
     let author_id = author_id.trim();
     let commentary = commentary.trim();
-    let value: serde_json::Value = serde_json::from_str(stdout.trim())
-        .map_err(|_| "Quote record was not readable. Not marked sent. Nothing was retried.".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        "Quote record was not readable. Not marked sent. Nothing was retried.".to_string()
+    })?;
     let data = value.get("data").unwrap_or(&value);
-    let found_author = data.get("author_id").and_then(serde_json::Value::as_str).unwrap_or("");
-    let new_id = data.get("id").and_then(serde_json::Value::as_str).unwrap_or("");
-    let text = data.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
-    let refs = data.get("referenced_tweets").and_then(serde_json::Value::as_array);
+    let found_author = data
+        .get("author_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let new_id = data
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let text = data
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let refs = data
+        .get("referenced_tweets")
+        .and_then(serde_json::Value::as_array);
     let quoted = refs.and_then(|rows| {
         rows.iter().find(|row| {
             row.get("type").and_then(serde_json::Value::as_str) == Some("quoted")
@@ -1215,7 +1282,8 @@ pub fn quote_x_record_confirms(
         })
     });
     let other_ref = refs.and_then(|rows| {
-        rows.iter().find(|row| row.get("type").and_then(serde_json::Value::as_str) != Some("quoted"))
+        rows.iter()
+            .find(|row| row.get("type").and_then(serde_json::Value::as_str) != Some("quoted"))
     });
     if found_author != author_id || author_id.is_empty() {
         return Err(format!(
@@ -1231,7 +1299,9 @@ pub fn quote_x_record_confirms(
         ));
     }
     if new_id.is_empty() || new_id == target_id || !new_id.chars().all(|ch| ch.is_ascii_digit()) {
-        return Err("Quote record had no new status id. Not marked sent. Nothing was retried.".into());
+        return Err(
+            "Quote record had no new status id. Not marked sent. Nothing was retried.".into(),
+        );
     }
     let body = quote_text_without_auto_url(text);
     if body != commentary || commentary.is_empty() {
@@ -1286,7 +1356,11 @@ pub fn browser_cli_from_help(help: &str) -> BrowserCli {
         || lower.contains("<session> <command>");
     let session_flag = lower.contains("--session") && !positional;
     BrowserCli {
-        session_flag: if positional { false } else { session_flag || lower.contains("--session") || help.trim().is_empty() },
+        session_flag: if positional {
+            false
+        } else {
+            session_flag || lower.contains("--session") || help.trim().is_empty()
+        },
         window_flag: lower.contains("--window") || help.trim().is_empty(),
     }
 }
@@ -1413,7 +1487,9 @@ pub fn quote_upload_read(stdout: &str, file_name: &str) -> Result<(), String> {
         ));
     }
     let Some(value) = first_json_value(&flat) else {
-        return Err("image upload returned no envelope. Not marked attached. Post was not clicked.".into());
+        return Err(
+            "image upload returned no envelope. Not marked attached. Post was not clicked.".into(),
+        );
     };
     if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
         return Err("image upload was rejected. Not marked attached. Post was not clicked.".into());
@@ -1491,7 +1567,9 @@ pub fn quote_upload_log_bridge(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     let start = lower.find("image upload blocked:").unwrap_or(0);
     let slice = &error[start..];
-    let end = slice.find(". Upload was not retried").unwrap_or(slice.len());
+    let end = slice
+        .find(". Upload was not retried")
+        .unwrap_or(slice.len());
     slice[..end].to_string()
 }
 
@@ -1549,7 +1627,11 @@ fn find_browser_target(value: &serde_json::Value) -> Option<ParsedBrowserTarget>
         }
     }
     if let Some(found) = obj.get("data").and_then(find_browser_target) {
-        let field = if found.field == "string" { "page" } else { found.field };
+        let field = if found.field == "string" {
+            "page"
+        } else {
+            found.field
+        };
         return Some(ParsedBrowserTarget {
             id: found.id,
             field,
@@ -1677,7 +1759,9 @@ pub fn quote_status_tabs(stdout: &str, status_id: &str) -> Vec<QuoteStatusTab> {
     let Some(rows) = rows else {
         return Vec::new();
     };
-    rows.iter().filter_map(|row| status_tab(row, status_id)).collect()
+    rows.iter()
+        .filter_map(|row| status_tab(row, status_id))
+        .collect()
 }
 
 fn status_tab(row: &serde_json::Value, status_id: &str) -> Option<QuoteStatusTab> {
@@ -1691,7 +1775,10 @@ fn status_tab(row: &serde_json::Value, status_id: &str) -> Option<QuoteStatusTab
     Some(QuoteStatusTab {
         window_id,
         group_id,
-        active: row.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false),
+        active: row
+            .get("active")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -1716,7 +1803,10 @@ pub fn quote_window_state(stdout: &str) -> Option<(&'static str, bool)> {
         "locked-fullscreen" => "locked-fullscreen",
         _ => return None,
     };
-    let focused = data.get("focused").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let focused = data
+        .get("focused")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     Some((state, focused))
 }
 
@@ -1743,7 +1833,10 @@ fn object_key_list(map: Option<&serde_json::Map<String, serde_json::Value>>) -> 
     };
     let mut keys: Vec<&str> = map
         .keys()
-        .filter(|key| key.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_'))
+        .filter(|key| {
+            key.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
         .map(String::as_str)
         .take(8)
         .collect();
@@ -1757,7 +1850,9 @@ fn object_key_list(map: Option<&serde_json::Map<String, serde_json::Value>>) -> 
 fn open_value_kind(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) if is_browser_target_id(text) => "target".into(),
-        serde_json::Value::String(text) if text.starts_with("http://") || text.starts_with("https://") => {
+        serde_json::Value::String(text)
+            if text.starts_with("http://") || text.starts_with("https://") =>
+        {
             "url".into()
         }
         serde_json::Value::String(_) => "string".into(),
@@ -1822,7 +1917,9 @@ pub fn quote_visibility(stdout: &str) -> String {
 
 fn known_visibility(text: &str) -> String {
     match text.trim().trim_matches('"') {
-        "visible" | "hidden" | "prerender" | "unloaded" => text.trim().trim_matches('"').to_string(),
+        "visible" | "hidden" | "prerender" | "unloaded" => {
+            text.trim().trim_matches('"').to_string()
+        }
         _ => "unknown".into(),
     }
 }
@@ -1865,7 +1962,10 @@ pub fn quote_landed_query(stdout: &str, status_id: &str) -> String {
 
 pub fn quote_query_shape(url: &str, status_id: &str) -> String {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
-    let Some(query) = url.split_once('?').map(|(_, rest)| rest.split('#').next().unwrap_or("")) else {
+    let Some(query) = url
+        .split_once('?')
+        .map(|(_, rest)| rest.split('#').next().unwrap_or(""))
+    else {
         return "open echo url-key no id-match no".into();
     };
     let mut url_key = false;
@@ -1894,12 +1994,19 @@ fn status_param_matches(value: &str, id: &str) -> bool {
     let Some(url) = value.split(['?', '#']).next() else {
         return false;
     };
-    let path = url.split("://").nth(1).and_then(|rest| rest.find('/').map(|i| &rest[i..])).unwrap_or(url);
+    let path = url
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.find('/').map(|i| &rest[i..]))
+        .unwrap_or(url);
     let marker = format!("/status/{id}");
     let Some(at) = path.find(&marker) else {
         return false;
     };
-    path[at + marker.len()..].chars().next().is_none_or(|ch| !ch.is_ascii_digit())
+    path[at + marker.len()..]
+        .chars()
+        .next()
+        .is_none_or(|ch| !ch.is_ascii_digit())
 }
 
 fn percent_decode_lossy(value: &str) -> String {
@@ -1908,7 +2015,9 @@ fn percent_decode_lossy(value: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2])) {
+            if let (Some(hi), Some(lo)) =
+                (hex_nibble(bytes[index + 1]), hex_nibble(bytes[index + 2]))
+            {
                 out.push((hi << 4) | lo);
                 index += 3;
                 continue;
@@ -1966,7 +2075,10 @@ pub struct QuoteVisibilityRead {
 /// `ready` requires the top document of this status to report `visible`.
 pub fn quote_visibility_read(stdout: &str) -> QuoteVisibilityRead {
     let outer = first_json_value(stdout);
-    let data = outer.as_ref().and_then(|value| value.get("data")).or(outer.as_ref());
+    let data = outer
+        .as_ref()
+        .and_then(|value| value.get("data"))
+        .or(outer.as_ref());
     let (kind, fields) = match data {
         Some(serde_json::Value::String(text)) => {
             if let Some(inner) = first_json_value(text) {
@@ -1975,7 +2087,9 @@ pub fn quote_visibility_read(stdout: &str) -> QuoteVisibilityRead {
                 return plain_visibility(text);
             }
         }
-        Some(serde_json::Value::Object(_)) => ("object", data.cloned().unwrap_or(serde_json::Value::Null)),
+        Some(serde_json::Value::Object(_)) => {
+            ("object", data.cloned().unwrap_or(serde_json::Value::Null))
+        }
         _ => {
             return QuoteVisibilityRead {
                 token: "unknown".into(),
@@ -1988,14 +2102,24 @@ pub fn quote_visibility_read(stdout: &str) -> QuoteVisibilityRead {
 }
 
 fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibilityRead {
-    let token = visibility_token(fields.get("v").and_then(serde_json::Value::as_str).unwrap_or(""));
+    let token = visibility_token(
+        fields
+            .get("v")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
     let hidden_flag = yes_no(fields.get("h"));
     let prerender = yes_no(fields.get("p"));
     let focus = yes_no(fields.get("f"));
     let top = yes_no(fields.get("t"));
     let path = yes_no(fields.get("m"));
     let compose = yes_no(fields.get("c"));
-    let host = host_class(fields.get("host").and_then(serde_json::Value::as_str).unwrap_or(""));
+    let host = host_class(
+        fields
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
     let route = if path == "yes" {
         "status"
     } else if compose == "yes" {
@@ -2003,9 +2127,27 @@ fn visibility_from_fields(kind: &str, fields: &serde_json::Value) -> QuoteVisibi
     } else {
         "no"
     };
-    let host_name = safe_location_token(fields.get("hn").or_else(|| fields.get("host")).and_then(serde_json::Value::as_str).unwrap_or(""), true);
-    let path_name = safe_location_token(fields.get("n").and_then(serde_json::Value::as_str).unwrap_or(""), false);
-    let scheme = safe_scheme(fields.get("s").and_then(serde_json::Value::as_str).unwrap_or(""));
+    let host_name = safe_location_token(
+        fields
+            .get("hn")
+            .or_else(|| fields.get("host"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        true,
+    );
+    let path_name = safe_location_token(
+        fields
+            .get("n")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+        false,
+    );
+    let scheme = safe_scheme(
+        fields
+            .get("s")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(""),
+    );
     let ready = token == "visible"
         && hidden_flag != "yes"
         && top == "yes"
@@ -2067,8 +2209,14 @@ fn safe_location_token(value: &str, host: bool) -> String {
         return "absent".into();
     }
     let ok = value.len() <= 120
-        && value.chars().all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'));
-    let shaped = if host { !value.contains('/') } else { value.starts_with('/') };
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '/'));
+    let shaped = if host {
+        !value.contains('/')
+    } else {
+        value.starts_with('/')
+    };
     if ok && shaped {
         value.to_ascii_lowercase()
     } else {
@@ -2084,7 +2232,11 @@ pub fn quote_eval_location(stdout: &str, status_id: &str) -> String {
     let text = value
         .as_str()
         .or_else(|| value.get("data").and_then(serde_json::Value::as_str))
-        .or_else(|| value.pointer("/data/url").and_then(serde_json::Value::as_str));
+        .or_else(|| {
+            value
+                .pointer("/data/url")
+                .and_then(serde_json::Value::as_str)
+        });
     match text {
         Some(text) => location_shape(text, status_id),
         None => "eval location unread".into(),
@@ -2098,7 +2250,13 @@ fn location_shape(text: &str, status_id: &str) -> String {
     };
     let scheme = safe_scheme(trimmed.split("://").next().unwrap_or(""));
     let (host, path_and_more) = rest.split_once('/').unwrap_or((rest, ""));
-    let host = host.split('@').next_back().unwrap_or(host).split(':').next().unwrap_or(host);
+    let host = host
+        .split('@')
+        .next_back()
+        .unwrap_or(host)
+        .split(':')
+        .next()
+        .unwrap_or(host);
     let path_tail = path_and_more.split(['?', '#']).next().unwrap_or("");
     let path = if path_tail.is_empty() {
         "/".to_string()
@@ -2158,7 +2316,13 @@ pub fn quote_view_line(tabs: &str, target: &str, field: &str, opened: &str, clic
 }
 
 /// Keep OpenCLI's own code and message. Drop credential-shaped lines.
-pub fn explain_opencli_failure(stage: &str, argv: &str, status: i32, stdout: &str, stderr: &str) -> String {
+pub fn explain_opencli_failure(
+    stage: &str,
+    argv: &str,
+    status: i32,
+    stdout: &str,
+    stderr: &str,
+) -> String {
     let cause = opencli_error_cause(stdout)
         .or_else(|| opencli_error_cause(stderr))
         .or_else(|| first_safe_line(stdout))
@@ -2181,8 +2345,14 @@ fn opencli_error_cause(text: &str) -> Option<String> {
         _ => String::new(),
     };
     let code = code_owned.as_str();
-    let message = error.get("message").and_then(serde_json::Value::as_str).unwrap_or("");
-    let hint = error.get("hint").and_then(serde_json::Value::as_str).unwrap_or("");
+    let message = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let hint = error
+        .get("hint")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     if code.is_empty() && message.is_empty() {
         return None;
     }
@@ -2552,7 +2722,11 @@ pub fn quote_opener_click_args(
     tab: Option<&str>,
 ) -> Vec<String> {
     let id: String = status_id.chars().filter(|ch| ch.is_ascii_digit()).collect();
-    let testid = if testid == "unretweet" { "unretweet" } else { "retweet" };
+    let testid = if testid == "unretweet" {
+        "unretweet"
+    } else {
+        "retweet"
+    };
     let css = format!(r#"article:has(a[href*="/status/{id}"] time) [data-testid="{testid}"]"#);
     let mut args = vec!["browser".to_string()];
     if !cli.session_flag {
@@ -2589,7 +2763,10 @@ pub fn quote_click_note(stdout: &str) -> String {
             .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
             .take(32)
             .collect();
-        return format!("click error {}", if safe.is_empty() { "error" } else { &safe });
+        return format!(
+            "click error {}",
+            if safe.is_empty() { "error" } else { &safe }
+        );
     }
     let data = value.get("data").unwrap_or(&value);
     let method = match data.get("click_method").and_then(serde_json::Value::as_str) {
@@ -3283,15 +3460,12 @@ fn json_if_string(value: serde_json::Value) -> serde_json::Value {
 fn payload_summary(value: &serde_json::Value) -> String {
     let keys = value
         .as_object()
-        .map(|map| {
-            map.keys()
-                .take(6)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(",")
-        })
+        .map(|map| map.keys().take(6).cloned().collect::<Vec<_>>().join(","))
         .unwrap_or_else(|| value_kind(value));
-    let data = value.get("data").map(value_kind).unwrap_or_else(|| "missing".into());
+    let data = value
+        .get("data")
+        .map(value_kind)
+        .unwrap_or_else(|| "missing".into());
     format!("payload keys {keys} · data {data}")
 }
 
@@ -3309,11 +3483,16 @@ fn value_kind(value: &serde_json::Value) -> String {
 }
 
 pub fn parse_quote_page_report(stdout: &str) -> Result<QuotePageReport, String> {
-    let value = first_json_value(stdout).ok_or_else(|| {
-        "stage result · eval returned no JSON · Post was not clicked".to_string()
-    })?;
+    let value = first_json_value(stdout)
+        .ok_or_else(|| "stage result · eval returned no JSON · Post was not clicked".to_string())?;
     if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
-        return Err(explain_opencli_failure("result", "browser eval", 0, stdout, ""));
+        return Err(explain_opencli_failure(
+            "result",
+            "browser eval",
+            0,
+            stdout,
+            "",
+        ));
     }
     let inner = unwrap_opencli_data(value.clone());
     let report = report_from_value(&inner);
@@ -3338,7 +3517,9 @@ pub fn eval_needs_poll(stdout: &str) -> bool {
     if value.get("ok").and_then(serde_json::Value::as_bool) == Some(false) {
         return false;
     }
-    report_from_value(&unwrap_opencli_data(value)).stage.is_empty()
+    report_from_value(&unwrap_opencli_data(value))
+        .stage
+        .is_empty()
 }
 
 fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
@@ -3349,7 +3530,12 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
             .unwrap_or("")
             .to_string()
     };
-    let flag = |key: &str| value.get(key).and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let flag = |key: &str| {
+        value
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    };
     let ids = value
         .get("status_ids")
         .and_then(serde_json::Value::as_array)
@@ -3362,7 +3548,10 @@ fn report_from_value(value: &serde_json::Value) -> QuotePageReport {
     QuotePageReport {
         stage: text("stage"),
         path: text("path"),
-        testid_count: value.get("testid_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+        testid_count: value
+            .get("testid_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
         composer: flag("composer"),
         composer_kind: text("composer_kind"),
         card: flag("card"),
@@ -3405,22 +3594,62 @@ pub fn quote_report_line(report: &QuotePageReport) -> String {
     format!(
         "stage {} · path {} · kind {} · card {} · composer {} · status ids {} · quote nodes {} · testids {} · post clicked {} · selected {} {} {} {} · before {} · after {} · menu {} · attach {} · {}",
         report.stage,
-        if report.path.is_empty() { "-" } else { &report.path },
-        if report.composer_kind.is_empty() { "-" } else { &report.composer_kind },
+        if report.path.is_empty() {
+            "-"
+        } else {
+            &report.path
+        },
+        if report.composer_kind.is_empty() {
+            "-"
+        } else {
+            &report.composer_kind
+        },
         if report.card { "yes" } else { "no" },
         if report.composer { "yes" } else { "no" },
         ids,
         report.quote_testids,
         report.testid_count,
         if report.clicked_post { "yes" } else { "no" },
-        if report.selected_scope.is_empty() { "-" } else { &report.selected_scope },
-        if report.selected_label.is_empty() { "-" } else { &report.selected_label },
-        if report.selected_testid.is_empty() { "-" } else { &report.selected_testid },
-        if report.selected_href_kind.is_empty() { "-" } else { &report.selected_href_kind },
-        if report.topo_before.is_empty() { "-" } else { &report.topo_before },
-        if report.topo_after.is_empty() { "-" } else { &report.topo_after },
-        if report.menu_shape.is_empty() { "-" } else { &report.menu_shape },
-        if report.attach.is_empty() { "-" } else { &report.attach },
+        if report.selected_scope.is_empty() {
+            "-"
+        } else {
+            &report.selected_scope
+        },
+        if report.selected_label.is_empty() {
+            "-"
+        } else {
+            &report.selected_label
+        },
+        if report.selected_testid.is_empty() {
+            "-"
+        } else {
+            &report.selected_testid
+        },
+        if report.selected_href_kind.is_empty() {
+            "-"
+        } else {
+            &report.selected_href_kind
+        },
+        if report.topo_before.is_empty() {
+            "-"
+        } else {
+            &report.topo_before
+        },
+        if report.topo_after.is_empty() {
+            "-"
+        } else {
+            &report.topo_after
+        },
+        if report.menu_shape.is_empty() {
+            "-"
+        } else {
+            &report.menu_shape
+        },
+        if report.attach.is_empty() {
+            "-"
+        } else {
+            &report.attach
+        },
         report.message
     )
 }
@@ -3466,7 +3695,9 @@ pub fn quote_outcome(
 ) -> Result<(), String> {
     let target_id = crate::model::post_id_from_input(target_id);
     if report.clicked_repost_confirm {
-        return Err("The quote check tried to repost. Not marked sent. Nothing was retried.".into());
+        return Err(
+            "The quote check tried to repost. Not marked sent. Nothing was retried.".into(),
+        );
     }
     let proven = report.quote_testids > 0
         && report.composer_kind != "reply"
@@ -4102,7 +4333,11 @@ mod tests {
         assert_eq!(follow_burst_label(false), "\u{2713} Unfollowed");
         assert_ne!(follow_burst_label(false), follow_burst_label(true));
         assert_eq!(quote_action_label(), "Q-tweet");
-        assert!(!quote_action_label().to_ascii_lowercase().contains("quote retweet"));
+        assert!(
+            !quote_action_label()
+                .to_ascii_lowercase()
+                .contains("quote retweet")
+        );
         let with_follow = card_action_labels(true);
         let text_only = card_action_labels(false);
         assert_eq!(
@@ -4111,7 +4346,10 @@ mod tests {
         );
         assert_eq!(text_only, ["Like", "Retweet", "Q-tweet", "Reply"]);
         assert_eq!(
-            with_follow.iter().filter(|label| **label == "Reply" || **label == "Comment").count(),
+            with_follow
+                .iter()
+                .filter(|label| **label == "Reply" || **label == "Comment")
+                .count(),
             1
         );
         let mut repost = crate::model::Post::default();
@@ -4147,7 +4385,10 @@ mod tests {
             }
             for outcome in withheld_outcomes() {
                 let withheld = withheld_note(*action, *outcome);
-                assert!(!withheld.contains('\u{2713}'), "{action:?} {outcome:?} {withheld}");
+                assert!(
+                    !withheld.contains('\u{2713}'),
+                    "{action:?} {outcome:?} {withheld}"
+                );
                 assert_ne!(withheld, success);
                 assert!(!withheld.contains(success), "{action:?} {outcome:?}");
             }
@@ -4215,24 +4456,30 @@ mod tests {
 
         let confirmed = r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#;
         assert!(prove_engage(EngageAction::Retweet, confirmed, None).is_ok());
-        assert!(prove_engage(
-            EngageAction::Like,
-            r#"[{"status":"success","message":"Tweet successfully liked."}]"#,
-            None
-        )
-        .is_ok());
-        assert!(prove_opencli_write(
-            OpenCliWrite::Reply,
-            r#"[{"status":"success","message":"Reply posted successfully."}]"#,
-            None
-        )
-        .is_ok());
-        assert!(prove_opencli_write(
-            OpenCliWrite::Follow,
-            r#"[{"status":"success","message":"Successfully followed @jack."}]"#,
-            Some("jack")
-        )
-        .is_ok());
+        assert!(
+            prove_engage(
+                EngageAction::Like,
+                r#"[{"status":"success","message":"Tweet successfully liked."}]"#,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            prove_opencli_write(
+                OpenCliWrite::Reply,
+                r#"[{"status":"success","message":"Reply posted successfully."}]"#,
+                None
+            )
+            .is_ok()
+        );
+        assert!(
+            prove_opencli_write(
+                OpenCliWrite::Follow,
+                r#"[{"status":"success","message":"Successfully followed @jack."}]"#,
+                Some("jack")
+            )
+            .is_ok()
+        );
         assert!(
             prove_opencli_write(
                 OpenCliWrite::Follow,
@@ -4260,14 +4507,18 @@ mod tests {
             assert!(err.contains("Nothing was retried"), "{err}");
         }
 
-        assert!(prove_new_post(
-            r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#
-        )
-        .unwrap()
-        .contains("42"));
+        assert!(
+            prove_new_post(
+                r#"[{"status":"success","message":"Tweet posted successfully.","id":"42"}]"#
+            )
+            .unwrap()
+            .contains("42")
+        );
         assert!(prove_new_post(r#"{"ok":true,"id":"42"}"#).is_err());
         assert!(prove_new_post("").is_err());
-        assert!(prove_reply(r#"[{"status":"success","message":"Reply posted successfully."}]"#).is_ok());
+        assert!(
+            prove_reply(r#"[{"status":"success","message":"Reply posted successfully."}]"#).is_ok()
+        );
     }
 
     #[test]
@@ -4320,7 +4571,10 @@ mod tests {
                     return Err("provider rejected".into());
                 }
                 if action == EngageAction::Retweet {
-                    Ok(r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#.into())
+                    Ok(
+                        r#"[{"status":"success","message":"Tweet successfully retweeted."}]"#
+                            .into(),
+                    )
                 } else {
                     Ok(r#"[{"status":"success","message":"Quote tweet posted successfully.","quoted_status_id_str":"2118971448614334959","text":"my words"}]"#.into())
                 }
@@ -4415,13 +4669,11 @@ mod tests {
         let engage = publisher.engage.lock().expect("engage").clone();
         assert_eq!(engage.len(), 1);
         assert_eq!(engage[0].0, EngageAction::Quote);
+        assert_eq!(engage[0].1, "https://x.com/i/status/2118971448614334959");
         assert_eq!(
-            engage[0].1,
-            "https://x.com/i/status/2118971448614334959"
+            db.receipt_ids("jasper_black", ReceiptKind::QTweet),
+            vec!["2118971448614334959".to_string()]
         );
-        assert_eq!(db.receipt_ids("jasper_black", ReceiptKind::QTweet), vec![
-            "2118971448614334959".to_string()
-        ]);
 
         let repost = run_gui_write(
             &publisher,
@@ -4462,10 +4714,7 @@ mod tests {
         );
         assert!(matches!(failed, GuiWriteOutcome::Rejected { .. }));
         assert_eq!(publisher.engage.lock().expect("engage").len(), before + 1);
-        assert_eq!(
-            db.confirmed("jasper_black", ToggleKind::Repost, "20"),
-            None
-        );
+        assert_eq!(db.confirmed("jasper_black", ToggleKind::Repost, "20"), None);
         let not_yes = run_gui_write(
             &publisher,
             &mut db,
@@ -4528,7 +4777,10 @@ mod tests {
             18,
             9,
         );
-        assert!(matches!(confirmed, GuiWriteOutcome::Rejected { .. }), "{confirmed:?}");
+        assert!(
+            matches!(confirmed, GuiWriteOutcome::Rejected { .. }),
+            "{confirmed:?}"
+        );
         assert_eq!(publisher.engage.lock().expect("engage").len(), before);
     }
 
@@ -4573,31 +4825,58 @@ mod tests {
         );
         assert!(prove_quote(&with_link, original).is_ok());
         let replied = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"2118971448614334959","type":"replied_to"}],"text":"100 is enough https://t.co/WYHmAufIq0"}}"#;
-        let err = quote_x_record_confirms(replied, original, "291497074", "100 is enough").unwrap_err();
+        let err =
+            quote_x_record_confirms(replied, original, "291497074", "100 is enough").unwrap_err();
         assert!(err.contains("replied_to"), "{err}");
         assert!(err.contains("Nothing was retried"), "{err}");
-        let other_author = quote_x_record_confirms(published, original, "20", "100 is enough").unwrap_err();
+        let other_author =
+            quote_x_record_confirms(published, original, "20", "100 is enough").unwrap_err();
         assert!(other_author.contains("291497074"), "{other_author}");
-        let other_words = quote_x_record_confirms(published, original, "291497074", "101 is enough").unwrap_err();
+        let other_words =
+            quote_x_record_confirms(published, original, "291497074", "101 is enough").unwrap_err();
         assert!(other_words.contains("did not match"), "{other_words}");
         let other_quote = r#"{"data":{"author_id":"291497074","id":"2119413665547821165","referenced_tweets":[{"id":"20","type":"quoted"}],"text":"100 is enough https://t.co/WYHmAufIq0"}}"#;
-        assert!(quote_x_record_confirms(other_quote, original, "291497074", "100 is enough").is_err());
+        assert!(
+            quote_x_record_confirms(other_quote, original, "291497074", "100 is enough").is_err()
+        );
         let upload = quote_upload_args(
-            browser_cli_from_help("Usage: opencli browser open <url> --session <name>\n--window <mode>\n"),
+            browser_cli_from_help(
+                "Usage: opencli browser open <url> --session <name>\n--window <mode>\n",
+            ),
             "termyx-quote",
             Some("A03BB6CCAE9402E75FCA7CB1AAED51FA"),
             "marked-quote-probe.png",
         );
-        assert!(upload.windows(2).any(|pair| pair[0] == "--testid" && pair[1] == "fileInput"));
-        assert!(upload.windows(2).any(|pair| pair[0] == "--session" && pair[1] == "termyx-quote"));
-        assert!(upload.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA"));
-        assert!(upload.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground"));
+        assert!(
+            upload
+                .windows(2)
+                .any(|pair| pair[0] == "--testid" && pair[1] == "fileInput")
+        );
+        assert!(
+            upload
+                .windows(2)
+                .any(|pair| pair[0] == "--session" && pair[1] == "termyx-quote")
+        );
+        assert!(
+            upload
+                .windows(2)
+                .any(|pair| pair[0] == "--tab" && pair[1] == "A03BB6CCAE9402E75FCA7CB1AAED51FA")
+        );
+        assert!(
+            upload
+                .windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+        );
         assert!(upload.iter().any(|arg| arg == "marked-quote-probe.png"));
         assert!(quote_upload_read(
             r#"{"ok":true,"data":{"uploaded":true,"files":1,"file_names":["marked-quote-probe.png"],"target":"fileInput","matches_n":1}}"#,
             "marked-quote-probe.png",
         ).is_ok());
-        let blocked = quote_upload_read(r#"{"ok":false,"error":{"code":-32000,"message":"Not allowed"}}"#, "marked-quote-probe.png").unwrap_err();
+        let blocked = quote_upload_read(
+            r#"{"ok":false,"error":{"code":-32000,"message":"Not allowed"}}"#,
+            "marked-quote-probe.png",
+        )
+        .unwrap_err();
         assert!(blocked.contains("-32000"), "{blocked}");
         assert!(blocked.contains("Not allowed"), "{blocked}");
         assert!(blocked.contains("not retried"), "{blocked}");
@@ -4635,7 +4914,10 @@ mod tests {
             "marked-quote-probe.png",
         ).unwrap_err();
         assert!(unnamed.contains("did not name the file"), "{unnamed}");
-        assert_eq!(quote_close_note(0, "Browser session tab lease released"), "session close acknowledged");
+        assert_eq!(
+            quote_close_note(0, "Browser session tab lease released"),
+            "session close acknowledged"
+        );
         let unknown = quote_close_note(75, "managed_resource_conflict");
         assert_eq!(unknown, "session close exit 75");
         assert!(!unknown.contains("conflict"), "{unknown}");
@@ -4665,7 +4947,13 @@ mod tests {
         );
         let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
         let row = |name: &str| {
-            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+            reports
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()
+                .clone()
         };
         let live = parse_quote_page_report(&row("live")["report"].to_string()).unwrap();
         assert_eq!(live.composer_kind, "quote", "{}", row("live"));
@@ -4678,7 +4966,8 @@ mod tests {
         assert!(err.contains("not a quote"), "{err}");
         assert!(err.contains("2119413665547821165"), "{err}");
         assert!(err.contains("No retry"), "{err}");
-        let wrong_words = parse_quote_page_report(&row("wrongwords")["report"].to_string()).unwrap();
+        let wrong_words =
+            parse_quote_page_report(&row("wrongwords")["report"].to_string()).unwrap();
         assert!(quote_outcome(Some("2119413665547821165"), &wrong_words, target).is_err());
     }
 
@@ -4688,7 +4977,12 @@ mod tests {
         let cli = browser_cli_from_help(current);
         assert!(cli.session_flag);
         assert!(cli.window_flag);
-        let args = browser_command(cli, "termyx-quote", "open", Some("https://x.com/i/status/20"));
+        let args = browser_command(
+            cli,
+            "termyx-quote",
+            "open",
+            Some("https://x.com/i/status/20"),
+        );
         assert_eq!(
             args,
             vec![
@@ -4704,7 +4998,12 @@ mod tests {
         let older = "Usage: opencli browser <session> <command>\nbrowser <session> open <url>\n--window background\n";
         let cli = browser_cli_from_help(older);
         assert!(!cli.session_flag);
-        let args = browser_command(cli, "termyx-quote", "open", Some("https://x.com/i/status/20"));
+        let args = browser_command(
+            cli,
+            "termyx-quote",
+            "open",
+            Some("https://x.com/i/status/20"),
+        );
         assert_eq!(args[0], "browser");
         assert_eq!(args[1], "termyx-quote");
         assert_eq!(args[2], "open");
@@ -4737,7 +5036,9 @@ mod tests {
         assert!(err.contains("empty object"), "{err}");
         assert!(err.contains("Post was not clicked"), "{err}");
         assert!(eval_needs_poll(blank));
-        assert!(!eval_needs_poll(r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#));
+        assert!(!eval_needs_poll(
+            r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#
+        ));
         let failed = parse_quote_page_report(
             r#"{"ok":false,"error":{"code":"NAVIGATION","message":"Navigation rejected.","hint":"ct0=secret"}}"#,
         )
@@ -4789,9 +5090,15 @@ mod tests {
         assert!(menu.contains("aria-label"));
         assert!(menu.contains("tweetQuote"));
         assert!(menu.contains("data-testid=\"quote\""));
-        assert!(crate::publish::quote_row_recorded("Quote row recorded. Post was not clicked."));
-        assert!(!crate::publish::quote_row_recorded("Quote menu item did not appear. Post was not clicked."));
-        assert!(!crate::publish::quote_row_recorded("Refused the repost confirm. Post was not clicked."));
+        assert!(crate::publish::quote_row_recorded(
+            "Quote row recorded. Post was not clicked."
+        ));
+        assert!(!crate::publish::quote_row_recorded(
+            "Quote menu item did not appear. Post was not clicked."
+        ));
+        assert!(!crate::publish::quote_row_recorded(
+            "Refused the repost confirm. Post was not clicked."
+        ));
         let opener = crate::publish::quote_opener_click_args(
             browser_cli_from_help(""),
             "termyx-quote",
@@ -4799,15 +5106,29 @@ mod tests {
             "retweet",
             None,
         );
-        assert!(opener.iter().any(|arg| arg.contains("[data-testid=\"retweet\"]")));
-        assert!(opener.iter().any(|arg| arg.contains("/status/2118971448614334959")));
+        assert!(
+            opener
+                .iter()
+                .any(|arg| arg.contains("[data-testid=\"retweet\"]"))
+        );
+        assert!(
+            opener
+                .iter()
+                .any(|arg| arg.contains("/status/2118971448614334959"))
+        );
         assert!(!opener.iter().any(|arg| arg.contains("Confirm")));
         assert_eq!(
-            crate::publish::quote_click_note(r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#),
+            crate::publish::quote_click_note(
+                r#"{"ok":true,"data":{"clicked":true,"click_method":"cdp"}}"#
+            ),
             "click cdp"
         );
-        assert!(!crate::publish::quote_click_trusted(r#"{"ok":true,"data":{"click_method":"js"}}"#));
-        assert!(crate::publish::quote_click_trusted(r#"{"ok":true,"data":{"click_method":"ax"}}"#));
+        assert!(!crate::publish::quote_click_trusted(
+            r#"{"ok":true,"data":{"click_method":"js"}}"#
+        ));
+        assert!(crate::publish::quote_click_trusted(
+            r#"{"ok":true,"data":{"click_method":"ax"}}"#
+        ));
         assert!(snap.contains("A visible link is not the card"));
         assert!(snap.contains("ancestors"));
         assert!(snap.contains("proofOne(dlg)"));
@@ -4821,21 +5142,46 @@ mod tests {
         );
         assert_eq!(pages, vec!["E54BF7E091EA017B99E02EF7373E08BC".to_string()]);
         let click = quote_native_click_args(browser_cli_from_help(""), "termyx-quote", None);
-        assert!(click.windows(2).any(|pair| pair[0] == "--role" && pair[1] == "menuitem"));
-        assert!(click.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
-        assert!(click.windows(2).any(|pair| pair[0] == "--window" && pair[1] == "foreground"));
+        assert!(
+            click
+                .windows(2)
+                .any(|pair| pair[0] == "--role" && pair[1] == "menuitem")
+        );
+        assert!(
+            click
+                .windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "Quote")
+        );
+        assert!(
+            click
+                .windows(2)
+                .any(|pair| pair[0] == "--window" && pair[1] == "foreground")
+        );
         assert!(!click.iter().any(|arg| arg == "background"));
-        assert!(!click.iter().any(|arg| arg.to_ascii_lowercase().contains("confirm")));
+        assert!(
+            !click
+                .iter()
+                .any(|arg| arg.to_ascii_lowercase().contains("confirm"))
+        );
         let positional = quote_native_click_args(
             browser_cli_from_help("Usage: opencli browser <session> <command>\n"),
             "termyx-quote",
             None,
         );
         assert_eq!(positional[1], "termyx-quote");
-        assert!(positional.windows(2).any(|pair| pair[0] == "--name" && pair[1] == "Quote"));
+        assert!(
+            positional
+                .windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == "Quote")
+        );
         let tab = "A03BB6CCAE9402E75FCA7CB1AAED51FA";
-        let targeted = quote_native_click_args(browser_cli_from_help(""), "termyx-quote", Some(tab));
-        assert!(targeted.windows(2).any(|pair| pair[0] == "--tab" && pair[1] == tab));
+        let targeted =
+            quote_native_click_args(browser_cli_from_help(""), "termyx-quote", Some(tab));
+        assert!(
+            targeted
+                .windows(2)
+                .any(|pair| pair[0] == "--tab" && pair[1] == tab)
+        );
         assert_eq!(quote_tab_count(r#"{"ok":true,"data":[]}"#), Some(0));
         assert_eq!(
             quote_surface_target(
@@ -4848,11 +5194,20 @@ mod tests {
         let parsed = quote_surface_target(opened).expect("page id");
         assert_eq!(parsed.id, tab);
         assert_eq!(parsed.field, "page");
-        assert!(quote_open_shape(opened).contains("page target"), "{}", quote_open_shape(opened));
-        assert!(quote_open_shape(r#"{"ok":true,"data":{"url":"https://x.com/i/status/20"}}"#).contains("page absent"));
+        assert!(
+            quote_open_shape(opened).contains("page target"),
+            "{}",
+            quote_open_shape(opened)
+        );
+        assert!(
+            quote_open_shape(r#"{"ok":true,"data":{"url":"https://x.com/i/status/20"}}"#)
+                .contains("page absent")
+        );
         assert_eq!(quote_visibility(r#"{"ok":true,"data":"hidden"}"#), "hidden");
         assert_eq!(quote_visibility("https://x.com/i/status/20"), "unknown");
-        assert!(quote_view_line("0", tab, "page", "visible", "hidden").contains("target field page"));
+        assert!(
+            quote_view_line("0", tab, "page", "visible", "hidden").contains("target field page")
+        );
         let selected = quote_select_ack(
             r#"{"ok":true,"data":{"selected":"A03BB6CCAE9402E75FCA7CB1AAED51FA"}}"#,
         );
@@ -4868,14 +5223,19 @@ mod tests {
         assert_eq!(tabs[0].group_id, Some(9));
         assert!(tabs[0].active);
         assert_eq!(
-            quote_window_state(r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false}}"#),
+            quote_window_state(
+                r#"{"ok":true,"data":{"id":5,"state":"minimized","focused":false}}"#
+            ),
             Some(("minimized", false))
         );
         assert_eq!(
             quote_group_name(r#"{"ok":true,"data":{"title":"OpenCLI Browser"}}"#),
             "OpenCLI Browser"
         );
-        assert_eq!(quote_group_name(r#"{"ok":true,"data":{"title":"Mail"}}"#), "other");
+        assert_eq!(
+            quote_group_name(r#"{"ok":true,"data":{"title":"Mail"}}"#),
+            "other"
+        );
         let hidden_eval = r#"{"ok":true,"data":"{\"v\":\"hidden\",\"h\":true,\"p\":false,\"f\":true,\"t\":true,\"m\":true,\"host\":\"x.com\"}"}"#;
         let hidden_read = quote_visibility_read(hidden_eval);
         assert_eq!(hidden_read.token, "hidden");
@@ -4934,11 +5294,16 @@ mod tests {
         let reply = parse_quote_page_report(reply_page).unwrap();
         assert!(!quote_post_allowed(&reply, original));
         let note = quote_outcome(Some("2119115255108526411"), &reply, original).unwrap_err();
-        assert!(note.contains("https://x.com/i/status/2119115255108526411"), "{note}");
+        assert!(
+            note.contains("https://x.com/i/status/2119115255108526411"),
+            "{note}"
+        );
         assert!(note.contains("a reply"), "{note}");
         assert!(note.contains("not a quote"), "{note}");
         let false_card = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"unknown","quote_testids":0,"status_ids":["2118971448614334959"],"testid_count":69,"clicked_post":false,"text_landed":true,"quoted_status_id":"2118971448614334959","message":"Inspect only. Post was not clicked."}"#;
-        assert!(!quote_inspect_ready(&parse_quote_page_report(false_card).unwrap()));
+        assert!(!quote_inspect_ready(
+            &parse_quote_page_report(false_card).unwrap()
+        ));
         let live = r#"{"stage":"composer","path":"/compose/post","composer_kind":"unknown","composer":true,"card":false,"status_ids":["2118971448614334959"],"quote_testids":0,"testid_count":70,"clicked_post":false,"selected_scope":"menu","selected_label":"Quote","selected_href_kind":"quote-url","message":"No quote attachment. Post was not clicked."}"#;
         let live_report = parse_quote_page_report(live).unwrap();
         assert!(!quote_inspect_ready(&live_report));
@@ -4948,9 +5313,15 @@ mod tests {
         assert!(live_line.contains("menu"), "{live_line}");
         let script = quote_page_script(original, Some("doesn’t"), false);
         let real = r#"{"stage":"inspect","path":"/compose/post","card":true,"composer":true,"composer_kind":"quote","quote_testids":1,"quoted_status_id":"2118971448614334959","text_landed":true,"clicked_repost_confirm":false,"message":"Inspect only. Post was not clicked."}"#;
-        assert!(quote_post_allowed(&parse_quote_page_report(real).unwrap(), original));
+        assert!(quote_post_allowed(
+            &parse_quote_page_report(real).unwrap(),
+            original
+        ));
         assert!(quote_inspect_ready(&parse_quote_page_report(real).unwrap()));
-        assert!(script.is_ascii(), "quote script must stay ASCII so atob cannot mojibake");
+        assert!(
+            script.is_ascii(),
+            "quote script must stay ASCII so atob cannot mojibake"
+        );
         assert!(script.contains("\\u2019"), "{script}");
         assert!(!script.contains("compose/post"));
         assert!(!script.contains("seen.card = true"));
@@ -5029,7 +5400,9 @@ mod tests {
     fn quote_landed_query_reports_the_url_parameter_without_the_address() {
         let id = "2118971448614334959";
         let compose = quote_composer_url(id);
-        let intact = format!(r#"{{"ok":true,"data":{{"url":"{compose}","page":"B94452EA22F530887AF90E615F8D7031"}}}}"#);
+        let intact = format!(
+            r#"{{"ok":true,"data":{{"url":"{compose}","page":"B94452EA22F530887AF90E615F8D7031"}}}}"#
+        );
         let line = quote_landed_query(&intact, id);
         assert_eq!(line, "open echo url-key yes id-match yes");
         assert!(!line.contains("https://"), "{line}");
@@ -5038,13 +5411,17 @@ mod tests {
             "open echo url-key no id-match no"
         );
         assert_eq!(
-            quote_query_shape("https://x.com/compose/post?url=https://x.com/i/status/111", id),
+            quote_query_shape(
+                "https://x.com/compose/post?url=https://x.com/i/status/111",
+                id
+            ),
             "open echo url-key yes id-match no"
         );
-        let damaged = format!(
-            "https://x.com/compose/post?url=https2Fx.com2Fstatus%2F{id}"
+        let damaged = format!("https://x.com/compose/post?url=https2Fx.com2Fstatus%2F{id}");
+        assert!(
+            quote_query_shape(&damaged, id).ends_with("id-match no"),
+            "{damaged}"
         );
-        assert!(quote_query_shape(&damaged, id).ends_with("id-match no"), "{damaged}");
         assert_eq!(quote_landed_query("not json", id), "open echo unread");
         let href = quote_eval_location(
             r#"{"ok":true,"data":"https://www.google.com/_/chrome/newtab"}"#,
@@ -5112,7 +5489,12 @@ mod tests {
         assert!(inside["quote_testids"].as_u64().unwrap() >= 1);
         assert_eq!(inside["status_ids"][0], target);
         assert!(!inside["status_ids"].to_string().contains("111"));
-        assert!(inside["attach"].as_str().unwrap().contains("in-dialog-textareas 1"));
+        assert!(
+            inside["attach"]
+                .as_str()
+                .unwrap()
+                .contains("in-dialog-textareas 1")
+        );
 
         let pasted = one("pasted");
         assert_eq!(pasted["card"], false);
@@ -5129,7 +5511,10 @@ mod tests {
         let seen_attach = seen["attach"].as_str().unwrap();
         assert!(seen_attach.contains("rolelinks 1"), "{seen_attach}");
         assert!(seen_attach.contains("after-editor"), "{seen_attach}");
-        assert!(seen_attach.contains("path /i/web/status/exact"), "{seen_attach}");
+        assert!(
+            seen_attach.contains("path /i/web/status/exact"),
+            "{seen_attach}"
+        );
         assert!(seen_attach.contains("id exact"), "{seen_attach}");
         assert!(!seen_attach.contains(target), "{seen_attach}");
 
@@ -5159,7 +5544,8 @@ mod tests {
         assert_eq!(reply["status_ids"].as_array().unwrap().len(), 0);
         assert_eq!(one("card")["card"], false);
 
-        let bound = quote_snap_script_bound(target, "cryptoXRPwhale", "IS OWNING 1,000 $XRP ENOUGH?");
+        let bound =
+            quote_snap_script_bound(target, "cryptoXRPwhale", "IS OWNING 1,000 $XRP ENOUGH?");
         let bound_path = dir.join("termy-quote-snap-bound.js");
         std::fs::write(&bound_path, &bound).unwrap();
         let output = std::process::Command::new("node")
@@ -5168,16 +5554,31 @@ mod tests {
             .output()
             .expect("node");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
         let row = |name: &str| {
-            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+            reports
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()
+                .clone()
         };
         let card = row("card");
         assert_eq!(card["card"], true, "{}", card["attach"]);
         assert_eq!(card["composer_kind"], "quote");
         assert_eq!(card["quoted_status_id"], target);
-        assert!(card["attach"].as_str().unwrap().contains("card-bind article"));
+        assert!(
+            card["attach"]
+                .as_str()
+                .unwrap()
+                .contains("card-bind article")
+        );
         assert!(!card["attach"].as_str().unwrap().contains("IS OWNING"));
         assert_eq!(row("wrongtext")["card"], false);
         assert_eq!(row("wronguser")["card"], false);
@@ -5195,9 +5596,25 @@ mod tests {
         assert!(split_attach.contains("card-bind miss"), "{split_attach}");
         let cashtag = row("cashtag");
         assert_eq!(cashtag["card"], true, "{}", cashtag["attach"]);
-        assert!(cashtag["attach"].as_str().unwrap().contains("text-equal yes"), "{}", cashtag["attach"]);
-        assert!(!cashtag["attach"].as_str().unwrap().contains("$1.23"), "{}", cashtag["attach"]);
-        assert_eq!(row("cashtagwrong")["card"], false, "{}", row("cashtagwrong")["attach"]);
+        assert!(
+            cashtag["attach"]
+                .as_str()
+                .unwrap()
+                .contains("text-equal yes"),
+            "{}",
+            cashtag["attach"]
+        );
+        assert!(
+            !cashtag["attach"].as_str().unwrap().contains("$1.23"),
+            "{}",
+            cashtag["attach"]
+        );
+        assert_eq!(
+            row("cashtagwrong")["card"],
+            false,
+            "{}",
+            row("cashtagwrong")["attach"]
+        );
         let card_attach = card["attach"].as_str().unwrap();
         assert!(card_attach.contains("text-in yes"), "{card_attach}");
         assert!(card_attach.contains("text-equal yes"), "{card_attach}");
@@ -5213,18 +5630,48 @@ mod tests {
             .output()
             .expect("node");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
         let row = |name: &str| {
-            reports.as_array().unwrap().iter().find(|item| item["name"] == name).unwrap().clone()
+            reports
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["name"] == name)
+                .unwrap()
+                .clone()
         };
         let emoji = row("emoji");
         assert_eq!(emoji["card"], true, "{}", emoji["attach"]);
-        assert!(emoji["attach"].as_str().unwrap().contains("text-equal yes"), "{}", emoji["attach"]);
-        assert!(emoji["attach"].as_str().unwrap().contains("card-chars 38"), "{}", emoji["attach"]);
-        assert!(emoji["attach"].as_str().unwrap().contains("source-chars 38"), "{}", emoji["attach"]);
+        assert!(
+            emoji["attach"].as_str().unwrap().contains("text-equal yes"),
+            "{}",
+            emoji["attach"]
+        );
+        assert!(
+            emoji["attach"].as_str().unwrap().contains("card-chars 38"),
+            "{}",
+            emoji["attach"]
+        );
+        assert!(
+            emoji["attach"]
+                .as_str()
+                .unwrap()
+                .contains("source-chars 38"),
+            "{}",
+            emoji["attach"]
+        );
         assert!(!emoji["attach"].as_str().unwrap().contains("IS OWNING"));
-        assert_eq!(row("wrongemoji")["card"], false, "{}", row("wrongemoji")["attach"]);
+        assert_eq!(
+            row("wrongemoji")["card"],
+            false,
+            "{}",
+            row("wrongemoji")["attach"]
+        );
         assert_eq!(row("wrongtext")["card"], false);
 
         let price_snap = quote_snap_script_bound(target, "cryptoXRPwhale", "$1.23 is enough");
@@ -5236,11 +5683,24 @@ mod tests {
             .output()
             .expect("node");
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let reports: serde_json::Value = serde_json::from_str(stdout.trim()).expect(&stdout);
-        let price = reports.as_array().unwrap().iter().find(|item| item["name"] == "authorprice").unwrap();
+        let price = reports
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["name"] == "authorprice")
+            .unwrap();
         assert_eq!(price["card"], true, "{}", price["attach"]);
-        assert!(price["attach"].as_str().unwrap().contains("text-equal yes"), "{}", price["attach"]);
+        assert!(
+            price["attach"].as_str().unwrap().contains("text-equal yes"),
+            "{}",
+            price["attach"]
+        );
     }
 
     #[test]
@@ -5248,7 +5708,8 @@ mod tests {
         let target = "2118971448614334959";
         let source = "IS OWNING 1,000 $XRP ENOUGH?";
         let snap = quote_snap_script_bound(target, "cryptoXRPwhale", source);
-        let post = quote_type_and_post_script_bound(target, "100 is enough", "cryptoXRPwhale", source);
+        let post =
+            quote_type_and_post_script_bound(target, "100 is enough", "cryptoXRPwhale", source);
         let dir = std::env::temp_dir();
         let snap_path = dir.join("termy-quote-publish-snap.js");
         let post_path = dir.join("termy-quote-publish-post.js");
@@ -5280,36 +5741,108 @@ mod tests {
         };
         let stray = row("stray");
         assert_eq!(stray["snap"]["card"], true, "{}", stray["snap"]["attach"]);
-        assert!(stray["snap"]["attach"].as_str().unwrap().contains("card-bind article"), "{}", stray["snap"]["attach"]);
-        assert!(stray["snap"]["attach"].as_str().unwrap().contains("text-equal yes"), "{}", stray["snap"]["attach"]);
+        assert!(
+            stray["snap"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("card-bind article"),
+            "{}",
+            stray["snap"]["attach"]
+        );
+        assert!(
+            stray["snap"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("text-equal yes"),
+            "{}",
+            stray["snap"]["attach"]
+        );
         assert_eq!(stray["post"]["card"], true, "{}", stray["post"]["attach"]);
         assert_eq!(stray["post"]["clicked_post"], true, "{}", stray["post"]);
         assert_eq!(stray["post"]["text_landed"], true, "{}", stray["post"]);
-        assert!(stray["post"]["attach"].as_str().unwrap().contains("card-bind article"), "{}", stray["post"]["attach"]);
+        assert!(
+            stray["post"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("card-bind article"),
+            "{}",
+            stray["post"]["attach"]
+        );
         assert_eq!(stray["clicks"], serde_json::json!(["modal-post"]));
         assert_eq!(stray["focused"], "modal-box");
         assert_eq!(stray["inline"], "");
 
         let spoiled = row("spoiled");
-        assert_eq!(spoiled["snap"]["card"], true, "{}", spoiled["snap"]["attach"]);
-        assert_eq!(spoiled["post"]["clicked_post"], false, "{}", spoiled["post"]);
+        assert_eq!(
+            spoiled["snap"]["card"], true,
+            "{}",
+            spoiled["snap"]["attach"]
+        );
+        assert_eq!(
+            spoiled["post"]["clicked_post"], false,
+            "{}",
+            spoiled["post"]
+        );
         assert_eq!(spoiled["post"]["text_landed"], true, "{}", spoiled["post"]);
-        assert!(spoiled["post"]["message"].as_str().unwrap().contains("not proven"), "{}", spoiled["post"]["message"]);
-        assert!(spoiled["post"]["attach"].as_str().unwrap().contains("text-equal no"), "{}", spoiled["post"]["attach"]);
-        assert!(spoiled["post"]["attach"].as_str().unwrap().contains("card-bind miss"), "{}", spoiled["post"]["attach"]);
+        assert!(
+            spoiled["post"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not proven"),
+            "{}",
+            spoiled["post"]["message"]
+        );
+        assert!(
+            spoiled["post"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("text-equal no"),
+            "{}",
+            spoiled["post"]["attach"]
+        );
+        assert!(
+            spoiled["post"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("card-bind miss"),
+            "{}",
+            spoiled["post"]["attach"]
+        );
         assert_eq!(spoiled["clicks"].as_array().unwrap().len(), 0);
 
         let wrong = row("wrong");
         assert_eq!(wrong["snap"]["card"], false, "{}", wrong["snap"]["attach"]);
         assert_eq!(wrong["post"]["card"], false, "{}", wrong["post"]["attach"]);
         assert_eq!(wrong["post"]["clicked_post"], false, "{}", wrong["post"]);
-        assert!(wrong["post"]["message"].as_str().unwrap().contains("No quote attachment"), "{}", wrong["post"]["message"]);
-        assert!(wrong["post"]["attach"].as_str().unwrap().contains("text-equal no"), "{}", wrong["post"]["attach"]);
+        assert!(
+            wrong["post"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("No quote attachment"),
+            "{}",
+            wrong["post"]["message"]
+        );
+        assert!(
+            wrong["post"]["attach"]
+                .as_str()
+                .unwrap()
+                .contains("text-equal no"),
+            "{}",
+            wrong["post"]["attach"]
+        );
         assert_eq!(wrong["clicks"].as_array().unwrap().len(), 0);
 
         let link_only = row("linkonly");
-        assert_eq!(link_only["snap"]["card"], false, "{}", link_only["snap"]["attach"]);
-        assert_eq!(link_only["post"]["card"], false, "{}", link_only["post"]["attach"]);
+        assert_eq!(
+            link_only["snap"]["card"], false,
+            "{}",
+            link_only["snap"]["attach"]
+        );
+        assert_eq!(
+            link_only["post"]["card"], false,
+            "{}",
+            link_only["post"]["attach"]
+        );
         assert_eq!(link_only["post"]["clicked_post"], false);
         assert_eq!(link_only["clicks"].as_array().unwrap().len(), 0);
     }

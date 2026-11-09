@@ -270,9 +270,7 @@ pub fn export_sanitized(path: &Path) -> Result<String, String> {
     }
     if sqlite_table_exists(&conn, "receipts")? {
         let mut receipts = conn
-            .prepare(
-                "SELECT account, kind, tweet_id, at_ms, text FROM receipts ORDER BY id",
-            )
+            .prepare("SELECT account, kind, tweet_id, at_ms, text FROM receipts ORDER BY id")
             .map_err(|error| format!("action database: {error}"))?;
         let receipt_rows = receipts
             .query_map([], |row| {
@@ -295,9 +293,7 @@ pub fn export_sanitized(path: &Path) -> Result<String, String> {
             ));
         }
         if !receipt_lines.is_empty() {
-            lines.push(
-                "receipts (read-only): account, kind, target, time_utc, text".into(),
-            );
+            lines.push("receipts (read-only): account, kind, target, time_utc, text".into());
             lines.extend(receipt_lines);
         }
     }
@@ -347,8 +343,7 @@ impl ActionDb {
         if path.exists() {
             if !sqlite_header_ok(path)? {
                 return Err(
-                    "action database is not a readable SQLite file. It was left in place."
-                        .into(),
+                    "action database is not a readable SQLite file. It was left in place.".into(),
                 );
             }
             let mut db = read_sqlite(path)?;
@@ -664,12 +659,7 @@ impl ActionDb {
         });
     }
 
-    pub fn confirmed(
-        &self,
-        account: &str,
-        kind: ToggleKind,
-        id: &str,
-    ) -> Option<bool> {
+    pub fn confirmed(&self, account: &str, kind: ToggleKind, id: &str) -> Option<bool> {
         let key = match kind {
             ToggleKind::Follow => account_key(id),
             _ => tweet_key(id),
@@ -733,12 +723,7 @@ impl ActionDb {
         ids
     }
 
-    pub fn pending_desired(
-        &self,
-        account: &str,
-        kind: ToggleKind,
-        id: &str,
-    ) -> Option<bool> {
+    pub fn pending_desired(&self, account: &str, kind: ToggleKind, id: &str) -> Option<bool> {
         let key = match kind {
             ToggleKind::Follow => account_key(id),
             _ => tweet_key(id),
@@ -821,9 +806,7 @@ impl ActionDb {
     }
 
     fn bucket(&mut self, account: &str) -> &mut AccountBucket {
-        self.accounts
-            .entry(account_key(account))
-            .or_default()
+        self.accounts.entry(account_key(account)).or_default()
     }
 
     fn toggle_mut(&mut self, account: &str, kind: ToggleKind, key: &str) -> &mut ToggleState {
@@ -1003,9 +986,8 @@ fn read_sqlite(path: &Path) -> Result<ActionDb, String> {
         .map_err(|error| format!("action database: {error}"))?;
     for row in toggle_rows {
         let row = row.map_err(|error| format!("action database: {error}"))?;
-        let kind = toggle_kind(&row.kind).ok_or_else(|| {
-            format!("action database has an unknown toggle kind {}", row.kind)
-        })?;
+        let kind = toggle_kind(&row.kind)
+            .ok_or_else(|| format!("action database has an unknown toggle kind {}", row.kind))?;
         let toggle = db.toggle_mut(&row.account, kind, &row.item_key);
         *toggle = row.into_state()?;
     }
@@ -1220,7 +1202,11 @@ mod tests {
         );
         assert_eq!(loaded.confirmed("ada", ToggleKind::Like, "1"), None);
         assert!(loaded.is_saved("ada", ToggleKind::Follow, "jack"));
-        assert!(loaded.pending_desired("ada", ToggleKind::Like, "1").is_none());
+        assert!(
+            loaded
+                .pending_desired("ada", ToggleKind::Like, "1")
+                .is_none()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1291,7 +1277,10 @@ mod tests {
             FinishResult::Applied
         );
         assert_eq!(db.confirmed("ada", ToggleKind::Follow, "jack"), Some(false));
-        assert!(db.pending_desired("ada", ToggleKind::Follow, "jack").is_none());
+        assert!(
+            db.pending_desired("ada", ToggleKind::Follow, "jack")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1368,10 +1357,17 @@ mod tests {
         db.record_receipt("ada", ReceiptKind::QTweet, "9", "Q-tweet sent", 1, 5);
         db.record_receipt("ada", ReceiptKind::Reply, "9", "reply sent", 2, 6);
         db.record_receipt("ada", ReceiptKind::Post, "", "1 part posted", 3, 7);
-        assert_eq!(db.receipt_ids("ada", ReceiptKind::Reply), vec!["9".to_string()]);
+        assert_eq!(
+            db.receipt_ids("ada", ReceiptKind::Reply),
+            vec!["9".to_string()]
+        );
         assert_eq!(db.confirmed("ada", ToggleKind::Repost, "9"), None);
         assert!(database_location_note().contains(FILE_NAME));
-        assert!(!database_location_note().to_ascii_lowercase().contains("token"));
+        assert!(
+            !database_location_note()
+                .to_ascii_lowercase()
+                .contains("token")
+        );
         assert!(!follow_write_allowed(true));
         assert!(follow_write_allowed(false));
     }
@@ -1388,12 +1384,21 @@ mod tests {
         fs::write(dir.join(LEGACY_JSON_NAME), json).unwrap();
         let db_path = dir.join(FILE_NAME);
         let loaded = ActionDb::load(&db_path).unwrap();
-        assert_eq!(loaded.confirmed("ada", ToggleKind::Follow, "jack"), Some(true));
-        assert_eq!(loaded.receipt_ids("ada", ReceiptKind::Reply), vec!["9".to_string()]);
+        assert_eq!(
+            loaded.confirmed("ada", ToggleKind::Follow, "jack"),
+            Some(true)
+        );
+        assert_eq!(
+            loaded.receipt_ids("ada", ReceiptKind::Reply),
+            vec!["9".to_string()]
+        );
         assert!(!dir.join(LEGACY_JSON_NAME).exists());
         assert!(dir.join("x-action-state.json.migrated").is_file());
         let again = ActionDb::load(&db_path).unwrap();
-        assert_eq!(again.receipt_ids("ada", ReceiptKind::Reply), vec!["9".to_string()]);
+        assert_eq!(
+            again.receipt_ids("ada", ReceiptKind::Reply),
+            vec!["9".to_string()]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1421,11 +1426,17 @@ mod tests {
         db.save(&db_path).unwrap();
         let conn = Connection::open(&db_path).unwrap();
         let mut stmt = conn.prepare("PRAGMA table_info(receipts)").unwrap();
-        let names: Vec<String> = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap().map(|name| name.unwrap()).collect();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|name| name.unwrap())
+            .collect();
         for banned in ["token", "password", "secret", "cookie", "authorization"] {
             assert!(!names.iter().any(|name| name.contains(banned)), "{names:?}");
         }
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
         assert_eq!(version, 1);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1437,7 +1448,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join(FILE_NAME);
         let mut db = ActionDb::default();
-        db.force_confirm("Jasper_Black", ToggleKind::Repost, "555", true, 1_762_000_000_000);
+        db.force_confirm(
+            "Jasper_Black",
+            ToggleKind::Repost,
+            "555",
+            true,
+            1_762_000_000_000,
+        );
         db.save(&db_path).unwrap();
         let before = fs::read(&db_path).unwrap();
         let text = export_sanitized(&db_path).unwrap();
@@ -1494,7 +1511,12 @@ mod tests {
         );
         let after = export_sanitized(&db_path).unwrap();
         assert!(after.contains("legacy-unverified"));
-        assert!(!after.lines().any(|line| line.contains("2119037065459568858") && line.contains("opencli-contract")));
+        assert!(
+            !after
+                .lines()
+                .any(|line| line.contains("2119037065459568858")
+                    && line.contains("opencli-contract"))
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

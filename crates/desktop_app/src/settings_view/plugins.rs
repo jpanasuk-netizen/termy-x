@@ -909,10 +909,13 @@ impl SettingsWindow {
                 SettingsSection::Plugins,
                 cx,
             ))
-            .child(self.render_settings_group("Runtime", vec![
-                self.render_plugin_runtime_row(),
-                self.render_plugin_actions_row(cx),
-            ]))
+            .child(self.render_settings_group(
+                "Runtime",
+                vec![
+                    self.render_plugin_runtime_row(),
+                    self.render_plugin_actions_row(cx),
+                ],
+            ))
             .child(self.render_settings_group("Installed plugins", installed_rows));
 
         for (plugin_id, settings) in self.plugin_settings.clone() {

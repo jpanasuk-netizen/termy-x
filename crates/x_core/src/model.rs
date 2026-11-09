@@ -281,7 +281,10 @@ impl Post {
         {
             return Some(url.to_string());
         }
-        if let Some(id) = self.referenced_status_id.as_deref().filter(|id| !id.is_empty())
+        if let Some(id) = self
+            .referenced_status_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
         {
             return Some(format!("https://x.com/i/status/{id}"));
         }
@@ -337,7 +340,9 @@ impl Post {
         if let Some(inner) = fetched.retweeted {
             return Some(*inner);
         }
-        if fetched.id != wrapper_id && fetched.bare_repost_handle().is_none() && !fetched.text.is_empty()
+        if fetched.id != wrapper_id
+            && fetched.bare_repost_handle().is_none()
+            && !fetched.text.is_empty()
         {
             return Some(fetched);
         }
