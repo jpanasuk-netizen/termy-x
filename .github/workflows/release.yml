@@ -21,6 +21,8 @@ concurrency:
 
 env:
   VERSION: ${{ github.event.release.tag_name || inputs.version }}
+  # Public anon key. Empty secret falls back to the key committed in supabase_defaults.rs.
+  TERMY_X_SUPABASE_DEFAULT_ANON_KEY: ${{ secrets.TERMY_X_SUPABASE_DEFAULT_ANON_KEY }}
   INNOSETUP_VERSION: 6.7.1
   # Microsoft.Windows.Console.ConPTY NuGet package bundled with the Windows
   # installer. Update both together; the hash is of the .nupkg file.

@@ -226,6 +226,34 @@ enum Cmd {
         #[arg(long, default_value_t = 80)]
         limit: usize,
     },
+    /// Optional Supabase sync for the local action database. Off until configured.
+    Supabase {
+        #[command(subcommand)]
+        action: SupabaseAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SupabaseAction {
+    /// Show whether sync is off, syncing, synced, or in error. Prints no keys.
+    Status,
+    /// Save the project URL. The anon key is read from TERMY_X_SUPABASE_ANON_KEY when set.
+    Configure {
+        #[arg(long)]
+        url: String,
+    },
+    /// Email/password sign-in. The password is read from TERMY_X_SUPABASE_PASSWORD and not stored.
+    SignIn {
+        #[arg(long)]
+        email: String,
+    },
+    /// Create an email account. The password is read from TERMY_X_SUPABASE_PASSWORD and not stored.
+    SignUp {
+        #[arg(long)]
+        email: String,
+    },
+    /// Forget the sync session on this PC.
+    SignOut,
 }
 
 #[derive(Subcommand, Debug)]
@@ -429,6 +457,9 @@ fn print_help_guide() {
     println!("  termy-xcli write unlike --to ID                Dry-run an unlike");
     println!("  termy-xcli write follow --to HANDLE            Dry-run a follow");
     println!("  termy-xcli write unfollow --to HANDLE          Dry-run an unfollow");
+    println!(
+        "  termy-xcli supabase status                     Optional sync status. Prints no keys"
+    );
     println!("  termy-xcli write post \"text\" --confirm yes    One real post. No retry.");
     println!("  termy-xcli post \"text\"");
     println!("  termy-xcli post --dry-run \"text\"          Plan only - never posts");
@@ -818,8 +849,20 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
             days,
             limit,
         } => cmd_analyze(handle, days, limit, json, io),
+        Cmd::Supabase { action } => cmd_supabase(action, io),
         Cmd::Help | Cmd::Doctor | Cmd::Config | Cmd::Auth | Cmd::Connect { .. } => 0,
     }
+}
+
+fn cmd_supabase(action: SupabaseAction, io: &mut CliIo) -> i32 {
+    let action = match action {
+        SupabaseAction::Status => crate::supabase_auth::CliAction::Status,
+        SupabaseAction::Configure { url } => crate::supabase_auth::CliAction::Configure { url },
+        SupabaseAction::SignIn { email } => crate::supabase_auth::CliAction::SignIn { email },
+        SupabaseAction::SignUp { email } => crate::supabase_auth::CliAction::SignUp { email },
+        SupabaseAction::SignOut => crate::supabase_auth::CliAction::SignOut,
+    };
+    crate::supabase_auth::cli(action, &mut io.config, io.http.as_ref())
 }
 
 fn resolve_handle(io: &CliIo, handle: Option<String>) -> Result<String, String> {

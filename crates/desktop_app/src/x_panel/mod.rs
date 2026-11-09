@@ -736,6 +736,7 @@ pub struct XPanel {
     sync_snapshot_ms: u64,
     action_persist: bool,
     sync_line: String,
+    account_sync: account_sync::UiState,
     /// Inline quote composer state (quote = retweet with your own words).
     quote_post_id: Option<String>,
     quote_author: String,
@@ -1132,6 +1133,7 @@ impl XPanel {
             sync_snapshot_ms: 0,
             action_persist,
             sync_line: String::new(),
+            account_sync: account_sync::UiState::from_config(&config),
             quote_post_id: None,
             quote_author: String::new(),
             quote_text: String::new(),
@@ -1257,6 +1259,7 @@ impl XPanel {
             // silently empty (or on fixtures) with no profile behind them.
             panel.status = "Checking your X connection\u{2026}".into();
             panel.start_connection_check(cx);
+            panel.launch_account_sync(cx);
         }
         panel.caret = panel.compose.len();
         panel
@@ -2458,6 +2461,7 @@ impl XPanel {
                             }
                         }
                         panel.bind_account(&handle);
+                        panel.schedule_supabase_pull(cx);
                         let next = panel.queued_section.take().unwrap_or(panel.section);
                         let next = if next == XSection::Compose {
                             XSection::Timeline
@@ -3456,6 +3460,9 @@ impl XPanel {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.account_sync_key(event, cx) {
+            return;
+        }
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
 
@@ -4623,6 +4630,43 @@ impl XPanel {
         }
         let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
         let _ = self.action_db.save(&config.action_state_path());
+        termy_x::supabase_sync::push_saved_in_background();
+    }
+
+    fn schedule_supabase_pull(&self, cx: &mut Context<Self>) {
+        if !self.live {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let config =
+                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let http = termy_x::io::UreqHttp::default();
+                    let db =
+                        termy_x::action_state::ActionDb::load(&config.action_state_path()).ok();
+                    db.map(|db| termy_x::supabase_sync::sync(&config, &http, &db, true))
+                })
+                .await;
+            let _ = this.update(cx, |panel, cx| {
+                if let Some(outcome) = outcome {
+                    let mut changed = false;
+                    for row in &outcome.toggles {
+                        changed |= panel.action_db.merge_cloud_toggle(row);
+                    }
+                    for row in &outcome.receipts {
+                        changed |= panel.action_db.merge_cloud_receipt(row);
+                    }
+                    if changed {
+                        panel.hydrate_actions();
+                        panel.persist_actions();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn next_action_seq(&mut self) -> u64 {
@@ -8093,6 +8137,7 @@ impl XPanel {
                     "Desk".into(),
                     "Inbox has Waiting/Done, AI draft, Reply (confirm), and Queue. Feeds filter by language, age, and mute. Followers snapshot is click-only. Analyze is a 14-day read of any handle.".into(),
                 ));
+                rows.push(self.account_sync_section(cx));
                 rows.push(card(
                     "Stats".into(),
                     "Lookup / Me shows OpenCLI profile totals (followers, following, posts, likes, verified, created_at) plus sums over the loaded tweet window. Missing fields are n/a. The Stats tab compares per-day engagement vs the prior window with a best-hour heatmap. Follower count is the profile payload, never len() of a capped followers page.".into(),
@@ -12384,6 +12429,7 @@ mod edit_keys_tests {
     }
 }
 
+mod account_sync;
 mod reply_guy_ui;
 pub use reply_guy_ui::XAskEvent;
 

@@ -57,6 +57,10 @@ pub struct XConfig {
     pub wsl_distro: String,
     pub wsl_user: String,
     pub config_dir: PathBuf,
+    /// Optional Supabase project URL. Empty means sync is off. Not a secret.
+    pub supabase_url: String,
+    /// Email used for optional Supabase Auth. Not a secret. The password is never stored.
+    pub supabase_email: String,
 }
 
 impl Default for XConfig {
@@ -97,6 +101,8 @@ impl Default for XConfig {
             wsl_distro: "Ubuntu".to_string(),
             wsl_user: String::new(),
             config_dir: default_config_dir(),
+            supabase_url: String::new(),
+            supabase_email: String::new(),
         }
     }
 }
@@ -224,6 +230,8 @@ impl XConfig {
             "agents.muse" | "agent_muse" => self.agent_muse = nonempty_owned(value),
             "agents.wsl_distro" => self.wsl_distro = value.to_string(),
             "agents.wsl_user" => self.wsl_user = value.to_string(),
+            "supabase_url" | "supabase.url" => self.supabase_url = value.to_string(),
+            "supabase_email" | "supabase.email" => self.supabase_email = value.to_string(),
             _ => {}
         }
     }
@@ -338,6 +346,14 @@ impl XConfig {
             "background_art",
             &format!("background_art = {}", self.background_art),
         )
+    }
+
+    pub fn save_supabase_url(&self, url: &str) -> Result<(), String> {
+        self.upsert_config_assignment("supabase_url", &format!("supabase_url = \"{url}\""))
+    }
+
+    pub fn save_supabase_email(&self, email: &str) -> Result<(), String> {
+        self.upsert_config_assignment("supabase_email", &format!("supabase_email = \"{email}\""))
     }
 
     pub fn save_list_sort(&self) -> Result<(), String> {
@@ -528,6 +544,10 @@ min_interval_ms = 1500
 opencli_bin = "opencli"
 twitter_bin = "twitter"
 agent_reach_bin = "agent-reach"
+
+# Optional. Leave empty to keep action state only on this machine.
+# supabase_url = "https://YOUR_PROJECT.supabase.co"
+# supabase_email = "you@example.com"
 "#
 }
 
