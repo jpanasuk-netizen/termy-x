@@ -39,6 +39,33 @@ pub fn is_termy_x_title(title: &str) -> bool {
     lower == "termy" || lower.starts_with("termy ")
 }
 
+/// Pull an outer window rectangle fully inside the work area. Width stays
+/// unless it is wider than the work area.
+pub fn clamp_outer(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> (i32, i32, i32, i32) {
+    let max_width = (right - left).max(1);
+    let max_height = (bottom - top).max(1);
+    let width = width.min(max_width).max(1);
+    let height = height.min(max_height).max(1);
+    let mut x = x.max(left);
+    let mut y = y.max(top);
+    if x + width > right {
+        x = right - width;
+    }
+    if y + height > bottom {
+        y = bottom - height;
+    }
+    (x, y, width, height)
+}
+
 pub fn snap_beside(
     host: Option<WindowRect>,
     monitor: WindowRect,
@@ -181,6 +208,16 @@ mod tests {
         assert_eq!(after.x, before.x + 80.0);
         assert_eq!(after.height, monitor().height);
         assert_eq!(after.y, monitor().y);
+    }
+
+    #[test]
+    fn a_window_above_the_work_area_is_pulled_inside() {
+        let (x, y, width, height) = clamp_outer(-10, -23, 687, 2116, 0, 0, 3840, 2100);
+        assert_eq!(width, 687);
+        assert!(x >= 0 && x + width <= 3840);
+        assert!(y >= 0 && y + height <= 2100);
+        assert_eq!(y, 0);
+        assert_eq!(height, 2100);
     }
 
     #[test]

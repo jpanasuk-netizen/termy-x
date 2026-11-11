@@ -15,13 +15,14 @@ use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
     COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DOCK_WIDTH, DeskFrame, DeskSettings,
     DeskStore, EditPopout, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk,
-    OutcomeKind, Phase, ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeProvider,
-    Topic, VISIBLE_NAME, WINDOW_PAD, apply_send_result, card_columns, card_from_post, close_editor,
-    column_count_for_width, column_from_cache, column_from_outcome, column_loading, daily_due,
-    draft_take, drafts_file, edit_reply, editor_send, filter_posts, fixture_column,
-    frame_from_parts, isolated_opencli_config, layout_takes, move_selection, open_editor,
-    page_label, post_reply_opencli, prepare_draft_file, request_send, scroll_by, surface_after_nav,
-    synthetic_fixture_posts, termy_xl_data_root, turn_page, within_termy_x_config, wrap_token,
+    OutcomeKind, Phase, ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeDraft,
+    TakeProvider, Topic, VISIBLE_NAME, WINDOW_PAD, apply_send_result, card_columns, card_from_post,
+    close_editor, column_count_for_width, column_from_cache, column_from_outcome,
+    column_loading_keep, daily_due, draft_take, drafts_file, edit_reply, editor_send, filter_posts,
+    fixture_column, frame_from_parts, isolated_opencli_config, layout_takes, move_selection,
+    offline_take, open_editor, page_label, post_reply_opencli, prepare_draft_file, request_send,
+    scroll_by, surface_after_nav, synthetic_fixture_posts, termy_xl_data_root, turn_page,
+    within_termy_x_config, wrap_token,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -69,6 +70,8 @@ pub struct TrendsDesk {
     history: Vec<termy_x::trends_desk::StoredReport>,
     history_index: Option<usize>,
     pub(crate) card_replies: HashMap<String, ReplyPhase>,
+    pub(crate) takes: HashMap<String, termy_x::trends_desk::TakeDraft>,
+    take_wave: u64,
     editing_card: Option<String>,
     pub(crate) selected: Option<String>,
     pub(crate) scroll_offsets: HashMap<String, f32>,
@@ -90,6 +93,7 @@ pub struct TrendsDesk {
     pub(crate) frame: DeskFrame,
     pub(crate) anim_target: Option<f32>,
     pub(crate) close_hooked: bool,
+    fitted: bool,
 }
 
 impl TrendsDesk {
@@ -162,6 +166,8 @@ impl TrendsDesk {
             history,
             history_index: None,
             card_replies: HashMap::new(),
+            takes: HashMap::new(),
+            take_wave: 0,
             editing_card: None,
             selected: None,
             scroll_offsets: HashMap::new(),
@@ -187,6 +193,7 @@ impl TrendsDesk {
             frame,
             anim_target: None,
             close_hooked: false,
+            fitted: false,
         }
     }
 
@@ -199,20 +206,97 @@ impl TrendsDesk {
             return;
         }
         self.started = true;
-        self.seed_takes();
+        self.begin_take_stream(cx);
         self.fetch_empty_subjects(cx);
         self.spawn_probe(cx);
         self.spawn_daily(cx);
     }
 
-    fn seed_takes(&mut self) {
+    fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
+        self.take_wave = self.take_wave.saturating_add(1);
+        let wave = self.take_wave;
+        let mut posts = Vec::new();
         for column in &self.columns {
-            for (id, text) in termy_x::trends_desk::takes_for_posts(&column.view.posts) {
-                self.card_replies
-                    .entry(id)
-                    .or_insert(ReplyPhase::Editing { text });
+            for post in &column.view.posts {
+                if posts
+                    .iter()
+                    .any(|seen: &termy_x::trends_desk::SourcePost| seen.id == post.id)
+                {
+                    continue;
+                }
+                posts.push(post.clone());
             }
         }
+        if self.options.fixture {
+            for post in &posts {
+                self.takes.insert(post.id.clone(), offline_take(post));
+            }
+            return;
+        }
+        for post in &posts {
+            self.takes.insert(
+                post.id.clone(),
+                TakeDraft {
+                    text: String::new(),
+                    source: "pending",
+                    note: String::new(),
+                },
+            );
+        }
+        if posts.is_empty() {
+            return;
+        }
+        let provider = TakeProvider::parse(&self.settings.take_provider);
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let mut model_down = false;
+            let mut shared_error: Option<String> = None;
+            for post in posts {
+                let post_id = post.id.clone();
+                let draft = if let Some(error) = shared_error.clone() {
+                    TakeDraft {
+                        text: error.clone(),
+                        source: "error",
+                        note: error,
+                    }
+                } else if model_down && provider == TakeProvider::Free {
+                    offline_take(&post)
+                } else {
+                    let post = post.clone();
+                    let config = config.clone();
+                    let provider = provider;
+                    cx.background_executor()
+                        .spawn(async move {
+                            let http = termy_x::io::UreqHttp::default();
+                            match draft_take(provider, &config, &post, &http) {
+                                Ok(draft) => draft,
+                                Err(error) => TakeDraft {
+                                    text: error.clone(),
+                                    source: "error",
+                                    note: error,
+                                },
+                            }
+                        })
+                        .await
+                };
+                if draft.source == "offline" {
+                    model_down = true;
+                }
+                if draft.source == "error"
+                    && (draft.note.contains("key") || draft.note.contains("No Treg"))
+                {
+                    shared_error = Some(draft.note.clone());
+                }
+                let _ = this.update(cx, |desk, cx| {
+                    if desk.take_wave != wave {
+                        return;
+                    }
+                    desk.takes.insert(post_id, draft);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
     }
 
     fn fetch_empty_subjects(&mut self, cx: &mut Context<Self>) {
@@ -241,7 +325,17 @@ impl TrendsDesk {
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
+                let cached = desk
+                    .columns
+                    .iter()
+                    .any(|column| !column.view.posts.is_empty() || column.cached.is_some());
                 desk.session = status;
+                if desk.session.state == SessionState::ProbeFailed && cached {
+                    desk.session.label =
+                        "Saved reports are loaded. OpenCLI whoami did not answer.".into();
+                    desk.session.detail =
+                        "Refresh runs a live search. The cards stay on the saved report.".into();
+                }
                 cx.notify();
             });
         })
@@ -298,7 +392,16 @@ impl TrendsDesk {
                 continue;
             }
             let query = termy_x::trends_desk::search_query(&column.topic.desc, &focus);
-            column.view = column_loading(&query);
+            let kept = if !column.view.posts.is_empty() {
+                column.view.posts.clone()
+            } else {
+                column
+                    .cached
+                    .as_ref()
+                    .map(|report| report.posts.clone())
+                    .unwrap_or_default()
+            };
+            column.view = column_loading_keep(&query, kept);
             topics.push(column.topic.clone());
         }
         cx.notify();
@@ -351,6 +454,7 @@ impl TrendsDesk {
                 }
                 desk.busy = false;
                 desk.apply_outcomes(outcomes.0, outcomes.1);
+                desk.begin_take_stream(cx);
                 cx.notify();
             });
         })
@@ -385,7 +489,6 @@ impl TrendsDesk {
                 }
             }
         }
-        self.seed_takes();
     }
 
     fn cancel_run(&mut self, cx: &mut Context<Self>) {
@@ -553,6 +656,8 @@ impl TrendsDesk {
             .card_replies
             .get(id)
             .map(|phase| phase.text().to_string())
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| self.takes.get(id).map(|take| take.text.clone()))
             .unwrap_or_default();
         let provider = TakeProvider::parse(&self.settings.take_provider);
         self.selected = Some(format!("take:{id}"));
@@ -582,6 +687,7 @@ impl TrendsDesk {
             return;
         };
         let provider = TakeProvider::parse(&self.settings.take_provider);
+        let config = self.config.clone();
         let current = self
             .card_replies
             .get(&id)
@@ -592,7 +698,7 @@ impl TrendsDesk {
                 .background_executor()
                 .spawn(async move {
                     let http = termy_x::io::UreqHttp::default();
-                    draft_take(provider, &post, &http)
+                    draft_take(provider, &config, &post, &http)
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
@@ -967,6 +1073,9 @@ impl Render for TrendsDesk {
         self.ensure_scrolls();
         self.maybe_refresh(cx);
         self.follow_host(window, cx);
+        if !self.fitted {
+            self.fitted = crate::xl_host::fit_window(window);
+        }
         let width: f32 = window.viewport_size().width.into();
         let mut root = div()
             .id("trends-desk")
@@ -1106,6 +1215,7 @@ impl TrendsDesk {
                             if this.writable {
                                 let _ = this.store.save_settings(&this.settings);
                             }
+                            this.begin_take_stream(cx);
                             cx.notify();
                         }),
                     ))
@@ -1118,6 +1228,7 @@ impl TrendsDesk {
                             if this.writable {
                                 let _ = this.store.save_settings(&this.settings);
                             }
+                            this.begin_take_stream(cx);
                             cx.notify();
                         }),
                     )),

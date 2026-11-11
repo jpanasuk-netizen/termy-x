@@ -70,6 +70,15 @@ pub fn heat_score(post: &SourcePost, now_unix: i64) -> Option<f64> {
     Some(engagement / hours)
 }
 
+/// Hide a zero or missing rate. "# 0/h" is not a badge.
+pub fn heat_badge(post: &SourcePost, now_unix: i64) -> Option<String> {
+    let score = heat_score(post, now_unix)?;
+    if score < 1.0 {
+        return None;
+    }
+    Some(heat_line(post, now_unix))
+}
+
 pub fn heat_line(post: &SourcePost, now_unix: i64) -> String {
     match heat_score(post, now_unix) {
         Some(score) => {
@@ -350,6 +359,51 @@ pub fn refresh_is_search_only(args: &[String]) -> bool {
 }
 
 pub fn local_offset_secs(now: i64) -> i32 {
+    #[cfg(windows)]
+    {
+        let _ = now;
+        #[repr(C)]
+        struct SystemTime {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[repr(C)]
+        struct TzInfo {
+            bias: i32,
+            standard_name: [u16; 32],
+            standard_date: SystemTime,
+            standard_bias: i32,
+            daylight_name: [u16; 32],
+            daylight_date: SystemTime,
+            daylight_bias: i32,
+        }
+        unsafe extern "system" {
+            fn GetTimeZoneInformation(info: *mut TzInfo) -> u32;
+        }
+        let mut info = std::mem::MaybeUninit::<TzInfo>::zeroed();
+        let kind = unsafe { GetTimeZoneInformation(info.as_mut_ptr()) };
+        let info = unsafe { info.assume_init() };
+        let extra = match kind {
+            2 => info.daylight_bias,
+            1 => info.standard_bias,
+            _ => 0,
+        };
+        return -(info.bias + extra) * 60;
+    }
+    #[cfg(not(windows))]
+    {
+        unix_local_offset(now)
+    }
+}
+
+#[cfg(not(windows))]
+fn unix_local_offset(now: i64) -> i32 {
     #[cfg(unix)]
     {
         #[repr(C)]
@@ -387,9 +441,15 @@ pub fn local_offset_secs(now: i64) -> i32 {
 pub fn format_clock(unix: i64, offset_secs: i32) -> String {
     let local = unix + offset_secs as i64;
     let rem = local.rem_euclid(86_400);
-    let hour = rem / 3600;
+    let hour24 = (rem / 3600) as u32;
     let minute = (rem % 3600) / 60;
-    format!("{hour:02}:{minute:02}")
+    let (hour, suffix) = match hour24 {
+        0 => (12, "AM"),
+        1..=11 => (hour24, "AM"),
+        12 => (12, "PM"),
+        _ => (hour24 - 12, "PM"),
+    };
+    format!("{hour}:{minute:02} {suffix}")
 }
 
 pub fn hud_line(
@@ -628,6 +688,9 @@ mod tests {
         let stamped = hud_line(0, 0, "free", Some(1_794_432_658), 0);
         assert!(!stamped.contains("1794432658"));
         assert!(stamped.contains(':'));
+        let utc_2150 = 86_400 + 21 * 3600 + 50 * 60;
+        assert_eq!(format_clock(utc_2150, 0), "9:50 PM");
+        assert_eq!(format_clock(utc_2150, -6 * 3600), "3:50 PM");
         assert!(line.contains("2 sent"));
         assert!(line.contains("free"));
     }

@@ -17,16 +17,17 @@ pub use cards::{
     ReplyPhase, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame, TakeProvider, TweetCard,
     WINDOW_PAD, apply_send_result, card_columns, card_from_post, char_count, close_editor,
     collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_right, expand_to_full,
-    frame_from_parts, layout_takes, move_selection, open_editor, open_width, page_index,
-    page_label, remember_width, request_send, scroll_by, scroll_of, subject_pages,
+    frame_from_parts, layout_takes, move_selection, offline_take, open_editor, open_width,
+    page_index, page_label, remember_width, request_send, scroll_by, scroll_of, subject_pages,
     take_column_count, takes_for_posts, toggle_dock, tone_variants, turn_page, wrap_token,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
     RunOutcome, SourcePost, StoredReport, Surface, Topic, VISIBLE_NAME, chicago_stamp,
-    column_count_for_width, column_from_cache, column_from_outcome, column_loading, daily_due,
-    default_topics, diff_urls, draft_text_from_title, filter_posts, fixture_column, idea_from,
-    outcome_error, reply_dry_run_args, search_query, slug_id, surface_after_nav, topic_id_ok,
+    column_count_for_width, column_from_cache, column_from_outcome, column_loading,
+    column_loading_keep, daily_due, default_topics, diff_urls, draft_text_from_title, filter_posts,
+    fixture_column, idea_from, outcome_error, reply_dry_run_args, search_query, slug_id,
+    surface_after_nav, topic_id_ok,
 };
 pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
@@ -35,16 +36,16 @@ pub use fetch::{
 };
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, TakeTone, apply_filters,
-    desk_key, flip_variant, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
-    provider_drafts, read_composer, refresh_due, refresh_is_search_only, replied_badge, save_pack,
-    sends_on_key, sort_by_heat, three_variants,
+    desk_key, flip_variant, heat_badge, heat_line, heat_score, hud_line, load_pack,
+    local_offset_secs, new_ids, provider_drafts, read_composer, refresh_due,
+    refresh_is_search_only, replied_badge, save_pack, sends_on_key, sort_by_heat, three_variants,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
 };
 pub use snap::{
-    Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, is_termy_x_title, snap_beside,
-    termy_areas,
+    Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, clamp_outer, is_termy_x_title,
+    snap_beside, termy_areas,
 };
 pub use store::{
     DATA_DIR_ENV, DATA_FOLDER, DIR_NAME, DeskStore, drafts_file, termy_xl_data_root,
@@ -85,11 +86,10 @@ use crate::config::XConfig;
 use crate::io::CommandRunner;
 
 pub fn isolated_opencli_config(data_root: &std::path::Path) -> XConfig {
-    XConfig {
-        config_dir: data_root.to_path_buf(),
-        official_enabled: false,
-        ..XConfig::default()
-    }
+    let mut config = XConfig::load(data_root);
+    config.config_dir = data_root.to_path_buf();
+    config.official_enabled = false;
+    config
 }
 
 pub fn run_saved_topic(

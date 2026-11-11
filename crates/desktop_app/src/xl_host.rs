@@ -74,6 +74,25 @@ pub(crate) fn find_termy_x() -> Option<WindowRect> {
     }
 }
 
+pub(crate) fn fit_window(window: &mut Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        crate::native_sdk::win32_window::register_window(
+            window,
+            termy_x::trends_desk::VISIBLE_NAME,
+        );
+        if let Some(hwnd) = crate::native_sdk::win32_window::hwnd_for_window(window) {
+            return fit_hwnd(hwnd);
+        }
+        return false;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        true
+    }
+}
+
 pub(crate) fn place_frame(window: &mut Window, frame: &DeskFrame) -> bool {
     #[cfg(target_os = "windows")]
     if place_win32(window, frame) {
@@ -148,7 +167,7 @@ fn place_win32(window: &mut Window, frame: &DeskFrame) -> bool {
     let Some(hwnd) = crate::native_sdk::win32_window::hwnd_for_window(window) else {
         return false;
     };
-    unsafe {
+    let placed = unsafe {
         SetWindowPos(
             hwnd,
             None,
@@ -156,6 +175,67 @@ fn place_win32(window: &mut Window, frame: &DeskFrame) -> bool {
             frame.y.round() as i32,
             frame.width.round() as i32,
             frame.height.round() as i32,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+        .is_ok()
+    };
+    fit_hwnd(hwnd);
+    placed
+}
+
+#[cfg(target_os = "windows")]
+fn fit_hwnd(hwnd: windows::Win32::Foundation::HWND) -> bool {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return false;
+    }
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_invalid() {
+        return false;
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        rcMonitor: RECT::default(),
+        rcWork: RECT::default(),
+        dwFlags: 0,
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return false;
+    }
+    let work = info.rcWork;
+    let (x, y, width, height) = termy_x::trends_desk::clamp_outer(
+        rect.left,
+        rect.top,
+        rect.right - rect.left,
+        rect.bottom - rect.top,
+        work.left,
+        work.top,
+        work.right,
+        work.bottom,
+    );
+    if x == rect.left
+        && y == rect.top
+        && width == rect.right - rect.left
+        && height == rect.bottom - rect.top
+    {
+        return true;
+    }
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            width,
+            height,
             SWP_NOZORDER | SWP_NOACTIVATE,
         )
         .is_ok()

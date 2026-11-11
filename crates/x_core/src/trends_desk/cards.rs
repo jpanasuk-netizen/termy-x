@@ -6,7 +6,7 @@
 use crate::io::{Http, HttpRequest};
 use crate::reply_guy::{self, Secret};
 
-use super::domain::{SourcePost, draft_text_from_title};
+use super::domain::SourcePost;
 
 /// Windows Termy opens at 1280×820. Termy XL sits beside it at twice the width
 /// and the same height. The window stays resizable.
@@ -550,12 +550,50 @@ pub struct TakeDraft {
     pub note: String,
 }
 
-pub fn free_take(post: &SourcePost) -> TakeDraft {
+pub fn offline_take(post: &SourcePost) -> TakeDraft {
     TakeDraft {
         text: super::domain::idea_from(post),
-        source: "free-template",
-        note: "Free take from the post. Not a paid model.".into(),
+        source: "offline",
+        note: "offline take".into(),
     }
+}
+
+/// The house free model (configured OpenAI-compatible endpoint, otherwise the
+/// local free default). A miss becomes an extractive take from this post only.
+pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &SourcePost) -> TakeDraft {
+    let system = "You write one short X reply under 220 characters. Mention the post's actual claim. No hashtags, no generic line that could fit a different post. Output only the reply.";
+    let body: String = post.text.chars().take(500).collect();
+    let user = format!(
+        "Author: {} @{}\nPost:\n{body}",
+        post.author_name, post.author
+    );
+    match crate::ai::chat_completion(config, http, system, &user) {
+        Ok(text) if specific_to_post(&text, post) => TakeDraft {
+            text,
+            source: "model",
+            note: "Free model draft. Not posted.".into(),
+        },
+        _ => offline_take(post),
+    }
+}
+
+fn specific_to_post(take: &str, post: &SourcePost) -> bool {
+    let take = take.to_lowercase();
+    if take.contains("not another hype pile-on")
+        || take.contains("people are actually engaging with this")
+    {
+        return false;
+    }
+    let name = post.author_name.trim().to_lowercase();
+    if name.chars().count() >= 4 && take.contains(&name) {
+        return true;
+    }
+    post.text.split_whitespace().any(|word| {
+        let word = word
+            .trim_matches(|ch: char| !ch.is_alphanumeric())
+            .to_lowercase();
+        word.chars().count() >= 5 && take.contains(&word)
+    })
 }
 
 /// Treg reads the existing Termy X key and checks it. It does not write a new
@@ -636,11 +674,12 @@ pub fn parse_treg_draft(body: &str) -> Result<String, String> {
 
 pub fn draft_take(
     provider: TakeProvider,
+    config: &crate::config::XConfig,
     post: &SourcePost,
     http: &dyn Http,
 ) -> Result<TakeDraft, String> {
     match provider {
-        TakeProvider::Free => Ok(free_take(post)),
+        TakeProvider::Free => Ok(free_take(config, http, post)),
         TakeProvider::Treg => treg_take(post, http),
     }
 }
@@ -802,10 +841,18 @@ mod tests {
     fn a_saved_report_makes_one_take_card_per_post() {
         let mut second = post();
         second.id = "56".into();
+        second.text =
+            "The New York State Bar requires lawyers to verify AI-generated legal advice.".into();
+        second.author_name = "NYLawJournal".into();
         let posts = vec![post(), second];
         let takes = takes_for_posts(&posts);
         assert_eq!(takes.len(), posts.len());
-        assert!(takes.iter().all(|(_, text)| !text.is_empty()));
+        assert_ne!(takes[0].1, takes[1].1);
+        assert!(takes[0].1.to_lowercase().contains("courts") || takes[0].1.contains("Ada"));
+        assert!(
+            takes[1].1.contains("NYLawJournal") || takes[1].1.to_lowercase().contains("lawyers")
+        );
+        assert!(takes.iter().all(|(_, text)| !text.contains("hype pile-on")));
         assert!(takes_for_posts(&[]).is_empty());
         let frames = layout_takes(
             687.0,
@@ -813,6 +860,7 @@ mod tests {
         );
         assert_eq!(frames.len(), 2);
         assert_eq!(take_column_count(687.0), 1);
+        assert!(take_column_count(1400.0) >= 2);
         assert!(take_column_count(2560.0) > take_column_count(687.0));
     }
 
@@ -947,31 +995,49 @@ mod tests {
 
     #[test]
     fn provider_selection_does_not_hide_a_treg_failure() {
-        let post = post();
+        let sample = post();
+        let config = crate::config::XConfig::default();
         let free = draft_take(
             TakeProvider::Free,
-            &post,
+            &config,
+            &sample,
             &ScriptHttp {
                 body: Err("unused".into()),
                 calls: std::sync::Mutex::new(Vec::new()),
             },
         )
         .unwrap();
-        assert_eq!(free.source, "free-template");
-        assert!(!free.text.is_empty());
-        assert_ne!(free.source, "treg");
+        assert_eq!(free.source, "offline");
+        assert!(free.note.contains("offline"));
+        assert!(free.text.contains("Courts") || free.text.contains("Ada"));
+        let mut other = post();
+        other.text =
+            "Quarterly earnings beat estimates after the finance desk revised guidance.".into();
+        other.author_name = "FinanceDesk".into();
+        let other_take = draft_take(
+            TakeProvider::Free,
+            &config,
+            &other,
+            &ScriptHttp {
+                body: Err("unused".into()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_ne!(free.text, other_take.text);
+        assert!(other_take.text.contains("earnings") || other_take.text.contains("FinanceDesk"));
         let http = ScriptHttp {
             body: Err("treg: no".into()),
             calls: std::sync::Mutex::new(Vec::new()),
         };
-        let err = draft_take(TakeProvider::Treg, &post, &http).unwrap_err();
+        let err = draft_take(TakeProvider::Treg, &config, &sample, &http).unwrap_err();
         assert!(err.contains("Treg") || err.contains("treg") || err.contains("key"));
         assert!(!err.contains("Hot take"));
         let http = ScriptHttp {
             body: Ok(r#"{"choices":[{"message":{"content":"A real Treg take"}}]}"#.into()),
             calls: std::sync::Mutex::new(Vec::new()),
         };
-        let drafted = treg_take_with_token("secret-token", &http, &post).unwrap();
+        let drafted = treg_take_with_token("secret-token", &http, &sample).unwrap();
         assert_eq!(drafted.text, "A real Treg take");
         assert_eq!(drafted.source, "treg");
         let failed = treg_take_with_token(
@@ -980,7 +1046,7 @@ mod tests {
                 body: Ok(r#"{"detail":"no tool"}"#.into()),
                 calls: std::sync::Mutex::new(Vec::new()),
             },
-            &post,
+            &sample,
         )
         .unwrap_err();
         assert!(failed.contains("treg"));

@@ -45,6 +45,17 @@ impl TrendsDesk {
             card.media.join(" ")
         };
         let reply_text = wrap_token(phase.text());
+        let shown = self.takes.get(&card.id);
+        let (take_line, take_tag) = match shown {
+            Some(take) if take.source == "pending" => ("Drafting take…".to_string(), None),
+            Some(take) if take.source == "offline" => (take.text.clone(), Some("offline take")),
+            Some(take) => (take.text.clone(), None),
+            None => (termy_x::trends_desk::idea_from(post), Some("offline take")),
+        };
+        let editing = self
+            .popout
+            .as_ref()
+            .is_some_and(|pop| pop.open && pop.card_id == card.id);
         let take_key = format!("take:{}", card.id);
         let selected = self.selected.as_deref() == Some(take_key.as_str());
         let handle = self
@@ -52,12 +63,15 @@ impl TrendsDesk {
             .get(&take_key)
             .cloned()
             .unwrap_or_default();
-        let status = match &phase {
-            ReplyPhase::Pending { .. } => "Pending send".to_string(),
-            ReplyPhase::Confirmed { receipt, .. } => format!("Confirmed · {receipt}"),
-            ReplyPhase::Failed { error, .. } => format!("Failed · {error}"),
-            ReplyPhase::Editing { .. } => "Editing reply".to_string(),
-            ReplyPhase::Idle => "Reply".to_string(),
+        let status = if editing {
+            "Editing reply".to_string()
+        } else {
+            match &phase {
+                ReplyPhase::Pending { .. } => "Pending send".to_string(),
+                ReplyPhase::Confirmed { receipt, .. } => format!("Confirmed · {receipt}"),
+                ReplyPhase::Failed { error, .. } => format!("Failed · {error}"),
+                ReplyPhase::Editing { .. } | ReplyPhase::Idle => String::new(),
+            }
         };
         div()
             .id(SharedString::from(format!("desk-card-{id}")))
@@ -124,12 +138,14 @@ impl TrendsDesk {
                     .text_size(px(14.0))
                     .whitespace_normal()
                     .text_color(rgb(0xffe56a))
-                    .child(if reply_text.trim().is_empty() {
-                        termy_x::trends_desk::idea_from(post)
-                    } else {
-                        reply_text.clone()
-                    }),
+                    .child(take_line),
             )
+            .children(take_tag.map(|tag| {
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x8e8e93))
+                    .child(tag)
+            }))
             .child(div().text_size(px(14.0)).whitespace_normal().child(format!(
                 "{}{} · @{}",
                 tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
@@ -165,25 +181,25 @@ impl TrendsDesk {
                     .text_color(rgb(0x7af6ff))
                     .child(wrap_token(&card.url)),
             )
-            .child(
+            .children(self.heat_for(post).map(|heat| {
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0xffd60a))
-                    .child(self.heat_for(post)),
-            )
-            .child(div().text_size(px(12.0)).child(status))
+                    .child(heat)
+            }))
+            .children((!status.is_empty()).then(|| div().text_size(px(12.0)).child(status)))
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(rgb(0x30d158))
                     .child(self.badge_for(&card.id).unwrap_or_default()),
             )
-            .child(
+            .children((!reply_text.trim().is_empty() && editing).then(|| {
                 div()
                     .text_size(px(12.0))
                     .whitespace_normal()
-                    .child(reply_text),
-            )
+                    .child(reply_text)
+            }))
             .child(
                 div()
                     .flex()

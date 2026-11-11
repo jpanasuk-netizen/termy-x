@@ -579,24 +579,39 @@ fn title_from(post: &SourcePost) -> String {
     }
 }
 
+/// A take built only from this post: who said it, and the claim in their words.
+/// The same sentence is never reused for a different post.
 pub fn idea_from(post: &SourcePost) -> String {
-    let text = take_chars(&collapse_ws(&post.text), 160);
-    let lower = text.to_lowercase();
-    if ["launch", "introduc", "ship", "releas", "announc"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        return format!("This drop is moving for a reason — {text}");
+    let who = if !post.author_name.trim().is_empty() {
+        post.author_name.trim().to_string()
+    } else if !post.author.trim().is_empty() {
+        format!("@{}", post.author.trim())
+    } else {
+        "This post".into()
+    };
+    let claim = claim_from(&post.text);
+    if claim.is_empty() {
+        format!("{who} posted an update with no text to quote.")
+    } else {
+        format!("{who}: {claim}")
     }
-    if ["ai", "claude", "gpt", "gemini", "openai", "anthropic"]
-        .iter()
-        .any(|needle| lower.contains(needle))
-    {
-        return "The AI timeline is loud on this one. Worth a clear take, not another hype pile-on."
-            .into();
-    }
-    "Hot take worth a reply: people are actually engaging with this, not just scrolling past."
-        .into()
+}
+
+fn claim_from(text: &str) -> String {
+    let cleaned = text
+        .split_whitespace()
+        .filter(|word| {
+            !word.starts_with("http://") && !word.starts_with("https://") && !word.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = collapse_ws(&cleaned);
+    let sentence = cleaned
+        .split(['.', '!', '?'])
+        .map(str::trim)
+        .find(|part| part.chars().count() >= 12)
+        .unwrap_or(cleaned.trim());
+    take_chars(sentence, 180)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,11 +912,22 @@ pub fn fixture_column(topic: &Topic, posts: Vec<SourcePost>) -> ColumnView {
 }
 
 pub fn column_loading(query: &str) -> ColumnView {
+    column_loading_keep(query, Vec::new())
+}
+
+/// A refresh keeps the saved cards on screen. An empty list is the only
+/// case that shows the loading line instead of posts.
+pub fn column_loading_keep(query: &str, posts: Vec<SourcePost>) -> ColumnView {
+    let posts_cached = !posts.is_empty();
     ColumnView {
         phase: Phase::Loading,
-        banner: format!("Loading “{query}” through OpenCLI. Nothing here is a new report yet."),
-        posts: Vec::new(),
-        posts_cached: false,
+        banner: if posts_cached {
+            format!("Refreshing “{query}”. Cards below are the saved report.")
+        } else {
+            format!("Loading “{query}” through OpenCLI. Nothing here is a new report yet.")
+        },
+        posts,
+        posts_cached,
         query: query.to_string(),
     }
 }

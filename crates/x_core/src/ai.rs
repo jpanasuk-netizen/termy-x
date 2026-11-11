@@ -25,6 +25,40 @@ pub fn draft_variants(
     }
 }
 
+/// One completion from the configured free endpoint. No template fallback.
+pub fn chat_completion(
+    config: &XConfig,
+    http: &dyn Http,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let (base, model) = config.ai_endpoint();
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.4,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+    })
+    .to_string();
+    let mut url = base.trim_end_matches('/').to_string();
+    url.push_str("/chat/completions");
+    let response = http.request(HttpRequest {
+        method: "POST",
+        url,
+        body: Some(body),
+        bearer: config.api_key(),
+        content_type: Some("application/json".into()),
+        headers: Vec::new(),
+    })?;
+    let text = completion_text(&response)?;
+    if let Some(key) = config.api_key() {
+        return Ok(text.replace(&key, "[redacted]"));
+    }
+    Ok(text)
+}
+
 fn model_variants(
     config: &XConfig,
     http: &dyn Http,

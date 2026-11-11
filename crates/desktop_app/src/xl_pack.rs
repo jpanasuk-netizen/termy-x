@@ -12,8 +12,8 @@ use gpui_kit::{
 use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
 use termy_x::trends_desk::{
     DeskKey, PackFile, Phase, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters,
-    desk_key, heat_line, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label,
-    refresh_due, replied_badge, save_pack,
+    desk_key, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label, refresh_due,
+    replied_badge, save_pack,
 };
 
 impl TrendsDesk {
@@ -70,8 +70,8 @@ impl TrendsDesk {
         )
     }
 
-    pub(crate) fn heat_for(&self, post: &SourcePost) -> String {
-        heat_line(post, Self::now_unix())
+    pub(crate) fn heat_for(&self, post: &SourcePost) -> Option<String> {
+        termy_x::trends_desk::heat_badge(post, Self::now_unix())
     }
 
     pub(crate) fn badge_for(&self, id: &str) -> Option<String> {
@@ -547,27 +547,29 @@ impl TrendsDesk {
                             .flex()
                             .flex_row()
                             .flex_wrap()
+                            .items_start()
                             .gap(px(12.0));
                         if column.view.phase == Phase::Loading && visible.is_empty() {
-                            list = list
-                                .child("Loading takes…")
-                                .child(refresh_button(topic_id.clone(), cx));
+                            list = list.child(status_row(
+                                "Loading takes…",
+                                refresh_button(topic_id.clone(), cx),
+                            ));
                         } else if column.view.phase == Phase::Error && visible.is_empty() {
-                            list = list
-                                .child(
-                                    div()
-                                        .p(px(12.0))
-                                        .rounded(px(10.0))
-                                        .border_1()
-                                        .border_color(rgb(0xff5d8f))
-                                        .bg(rgb(0x3a1d1d))
-                                        .child(column.view.banner.clone()),
-                                )
-                                .child(refresh_button(topic_id.clone(), cx));
+                            list = list.child(status_row(
+                                &column.view.banner,
+                                refresh_button(topic_id.clone(), cx),
+                            ));
                         } else if visible.is_empty() {
-                            list = list
-                                .child("Not run yet.")
-                                .child(refresh_button(topic_id.clone(), cx));
+                            list = list.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(8.0))
+                                    .h(px(36.0))
+                                    .child("Not run yet.")
+                                    .child(refresh_button(topic_id.clone(), cx)),
+                            );
                         }
                         for (post, frame) in visible.iter().zip(frames.iter()) {
                             list = list.child(
@@ -601,6 +603,18 @@ impl TrendsDesk {
             .children(rows)
             .into_any_element()
     }
+}
+
+fn status_row(label: &str, action: gpui_kit::AnyElement) -> gpui_kit::AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .h(px(36.0))
+        .child(label.to_string())
+        .child(action)
+        .into_any_element()
 }
 
 fn refresh_button(topic_id: String, cx: &mut Context<TrendsDesk>) -> gpui_kit::AnyElement {
