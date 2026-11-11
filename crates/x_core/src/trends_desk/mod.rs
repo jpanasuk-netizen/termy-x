@@ -9,6 +9,7 @@ mod domain;
 mod fetch;
 mod pack;
 mod parse;
+mod snap;
 mod store;
 
 pub use cards::{
@@ -39,6 +40,10 @@ pub use pack::{
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
+};
+pub use snap::{
+    Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, is_termy_x_title, snap_beside,
+    termy_areas,
 };
 pub use store::{
     DATA_DIR_ENV, DATA_FOLDER, DIR_NAME, DeskStore, drafts_file, termy_xl_data_root,

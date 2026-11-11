@@ -218,6 +218,7 @@ impl TrendsDesk {
             ("hits".into(), "Hit List".into()),
             ("receipts".into(), "Receipts".into()),
             ("heat".into(), "Sort by heat".into()),
+            ("termy".into(), "Termy areas".into()),
             ("free".into(), "Provider Free".into()),
             ("treg".into(), "Provider Treg".into()),
         ];
@@ -269,6 +270,7 @@ impl TrendsDesk {
             match action {
                 "hits" => self.board = "hits".into(),
                 "receipts" => self.board = "receipts".into(),
+                "termy" => self.board = "termy".into(),
                 "heat" => {
                     self.pack.sort_heat = !self.pack.sort_heat;
                     self.save_pack_file();
@@ -291,6 +293,27 @@ impl TrendsDesk {
             }
             list = list.child(button(
                 "desk-board-back",
+                "Back",
+                false,
+                cx.listener(|this, _, _, cx| {
+                    this.board = "subject".into();
+                    cx.notify();
+                }),
+            ));
+            return Some(list.into_any_element());
+        }
+        if self.board == "termy" {
+            let mut list = div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child("Termy areas. Posts, replies, reposts, quotes, and follows still need an explicit click. Image quotes stay unsupported. The live Termy X panel is not mounted here, because that panel writes the Termy X config directory.");
+            for area in termy_x::trends_desk::termy_areas() {
+                let gate = termy_x::trends_desk::area_gate(*area, false);
+                list = list.child(format!("{area:?} · {gate:?}"));
+            }
+            list = list.child(button(
+                "desk-board-back-3",
                 "Back",
                 false,
                 cx.listener(|this, _, _, cx| {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_kit::{
     App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
@@ -79,6 +79,8 @@ pub struct TrendsDesk {
     pub(crate) palette: bool,
     pub(crate) palette_query: String,
     pub(crate) board: String,
+    pub(crate) last_host: Option<termy_x::trends_desk::WindowRect>,
+    pub(crate) last_follow: Option<Instant>,
     pub(crate) session: SessionStatus,
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -169,6 +171,8 @@ impl TrendsDesk {
             palette: false,
             palette_query: String::new(),
             board: "subject".into(),
+            last_host: None,
+            last_follow: None,
             session: SessionStatus {
                 state: SessionState::ProbeFailed,
                 label: "Checking OpenCLI…".into(),
@@ -828,10 +832,13 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
             })
             .map_err(|error| error.to_string());
     }
-    cx.open_window(desk_window_options(&saved_frame()), move |window, cx| {
-        window.set_window_title(VISIBLE_NAME);
-        cx.new(|cx| TrendsDesk::new(options, cx))
-    })
+    cx.open_window(
+        desk_window_options(&snapped_frame(cx)),
+        move |window, cx| {
+            window.set_window_title(VISIBLE_NAME);
+            cx.new(|cx| TrendsDesk::new(options, cx))
+        },
+    )
     .map(|_| ())
     .map_err(|error| error.to_string())
 }
@@ -863,6 +870,25 @@ fn set_standalone_app_id() {
 
 #[cfg(not(target_os = "windows"))]
 fn set_standalone_app_id() {}
+
+fn snapped_frame(cx: &App) -> DeskFrame {
+    let saved = saved_frame();
+    let monitor = crate::xl_host::monitor_rect_app(cx);
+    let snap = termy_x::trends_desk::snap_beside(
+        crate::xl_host::find_termy_x(),
+        monitor,
+        saved.expanded,
+        saved.expanded_width,
+    );
+    DeskFrame {
+        x: snap.x,
+        y: snap.y,
+        width: snap.width,
+        height: snap.height,
+        expanded: saved.expanded,
+        expanded_width: saved.expanded_width,
+    }
+}
 
 fn saved_frame() -> DeskFrame {
     let root = termy_xl_data_root();
@@ -904,6 +930,7 @@ impl Render for TrendsDesk {
         self.ensure_close_hook(window, cx);
         self.ensure_scrolls();
         self.maybe_refresh(cx);
+        self.follow_host(window, cx);
         let width: f32 = window.viewport_size().width.into();
         let mut root = div()
             .id("trends-desk")

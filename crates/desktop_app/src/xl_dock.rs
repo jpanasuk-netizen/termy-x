@@ -54,9 +54,7 @@ impl TrendsDesk {
             self.frame = expand_to_full(self.frame, room);
         }
         self.anim_target = None;
-        window.resize(size(px(self.frame.width), px(self.frame.height)));
-        self.write_frame();
-        cx.notify();
+        self.retarget(window, cx);
     }
 
     pub(crate) fn write_frame(&mut self) {

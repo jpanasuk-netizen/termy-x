@@ -81,7 +81,7 @@ termy-xcli trends-desk status
 termy-xcli trends-desk run --topic all --focus AI
 ```
 
-The window starts as a 72px dock with the XL mark. Clicking XL or pressing Ctrl+Shift+X opens the workspace in one resize, to the right from the same left edge, at 2560 wide or the last saved width. It shrinks only when that width does not fit the monitor. Esc collapses it when nothing is selected. One subject fills the page. Each take is its own gold card, and Reply, Edit, and Draft take open a reply box that posts only from Send. From an installed Termy build, `termy --trends-desk` opens that window in the Termy process and does not replace the Termy shortcut. `--fixture` is labeled sample data.
+On Windows, Termy XL looks for a visible window titled Termy (not Termy XL) and sits its left edge on that window's right edge, matching its top and height. The 72px dock stays on that edge and the workspace opens to the right. If Termy X is not found, XL uses the right half of the monitor. Elsewhere the same placement is saved, and the live move uses the platform resize. Clicking XL or pressing Ctrl+Shift+X opens at 2560 wide, or the last saved width, clamped only when the space beside Termy X is smaller. Esc collapses it when nothing is selected. One subject fills the page. Each take is its own gold card, and Reply, Edit, and Draft take open a reply box that posts only from Send. From an installed Termy build, `termy --trends-desk` opens that window in the Termy process and does not replace the Termy shortcut. `--fixture` is labeled sample data.
 
 Inside Termy, use **Termy XL** in the command palette or View menu, or **Open Termy XL** on the Trends tab.
 
