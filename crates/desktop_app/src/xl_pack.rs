@@ -359,8 +359,11 @@ impl TrendsDesk {
         }
         if self.board == "receipts" {
             let mut list = div().flex().flex_col().gap(px(8.0)).child("Receipts");
+            let now = Self::now_unix();
+            let offset = termy_x::trends_desk::local_offset_secs(now);
             for mark in &self.pack.receipts {
-                list = list.child(format!("{} · {} · {}", mark.status, mark.at_unix, mark.url));
+                let when = termy_x::trends_desk::format_clock(mark.at_unix, offset);
+                list = list.child(format!("{} · {when} · {}", mark.status, mark.url));
             }
             if self.pack.receipts.is_empty() {
                 list = list.child("No replies sent from Termy XL yet.");

@@ -63,6 +63,12 @@ if ([System.IO.Path]::GetFileName($sourceExe) -eq "x.exe") {
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 function Backup-ThenCopy([string]$From, [string]$To) {
     if (Test-Path $To) {
+        $fromHash = (Get-FileHash -Algorithm SHA256 $From).Hash
+        $toHash = (Get-FileHash -Algorithm SHA256 $To).Hash
+        if ($fromHash -eq $toHash) {
+            Write-Output "unchanged $To"
+            return
+        }
         $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $backup = "$To.$stamp.bak"
         Copy-Item -Force $To $backup

@@ -43,6 +43,9 @@ pub fn append_desk_log_limited(root: &Path, line: &str, max_bytes: u64) {
     if let Ok(meta) = fs::metadata(&path)
         && meta.len() > max_bytes
     {
+        let _ = fs::remove_file(dir.join("termy-xl.log.3"));
+        let _ = fs::rename(dir.join("termy-xl.log.2"), dir.join("termy-xl.log.3"));
+        let _ = fs::rename(dir.join("termy-xl.log.1"), dir.join("termy-xl.log.2"));
         let _ = fs::rename(&path, dir.join("termy-xl.log.1"));
     }
     let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
@@ -65,9 +68,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         append_desk_log_limited(&dir, "0123456789", 8);
-        append_desk_log_limited(&dir, "next", 8);
+        append_desk_log_limited(&dir, "second-line", 8);
+        append_desk_log_limited(&dir, "third-line", 8);
         assert!(dir.join("logs").join("termy-xl.log").is_file());
         assert!(dir.join("logs").join("termy-xl.log.1").is_file());
+        assert!(dir.join("logs").join("termy-xl.log.2").is_file());
         let kept = std::fs::read_to_string(dir.join("logs").join("termy-xl.log")).unwrap();
         assert!(!kept.contains("super"));
         let _ = std::fs::remove_dir_all(&dir);

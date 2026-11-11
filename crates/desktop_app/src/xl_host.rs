@@ -9,7 +9,11 @@ use termy_x::trends_desk::{DeskFrame, WindowRect, snap_beside};
 mod tests {
     #[test]
     fn a_minimized_window_is_restored_before_focus() {
-        assert_eq!(super::focus_steps(true), ["restore", "show", "foreground"]);
+        assert_eq!(
+            super::focus_steps(true),
+            ["restore", "show", "raise", "foreground"]
+        );
+        assert!(super::focus_steps(false).contains(&"raise"));
         assert!(!super::focus_steps(false).contains(&"restore"));
     }
 }
@@ -52,22 +56,22 @@ fn rect_from_bounds(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> WindowRect {
     }
 }
 
-/// What a second launch should do. A minimized window is restored first.
+/// What a second launch should do. A minimized window is restored, then raised.
 pub fn focus_steps(minimized: bool) -> &'static [&'static str] {
     if minimized {
-        &["restore", "show", "foreground"]
+        &["restore", "show", "raise", "foreground"]
     } else {
-        &["show", "foreground"]
+        &["show", "raise", "foreground"]
     }
 }
 
 pub(crate) fn focus_existing() {
     #[cfg(target_os = "windows")]
     {
-        use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            BringWindowToTop, FindWindowW, GetForegroundWindow, IsIconic, SW_RESTORE, SW_SHOW,
-            SetForegroundWindow, ShowWindow,
+            BringWindowToTop, FindWindowW, GetForegroundWindow, HWND_NOTOPMOST, HWND_TOPMOST,
+            IsIconic, SW_RESTORE, SW_SHOW, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+            SetForegroundWindow, SetWindowPos, ShowWindow,
         };
         use windows::core::PCWSTR;
         let title: Vec<u16> = "Termy XL"
@@ -85,31 +89,50 @@ pub(crate) fn focus_existing() {
             }
             let _ = ShowWindow(hwnd, SW_SHOW);
             let foreground = GetForegroundWindow();
-            attach_foreground(foreground, hwnd);
+            let attached = attach_foreground_thread(foreground, true);
             let _ = BringWindowToTop(hwnd);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
             let _ = SetForegroundWindow(hwnd);
-            let _ = attach_foreground(foreground, HWND::default());
+            if attached {
+                let _ = attach_foreground_thread(foreground, false);
+            }
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-unsafe fn attach_foreground(
+unsafe fn attach_foreground_thread(
     foreground: windows::Win32::Foundation::HWND,
-    target: windows::Win32::Foundation::HWND,
-) {
+    attach: bool,
+) -> bool {
     use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
     if foreground.is_invalid() {
-        return;
+        return false;
     }
     let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
     let current = unsafe { GetCurrentThreadId() };
     if foreground_thread == 0 || foreground_thread == current {
-        return;
+        return false;
     }
-    let attach = !target.is_invalid();
-    let _ = unsafe { AttachThreadInput(current, foreground_thread, attach) };
+    unsafe { AttachThreadInput(current, foreground_thread, attach) }.is_ok()
 }
 
 pub(crate) fn find_termy_x() -> Option<WindowRect> {

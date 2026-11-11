@@ -1102,6 +1102,17 @@ mod tests {
         assert_eq!(modeled.source, "model");
         assert!(modeled.text.contains("court") || modeled.text.contains("models"));
         assert!(answered.calls.lock().unwrap()[0].contains("vyce.example/v1/chat/completions"));
+        struct EnvReset(Option<String>);
+        impl Drop for EnvReset {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => unsafe { std::env::set_var("TERMY_X_TREG_TOKEN", value) },
+                    None => unsafe { std::env::remove_var("TERMY_X_TREG_TOKEN") },
+                }
+            }
+        }
+        let _reset = EnvReset(std::env::var("TERMY_X_TREG_TOKEN").ok());
+        unsafe { std::env::set_var("TERMY_X_TREG_TOKEN", "real-key-must-not-be-used") };
         let dir = std::env::temp_dir().join(format!("xl-treg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1117,8 +1128,10 @@ mod tests {
         let err = draft_take(TakeProvider::Treg, &isolated, &sample, &http).unwrap_err();
         assert!(err.contains("No Treg key"));
         assert!(http.calls.lock().unwrap().is_empty());
+        assert!(!err.contains("real-key-must-not-be-used"));
         assert!(!err.contains("Hot take"));
         let _ = std::fs::remove_dir_all(&dir);
+        drop(_reset);
         let http = ScriptHttp {
             body: Ok(r#"{"choices":[{"message":{"content":"A real Treg take"}}]}"#.into()),
             calls: std::sync::Mutex::new(Vec::new()),
