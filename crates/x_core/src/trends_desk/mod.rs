@@ -81,6 +81,27 @@ mod fixture_tests {
         assert_ne!(view.phase, Phase::Fresh);
         assert!(view.banner.contains("not a live fetch"));
     }
+
+    #[test]
+    fn xl_reads_termy_x_ai_settings_without_taking_its_directory() {
+        let mut xl = XConfig::default();
+        xl.config_dir = std::path::PathBuf::from("/xl");
+        let mut termy = XConfig::default();
+        termy.config_dir = std::path::PathBuf::from("/termy");
+        termy.ai_base_url = "https://vyce.example/v1".into();
+        termy.ai_model = "glm-5.3-flash".into();
+        termy.ai_api_key = "secret-key".into();
+        termy.ai_explicit = true;
+        copy_ai_if_unset(&mut xl, &termy);
+        assert_eq!(xl.ai_endpoint().0, "https://vyce.example/v1");
+        assert_eq!(xl.ai_endpoint().1, "glm-5.3-flash");
+        assert_eq!(xl.ai_api_key, "secret-key");
+        assert_eq!(xl.config_dir, std::path::PathBuf::from("/xl"));
+        xl.ai_explicit = true;
+        xl.ai_base_url = "http://xl-local/v1".into();
+        copy_ai_if_unset(&mut xl, &termy);
+        assert_eq!(xl.ai_endpoint().0, "http://xl-local/v1");
+    }
 }
 
 use std::sync::Arc;
@@ -91,9 +112,28 @@ use crate::io::CommandRunner;
 
 pub fn isolated_opencli_config(data_root: &std::path::Path) -> XConfig {
     let mut config = XConfig::load(data_root);
-    config.config_dir = data_root.to_path_buf();
     config.official_enabled = false;
+    if !config.ai_explicit {
+        let shared = XConfig::load(&crate::config::default_config_dir());
+        copy_ai_if_unset(&mut config, &shared);
+    }
+    config.config_dir = data_root.to_path_buf();
     config
+}
+
+/// Read Termy X's draft endpoint into XL when XL has none of its own.
+/// Does not change `config_dir` and does not write the Termy X file.
+pub fn copy_ai_if_unset(into: &mut XConfig, from: &XConfig) {
+    if into.ai_explicit || !from.ai_explicit {
+        return;
+    }
+    into.ai_base_url = from.ai_base_url.clone();
+    into.ai_model = from.ai_model.clone();
+    into.ai_key_env = from.ai_key_env.clone();
+    if into.ai_api_key.trim().is_empty() {
+        into.ai_api_key = from.ai_api_key.clone();
+    }
+    into.ai_explicit = true;
 }
 
 pub fn run_saved_topic(

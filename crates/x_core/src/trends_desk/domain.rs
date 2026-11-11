@@ -579,8 +579,8 @@ fn title_from(post: &SourcePost) -> String {
     }
 }
 
-/// A take built only from this post: who said it, and the claim in their words.
-/// The same sentence is never reused for a different post.
+/// A take built only from this post: a question, a counterpoint, or why it matters.
+/// It is not a copy of the headline, and two posts do not share one sentence.
 pub fn idea_from(post: &SourcePost) -> String {
     let who = if !post.author_name.trim().is_empty() {
         post.author_name.trim().to_string()
@@ -591,9 +591,17 @@ pub fn idea_from(post: &SourcePost) -> String {
     };
     let claim = claim_from(&post.text);
     if claim.is_empty() {
-        format!("{who} posted an update with no text to quote.")
-    } else {
-        format!("{who}: {claim}")
+        return format!("What is {who} actually asking people to believe?");
+    }
+    let bucket = post
+        .id
+        .bytes()
+        .fold(0u8, |sum, byte| sum.wrapping_add(byte))
+        % 3;
+    match bucket {
+        0 => format!("Does this hold up? {who} says {claim}"),
+        1 => format!("A counterpoint to {who}: {claim} skips who bears the cost."),
+        _ => format!("Why it matters: {claim} — {who} is asking for a decision, not a scroll."),
     }
 }
 

@@ -438,16 +438,38 @@ fn unix_local_offset(now: i64) -> i32 {
     }
 }
 
-pub fn format_post_time(raw: &str, offset_secs: i32) -> String {
+pub fn format_post_time(raw: &str, now: i64, offset_secs: i32) -> String {
     let Some(unix) = crate::time::parse_created_at(raw) else {
         return raw.to_string();
     };
+    let age = now.saturating_sub(unix);
+    if now >= unix && age < 60 {
+        return "just now".into();
+    }
+    if now >= unix && age < 3600 {
+        return format!("{}m ago", (age / 60).max(1));
+    }
+    if now >= unix && age < 36 * 3600 {
+        return format!("{}h ago", (age / 3600).max(1));
+    }
     let local = unix + offset_secs as i64;
-    format!(
-        "{} {}",
-        crate::time::ymd(local),
-        format_clock(unix, offset_secs)
-    )
+    let date = crate::time::ymd(local);
+    let month = match date.get(5..7).unwrap_or("01") {
+        "01" => "Jan",
+        "02" => "Feb",
+        "03" => "Mar",
+        "04" => "Apr",
+        "05" => "May",
+        "06" => "Jun",
+        "07" => "Jul",
+        "08" => "Aug",
+        "09" => "Sep",
+        "10" => "Oct",
+        "11" => "Nov",
+        _ => "Dec",
+    };
+    let day = date.get(8..10).unwrap_or("01").trim_start_matches('0');
+    format!("{month} {day}, {}", format_clock(unix, offset_secs))
 }
 
 pub fn next_refresh_text(
@@ -731,6 +753,15 @@ mod tests {
         let utc_2150 = 86_400 + 21 * 3600 + 50 * 60;
         assert_eq!(format_clock(utc_2150, 0), "9:50 PM");
         assert_eq!(format_clock(utc_2150, -6 * 3600), "3:50 PM");
+        let raw = "Tue Nov 10 16:32:51 +0000 2026";
+        let posted = crate::time::parse_created_at(raw).unwrap();
+        assert_eq!(
+            format_post_time(raw, posted + 2 * 3600, -6 * 3600),
+            "2h ago"
+        );
+        let older = format_post_time(raw, posted + 50 * 3600, -6 * 3600);
+        assert!(older.contains("10:32 AM"), "{older}");
+        assert!(!older.contains("+0000"));
         assert!(line.contains("2 sent"));
         assert!(line.contains("free"));
     }

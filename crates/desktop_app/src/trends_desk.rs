@@ -250,9 +250,18 @@ impl TrendsDesk {
         }
         let provider = TakeProvider::parse(&self.settings.take_provider);
         let config = self.config.clone();
+        if provider == TakeProvider::Free {
+            let (base, model) = config.ai_endpoint();
+            termy_x::trends_desk::append_desk_log(
+                &self.data_root,
+                &format!("free takes: {model} @ {base}, timeout 30s"),
+            );
+        }
         cx.spawn(async move |this, cx| {
             let mut model_down = false;
+            let mut shared_offline: Option<String> = None;
             let mut shared_error: Option<String> = None;
+            let mut logged_offline = false;
             for post in posts {
                 let post_id = post.id.clone();
                 let draft = if let Some(error) = shared_error.clone() {
@@ -262,14 +271,20 @@ impl TrendsDesk {
                         note: error,
                     }
                 } else if model_down && provider == TakeProvider::Free {
-                    offline_take(&post)
+                    let mut draft = offline_take(&post);
+                    if let Some(reason) = &shared_offline {
+                        draft.note = reason.clone();
+                    }
+                    draft
                 } else {
                     let post = post.clone();
                     let config = config.clone();
                     let provider = provider;
                     cx.background_executor()
                         .spawn(async move {
-                            let http = termy_x::io::UreqHttp::default();
+                            let http = termy_x::io::UreqHttp::with_timeout(
+                                std::time::Duration::from_secs(30),
+                            );
                             match draft_take(provider, &config, &post, &http) {
                                 Ok(draft) => draft,
                                 Err(error) => TakeDraft {
@@ -282,6 +297,9 @@ impl TrendsDesk {
                         .await
                 };
                 if draft.source == "offline" {
+                    if shared_offline.is_none() && draft.note.starts_with("free model") {
+                        shared_offline = Some(draft.note.clone());
+                    }
                     model_down = true;
                 }
                 if draft.source == "error"
@@ -298,6 +316,13 @@ impl TrendsDesk {
                             &desk.data_root,
                             &format!("take failed: {}", draft.note),
                         );
+                    }
+                    if draft.source == "offline"
+                        && !logged_offline
+                        && draft.note.starts_with("free model")
+                    {
+                        logged_offline = true;
+                        termy_x::trends_desk::append_desk_log(&desk.data_root, &draft.note);
                     }
                     desk.takes.insert(post_id, draft);
                     cx.notify();

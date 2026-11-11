@@ -238,7 +238,7 @@ pub fn layout_takes(viewport: f32, ids: &[impl AsRef<str>]) -> Vec<TakeFrame> {
         columns -= 1;
     }
     let width = if columns == 1 {
-        inner.min(TAKE_CARD_MAX)
+        inner
     } else {
         ((inner - gap * (columns as f32 - 1.0)) / columns as f32).min(TAKE_CARD_MAX)
     };
@@ -573,39 +573,56 @@ pub fn offline_take(post: &SourcePost) -> TakeDraft {
 /// The house free model (configured OpenAI-compatible endpoint, otherwise the
 /// local free default). A miss becomes an extractive take from this post only.
 pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &SourcePost) -> TakeDraft {
-    let system = "You write one short X reply under 220 characters. Mention the post's actual claim. No hashtags, no generic line that could fit a different post. Output only the reply.";
+    let (base, model) = config.ai_endpoint();
+    let system = "You write one short X reply under 220 characters. Take a side: a question, a counterpoint, or why it matters. Use a detail from this post. No hashtags. Output only the reply.";
     let body: String = post.text.chars().take(500).collect();
     let user = format!(
         "Author: {} @{}\nPost:\n{body}",
         post.author_name, post.author
     );
+    let where_from = format!("{model} @ {base}");
     match crate::ai::chat_completion(config, http, system, &user) {
-        Ok(text) if specific_to_post(&text, post) => TakeDraft {
+        Ok(text) if text.trim().chars().count() >= 8 && !is_canned(&text) => TakeDraft {
             text,
             source: "model",
-            note: "Free model draft. Not posted.".into(),
+            note: format!("Free model draft ({where_from}). Not posted."),
         },
-        _ => offline_take(post),
+        Ok(_) => offline_with(
+            post,
+            &format!("free model unreachable: empty or generic draft ({where_from})"),
+        ),
+        Err(error) => {
+            let error = redact_token(&error, &config.api_key().unwrap_or_default());
+            let error = shorten_reason(&error);
+            offline_with(
+                post,
+                &format!("free model unreachable: {error} ({where_from})"),
+            )
+        }
     }
 }
 
-fn specific_to_post(take: &str, post: &SourcePost) -> bool {
-    let take = take.to_lowercase();
-    if take.contains("not another hype pile-on")
-        || take.contains("people are actually engaging with this")
-    {
-        return false;
+fn offline_with(post: &SourcePost, reason: &str) -> TakeDraft {
+    let mut draft = offline_take(post);
+    draft.note = reason.to_string();
+    draft
+}
+
+fn is_canned(text: &str) -> bool {
+    let text = text.to_lowercase();
+    text.contains("not another hype pile-on")
+        || text.contains("people are actually engaging with this")
+}
+
+fn shorten_reason(error: &str) -> String {
+    let error = error.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = error.chars();
+    let short: String = chars.by_ref().take(160).collect();
+    if chars.next().is_some() {
+        format!("{short}…")
+    } else {
+        short
     }
-    let name = post.author_name.trim().to_lowercase();
-    if name.chars().count() >= 4 && take.contains(&name) {
-        return true;
-    }
-    post.text.split_whitespace().any(|word| {
-        let word = word
-            .trim_matches(|ch: char| !ch.is_alphanumeric())
-            .to_lowercase();
-        word.chars().count() >= 5 && take.contains(&word)
-    })
 }
 
 /// Treg reads the existing Termy X key and checks it. It does not write a new
@@ -844,7 +861,12 @@ mod tests {
             }
             for frame in &frames {
                 ids.push(frame.id.clone());
-                assert!(frame.width <= TAKE_CARD_MAX + 0.01);
+                if columns == 1 {
+                    let inner = viewport - WINDOW_PAD * 2.0;
+                    assert!((frame.width - inner).abs() < 1.0);
+                } else {
+                    assert!(frame.width <= TAKE_CARD_MAX + 0.01);
+                }
                 assert!(frame.right() <= viewport - WINDOW_PAD + 0.01);
                 assert!(frame.width > 0.0);
             }
@@ -879,6 +901,7 @@ mod tests {
             &takes.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
         );
         assert_eq!(frames.len(), 2);
+        assert!((frames[0].width - (687.0 - WINDOW_PAD * 2.0)).abs() < 1.0);
         assert_eq!(take_column_count(687.0), 1);
         assert!(take_column_count(1400.0) >= 2);
         let wide = expand_locked(
@@ -1042,8 +1065,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(free.source, "offline");
-        assert!(free.note.contains("offline"));
+        assert!(free.note.starts_with("free model unreachable"));
+        assert!(free.note.contains("127.0.0.1:11434"));
         assert!(free.text.contains("Courts") || free.text.contains("Ada"));
+        assert!(!free.text.starts_with("Ada Lovelace:"));
         let mut other = post();
         other.text =
             "Quarterly earnings beat estimates after the finance desk revised guidance.".into();
@@ -1060,6 +1085,23 @@ mod tests {
         .unwrap();
         assert_ne!(free.text, other_take.text);
         assert!(other_take.text.contains("earnings") || other_take.text.contains("FinanceDesk"));
+        let configured = crate::config::XConfig {
+            ai_base_url: "https://vyce.example/v1".into(),
+            ai_model: "glm-5.3-flash".into(),
+            ai_explicit: true,
+            ..crate::config::XConfig::default()
+        };
+        let answered = ScriptHttp {
+            body: Ok(
+                r#"{"choices":[{"message":{"content":"Testing court models in public is the actual change, not the headline."}}]}"#
+                    .into(),
+            ),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let modeled = draft_take(TakeProvider::Free, &configured, &sample, &answered).unwrap();
+        assert_eq!(modeled.source, "model");
+        assert!(modeled.text.contains("court") || modeled.text.contains("models"));
+        assert!(answered.calls.lock().unwrap()[0].contains("vyce.example/v1/chat/completions"));
         let dir = std::env::temp_dir().join(format!("xl-treg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

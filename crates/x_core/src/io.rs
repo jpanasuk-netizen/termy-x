@@ -802,6 +802,17 @@ pub struct UreqHttp {
     agent: ureq::Agent,
 }
 
+impl UreqHttp {
+    pub fn with_timeout(total: Duration) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new()
+                .timeout(total)
+                .timeout_connect(Duration::from_secs(5))
+                .build(),
+        }
+    }
+}
+
 impl Default for UreqHttp {
     fn default() -> Self {
         Self {

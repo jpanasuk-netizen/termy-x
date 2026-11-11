@@ -41,6 +41,7 @@ impl TrendsDesk {
             .map(|raw| {
                 termy_x::trends_desk::format_post_time(
                     raw,
+                    crate::trends_desk::TrendsDesk::now_unix(),
                     termy_x::trends_desk::local_offset_secs(
                         crate::trends_desk::TrendsDesk::now_unix(),
                     ),
@@ -56,9 +57,19 @@ impl TrendsDesk {
         let shown = self.takes.get(&card.id);
         let (take_line, take_tag) = match shown {
             Some(take) if take.source == "pending" => ("Drafting take…".to_string(), None),
-            Some(take) if take.source == "offline" => (take.text.clone(), Some("offline take")),
+            Some(take) if take.source == "offline" => (
+                take.text.clone(),
+                Some(if take.note.starts_with("free model") {
+                    take.note.clone()
+                } else {
+                    "offline take".into()
+                }),
+            ),
             Some(take) => (take.text.clone(), None),
-            None => (termy_x::trends_desk::idea_from(post), Some("offline take")),
+            None => (
+                termy_x::trends_desk::idea_from(post),
+                Some("offline take".to_string()),
+            ),
         };
         let editing = self
             .popout

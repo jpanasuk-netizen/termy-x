@@ -33,6 +33,8 @@ pub struct XConfig {
     pub ai_key_env: String,
     pub ai_base_url: String,
     pub ai_model: String,
+    /// Optional key from x.toml. Env vars still win. Never logged.
+    pub ai_api_key: String,
     /// Set when a config file or env var chose the endpoint. The free local
     /// default stays implicit so a dead Ollama falls back to templates.
     pub ai_explicit: bool,
@@ -83,6 +85,7 @@ impl Default for XConfig {
             ai_key_env: "TERMY_X_AI_API_KEY".to_string(),
             ai_base_url: String::new(),
             ai_model: String::new(),
+            ai_api_key: String::new(),
             ai_explicit: false,
             min_interval_ms: 1500,
             bulk_cap: crate::bulk::DEFAULT_BULK_CAP,
@@ -197,6 +200,7 @@ impl XConfig {
                 self.ai_explicit = true;
             }
             "ai.model" => self.ai_model = value.to_string(),
+            "ai.api_key" => self.ai_api_key = value.to_string(),
             // `ai.preset = "xai"` (or "grok"): Grok via xAI's OpenAI-compatible API.
             "ai.preset" if matches!(value.trim(), "xai" | "grok") => {
                 self.ai_base_url = crate::reply_guy::XAI_BASE_URL.to_string();
@@ -308,13 +312,15 @@ impl XConfig {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        nonempty_var(&self.ai_key_env).or_else(|| {
-            if self.ai_base_url.contains("api.x.ai") {
-                crate::reply_guy::load_secret(self, crate::reply_guy::Secret::Grok)
-            } else {
-                nonempty_var("OPENAI_API_KEY")
-            }
-        })
+        nonempty_var(&self.ai_key_env)
+            .or_else(|| nonempty_owned(&self.ai_api_key))
+            .or_else(|| {
+                if self.ai_base_url.contains("api.x.ai") {
+                    crate::reply_guy::load_secret(self, crate::reply_guy::Secret::Grok)
+                } else {
+                    nonempty_var("OPENAI_API_KEY")
+                }
+            })
     }
 
     /// The user's own X developer bearer token, from their shell env only.
