@@ -5,6 +5,7 @@
 //! The GPU does not speed that up. `--fixture` draws labeled sample cards and
 //! does not save them.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,12 +19,13 @@ use gpui_kit::{
 use termy_x::XConfig;
 use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
-    ChangeTag, ColumnView, DeskSettings, DeskStore, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav,
-    OpenCliDesk, OutcomeKind, Phase, RunOutcome, SessionState, SessionStatus, Surface, Topic,
-    VISIBLE_NAME, column_count_for_width, column_from_cache, column_from_outcome, column_loading,
-    daily_due, drafts_file, filter_posts, fixture_column, handoff_draft_to_termy_x,
-    isolated_opencli_config, prepare_draft_file, surface_after_nav, synthetic_fixture_posts,
-    termy_xl_data_root, within_termy_x_config,
+    COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DeskSettings, DeskStore, GPU_NOTE,
+    IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk, OutcomeKind, Phase, ReplyPhase, RunOutcome,
+    SessionState, SessionStatus, Surface, TakeProvider, Topic, VISIBLE_NAME, apply_send_result,
+    card_columns, card_from_post, column_count_for_width, column_from_cache, column_from_outcome,
+    column_loading, daily_due, draft_take, drafts_file, edit_reply, filter_posts, fixture_column,
+    isolated_opencli_config, post_reply_opencli, prepare_draft_file, request_send,
+    surface_after_nav, synthetic_fixture_posts, termy_xl_data_root, within_termy_x_config,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -70,6 +72,8 @@ pub struct TrendsDesk {
     reply_note: String,
     history: Vec<termy_x::trends_desk::StoredReport>,
     history_index: Option<usize>,
+    card_replies: HashMap<String, ReplyPhase>,
+    editing_card: Option<String>,
     session: SessionStatus,
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -134,6 +138,8 @@ impl TrendsDesk {
             reply_note: "Inspect replies reads a thread. It does not post.".into(),
             history,
             history_index: None,
+            card_replies: HashMap::new(),
+            editing_card: None,
             session: SessionStatus {
                 state: SessionState::ProbeFailed,
                 label: "Checking OpenCLI…".into(),
@@ -404,24 +410,225 @@ impl TrendsDesk {
         cx.notify();
     }
 
-    fn handoff_to_termy_x(&mut self, cx: &mut Context<Self>) {
-        if self.draft_text.trim().is_empty() {
-            self.draft_note = "Prepare a draft first. Nothing was copied.".into();
-            cx.notify();
+    fn tweet_card(
+        &self,
+        post: &termy_x::trends_desk::SourcePost,
+        column: &ColumnUi,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::AnyElement {
+        let card = card_from_post(post);
+        let phase = self
+            .card_replies
+            .get(&card.id)
+            .cloned()
+            .unwrap_or(ReplyPhase::Idle);
+        let tag = column
+            .tags
+            .iter()
+            .find(|(url, _)| url == &card.url)
+            .map(|(_, tag)| match tag {
+                ChangeTag::New => "NEW",
+                ChangeTag::Rising => "RISING",
+                ChangeTag::Fading => "FADING",
+            });
+        let url = card.url.clone();
+        let id = card.id.clone();
+        let take_id = id.clone();
+        let edit_id = id.clone();
+        let send_id = id.clone();
+        let created = card
+            .created_at
+            .clone()
+            .unwrap_or_else(|| "time not provided".into());
+        let media = if card.media.is_empty() {
+            "no media".to_string()
+        } else {
+            card.media.join(" ")
+        };
+        let reply_text = phase.text().to_string();
+        let status = match &phase {
+            ReplyPhase::Pending { .. } => "Pending send".to_string(),
+            ReplyPhase::Confirmed { receipt, .. } => format!("Confirmed · {receipt}"),
+            ReplyPhase::Failed { error, .. } => format!("Failed · {error}"),
+            ReplyPhase::Editing { .. } => "Editing reply".to_string(),
+            ReplyPhase::Idle => "Reply".to_string(),
+        };
+        div()
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .bg(rgb(0x10141c))
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(div().text_size(px(14.0)).child(format!(
+                "{}{} · @{}",
+                tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
+                card.author_name,
+                card.handle
+            )))
+            .child(div().text_size(px(13.0)).child(card.text))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xc7c7cc))
+                    .child(format!(
+                        "{created} · {} likes · {} reposts · {} replies · {} views",
+                        card.likes, card.reposts, card.replies, card.views
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x8e8e93))
+                    .child(media),
+            )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child(card.url.clone()),
+            )
+            .child(div().text_size(px(12.0)).child(status))
+            .child(div().text_size(px(12.0)).child(if reply_text.is_empty() {
+                "Reply composer is empty.".to_string()
+            } else {
+                reply_text
+            }))
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(button(
+                        SharedString::from(format!("desk-open-{id}")),
+                        "Open source",
+                        false,
+                        cx.listener(move |_, _, _, _| open_status(&url)),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-take-{id}")),
+                        "Draft take",
+                        false,
+                        cx.listener(move |this, _, _, cx| this.draft_take_for(take_id.clone(), cx)),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-edit-{id}")),
+                        "Edit reply",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.editing_card = Some(edit_id.clone());
+                            let phase = this
+                                .card_replies
+                                .get(&edit_id)
+                                .cloned()
+                                .unwrap_or(ReplyPhase::Idle);
+                            this.card_replies.insert(
+                                edit_id.clone(),
+                                edit_reply(&phase, phase.text().to_string()),
+                            );
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-send-{id}")),
+                        "Send",
+                        false,
+                        cx.listener(move |this, _, _, cx| this.send_reply(send_id.clone(), cx)),
+                    )),
+            )
+            .into_any_element()
+    }
+
+    fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
             return;
-        }
-        match handoff_draft_to_termy_x(&self.draft_text, self.draft_reply_to.as_deref()) {
-            Ok(id) => {
-                self.draft_note = format!(
-                    "Copied to the Termy X draft file as {id}. The Termy XL copy is unchanged. Nothing was posted."
-                );
-            }
+        };
+        let provider = TakeProvider::parse(&self.settings.take_provider);
+        let current = self
+            .card_replies
+            .get(&id)
+            .cloned()
+            .unwrap_or(ReplyPhase::Idle);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let http = termy_x::io::UreqHttp::default();
+                    draft_take(provider, &post, &http)
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                match result {
+                    Ok(draft) => {
+                        desk.card_replies
+                            .insert(id, edit_reply(&current, draft.text));
+                        desk.draft_note = draft.note;
+                    }
+                    Err(error) => {
+                        let text = current.text().to_string();
+                        desk.card_replies
+                            .insert(id, ReplyPhase::Failed { text, error });
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn send_reply(&mut self, id: String, cx: &mut Context<Self>) {
+        let phase = self
+            .card_replies
+            .get(&id)
+            .cloned()
+            .unwrap_or(ReplyPhase::Idle);
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        match request_send(&phase, true) {
             Err(error) => {
-                self.draft_note =
-                    format!("Termy X copy failed. The Termy XL draft is unchanged. {error}");
+                let text = phase.text().to_string();
+                if !text.is_empty() {
+                    self.card_replies
+                        .insert(id, ReplyPhase::Failed { text, error });
+                }
+                cx.notify();
+            }
+            Ok(pending) => {
+                let text = pending.text().to_string();
+                self.card_replies.insert(id.clone(), pending.clone());
+                cx.notify();
+                let bin = self.config.opencli_bin.clone();
+                let url = post.url.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let runner = termy_x::io::SystemRunner;
+                            post_reply_opencli(&bin, &runner, &url, &text)
+                        })
+                        .await;
+                    let _ = this.update(cx, |desk, cx| {
+                        let pending = desk.card_replies.get(&id).cloned().unwrap_or(pending);
+                        desk.card_replies
+                            .insert(id, apply_send_result(&pending, result));
+                        cx.notify();
+                    });
+                })
+                .detach();
             }
         }
-        cx.notify();
     }
 
     fn save_settings(&mut self, cx: &mut Context<Self>) {
@@ -472,6 +679,33 @@ impl TrendsDesk {
     fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+        if let Some(id) = self.editing_card.clone() {
+            let phase = self
+                .card_replies
+                .get(&id)
+                .cloned()
+                .unwrap_or(ReplyPhase::Idle);
+            if key == "escape" {
+                self.editing_card = None;
+            } else if key == "backspace" {
+                let mut text = phase.text().to_string();
+                text.pop();
+                self.card_replies.insert(id, edit_reply(&phase, text));
+            } else if let Some(ch) = event.keystroke.key_char.as_deref()
+                && !mods.platform
+                && !mods.control
+                && !ch.is_empty()
+            {
+                let mut text = phase.text().to_string();
+                if text.chars().count() < 240 {
+                    text.push_str(ch);
+                }
+                self.card_replies.insert(id, edit_reply(&phase, text));
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if key == "escape" {
             self.field = None;
             cx.notify();
@@ -597,7 +831,7 @@ fn desk_window_options() -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
             origin: point(px(24.0), px(24.0)),
-            size: size(px(3440.0), px(1400.0)),
+            size: size(px(COMPANION_WIDTH), px(COMPANION_HEIGHT)),
         })),
         titlebar: Some(gpui_kit::TitlebarOptions {
             title: Some(VISIBLE_NAME.into()),
@@ -721,6 +955,30 @@ impl TrendsDesk {
                         "Cancel",
                         false,
                         cx.listener(|this, _, _, cx| this.cancel_run(cx)),
+                    ))
+                    .child(button(
+                        "desk-take-free",
+                        "Free takes",
+                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Free,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.take_provider = "free".into();
+                            if this.writable {
+                                let _ = this.store.save_settings(&this.settings);
+                            }
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        "desk-take-treg",
+                        "Treg takes",
+                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Treg,
+                        cx.listener(|this, _, _, cx| {
+                            this.settings.take_provider = "treg".into();
+                            if this.writable {
+                                let _ = this.store.save_settings(&this.settings);
+                            }
+                            cx.notify();
+                        }),
                     )),
             )
             .into_any_element()
@@ -853,7 +1111,15 @@ impl TrendsDesk {
                 div()
                     .text_size(px(12.0))
                     .text_color(phase_color(column.view.phase))
-                    .child(format!("{phase} · {}", column.view.banner)),
+                    .child(format!(
+                        "{phase} · {} · {}",
+                        if card_columns(width) > 1 {
+                            "grid"
+                        } else {
+                            "list"
+                        },
+                        column.view.banner
+                    )),
             );
         let visible = filter_posts(&column.view.posts, &self.filter_text);
         if visible.is_empty() && column.view.phase != Phase::Loading {
@@ -866,85 +1132,7 @@ impl TrendsDesk {
             ));
         }
         for post in visible {
-            let tag =
-                column
-                    .tags
-                    .iter()
-                    .find(|(url, _)| url == &post.url)
-                    .map(|(_, tag)| match tag {
-                        ChangeTag::New => "NEW",
-                        ChangeTag::Rising => "RISING",
-                        ChangeTag::Fading => "FADING",
-                    });
-            let title = post.text.chars().take(110).collect::<String>();
-            let url = post.url.clone();
-            let reply_query = post.text.chars().take(120).collect::<String>();
-            let created = post
-                .created_at
-                .clone()
-                .unwrap_or_else(|| "time not provided".into());
-            body = body.child(
-                div()
-                    .p(px(10.0))
-                    .rounded(px(10.0))
-                    .bg(rgb(0x10141c))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(div().text_size(px(14.0)).child(format!(
-                        "{}{}",
-                        tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
-                        title
-                    )))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0xc7c7cc))
-                            .child(format!(
-                                "@{} · {} · {}",
-                                post.author,
-                                created,
-                                post.engagement_label()
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x7af6ff))
-                            .child(post.url.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(button(
-                                SharedString::from(format!("desk-open-{}", post.id)),
-                                "Open source",
-                                false,
-                                cx.listener(move |_, _, _, _| open_status(&url)),
-                            ))
-                            .child(button(
-                                SharedString::from(format!("desk-replies-{}", post.id)),
-                                "Inspect replies",
-                                false,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.inspect(reply_query.clone(), cx);
-                                }),
-                            ))
-                            .child(button(
-                                SharedString::from(format!("desk-draft-{}", post.id)),
-                                "Prepare draft",
-                                false,
-                                {
-                                    let title = title.clone();
-                                    let reply = post.url.clone();
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.prepare(&title, Some(reply.clone()), cx);
-                                    })
-                                },
-                            )),
-                    ),
-            );
+            body = body.child(self.tweet_card(post, column, cx));
         }
         body.into_any_element()
     }
@@ -1017,12 +1205,6 @@ impl TrendsDesk {
                 &self.draft_text,
                 Field::Draft,
                 cx,
-            ))
-            .child(button(
-                "desk-handoff-termy-x",
-                "Copy draft to Termy X",
-                false,
-                cx.listener(|this, _, _, cx| this.handoff_to_termy_x(cx)),
             ))
             .child(
                 div().text_size(px(12.0)).text_color(rgb(0x8e8e93)).child(

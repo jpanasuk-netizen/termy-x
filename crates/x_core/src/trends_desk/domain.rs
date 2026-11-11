@@ -29,6 +29,12 @@ pub struct SourcePost {
     pub reposts: u64,
     pub views: u64,
     #[serde(default)]
+    pub replies: u64,
+    #[serde(default)]
+    pub author_name: String,
+    #[serde(default)]
+    pub media: Vec<String>,
+    #[serde(default)]
     pub in_reply_to: Option<String>,
 }
 
@@ -76,6 +82,9 @@ impl SourcePost {
             likes: metric(value, &["likes", "like_count", "favorite_count"]),
             reposts: metric(value, &["retweets", "reposts", "retweet_count"]),
             views: metric(value, &["views", "view_count", "impression_count"]),
+            replies: metric(value, &["replies", "reply_count"]),
+            author_name: display_name_of(value),
+            media: media_urls_of(value),
             in_reply_to: first_str(
                 value,
                 &[
@@ -199,6 +208,52 @@ fn is_x_host(host: &str) -> bool {
             | "vxtwitter.com"
     ) || host.ends_with(".twitter.com")
         || host.ends_with(".x.com")
+}
+
+fn display_name_of(value: &Value) -> String {
+    if let Some(text) = first_str(value, &["author_name", "authorName", "name"]) {
+        return text.to_string();
+    }
+    for key in ["author", "user"] {
+        if let Some(node) = value.get(key)
+            && let Some(text) = first_str(node, &["name", "display_name"])
+        {
+            return text.to_string();
+        }
+    }
+    String::new()
+}
+
+fn media_urls_of(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["media_urls", "images"] {
+        if let Some(items) = value.get(key).and_then(Value::as_array) {
+            for item in items {
+                push_media(&mut out, item);
+            }
+        }
+    }
+    if let Some(items) = value.get("media").and_then(Value::as_array) {
+        for item in items {
+            push_media(&mut out, item);
+        }
+    }
+    out
+}
+
+fn push_media(out: &mut Vec<String>, item: &Value) {
+    let text = item.as_str().or_else(|| {
+        first_str(
+            item,
+            &["url", "media_url_https", "poster", "preview_image_url"],
+        )
+    });
+    if let Some(text) = text
+        && text.starts_with("http")
+        && !out.iter().any(|existing| existing == text)
+    {
+        out.push(text.to_string());
+    }
 }
 
 fn author_of(value: &Value) -> String {
@@ -593,6 +648,9 @@ pub struct DeskSettings {
     pub daily_at: String,
     #[serde(default)]
     pub daily_done: Option<String>,
+    /// `free` or `treg`. Draft takes never post.
+    #[serde(default = "default_take_provider")]
+    pub take_provider: String,
 }
 
 fn default_focus() -> String {
@@ -611,6 +669,10 @@ fn default_daily_at() -> String {
     "06:00".into()
 }
 
+fn default_take_provider() -> String {
+    "free".into()
+}
+
 impl Default for DeskSettings {
     fn default() -> Self {
         Self {
@@ -621,6 +683,7 @@ impl Default for DeskSettings {
             daily: true,
             daily_at: default_daily_at(),
             daily_done: None,
+            take_provider: default_take_provider(),
         }
     }
 }

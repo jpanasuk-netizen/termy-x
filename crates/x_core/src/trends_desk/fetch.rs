@@ -321,6 +321,45 @@ pub fn handoff_draft_to_termy_x(text: &str, reply_to: Option<&str>) -> Result<St
     Ok(draft.id)
 }
 
+/// One explicit reply through OpenCLI. Callers must already have an explicit send.
+/// Never uses a program named `x.exe` and never the official X API.
+pub fn post_reply_opencli(
+    bin: &str,
+    runner: &dyn CommandRunner,
+    target_url: &str,
+    text: &str,
+) -> Result<String, String> {
+    refuse_unsafe_cli_name(bin)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("Write a reply first.".into());
+    }
+    if !target_url.contains("/status/") {
+        return Err("Reply target is not a status URL. Nothing was posted.".into());
+    }
+    let args = vec![
+        "twitter".into(),
+        "reply".into(),
+        target_url.to_string(),
+        text.to_string(),
+        "--window".into(),
+        "background".into(),
+        "-f".into(),
+        "json".into(),
+    ];
+    let output = runner.run_timeout(bin, &args, Duration::from_secs(180))?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stdout, output.stderr);
+        return Err(shorten(&redact_secrets(&humanize_error(&combined))));
+    }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(output.stdout.trim())
+        && let Err(error) = super::parse::unwrap_opencli_data(value)
+    {
+        return Err(shorten(&redact_secrets(&error.to_string())));
+    }
+    Ok(format!("reply receipt · {target_url}"))
+}
+
 pub fn search_args(query: &str, limit: usize) -> Vec<String> {
     let query = argv_text(query);
     vec![

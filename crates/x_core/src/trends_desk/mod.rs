@@ -4,11 +4,17 @@
 //! A failed fetch keeps the last saved report labeled cached and does not
 //! write a fixture success. Publishing stays on the existing confirm path.
 
+mod cards;
 mod domain;
 mod fetch;
 mod parse;
 mod store;
 
+pub use cards::{
+    COMPANION_HEIGHT, COMPANION_WIDTH, ReplyPhase, TakeDraft, TakeProvider, TweetCard,
+    apply_send_result, card_columns, card_from_post, commit_send, draft_take, edit_reply,
+    request_send,
+};
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
     RunOutcome, SourcePost, StoredReport, Surface, Topic, VISIBLE_NAME, chicago_stamp,
@@ -18,7 +24,7 @@ pub use domain::{
 };
 pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
-    SessionStatus, handoff_draft_to_termy_x, prepare_draft, prepare_draft_file,
+    SessionStatus, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft, prepare_draft_file,
     refuse_unsafe_cli_name, run_topics, search_args,
 };
 pub use parse::{

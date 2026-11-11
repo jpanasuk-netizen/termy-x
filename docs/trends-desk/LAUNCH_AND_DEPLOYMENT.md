@@ -81,7 +81,7 @@ termy-xcli trends-desk status
 termy-xcli trends-desk run --topic all --focus AI
 ```
 
-From an installed Termy build, `termy --trends-desk` opens the Termy XL window in the Termy process. That does not replace the Termy shortcut. `--fixture` is labeled sample data.
+The window opens at 2560×820, twice the Windows Termy width and the same height, so it can sit beside Termy X. It is resizable. Narrower widths drop to a single card column. From an installed Termy build, `termy --trends-desk` opens that window in the Termy process and does not replace the Termy shortcut. `--fixture` is labeled sample data.
 
 Inside Termy, use **Termy XL** in the command palette or View menu, or **Open Termy XL** on the Trends tab.
 
