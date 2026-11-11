@@ -37,7 +37,15 @@ impl TrendsDesk {
         let send_id = id.clone();
         let created = card
             .created_at
-            .clone()
+            .as_deref()
+            .map(|raw| {
+                termy_x::trends_desk::format_post_time(
+                    raw,
+                    termy_x::trends_desk::local_offset_secs(
+                        crate::trends_desk::TrendsDesk::now_unix(),
+                    ),
+                )
+            })
             .unwrap_or_else(|| "time not provided".into());
         let media = if card.media.is_empty() {
             "no media".to_string()

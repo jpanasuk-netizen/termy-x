@@ -982,6 +982,18 @@ fn error_banner(message: &str, cached: Option<&StoredReport>) -> String {
     }
 }
 
+pub fn shift_index(len: usize, index: usize, delta: i32) -> Option<usize> {
+    if len == 0 || index >= len {
+        return None;
+    }
+    let next = index as i32 + delta;
+    if next < 0 || next >= len as i32 {
+        None
+    } else {
+        Some(next as usize)
+    }
+}
+
 pub fn column_count_for_width(width: f32) -> usize {
     if width >= 3000.0 {
         4
@@ -1225,6 +1237,10 @@ mod tests {
         assert_eq!(column_count_for_width(1920.0), 3);
         assert_eq!(column_count_for_width(1600.0), 2);
         assert_eq!(column_count_for_width(800.0), 1);
+        assert_eq!(shift_index(3, 1, -1), Some(0));
+        assert_eq!(shift_index(3, 0, -1), None);
+        assert_eq!(shift_index(3, 2, 1), None);
+        assert_eq!(shift_index(12, 2, 1), Some(3));
     }
 
     #[test]

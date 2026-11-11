@@ -5,6 +5,15 @@ use gpui_kit::{App, Window, px, size};
 use crate::trends_desk::TrendsDesk;
 use termy_x::trends_desk::{DeskFrame, WindowRect, snap_beside};
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn a_minimized_window_is_restored_before_focus() {
+        assert_eq!(super::focus_steps(true), ["restore", "show", "foreground"]);
+        assert!(!super::focus_steps(false).contains(&"restore"));
+    }
+}
+
 pub(crate) fn monitor_rect(window: &Window, cx: &App) -> WindowRect {
     window
         .display(cx)
@@ -43,24 +52,64 @@ fn rect_from_bounds(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> WindowRect {
     }
 }
 
+/// What a second launch should do. A minimized window is restored first.
+pub fn focus_steps(minimized: bool) -> &'static [&'static str] {
+    if minimized {
+        &["restore", "show", "foreground"]
+    } else {
+        &["show", "foreground"]
+    }
+}
+
 pub(crate) fn focus_existing() {
     #[cfg(target_os = "windows")]
     {
+        use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+            BringWindowToTop, FindWindowW, GetForegroundWindow, IsIconic, SW_RESTORE, SW_SHOW,
+            SetForegroundWindow, ShowWindow,
         };
         use windows::core::PCWSTR;
         let title: Vec<u16> = "Termy XL"
             .encode_utf16()
             .chain(std::iter::once(0))
             .collect();
-        if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) } {
-            unsafe {
+        let Ok(hwnd) = (unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }) else {
+            return;
+        };
+        let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+        let _plan = focus_steps(minimized);
+        unsafe {
+            if minimized {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
-                let _ = SetForegroundWindow(hwnd);
             }
+            let _ = ShowWindow(hwnd, SW_SHOW);
+            let foreground = GetForegroundWindow();
+            attach_foreground(foreground, hwnd);
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            let _ = attach_foreground(foreground, HWND::default());
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn attach_foreground(
+    foreground: windows::Win32::Foundation::HWND,
+    target: windows::Win32::Foundation::HWND,
+) {
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    if foreground.is_invalid() {
+        return;
+    }
+    let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let current = unsafe { GetCurrentThreadId() };
+    if foreground_thread == 0 || foreground_thread == current {
+        return;
+    }
+    let attach = !target.is_invalid();
+    let _ = unsafe { AttachThreadInput(current, foreground_thread, attach) };
 }
 
 pub(crate) fn find_termy_x() -> Option<WindowRect> {

@@ -438,6 +438,39 @@ fn unix_local_offset(now: i64) -> i32 {
     }
 }
 
+pub fn format_post_time(raw: &str, offset_secs: i32) -> String {
+    let Some(unix) = crate::time::parse_created_at(raw) else {
+        return raw.to_string();
+    };
+    let local = unix + offset_secs as i64;
+    format!(
+        "{} {}",
+        crate::time::ymd(local),
+        format_clock(unix, offset_secs)
+    )
+}
+
+pub fn next_refresh_text(
+    last: Option<i64>,
+    now: i64,
+    enabled: bool,
+    minutes: u64,
+    offset_secs: i32,
+) -> String {
+    if !enabled {
+        return "auto-refresh off".into();
+    }
+    let Some(last) = last else {
+        return "next refresh now".into();
+    };
+    let due = last.saturating_add(minutes as i64 * 60);
+    if now >= due {
+        "next refresh now".into()
+    } else {
+        format!("next refresh {}", format_clock(due, offset_secs))
+    }
+}
+
 pub fn format_clock(unix: i64, offset_secs: i32) -> String {
     let local = unix + offset_secs as i64;
     let rem = local.rem_euclid(86_400);
@@ -487,8 +520,8 @@ pub fn desk_key(key: &str, ctrl: bool, shift: bool) -> DeskKey {
     match key {
         "j" => DeskKey::Select(1),
         "k" => DeskKey::Select(-1),
-        "h" | "left" | "pageup" => DeskKey::Page(-1),
-        "l" | "right" | "pagedown" => DeskKey::Page(1),
+        "h" | "left" | "pageup" | "page_up" => DeskKey::Page(-1),
+        "l" | "right" | "pagedown" | "page_down" => DeskKey::Page(1),
         "d" => DeskKey::Draft,
         "r" => DeskKey::Reply,
         "o" => DeskKey::Open,
@@ -678,6 +711,13 @@ mod tests {
         assert_eq!(desk_key("d", false, false), DeskKey::Draft);
         assert_eq!(desk_key("enter", false, false), DeskKey::Unbound);
         assert_eq!(desk_key("k", true, false), DeskKey::Palette);
+        assert_eq!(desk_key("page_up", false, false), DeskKey::Page(-1));
+        assert_eq!(desk_key("right", false, false), DeskKey::Page(1));
+        assert_eq!(
+            next_refresh_text(Some(0), 10, false, 15, 0),
+            "auto-refresh off"
+        );
+        assert!(next_refresh_text(Some(0), 10, true, 15, -6 * 3600).contains("next refresh"));
         let args = search_args("ai", 20);
         assert!(refresh_is_search_only(&args));
         assert!(refresh_due(None, 100, true, 10));

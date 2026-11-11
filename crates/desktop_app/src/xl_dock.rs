@@ -6,7 +6,7 @@ use gpui_kit::{
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{DOCK_WIDTH, collapse_dock, expand_to_full, remember_width};
+use termy_x::trends_desk::{DOCK_WIDTH, LOCKED_OPEN_WIDTH, collapse_dock, expand_locked};
 
 impl TrendsDesk {
     pub(crate) fn xl_mark(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -48,10 +48,11 @@ impl TrendsDesk {
         let room = available_room(window, cx, self.frame.x);
         if self.frame.expanded {
             self.frame.width = live_width;
-            self.frame.expanded_width = remember_width(self.frame.expanded_width, live_width, room);
+            self.frame.expanded_width = LOCKED_OPEN_WIDTH;
             self.frame = collapse_dock(self.frame);
+            self.frame.expanded_width = LOCKED_OPEN_WIDTH;
         } else {
-            self.frame = expand_to_full(self.frame, room);
+            self.frame = expand_locked(self.frame, room);
         }
         self.anim_target = None;
         self.retarget(window, cx);
@@ -82,7 +83,7 @@ impl TrendsDesk {
                 desk.frame.height = bounds.size.height.into();
                 if desk.frame.expanded {
                     desk.frame.width = bounds.size.width.into();
-                    desk.frame.expanded_width = desk.frame.width;
+                    desk.frame.expanded_width = LOCKED_OPEN_WIDTH;
                 }
                 desk.write_frame();
             });

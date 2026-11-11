@@ -94,6 +94,7 @@ pub struct TrendsDesk {
     pub(crate) anim_target: Option<f32>,
     pub(crate) close_hooked: bool,
     fitted: bool,
+    pub(crate) card_window: usize,
 }
 
 impl TrendsDesk {
@@ -194,6 +195,7 @@ impl TrendsDesk {
             anim_target: None,
             close_hooked: false,
             fitted: false,
+            card_window: 12,
         }
     }
 
@@ -291,6 +293,12 @@ impl TrendsDesk {
                     if desk.take_wave != wave {
                         return;
                     }
+                    if draft.source == "error" {
+                        termy_x::trends_desk::append_desk_log(
+                            &desk.data_root,
+                            &format!("take failed: {}", draft.note),
+                        );
+                    }
                     desk.takes.insert(post_id, draft);
                     cx.notify();
                 });
@@ -330,6 +338,12 @@ impl TrendsDesk {
                     .iter()
                     .any(|column| !column.view.posts.is_empty() || column.cached.is_some());
                 desk.session = status;
+                if desk.session.state == SessionState::ProbeFailed {
+                    termy_x::trends_desk::append_desk_log(
+                        &desk.data_root,
+                        &format!("opencli probe: {}", desk.session.detail),
+                    );
+                }
                 if desk.session.state == SessionState::ProbeFailed && cached {
                     desk.session.label =
                         "Saved reports are loaded. OpenCLI whoami did not answer.".into();
@@ -829,6 +843,55 @@ impl TrendsDesk {
         }
         let _ = topic;
         cx.notify();
+    }
+
+    fn shift_subject(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .columns
+            .iter()
+            .position(|column| column.topic.id == self.settings.subject_id)
+        else {
+            return;
+        };
+        let Some(next) = termy_x::trends_desk::shift_index(self.columns.len(), index, delta) else {
+            return;
+        };
+        self.columns.swap(index, next);
+        self.persist_topics();
+        cx.notify();
+    }
+
+    fn remove_subject(&mut self, cx: &mut Context<Self>) {
+        if self.columns.len() <= 1 {
+            self.draft_note = "Keep at least one subject.".into();
+            cx.notify();
+            return;
+        }
+        let Some(index) = self
+            .columns
+            .iter()
+            .position(|column| column.topic.id == self.settings.subject_id)
+        else {
+            return;
+        };
+        self.columns.remove(index);
+        if let Some(column) = self.columns.get(index.min(self.columns.len() - 1)) {
+            self.settings.subject_id = column.topic.id.clone();
+        }
+        self.persist_topics();
+        let _ = self.store.save_settings(&self.settings);
+        cx.notify();
+    }
+
+    fn persist_topics(&mut self) {
+        let topics: Vec<Topic> = self
+            .columns
+            .iter()
+            .map(|column| column.topic.clone())
+            .collect();
+        if let Err(error) = self.store.save_topics(&topics) {
+            self.draft_note = error;
+        }
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -1440,6 +1503,24 @@ impl TrendsDesk {
                         "Add column",
                         false,
                         cx.listener(|this, _, _, cx| this.add_topic(cx)),
+                    ))
+                    .child(button(
+                        "desk-topic-earlier",
+                        "Earlier",
+                        false,
+                        cx.listener(|this, _, _, cx| this.shift_subject(-1, cx)),
+                    ))
+                    .child(button(
+                        "desk-topic-later",
+                        "Later",
+                        false,
+                        cx.listener(|this, _, _, cx| this.shift_subject(1, cx)),
+                    ))
+                    .child(button(
+                        "desk-topic-remove",
+                        "Remove column",
+                        false,
+                        cx.listener(|this, _, _, cx| this.remove_subject(cx)),
                     ))
                     .child(button(
                         "desk-toggle-daily",

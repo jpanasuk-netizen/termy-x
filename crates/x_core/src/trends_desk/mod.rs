@@ -7,6 +7,7 @@
 mod cards;
 mod domain;
 mod fetch;
+mod log;
 mod pack;
 mod parse;
 mod snap;
@@ -16,29 +17,32 @@ pub use cards::{
     COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, EditPopout, LOCKED_OPEN_WIDTH,
     ReplyPhase, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame, TakeProvider, TweetCard,
     WINDOW_PAD, apply_send_result, card_columns, card_from_post, char_count, close_editor,
-    collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_right, expand_to_full,
-    frame_from_parts, layout_takes, move_selection, offline_take, open_editor, open_width,
-    page_index, page_label, remember_width, request_send, scroll_by, scroll_of, subject_pages,
-    take_column_count, takes_for_posts, toggle_dock, tone_variants, turn_page, wrap_token,
+    collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_locked, expand_right,
+    expand_to_full, frame_from_parts, layout_takes, move_selection, offline_take, open_editor,
+    open_width, page_index, page_label, remember_width, request_send, scroll_by, scroll_of,
+    subject_pages, take_column_count, takes_for_posts, toggle_dock, tone_variants, turn_page,
+    wrap_token,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
     RunOutcome, SourcePost, StoredReport, Surface, Topic, VISIBLE_NAME, chicago_stamp,
     column_count_for_width, column_from_cache, column_from_outcome, column_loading,
     column_loading_keep, daily_due, default_topics, diff_urls, draft_text_from_title, filter_posts,
-    fixture_column, idea_from, outcome_error, reply_dry_run_args, search_query, slug_id,
-    surface_after_nav, topic_id_ok,
+    fixture_column, idea_from, outcome_error, reply_dry_run_args, search_query, shift_index,
+    slug_id, surface_after_nav, topic_id_ok,
 };
 pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
     SessionStatus, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft, prepare_draft_file,
     refuse_unsafe_cli_name, run_topics, search_args,
 };
+pub use log::{append_desk_log, redact_log};
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, TakeTone, apply_filters,
-    desk_key, flip_variant, heat_badge, heat_line, heat_score, hud_line, load_pack,
-    local_offset_secs, new_ids, provider_drafts, read_composer, refresh_due,
-    refresh_is_search_only, replied_badge, save_pack, sends_on_key, sort_by_heat, three_variants,
+    desk_key, flip_variant, format_post_time, heat_badge, heat_line, heat_score, hud_line,
+    load_pack, local_offset_secs, new_ids, next_refresh_text, provider_drafts, read_composer,
+    refresh_due, refresh_is_search_only, replied_badge, save_pack, sends_on_key, sort_by_heat,
+    three_variants,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

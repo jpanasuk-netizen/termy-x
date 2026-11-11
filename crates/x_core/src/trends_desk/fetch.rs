@@ -124,7 +124,7 @@ impl OpenCliDesk {
         if let Err(error) = self.preflight() {
             return outcome_error(topic, focus, error);
         }
-        let args = search_args(&query, 24);
+        let args = search_args(&query, 100);
         match self.run(&args, SEARCH_TIMEOUT, cancel) {
             Err(error) => outcome_error(
                 topic,
@@ -369,7 +369,7 @@ pub fn search_args(query: &str, limit: usize) -> Vec<String> {
         "--product".into(),
         "top".into(),
         "--limit".into(),
-        limit.clamp(1, 50).to_string(),
+        limit.clamp(1, 100).to_string(),
         "-f".into(),
         "json".into(),
     ]
@@ -731,6 +731,8 @@ mod tests {
     #[test]
     fn shell_metacharacters_stay_one_argument() {
         let args = search_args("law; rm -rf /", 10);
+        let wide = search_args("ai", 500);
+        assert!(wide.iter().any(|arg| arg == "100"));
         assert_eq!(args[2], "law; rm -rf /");
         assert_eq!(args.iter().filter(|arg| *arg == "law; rm -rf /").count(), 1);
     }

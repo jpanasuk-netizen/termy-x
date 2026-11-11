@@ -61,13 +61,22 @@ impl TrendsDesk {
             .values()
             .filter(|phase| !phase.text().is_empty())
             .count();
-        hud_line(
+        let line = hud_line(
             sent,
             drafts,
             &self.settings.take_provider,
             self.pack.last_refresh,
             termy_x::trends_desk::local_offset_secs(Self::now_unix()),
-        )
+        );
+        let offset = termy_x::trends_desk::local_offset_secs(Self::now_unix());
+        let next = termy_x::trends_desk::next_refresh_text(
+            self.pack.last_refresh,
+            Self::now_unix(),
+            self.pack.refresh_on,
+            self.pack.refresh_minutes,
+            offset,
+        );
+        format!("{line} · {next}")
     }
 
     pub(crate) fn heat_for(&self, post: &SourcePost) -> Option<String> {
@@ -445,7 +454,9 @@ impl TrendsDesk {
         };
         let subject_key = format!("subject:{}", column.topic.id);
         let subject_selected = self.selected.as_deref() == Some(subject_key.as_str());
-        let visible = self.visible_posts(column);
+        let all_visible = self.visible_posts(column);
+        let hidden = all_visible.len().saturating_sub(self.card_window);
+        let visible: Vec<_> = all_visible.into_iter().take(self.card_window).collect();
         let fresh = self.new_count(
             &column.topic.id,
             &visible
@@ -570,6 +581,18 @@ impl TrendsDesk {
                                     .child("Not run yet.")
                                     .child(refresh_button(topic_id.clone(), cx)),
                             );
+                        }
+                        if hidden > 0 {
+                            list = list.child(button(
+                                "desk-show-more",
+                                format!("Show {hidden} more"),
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.card_window = this.card_window.saturating_add(12);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ));
                         }
                         for (post, frame) in visible.iter().zip(frames.iter()) {
                             list = list.child(

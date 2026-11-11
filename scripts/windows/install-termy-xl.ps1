@@ -61,10 +61,19 @@ if ([System.IO.Path]::GetFileName($sourceExe) -eq "x.exe") {
 }
 
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-Copy-Item -Force $sourceExe (Join-Path $InstallDir $binaryName)
+function Backup-ThenCopy([string]$From, [string]$To) {
+    if (Test-Path $To) {
+        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+        $backup = "$To.$stamp.bak"
+        Copy-Item -Force $To $backup
+        Write-Output "backed up $To -> $backup"
+    }
+    Copy-Item -Force $From $To
+}
+Backup-ThenCopy $sourceExe (Join-Path $InstallDir $binaryName)
 $sourceCli = Join-Path $SourceDir $cliName
 if (Test-Path $sourceCli) {
-    Copy-Item -Force $sourceCli (Join-Path $InstallDir $cliName)
+    Backup-ThenCopy $sourceCli (Join-Path $InstallDir $cliName)
 }
 
 $target = Join-Path $InstallDir $binaryName
@@ -73,6 +82,14 @@ $shortcutPaths = @(
     (Join-Path ([Environment]::GetFolderPath("Desktop")) "$visibleName.lnk"),
     (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\$visibleName.lnk")
 )
+foreach ($root in @($env:OneDrive, $env:OneDriveConsumer, (Join-Path $env:USERPROFILE "OneDrive"))) {
+    if (-not $root) { continue }
+    $oneDriveDesktop = Join-Path $root "Desktop"
+    if (Test-Path $oneDriveDesktop) {
+        $shortcutPaths += (Join-Path $oneDriveDesktop "$visibleName.lnk")
+    }
+}
+$shortcutPaths = $shortcutPaths | Select-Object -Unique
 foreach ($shortcutPath in $shortcutPaths) {
     $leaf = [System.IO.Path]::GetFileName($shortcutPath)
     if ($leaf -eq "Termy.lnk" -or $leaf -eq "Termy X.lnk") {

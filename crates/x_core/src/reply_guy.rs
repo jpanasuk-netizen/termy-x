@@ -124,6 +124,16 @@ pub fn store_secret(config: &XConfig, which: Secret, value: &str) -> Result<(), 
     crate::auth::write_private_file(&secrets_path(config), &json)
 }
 
+/// The secrets file only. Process env and the keychain are not read.
+pub fn load_file_secret(config: &XConfig, which: Secret) -> Option<String> {
+    read_file_secrets(config)
+        .get(which.account())
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 pub fn load_secret(config: &XConfig, which: Secret) -> Option<String> {
     for var in which.env_vars() {
         if let Ok(value) = std::env::var(var)

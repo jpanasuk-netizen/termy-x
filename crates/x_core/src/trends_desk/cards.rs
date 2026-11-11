@@ -101,6 +101,18 @@ pub fn open_width(preferred: f32, available: Option<f32>) -> f32 {
 
 /// One resize to the full workspace. The left edge stays at `frame.x`.
 /// `expanded_width` stays the preferred width even when the monitor clamps the open size.
+/// One step to the locked open width. A saved width does not replace it.
+pub fn expand_locked(frame: DeskFrame, available: Option<f32>) -> DeskFrame {
+    DeskFrame {
+        x: frame.x,
+        y: frame.y,
+        width: open_width(LOCKED_OPEN_WIDTH, available),
+        height: frame.height,
+        expanded: true,
+        expanded_width: LOCKED_OPEN_WIDTH,
+    }
+}
+
 pub fn expand_to_full(frame: DeskFrame, available: Option<f32>) -> DeskFrame {
     let preferred = if frame.expanded_width <= DOCK_WIDTH {
         COMPANION_WIDTH
@@ -599,9 +611,17 @@ fn specific_to_post(take: &str, post: &SourcePost) -> bool {
 /// Treg reads the existing Termy X key and checks it. It does not write a new
 /// key and it does not fall back to a fake success when the check fails.
 /// The wording is still the free Reply Guy template, labeled as such.
-pub fn treg_take(post: &SourcePost, http: &dyn Http) -> Result<TakeDraft, String> {
-    let config = crate::config::XConfig::default();
-    let Some(token) = reply_guy::load_secret(&config, Secret::Treg) else {
+pub fn treg_take(
+    config: &crate::config::XConfig,
+    http: &dyn Http,
+    post: &SourcePost,
+) -> Result<TakeDraft, String> {
+    let token = if config.token_store == "file" {
+        reply_guy::load_file_secret(config, Secret::Treg)
+    } else {
+        reply_guy::load_secret(config, Secret::Treg)
+    };
+    let Some(token) = token else {
         return Err("No Treg key is saved in Termy X.".into());
     };
     treg_take_with_token(&token, http, post)
@@ -680,7 +700,7 @@ pub fn draft_take(
 ) -> Result<TakeDraft, String> {
     match provider {
         TakeProvider::Free => Ok(free_take(config, http, post)),
-        TakeProvider::Treg => treg_take(post, http),
+        TakeProvider::Treg => treg_take(config, http, post),
     }
 }
 
@@ -861,6 +881,20 @@ mod tests {
         assert_eq!(frames.len(), 2);
         assert_eq!(take_column_count(687.0), 1);
         assert!(take_column_count(1400.0) >= 2);
+        let wide = expand_locked(
+            DeskFrame {
+                x: 10.0,
+                y: 20.0,
+                width: DOCK_WIDTH,
+                height: 900.0,
+                expanded: false,
+                expanded_width: 2560.0,
+            },
+            Some(2000.0),
+        );
+        assert_eq!(wide.width, LOCKED_OPEN_WIDTH);
+        assert_eq!(wide.expanded_width, LOCKED_OPEN_WIDTH);
+        assert!(wide.expanded);
         assert!(take_column_count(2560.0) > take_column_count(687.0));
     }
 
@@ -1026,13 +1060,23 @@ mod tests {
         .unwrap();
         assert_ne!(free.text, other_take.text);
         assert!(other_take.text.contains("earnings") || other_take.text.contains("FinanceDesk"));
+        let dir = std::env::temp_dir().join(format!("xl-treg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let isolated = crate::config::XConfig {
+            config_dir: dir.clone(),
+            token_store: "file".into(),
+            ..crate::config::XConfig::default()
+        };
         let http = ScriptHttp {
             body: Err("treg: no".into()),
             calls: std::sync::Mutex::new(Vec::new()),
         };
-        let err = draft_take(TakeProvider::Treg, &config, &sample, &http).unwrap_err();
-        assert!(err.contains("Treg") || err.contains("treg") || err.contains("key"));
+        let err = draft_take(TakeProvider::Treg, &isolated, &sample, &http).unwrap_err();
+        assert!(err.contains("No Treg key"));
+        assert!(http.calls.lock().unwrap().is_empty());
         assert!(!err.contains("Hot take"));
+        let _ = std::fs::remove_dir_all(&dir);
         let http = ScriptHttp {
             body: Ok(r#"{"choices":[{"message":{"content":"A real Treg take"}}]}"#.into()),
             calls: std::sync::Mutex::new(Vec::new()),
