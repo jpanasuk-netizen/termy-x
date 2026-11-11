@@ -36,13 +36,13 @@ pub use fetch::{
     SessionStatus, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft, prepare_draft_file,
     refuse_unsafe_cli_name, run_topics, search_args,
 };
-pub use log::{append_desk_log, redact_log};
+pub use log::{append_desk_log, redact_log, should_log_model_failure};
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, TakeTone, apply_filters,
     desk_key, flip_variant, format_clock, format_post_time, heat_badge, heat_line, heat_score,
     hud_line, load_pack, local_offset_secs, new_ids, next_refresh_text, provider_drafts,
     read_composer, refresh_due, refresh_is_search_only, replied_badge, save_pack, sends_on_key,
-    sort_by_heat, three_variants,
+    should_auto_refresh, sort_by_heat, three_variants,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

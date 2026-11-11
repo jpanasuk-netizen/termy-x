@@ -12,7 +12,7 @@ use gpui_kit::{
 use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
 use termy_x::trends_desk::{
     DeskKey, PackFile, Phase, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters,
-    desk_key, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label, refresh_due,
+    desk_key, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label,
     replied_badge, save_pack,
 };
 
@@ -380,15 +380,17 @@ impl TrendsDesk {
     }
 
     pub(crate) fn maybe_refresh(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.options.fixture {
+        if self.options.fixture {
             return;
         }
         let now = Self::now_unix();
-        if !refresh_due(
+        if !termy_x::trends_desk::should_auto_refresh(
             self.pack.last_refresh,
             now,
             self.pack.refresh_on,
             self.pack.refresh_minutes,
+            self.busy,
+            self.free_halted,
         ) {
             return;
         }

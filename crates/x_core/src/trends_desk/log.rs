@@ -30,6 +30,11 @@ pub fn redact_log(line: &str) -> String {
     out
 }
 
+/// One model failure is recorded once per refresh, not once per card.
+pub fn should_log_model_failure(already_logged: bool, note: &str) -> bool {
+    !already_logged && !note.trim().is_empty()
+}
+
 pub fn append_desk_log(root: &Path, line: &str) {
     append_desk_log_limited(root, line, MAX_BYTES);
 }
@@ -64,6 +69,16 @@ mod tests {
         assert!(!line.contains("super-secret-value"));
         assert!(!line.contains("abc123"));
         assert!(line.contains("[redacted]"));
+        let note = "http 402: payment required ref abc";
+        let mut logged = false;
+        let mut lines = 0;
+        for _ in 0..149 {
+            if should_log_model_failure(logged, note) {
+                logged = true;
+                lines += 1;
+            }
+        }
+        assert_eq!(lines, 1);
         let dir = std::env::temp_dir().join(format!("xl-log-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

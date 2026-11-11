@@ -70,7 +70,7 @@ pub struct TrendsDesk {
     ai_key_text: String,
     pub(crate) model_notice: String,
     pub(crate) model_detail: String,
-    free_halted: bool,
+    pub(crate) free_halted: bool,
     draft_text: String,
     draft_reply_to: Option<String>,
     draft_note: String,
@@ -230,6 +230,7 @@ impl TrendsDesk {
         self.fetch_empty_subjects(cx);
         self.spawn_probe(cx);
         self.spawn_daily(cx);
+        self.spawn_refresh(cx);
     }
 
     fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
@@ -356,7 +357,6 @@ impl TrendsDesk {
                         .await
                 };
                 if provider == TakeProvider::Free && termy_x::ai::blocks_free_model(&draft.note) {
-                    termy_x::trends_desk::append_desk_log(&data_root, &draft.note);
                     if !tried_next {
                         tried_next = true;
                         if let Some(next) = later.first().cloned() {
@@ -388,7 +388,6 @@ impl TrendsDesk {
                                     }
                                 })
                                 .await;
-                            termy_x::trends_desk::append_desk_log(&data_root, &retry.note);
                             if retry.source == "model"
                                 && !termy_x::ai::blocks_free_model(&retry.note)
                             {
@@ -418,22 +417,21 @@ impl TrendsDesk {
                 {
                     shared_error = Some(draft.note.clone());
                 }
+                let record_failure = (draft.source == "offline" || draft.source == "error")
+                    && termy_x::trends_desk::should_log_model_failure(logged_offline, &draft.note);
+                if record_failure {
+                    logged_offline = true;
+                    termy_x::trends_desk::append_desk_log(&data_root, &draft.note);
+                }
+                let failure_note = record_failure.then(|| draft.note.clone());
                 let _ = this.update(cx, |desk, cx| {
                     if desk.take_wave != wave {
                         return;
                     }
-                    if draft.source == "error" {
-                        termy_x::trends_desk::append_desk_log(
-                            &desk.data_root,
-                            &format!("take failed: {}", draft.note),
-                        );
-                    }
-                    if draft.source == "offline" && !logged_offline && !draft.note.is_empty() {
-                        logged_offline = true;
-                        termy_x::trends_desk::append_desk_log(&desk.data_root, &draft.note);
-                        desk.model_detail = draft.note.clone();
-                        desk.model_notice = termy_x::trends_desk::short_take_note(&draft.note);
-                        if termy_x::ai::blocks_free_model(&draft.note) {
+                    if let Some(note) = failure_note {
+                        desk.model_detail = note.clone();
+                        desk.model_notice = termy_x::trends_desk::short_take_note(&note);
+                        if termy_x::ai::blocks_free_model(&note) {
                             desk.free_halted = true;
                         }
                     }
@@ -490,6 +488,21 @@ impl TrendsDesk {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn spawn_refresh(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(15))
+                    .await;
+                let _ = this.update(cx, |desk, cx| {
+                    desk.maybe_refresh(cx);
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }

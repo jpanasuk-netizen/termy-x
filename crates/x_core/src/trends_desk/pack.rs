@@ -352,6 +352,19 @@ pub fn refresh_due(last: Option<i64>, now: i64, enabled: bool, minutes: u64) -> 
     }
 }
 
+/// A stopped free-model session does not block the read-only post search.
+pub fn should_auto_refresh(
+    last: Option<i64>,
+    now: i64,
+    enabled: bool,
+    minutes: u64,
+    busy: bool,
+    model_halted: bool,
+) -> bool {
+    let _ = model_halted;
+    !busy && refresh_due(last, now, enabled, minutes)
+}
+
 pub fn refresh_is_search_only(args: &[String]) -> bool {
     args.first().map(String::as_str) == Some("twitter")
         && args.get(1).map(String::as_str) == Some("search")
@@ -745,6 +758,19 @@ mod tests {
         assert!(refresh_due(None, 100, true, 10));
         assert!(!refresh_due(Some(100), 200, true, 10));
         assert!(!refresh_due(Some(0), 10_000, false, 10));
+        let last = 1_700_000_000;
+        assert!(
+            !should_auto_refresh(Some(last), last + 9 * 60, true, 10, false, true),
+            "nine minutes is early"
+        );
+        assert!(
+            should_auto_refresh(Some(last), last + 10 * 60, true, 10, false, true),
+            "a stopped free model still lets the search run"
+        );
+        assert!(
+            !should_auto_refresh(Some(last), last + 10 * 60, true, 10, true, false),
+            "a search already in flight is not started again"
+        );
         assert_eq!(new_ids(&["a".into()], &["a".into(), "b".into()]).len(), 1);
         let line = hud_line(2, 1, "free", None, 0);
         let stamped = hud_line(0, 0, "free", Some(1_794_432_658), 0);
