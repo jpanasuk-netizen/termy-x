@@ -59,10 +59,10 @@ impl TrendsDesk {
             Some(take) if take.source == "pending" => ("Drafting take…".to_string(), None),
             Some(take) if take.source == "offline" => (
                 take.text.clone(),
-                Some(if take.note.starts_with("free model") {
-                    take.note.clone()
+                Some(if take.note.is_empty() || take.note == "offline take" {
+                    "offline take".to_string()
                 } else {
-                    "offline take".into()
+                    take.note.clone()
                 }),
             ),
             Some(take) => (take.text.clone(), None),

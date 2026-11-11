@@ -38,6 +38,9 @@ pub(crate) enum Field {
     TopicDesc,
     Draft,
     DailyAt,
+    AiBase,
+    AiModel,
+    AiKey,
 }
 
 pub(crate) struct ColumnUi {
@@ -62,6 +65,9 @@ pub struct TrendsDesk {
     pub(crate) filter_text: String,
     topic_name: String,
     topic_desc: String,
+    ai_base_text: String,
+    ai_model_text: String,
+    ai_key_text: String,
     draft_text: String,
     draft_reply_to: Option<String>,
     draft_note: String,
@@ -144,6 +150,9 @@ impl TrendsDesk {
                 }
             })
             .collect();
+        let ai_base_text = config.ai_base_url.clone();
+        let ai_model_text = config.ai_model.clone();
+        let ai_key_text = config.ai_api_key.clone();
         Self {
             focus_handle: cx.focus_handle(),
             options,
@@ -159,6 +168,9 @@ impl TrendsDesk {
             filter_text: String::new(),
             topic_name: String::new(),
             topic_desc: String::new(),
+            ai_base_text,
+            ai_model_text,
+            ai_key_text,
             draft_text: String::new(),
             draft_reply_to: None,
             draft_note: "Drafts stay in the Termy XL data folder. Copy to Termy X is a separate step and does not post.".into(),
@@ -249,17 +261,42 @@ impl TrendsDesk {
             return;
         }
         let provider = TakeProvider::parse(&self.settings.take_provider);
-        let config = self.config.clone();
-        if provider == TakeProvider::Free {
-            let (base, model) = config.ai_endpoint();
-            termy_x::trends_desk::append_desk_log(
-                &self.data_root,
-                &format!("free takes: {model} @ {base}, timeout 30s"),
-            );
-        }
+        let mut config = self.config.clone();
+        let data_root = self.data_root.clone();
         cx.spawn(async move |this, cx| {
             let mut model_down = false;
             let mut shared_offline: Option<String> = None;
+            if provider == TakeProvider::Free {
+                let listed = config.clone();
+                let picked = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let http =
+                            termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(30));
+                        termy_x::ai::choose_chat_model(&listed, &http)
+                    })
+                    .await;
+                let (base, preferred) = config.ai_endpoint();
+                match picked {
+                    Ok(choice) => {
+                        let line = if choice.substituted {
+                            format!(
+                                "free takes: model {preferred} not installed, using {} @ {base}",
+                                choice.model
+                            )
+                        } else {
+                            format!("free takes: {} @ {base}", choice.model)
+                        };
+                        termy_x::trends_desk::append_desk_log(&data_root, &line);
+                        config.ai_model = choice.model;
+                    }
+                    Err(reason) => {
+                        termy_x::trends_desk::append_desk_log(&data_root, &reason);
+                        model_down = true;
+                        shared_offline = Some(reason);
+                    }
+                }
+            }
             let mut shared_error: Option<String> = None;
             let mut logged_offline = false;
             for post in posts {
@@ -825,6 +862,27 @@ impl TrendsDesk {
         }
     }
 
+    fn save_model(&mut self, cx: &mut Context<Self>) {
+        self.config.ai_base_url = self.ai_base_text.trim().to_string();
+        self.config.ai_model = self.ai_model_text.trim().to_string();
+        self.config.ai_api_key = self.ai_key_text.trim().to_string();
+        self.config.ai_explicit = !self.config.ai_base_url.is_empty();
+        match self.config.save_ai(
+            &self.config.ai_base_url,
+            &self.config.ai_model,
+            &self.config.ai_api_key,
+        ) {
+            Ok(()) => {
+                self.draft_note =
+                    "Saved the free model in Termy XL. The key stays in that file and is not logged."
+                        .into();
+            }
+            Err(error) => self.draft_note = error,
+        }
+        self.begin_take_stream(cx);
+        cx.notify();
+    }
+
     fn save_settings(&mut self, cx: &mut Context<Self>) {
         self.settings.focus = self.focus_text.trim().to_string();
         if let Err(error) = self.store.save_settings(&self.settings) {
@@ -1013,6 +1071,9 @@ impl TrendsDesk {
             Field::TopicDesc => &mut self.topic_desc,
             Field::Draft => &mut self.draft_text,
             Field::DailyAt => &mut self.settings.daily_at,
+            Field::AiBase => &mut self.ai_base_text,
+            Field::AiModel => &mut self.ai_model_text,
+            Field::AiKey => &mut self.ai_key_text,
         }
     }
 
@@ -1491,6 +1552,39 @@ impl TrendsDesk {
             .flex()
             .flex_col()
             .gap(px(8.0))
+            .child({
+                let (base, model) = self.config.ai_endpoint();
+                div()
+                    .text_size(px(12.0))
+                    .child(format!("Free model: {model} @ {base}"))
+            })
+            .child(self.field_chip(
+                "desk-ai-base",
+                "Model URL",
+                &self.ai_base_text,
+                Field::AiBase,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-ai-model",
+                "Model name",
+                &self.ai_model_text,
+                Field::AiModel,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-ai-key",
+                "Model key",
+                &self.ai_key_text,
+                Field::AiKey,
+                cx,
+            ))
+            .child(button(
+                "desk-save-ai",
+                "Save model",
+                false,
+                cx.listener(|this, _, _, cx| this.save_model(cx)),
+            ))
             .child(self.field_chip("desk-focus", "Focus", &self.focus_text, Field::Focus, cx))
             .child(self.field_chip(
                 "desk-daily-at",

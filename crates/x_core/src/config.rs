@@ -362,6 +362,19 @@ impl XConfig {
         self.upsert_config_assignment("supabase_email", &format!("supabase_email = \"{email}\""))
     }
 
+    /// Writes the free-model endpoint into this config directory only.
+    pub fn save_ai(&self, base: &str, model: &str, key: &str) -> Result<(), String> {
+        let base = toml_string(base);
+        let model = toml_string(model);
+        let key = toml_string(key);
+        self.upsert_config_assignment("ai.base_url", &format!("ai.base_url = {base}"))?;
+        self.upsert_config_assignment("ai.model", &format!("ai.model = {model}"))?;
+        if !key.trim_matches('"').is_empty() {
+            self.upsert_config_assignment("ai.api_key", &format!("ai.api_key = {key}"))?;
+        }
+        Ok(())
+    }
+
     pub fn save_list_sort(&self) -> Result<(), String> {
         self.upsert_config_assignment(
             "list_sort",
@@ -475,6 +488,13 @@ fn parse_bool(value: &str) -> bool {
     matches!(
         value.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "yes" | "on"
+    )
+}
+
+fn toml_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value.trim().replace('\\', "\\\\").replace('"', "\\\"")
     )
 }
 
@@ -694,5 +714,22 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn save_ai_writes_the_xl_file_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = XConfig::load(dir.path());
+        config
+            .save_ai("http://127.0.0.1:11434/v1", "qwen2.5", "secret-key")
+            .unwrap();
+        let loaded = XConfig::load(dir.path());
+        assert_eq!(loaded.ai_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(loaded.ai_model, "qwen2.5");
+        assert_eq!(loaded.ai_api_key, "secret-key");
+        assert!(loaded.ai_explicit);
+        let text = std::fs::read_to_string(dir.path().join("x.toml")).unwrap();
+        assert!(text.contains("ai.base_url"));
+        assert!(!text.contains("TERMY"));
     }
 }

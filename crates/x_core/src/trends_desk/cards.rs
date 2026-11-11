@@ -573,7 +573,15 @@ pub fn offline_take(post: &SourcePost) -> TakeDraft {
 /// The house free model (configured OpenAI-compatible endpoint, otherwise the
 /// local free default). A miss becomes an extractive take from this post only.
 pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &SourcePost) -> TakeDraft {
-    let (base, model) = config.ai_endpoint();
+    let (base, _) = config.ai_endpoint();
+    let mut config = config.clone();
+    if config.ai_model.trim().is_empty() {
+        match crate::ai::choose_chat_model(&config, http) {
+            Ok(choice) => config.ai_model = choice.model,
+            Err(reason) => return offline_with(post, &reason),
+        }
+    }
+    let model = config.ai_endpoint().1;
     let system = "You write one short X reply under 220 characters. Take a side: a question, a counterpoint, or why it matters. Use a detail from this post. No hashtags. Output only the reply.";
     let body: String = post.text.chars().take(500).collect();
     let user = format!(
@@ -581,7 +589,7 @@ pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &Source
         post.author_name, post.author
     );
     let where_from = format!("{model} @ {base}");
-    match crate::ai::chat_completion(config, http, system, &user) {
+    match crate::ai::chat_completion(&config, http, system, &user) {
         Ok(text) if text.trim().chars().count() >= 8 && !is_canned(&text) => TakeDraft {
             text,
             source: "model",

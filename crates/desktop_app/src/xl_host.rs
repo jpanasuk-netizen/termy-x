@@ -132,7 +132,7 @@ unsafe fn attach_foreground_thread(
     if foreground_thread == 0 || foreground_thread == current {
         return false;
     }
-    unsafe { AttachThreadInput(current, foreground_thread, attach) }.is_ok()
+    unsafe { AttachThreadInput(current, foreground_thread, attach) }.as_bool()
 }
 
 pub(crate) fn find_termy_x() -> Option<WindowRect> {
