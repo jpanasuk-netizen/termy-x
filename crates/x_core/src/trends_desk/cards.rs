@@ -14,8 +14,8 @@ pub const COMPANION_WIDTH: f32 = 2560.0;
 pub const COMPANION_HEIGHT: f32 = 820.0;
 /// Slim dock that sits beside Termy X until XL is opened.
 pub const DOCK_WIDTH: f32 = 72.0;
-/// One animation step. The left edge stays put; only the width changes.
-pub const WIDTH_STEP: f32 = 240.0;
+/// Inset between the window edge and a take card's outer border.
+pub const WINDOW_PAD: f32 = 16.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeskFrame {
@@ -71,22 +71,6 @@ pub fn expand_right(frame: DeskFrame) -> DeskFrame {
     }
 }
 
-pub fn collapse_dock(frame: DeskFrame) -> DeskFrame {
-    let expanded_width = if frame.width > DOCK_WIDTH {
-        frame.width
-    } else {
-        frame.expanded_width
-    };
-    DeskFrame {
-        x: frame.x,
-        y: frame.y,
-        width: DOCK_WIDTH,
-        height: frame.height,
-        expanded: false,
-        expanded_width,
-    }
-}
-
 pub fn toggle_dock(frame: DeskFrame) -> DeskFrame {
     if frame.expanded {
         collapse_dock(frame)
@@ -95,12 +79,76 @@ pub fn toggle_dock(frame: DeskFrame) -> DeskFrame {
     }
 }
 
-pub fn step_width(current: f32, target: f32) -> f32 {
-    let delta = target - current;
-    if delta.abs() <= WIDTH_STEP {
-        target
+/// Preferred width, or the monitor's free width when the preferred width does not fit.
+/// A missing measurement never shrinks the window.
+pub fn open_width(preferred: f32, available: Option<f32>) -> f32 {
+    let full = if preferred <= DOCK_WIDTH {
+        COMPANION_WIDTH
     } else {
-        current + delta.signum() * WIDTH_STEP
+        preferred
+    };
+    match available {
+        Some(room) if room.is_finite() && room + 0.5 < full && room > DOCK_WIDTH => room,
+        _ => full,
+    }
+}
+
+/// One resize to the full workspace. The left edge stays at `frame.x`.
+/// `expanded_width` stays the preferred width even when the monitor clamps the open size.
+pub fn expand_to_full(frame: DeskFrame, available: Option<f32>) -> DeskFrame {
+    let preferred = if frame.expanded_width <= DOCK_WIDTH {
+        COMPANION_WIDTH
+    } else {
+        frame.expanded_width
+    };
+    DeskFrame {
+        x: frame.x,
+        y: frame.y,
+        width: open_width(preferred, available),
+        height: frame.height,
+        expanded: true,
+        expanded_width: preferred,
+    }
+}
+
+/// Keep a user resize. A width that only exists because the monitor was smaller
+/// does not replace a larger preferred width.
+pub fn remember_width(preferred: f32, current: f32, available: Option<f32>) -> f32 {
+    if current <= DOCK_WIDTH + 0.5 {
+        return if preferred <= DOCK_WIDTH {
+            COMPANION_WIDTH
+        } else {
+            preferred
+        };
+    }
+    if let Some(room) = available
+        && current + 4.0 >= room
+        && preferred > current + 4.0
+    {
+        return preferred;
+    }
+    current
+}
+
+pub fn collapse_dock(frame: DeskFrame) -> DeskFrame {
+    let from_live = if frame.width > DOCK_WIDTH {
+        frame.width
+    } else {
+        0.0
+    };
+    let expanded_width = frame.expanded_width.max(from_live);
+    let expanded_width = if expanded_width <= DOCK_WIDTH {
+        COMPANION_WIDTH
+    } else {
+        expanded_width
+    };
+    DeskFrame {
+        x: frame.x,
+        y: frame.y,
+        width: DOCK_WIDTH,
+        height: frame.height,
+        expanded: false,
+        expanded_width,
     }
 }
 
@@ -147,6 +195,199 @@ pub fn card_from_post(post: &SourcePost) -> TweetCard {
 
 pub fn card_columns(width: f32) -> usize {
     if width >= 1800.0 { 2 } else { 1 }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TakeFrame {
+    pub id: String,
+    pub x: f32,
+    pub width: f32,
+}
+
+impl TakeFrame {
+    pub fn right(&self) -> f32 {
+        self.x + self.width
+    }
+}
+
+/// One frame per take. Every card shares the same inset so its right edge
+/// stays inside the window at any width.
+pub fn layout_takes(viewport: f32, ids: &[impl AsRef<str>]) -> Vec<TakeFrame> {
+    let width = (viewport - WINDOW_PAD * 2.0).max(0.0);
+    ids.iter()
+        .map(|id| TakeFrame {
+            id: id.as_ref().to_string(),
+            x: WINDOW_PAD,
+            width,
+        })
+        .collect()
+}
+
+/// Break long tokens so a URL or handle can wrap inside the card.
+pub fn wrap_token(text: &str) -> String {
+    const LIMIT: usize = 24;
+    let mut out = String::new();
+    for token in text.split_inclusive(char::is_whitespace) {
+        let chars: Vec<char> = token.chars().collect();
+        if chars.len() <= LIMIT {
+            out.extend(chars);
+            continue;
+        }
+        for (index, ch) in chars.into_iter().enumerate() {
+            if index > 0 && index % LIMIT == 0 && !ch.is_whitespace() {
+                out.push('\u{200b}');
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubjectPage {
+    pub id: String,
+    pub name: String,
+}
+
+pub fn subject_pages(pairs: &[(&str, &str)]) -> Vec<SubjectPage> {
+    pairs
+        .iter()
+        .filter(|(id, _)| !id.is_empty())
+        .map(|(id, name)| SubjectPage {
+            id: (*id).to_string(),
+            name: if name.is_empty() {
+                (*id).to_string()
+            } else {
+                (*name).to_string()
+            },
+        })
+        .collect()
+}
+
+pub fn page_index(pages: &[SubjectPage], saved_id: &str) -> usize {
+    pages
+        .iter()
+        .position(|page| page.id == saved_id)
+        .unwrap_or(0)
+}
+
+/// Move one page. The index stays inside the book.
+pub fn turn_page(index: usize, count: usize, delta: i32) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let next = index as i32 + delta;
+    if next < 0 {
+        0
+    } else if next >= count as i32 {
+        count - 1
+    } else {
+        next as usize
+    }
+}
+
+pub fn page_label(index: usize, count: usize, name: &str) -> String {
+    if count == 0 {
+        "0 / 0".into()
+    } else {
+        format!("{} / {} · {}", index + 1, count, name)
+    }
+}
+
+pub fn move_selection(ids: &[String], current: Option<&str>, delta: i32) -> Option<String> {
+    if ids.is_empty() {
+        return None;
+    }
+    let pos = current.and_then(|id| ids.iter().position(|item| item == id));
+    let next = match (pos, delta.signum()) {
+        (None, 1..) => 0,
+        (None, _) => ids.len() - 1,
+        (Some(index), _) => {
+            let next = index as i32 + delta;
+            if next < 0 {
+                0
+            } else if next >= ids.len() as i32 {
+                ids.len() - 1
+            } else {
+                next as usize
+            }
+        }
+    };
+    Some(ids[next].clone())
+}
+
+pub fn scroll_by(
+    offsets: &mut std::collections::HashMap<String, f32>,
+    id: &str,
+    delta: f32,
+    limit: f32,
+) -> f32 {
+    let limit = limit.max(0.0);
+    let next = (offsets.get(id).copied().unwrap_or(0.0) + delta).clamp(0.0, limit);
+    offsets.insert(id.to_string(), next);
+    next
+}
+
+pub fn scroll_of(offsets: &std::collections::HashMap<String, f32>, id: &str) -> f32 {
+    offsets.get(id).copied().unwrap_or(0.0)
+}
+
+/// Floating reply editor. Closing it never posts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EditPopout {
+    pub card_id: String,
+    pub open: bool,
+    pub draft: String,
+    pub tone: String,
+    pub variants: Vec<String>,
+    pub provider: TakeProvider,
+}
+
+pub fn open_editor(card_id: &str, draft: &str, provider: TakeProvider) -> EditPopout {
+    let tone = crate::model::Tone::Reply;
+    EditPopout {
+        card_id: card_id.to_string(),
+        open: true,
+        draft: draft.to_string(),
+        tone: tone.as_str().to_string(),
+        variants: tone_variants(draft, tone),
+        provider,
+    }
+}
+
+pub fn close_editor(pop: &EditPopout) -> EditPopout {
+    EditPopout {
+        open: false,
+        ..pop.clone()
+    }
+}
+
+/// Send is allowed only from an open editor and an explicit click.
+/// This does not post. The caller posts only after `Ok`.
+pub fn editor_send(pop: &EditPopout, explicit: bool) -> Result<String, String> {
+    if !explicit {
+        return Err("Send requires an explicit click.".into());
+    }
+    if !pop.open {
+        return Err("The editor is closed. Nothing was posted.".into());
+    }
+    let text = pop.draft.trim();
+    if text.is_empty() {
+        return Err("Write a reply first.".into());
+    }
+    Ok(text.to_string())
+}
+
+pub fn tone_variants(idea: &str, tone: crate::model::Tone) -> Vec<String> {
+    crate::ai::template_variants(idea, tone, 3)
+        .into_iter()
+        .map(|draft| draft.text)
+        .take(3)
+        .collect()
+}
+
+pub fn char_count(text: &str) -> usize {
+    crate::text::weighted_len_limited(text, crate::text::STANDARD_CHAR_LIMIT).weighted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -412,14 +653,111 @@ mod tests {
         let again = toggle_dock(shut);
         assert_eq!(again.x, shut.x);
         assert_eq!(again.width, 1800.0);
-        let mut width = DOCK_WIDTH;
-        while width < COMPANION_WIDTH {
-            let next = step_width(width, COMPANION_WIDTH);
-            assert!(next > width);
-            assert!(next <= COMPANION_WIDTH);
-            width = next;
+        let jumped = expand_to_full(dock, None);
+        assert_eq!(jumped.x, dock.x);
+        assert_eq!(jumped.width, COMPANION_WIDTH);
+        let clamped = expand_to_full(dock, Some(1400.0));
+        assert_eq!(clamped.x, dock.x);
+        assert_eq!(clamped.width, 1400.0);
+        assert_eq!(clamped.expanded_width, COMPANION_WIDTH);
+        assert_eq!(
+            remember_width(COMPANION_WIDTH, 1400.0, Some(1400.0)),
+            COMPANION_WIDTH
+        );
+        assert_eq!(
+            remember_width(COMPANION_WIDTH, 1800.0, Some(3440.0)),
+            1800.0
+        );
+        assert_eq!(open_width(0.0, None), COMPANION_WIDTH);
+    }
+
+    #[test]
+    fn each_take_is_its_own_card_inside_the_window() {
+        for viewport in [900.0, 1600.0, 2560.0] {
+            let frames = layout_takes(viewport, &["law-1", "law-2", "law-3"]);
+            assert_eq!(frames.len(), 3);
+            let mut ids = Vec::new();
+            for frame in &frames {
+                ids.push(frame.id.clone());
+                assert!((frame.x - WINDOW_PAD).abs() < 0.01);
+                assert!(frame.right() <= viewport - WINDOW_PAD + 0.01);
+                assert!(frame.width > 0.0);
+            }
+            assert_eq!(
+                ids.len(),
+                ids.iter().collect::<std::collections::HashSet<_>>().len()
+            );
         }
-        assert_eq!(width, COMPANION_WIDTH);
+        let broken = wrap_token("https://x.com/a-very-long-handle/status/123456789012345678901234");
+        assert!(broken.contains('\u{200b}'));
+    }
+
+    #[test]
+    fn subject_pages_stay_in_bounds_and_map_by_id() {
+        let pages = subject_pages(&[("law", "Law"), ("finance", "Finance"), ("ai", "AI")]);
+        assert_eq!(page_index(&pages, "finance"), 1);
+        assert_eq!(page_index(&pages, "missing"), 0);
+        assert_eq!(turn_page(0, pages.len(), -1), 0);
+        assert_eq!(turn_page(2, pages.len(), 1), 2);
+        assert_eq!(turn_page(1, pages.len(), 1), 2);
+        assert_eq!(page_label(1, pages.len(), "Finance"), "2 / 3 · Finance");
+        assert_eq!(pages[page_index(&pages, "ai")].id, "ai");
+    }
+
+    #[test]
+    fn selection_moves_one_card_and_does_not_send() {
+        let ids: Vec<String> = vec!["subject:law".into(), "take:1".into(), "take:2".into()];
+        let phase = ReplyPhase::Editing {
+            text: "keep this".into(),
+        };
+        let selected = Some(ids[1].clone());
+        let down = move_selection(&ids, selected.as_deref(), 1);
+        assert_eq!(down.as_deref(), Some("take:2"));
+        let up = move_selection(&ids, down.as_deref(), -1);
+        assert_eq!(up.as_deref(), Some("take:1"));
+        assert_eq!(
+            move_selection(&ids, Some("take:2"), 1).as_deref(),
+            Some("take:2")
+        );
+        assert_eq!(phase.text(), "keep this");
+        let cleared: Option<String> = None;
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn scroll_offsets_are_per_card() {
+        let mut offsets = std::collections::HashMap::new();
+        assert_eq!(scroll_by(&mut offsets, "take:1", 30.0, 80.0), 30.0);
+        assert_eq!(scroll_by(&mut offsets, "take:2", 12.0, 80.0), 12.0);
+        assert_eq!(scroll_by(&mut offsets, "take:1", 100.0, 80.0), 80.0);
+        assert_eq!(scroll_of(&offsets, "take:1"), 80.0);
+        assert_eq!(scroll_of(&offsets, "take:2"), 12.0);
+        assert_eq!(scroll_of(&offsets, "take:3"), 0.0);
+    }
+
+    #[test]
+    fn closing_the_editor_keeps_the_draft_and_does_not_send() {
+        let open = open_editor("55", "hello take", TakeProvider::Free);
+        assert!(open.open);
+        assert_eq!(open.variants.len(), 3);
+        assert_eq!(char_count("hi"), 2);
+        let closed = close_editor(&open);
+        assert!(!closed.open);
+        assert_eq!(closed.draft, "hello take");
+        assert!(editor_send(&closed, true).is_err());
+        assert!(editor_send(&open, false).is_err());
+        let poster = MockPoster {
+            result: Ok("nope".into()),
+            calls: std::sync::Mutex::new(0),
+        };
+        let phase = ReplyPhase::Editing {
+            text: closed.draft.clone(),
+        };
+        let after = commit_send(&phase, false, "https://x.com/ada/status/55", &poster);
+        assert_eq!(*poster.calls.lock().unwrap(), 0);
+        assert_eq!(after.text(), "hello take");
+        assert_eq!(editor_send(&open, true).unwrap(), "hello take");
+        assert_eq!(*poster.calls.lock().unwrap(), 0);
     }
 
     #[test]

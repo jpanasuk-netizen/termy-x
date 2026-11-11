@@ -662,6 +662,9 @@ pub struct DeskSettings {
     pub expanded_width: u32,
     #[serde(default = "default_frame_height")]
     pub frame_height: u32,
+    /// Last subject page, stored with the rest of the Termy XL settings.
+    #[serde(default)]
+    pub subject_id: String,
 }
 
 fn default_focus() -> String {
@@ -712,6 +715,7 @@ impl Default for DeskSettings {
             frame_y: default_frame_origin(),
             expanded_width: default_expanded_width(),
             frame_height: default_frame_height(),
+            subject_id: String::new(),
         }
     }
 }

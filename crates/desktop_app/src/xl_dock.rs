@@ -6,7 +6,7 @@ use gpui_kit::{
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{DOCK_WIDTH, step_width, toggle_dock};
+use termy_x::trends_desk::{DOCK_WIDTH, collapse_dock, expand_to_full, remember_width};
 
 impl TrendsDesk {
     pub(crate) fn xl_mark(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -44,33 +44,19 @@ impl TrendsDesk {
         self.frame.x = bounds.origin.x.into();
         self.frame.y = bounds.origin.y.into();
         self.frame.height = bounds.size.height.into();
+        let live_width: f32 = bounds.size.width.into();
+        let room = available_room(window, cx, self.frame.x);
         if self.frame.expanded {
-            self.frame.width = bounds.size.width.into();
+            self.frame.width = live_width;
+            self.frame.expanded_width = remember_width(self.frame.expanded_width, live_width, room);
+            self.frame = collapse_dock(self.frame);
+        } else {
+            self.frame = expand_to_full(self.frame, room);
         }
-        self.frame = toggle_dock(self.frame);
+        self.anim_target = None;
+        window.resize(size(px(self.frame.width), px(self.frame.height)));
         self.write_frame();
-        self.anim_target = Some(self.frame.width);
-        self.step_frame(window, cx);
-    }
-
-    pub(crate) fn step_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(target) = self.anim_target else {
-            return;
-        };
-        let bounds = window.bounds();
-        let current: f32 = bounds.size.width.into();
-        let next = step_width(current, target);
-        window.resize(size(px(next), px(bounds.size.height.into())));
-        if (next - target).abs() < 0.5 {
-            self.anim_target = None;
-            cx.notify();
-            return;
-        }
         cx.notify();
-        let entity = cx.entity().clone();
-        window.on_next_frame(move |window, cx| {
-            let _ = entity.update(cx, |desk, cx| desk.step_frame(window, cx));
-        });
     }
 
     pub(crate) fn write_frame(&mut self) {
@@ -105,4 +91,11 @@ impl TrendsDesk {
             true
         });
     }
+}
+
+fn available_room(window: &Window, cx: &mut Context<TrendsDesk>, left: f32) -> Option<f32> {
+    let display = window.display(cx)?;
+    let bounds = display.visible_bounds();
+    let right = f32::from(bounds.origin.x) + f32::from(bounds.size.width);
+    Some((right - left).max(0.0))
 }

@@ -1,10 +1,4 @@
-//! GPU-rendered Trends Desk window.
-//!
-//! The window is a normal GPUI surface, the same renderer Termy uses for the
-//! rest of the desktop. OpenCLI still does the search on a background thread.
-//! The GPU does not speed that up. `--fixture` draws labeled sample cards and
-//! does not save them.
-
+//! GPU-rendered Trends Desk window. OpenCLI searches on a background thread.
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,13 +14,14 @@ use termy_x::XConfig;
 use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
     COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DOCK_WIDTH, DeskFrame, DeskSettings,
-    DeskStore, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk, OutcomeKind, Phase,
-    ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeProvider, Topic,
-    VISIBLE_NAME, apply_send_result, card_columns, card_from_post, column_count_for_width,
-    column_from_cache, column_from_outcome, column_loading, daily_due, draft_take, drafts_file,
-    edit_reply, filter_posts, fixture_column, frame_from_parts, isolated_opencli_config,
-    post_reply_opencli, prepare_draft_file, request_send, surface_after_nav,
-    synthetic_fixture_posts, termy_xl_data_root, within_termy_x_config,
+    DeskStore, EditPopout, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk,
+    OutcomeKind, Phase, ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeProvider,
+    Topic, VISIBLE_NAME, WINDOW_PAD, apply_send_result, card_columns, card_from_post, close_editor,
+    column_count_for_width, column_from_cache, column_from_outcome, column_loading, daily_due,
+    draft_take, drafts_file, edit_reply, editor_send, filter_posts, fixture_column,
+    frame_from_parts, isolated_opencli_config, layout_takes, move_selection, open_editor,
+    page_label, post_reply_opencli, prepare_draft_file, request_send, scroll_by, surface_after_nav,
+    synthetic_fixture_posts, termy_xl_data_root, turn_page, within_termy_x_config, wrap_token,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -44,11 +39,11 @@ enum Field {
     DailyAt,
 }
 
-struct ColumnUi {
-    topic: Topic,
-    view: ColumnView,
+pub(crate) struct ColumnUi {
+    pub(crate) topic: Topic,
+    pub(crate) view: ColumnView,
     cached: Option<termy_x::trends_desk::StoredReport>,
-    tags: Vec<(String, ChangeTag)>,
+    pub(crate) tags: Vec<(String, ChangeTag)>,
 }
 
 pub struct TrendsDesk {
@@ -59,7 +54,7 @@ pub struct TrendsDesk {
     pub(crate) store: DeskStore,
     pub(crate) writable: bool,
     pub(crate) settings: DeskSettings,
-    columns: Vec<ColumnUi>,
+    pub(crate) columns: Vec<ColumnUi>,
     surface: Surface,
     field: Option<Field>,
     focus_text: String,
@@ -73,8 +68,13 @@ pub struct TrendsDesk {
     reply_note: String,
     history: Vec<termy_x::trends_desk::StoredReport>,
     history_index: Option<usize>,
-    card_replies: HashMap<String, ReplyPhase>,
+    pub(crate) card_replies: HashMap<String, ReplyPhase>,
     editing_card: Option<String>,
+    pub(crate) selected: Option<String>,
+    pub(crate) scroll_offsets: HashMap<String, f32>,
+    pub(crate) scroll_handles: HashMap<String, gpui_kit::ScrollHandle>,
+    pub(crate) popout: Option<EditPopout>,
+    pub(crate) pop_caret: termy_x::draft_edit::DraftCaret,
     session: SessionStatus,
     generation: u64,
     cancel: Arc<AtomicBool>,
@@ -151,6 +151,11 @@ impl TrendsDesk {
             history_index: None,
             card_replies: HashMap::new(),
             editing_card: None,
+            selected: None,
+            scroll_offsets: HashMap::new(),
+            scroll_handles: HashMap::new(),
+            popout: None,
+            pop_caret: termy_x::draft_edit::DraftCaret::collapsed(0),
             session: SessionStatus {
                 state: SessionState::ProbeFailed,
                 label: "Checking OpenCLI…".into(),
@@ -424,135 +429,99 @@ impl TrendsDesk {
         cx.notify();
     }
 
-    fn tweet_card(
-        &self,
-        post: &termy_x::trends_desk::SourcePost,
-        column: &ColumnUi,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let card = card_from_post(post);
-        let phase = self
-            .card_replies
-            .get(&card.id)
-            .cloned()
-            .unwrap_or(ReplyPhase::Idle);
-        let tag = column
-            .tags
+    fn page_ids(&self) -> Vec<String> {
+        let index = self
+            .columns
             .iter()
-            .find(|(url, _)| url == &card.url)
-            .map(|(_, tag)| match tag {
-                ChangeTag::New => "NEW",
-                ChangeTag::Rising => "RISING",
-                ChangeTag::Fading => "FADING",
-            });
-        let url = card.url.clone();
-        let id = card.id.clone();
-        let take_id = id.clone();
-        let edit_id = id.clone();
-        let send_id = id.clone();
-        let created = card
-            .created_at
-            .clone()
-            .unwrap_or_else(|| "time not provided".into());
-        let media = if card.media.is_empty() {
-            "no media".to_string()
-        } else {
-            card.media.join(" ")
+            .position(|column| column.topic.id == self.settings.subject_id)
+            .unwrap_or(0);
+        let Some(column) = self.columns.get(index) else {
+            return Vec::new();
         };
-        let reply_text = phase.text().to_string();
-        let status = match &phase {
-            ReplyPhase::Pending { .. } => "Pending send".to_string(),
-            ReplyPhase::Confirmed { receipt, .. } => format!("Confirmed · {receipt}"),
-            ReplyPhase::Failed { error, .. } => format!("Failed · {error}"),
-            ReplyPhase::Editing { .. } => "Editing reply".to_string(),
-            ReplyPhase::Idle => "Reply".to_string(),
-        };
-        div()
-            .p(px(10.0))
-            .rounded(px(10.0))
-            .bg(rgb(0x10141c))
-            .flex()
-            .flex_col()
-            .gap(px(4.0))
-            .child(div().text_size(px(14.0)).child(format!(
-                "{}{} · @{}",
-                tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
-                card.author_name,
-                card.handle
-            )))
-            .child(div().text_size(px(13.0)).child(card.text))
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0xc7c7cc))
-                    .child(format!(
-                        "{created} · {} likes · {} reposts · {} replies · {} views",
-                        card.likes, card.reposts, card.replies, card.views
-                    )),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x8e8e93))
-                    .child(media),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x7af6ff))
-                    .child(card.url.clone()),
-            )
-            .child(div().text_size(px(12.0)).child(status))
-            .child(div().text_size(px(12.0)).child(if reply_text.is_empty() {
-                "Reply composer is empty.".to_string()
-            } else {
-                reply_text
-            }))
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(button(
-                        SharedString::from(format!("desk-open-{id}")),
-                        "Open source",
-                        false,
-                        cx.listener(move |_, _, _, _| open_status(&url)),
-                    ))
-                    .child(button(
-                        SharedString::from(format!("desk-take-{id}")),
-                        "Draft take",
-                        false,
-                        cx.listener(move |this, _, _, cx| this.draft_take_for(take_id.clone(), cx)),
-                    ))
-                    .child(button(
-                        SharedString::from(format!("desk-edit-{id}")),
-                        "Edit reply",
-                        false,
-                        cx.listener(move |this, _, _, cx| {
-                            this.editing_card = Some(edit_id.clone());
-                            let phase = this
-                                .card_replies
-                                .get(&edit_id)
-                                .cloned()
-                                .unwrap_or(ReplyPhase::Idle);
-                            this.card_replies.insert(
-                                edit_id.clone(),
-                                edit_reply(&phase, phase.text().to_string()),
-                            );
-                            cx.notify();
-                        }),
-                    ))
-                    .child(button(
-                        SharedString::from(format!("desk-send-{id}")),
-                        "Send",
-                        false,
-                        cx.listener(move |this, _, _, cx| this.send_reply(send_id.clone(), cx)),
-                    )),
-            )
-            .into_any_element()
+        let mut ids = vec![format!("subject:{}", column.topic.id)];
+        for post in filter_posts(&column.view.posts, &self.filter_text) {
+            ids.push(format!("take:{}", post.id));
+        }
+        ids
     }
 
-    fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
+    fn popout_key(&mut self, key: &str, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        use termy_x::draft_edit::Motion;
+        if key == "escape" {
+            self.close_popout();
+            cx.notify();
+            return;
+        }
+        let Some(mut pop) = self.popout.clone() else {
+            return;
+        };
+        let mut caret = self.pop_caret;
+        let lines = [(0, pop.draft.len())];
+        if key == "backspace" {
+            caret.backspace(&mut pop.draft);
+        } else if key == "left" {
+            caret.move_by(&pop.draft, &lines, Motion::Left, false);
+        } else if key == "right" {
+            caret.move_by(&pop.draft, &lines, Motion::Right, false);
+        } else if let Some(ch) = event.keystroke.key_char.as_deref()
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.platform
+            && !ch.is_empty()
+        {
+            caret.insert(&mut pop.draft, ch);
+        }
+        self.pop_caret = caret;
+        self.popout = Some(pop);
+        cx.notify();
+    }
+
+    pub(crate) fn send_from_popout(&mut self, cx: &mut Context<Self>) {
+        let Some(pop) = self.popout.clone() else {
+            return;
+        };
+        match editor_send(&pop, true) {
+            Err(error) => self.draft_note = error,
+            Ok(text) => {
+                self.card_replies
+                    .insert(pop.card_id.clone(), ReplyPhase::Editing { text });
+                self.send_reply(pop.card_id, cx);
+            }
+        }
+    }
+
+    pub(crate) fn set_pop_tone(&mut self, tone: &str) {
+        let Some(pop) = self.popout.as_mut() else {
+            return;
+        };
+        let parsed = termy_x::model::Tone::parse(tone).unwrap_or(termy_x::model::Tone::Reply);
+        pop.tone = parsed.as_str().to_string();
+        pop.variants = termy_x::trends_desk::tone_variants(&pop.draft, parsed);
+    }
+
+    pub(crate) fn open_popout(&mut self, id: &str) {
+        let text = self
+            .card_replies
+            .get(id)
+            .map(|phase| phase.text().to_string())
+            .unwrap_or_default();
+        let provider = TakeProvider::parse(&self.settings.take_provider);
+        self.selected = Some(format!("take:{id}"));
+        self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
+        self.popout = Some(open_editor(id, &text, provider));
+    }
+
+    pub(crate) fn close_popout(&mut self) {
+        let Some(pop) = self.popout.take() else {
+            return;
+        };
+        let closed = close_editor(&pop);
+        self.card_replies.insert(
+            pop.card_id.clone(),
+            edit_reply(&ReplyPhase::Idle, closed.draft),
+        );
+    }
+
+    pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
         let Some(post) = self
             .columns
             .iter()
@@ -580,8 +549,11 @@ impl TrendsDesk {
                 match result {
                     Ok(draft) => {
                         desk.card_replies
-                            .insert(id, edit_reply(&current, draft.text));
+                            .insert(id.clone(), edit_reply(&current, draft.text.clone()));
                         desk.draft_note = draft.note;
+                        desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(draft.text.len());
+                        desk.popout = Some(open_editor(&id, &draft.text, provider));
+                        desk.selected = Some(format!("take:{id}"));
                     }
                     Err(error) => {
                         let text = current.text().to_string();
@@ -725,9 +697,41 @@ impl TrendsDesk {
             cx.notify();
             return;
         }
+        if self.popout.as_ref().is_some_and(|pop| pop.open) {
+            self.popout_key(key, event, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.surface == Surface::Columns && self.field.is_none() {
+            match key {
+                "left" | "pageup" => {
+                    self.turn_subject(-1);
+                    cx.notify();
+                    return;
+                }
+                "right" | "pagedown" => {
+                    self.turn_subject(1);
+                    cx.notify();
+                    return;
+                }
+                "up" | "down" => {
+                    let ids = self.page_ids();
+                    self.selected = move_selection(
+                        &ids,
+                        self.selected.as_deref(),
+                        if key == "down" { 1 } else { -1 },
+                    );
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if key == "escape" {
             if self.field.is_some() {
                 self.field = None;
+            } else if self.selected.is_some() {
+                self.selected = None;
             } else if self.frame.expanded {
                 self.toggle_frame(window, cx);
             }
@@ -888,6 +892,7 @@ impl Render for TrendsDesk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_started(cx);
         self.ensure_close_hook(window, cx);
+        self.ensure_scrolls();
         let width: f32 = window.viewport_size().width.into();
         let mut root = div()
             .id("trends-desk")
@@ -924,6 +929,9 @@ impl Render for TrendsDesk {
                         }),
                 )
                 .child(self.footer());
+        }
+        if self.popout.as_ref().is_some_and(|pop| pop.open) {
+            root = root.child(self.reply_popout(cx));
         }
         root
     }
@@ -1083,21 +1091,148 @@ impl TrendsDesk {
             .into_any_element()
     }
 
+    fn ensure_scrolls(&mut self) {
+        for column in &self.columns {
+            for post in &column.view.posts {
+                self.scroll_handles
+                    .entry(format!("take:{}", post.id))
+                    .or_default();
+            }
+        }
+    }
+
+    fn turn_subject(&mut self, delta: i32) {
+        let count = self.columns.len();
+        let index = self
+            .columns
+            .iter()
+            .position(|column| column.topic.id == self.settings.subject_id)
+            .unwrap_or(0);
+        let next = turn_page(index, count, delta);
+        if let Some(column) = self.columns.get(next) {
+            self.settings.subject_id = column.topic.id.clone();
+            if self.writable {
+                let _ = self.store.save_settings(&self.settings);
+            }
+        }
+    }
+
     fn columns_view(
         &self,
         width: f32,
-        per_row: usize,
+        _per_row: usize,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
-        let col_w = (width / per_row as f32).clamp(280.0, 1600.0);
-        let mut rows: Vec<gpui_kit::AnyElement> = Vec::new();
-        for chunk in self.columns.chunks(per_row) {
-            let mut row = div().flex().flex_row().gap(px(12.0)).mb(px(12.0));
-            for column in chunk {
-                row = row.child(self.column_card(column, col_w, cx));
-            }
-            rows.push(row.into_any_element());
+        let index = self
+            .columns
+            .iter()
+            .position(|column| column.topic.id == self.settings.subject_id)
+            .unwrap_or(0);
+        let Some(column) = self.columns.get(index) else {
+            return div().child("No subjects yet.").into_any_element();
+        };
+        let label = page_label(index, self.columns.len(), &column.topic.name);
+        let subject_key = format!("subject:{}", column.topic.id);
+        let subject_selected = self.selected.as_deref() == Some(subject_key.as_str());
+        let visible = filter_posts(&column.view.posts, &self.filter_text);
+        let ids: Vec<String> = visible.iter().map(|post| post.id.clone()).collect();
+        let frames = layout_takes(width, &ids);
+        let mut page = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .p(px(WINDOW_PAD))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.selected = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("desk-subject-page")
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .rounded(px(16.0))
+                    .border_1()
+                    .border_color(if subject_selected {
+                        rgb(0xffe56a)
+                    } else {
+                        rgb(0xffd60a)
+                    })
+                    .bg(if subject_selected {
+                        rgb(0x2a2410)
+                    } else {
+                        rgb(0x12100a)
+                    })
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(12.0))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let subject_key = subject_key.clone();
+                            move |this, _, _, cx| {
+                                this.selected = Some(subject_key.clone());
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(button(
+                                "desk-page-prev",
+                                "Prev",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.turn_subject(-1);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(div().text_size(px(16.0)).child(label))
+                            .child(button(
+                                "desk-page-next",
+                                "Next",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.turn_subject(1);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x8e8e93))
+                            .child(column.topic.desc.clone()),
+                    ),
+            );
+        let mut list = div()
+            .id("desk-take-list")
+            .flex_1()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(10.0));
+        for (post, frame) in visible.iter().zip(frames.iter()) {
+            let _ = frame.right();
+            list = list.child(self.tweet_card(post, column, cx));
         }
+        if visible.is_empty() {
+            list = list.child("No takes in this subject.");
+        }
+        page = page.child(list);
+        let mut rows: Vec<gpui_kit::AnyElement> = vec![page.into_any_element()];
         if self.session.state == SessionState::Missing {
             rows.insert(
                 0,
@@ -1112,76 +1247,6 @@ impl TrendsDesk {
             );
         }
         div().flex().flex_col().children(rows).into_any_element()
-    }
-
-    fn column_card(
-        &self,
-        column: &ColumnUi,
-        width: f32,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let id = column.topic.id.clone();
-        let phase = phase_label(column.view.phase);
-        let mut body = div()
-            .w(px(width))
-            .min_h(px(240.0))
-            .p(px(12.0))
-            .rounded(px(14.0))
-            .bg(rgb(0x16161e))
-            .border_1()
-            .border_color(phase_color(column.view.phase))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().text_size(px(18.0)).child(column.topic.name.clone()))
-                    .child(button(
-                        SharedString::from(format!("desk-run-{id}")),
-                        "Run",
-                        false,
-                        cx.listener(move |this, _, _, cx| {
-                            this.start_run(std::slice::from_ref(&id), cx);
-                        }),
-                    )),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0x8e8e93))
-                    .child(column.topic.desc.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(phase_color(column.view.phase))
-                    .child(format!(
-                        "{phase} · {} · {}",
-                        if card_columns(width) > 1 {
-                            "grid"
-                        } else {
-                            "list"
-                        },
-                        column.view.banner
-                    )),
-            );
-        let visible = filter_posts(&column.view.posts, &self.filter_text);
-        if visible.is_empty() && column.view.phase != Phase::Loading {
-            body = body.child(div().text_size(px(13.0)).child(
-                if self.filter_text.trim().is_empty() {
-                    "No cards in this column."
-                } else {
-                    "No cards match the filter."
-                },
-            ));
-        }
-        for post in visible {
-            body = body.child(self.tweet_card(post, column, cx));
-        }
-        body.into_any_element()
     }
 
     fn history_view(&self) -> gpui_kit::AnyElement {
@@ -1383,7 +1448,7 @@ fn nav_button(
     )
 }
 
-fn button(
+pub(crate) fn button(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
     active: bool,
@@ -1428,7 +1493,7 @@ fn phase_color(phase: Phase) -> Rgba {
     }
 }
 
-fn open_status(url: &str) {
+pub(crate) fn open_status(url: &str) {
     if url.starts_with("https://x.com/") && url.contains("/status/") {
         let _ = webbrowser::open(url);
     }
