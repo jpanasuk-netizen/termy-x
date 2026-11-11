@@ -35,6 +35,10 @@ pub struct SourcePost {
     #[serde(default)]
     pub media: Vec<String>,
     #[serde(default)]
+    pub verified: bool,
+    #[serde(default)]
+    pub lang: String,
+    #[serde(default)]
     pub in_reply_to: Option<String>,
 }
 
@@ -85,6 +89,14 @@ impl SourcePost {
             replies: metric(value, &["replies", "reply_count"]),
             author_name: display_name_of(value),
             media: media_urls_of(value),
+            verified: value
+                .get("verified")
+                .and_then(Value::as_bool)
+                .or_else(|| value.get("is_blue_verified").and_then(Value::as_bool))
+                .unwrap_or(false),
+            lang: first_str(value, &["lang", "language"])
+                .unwrap_or("")
+                .to_string(),
             in_reply_to: first_str(
                 value,
                 &[

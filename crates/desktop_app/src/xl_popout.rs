@@ -10,8 +10,7 @@ use gpui_kit::{
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::model::Tone;
-use termy_x::trends_desk::{TakeProvider, char_count, wrap_token};
+use termy_x::trends_desk::{TakeProvider, TakeTone, char_count, wrap_token};
 
 impl TrendsDesk {
     pub(crate) fn reply_popout(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
@@ -73,34 +72,30 @@ impl TrendsDesk {
                 div()
                     .text_size(px(11.0))
                     .text_color(if over { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
-                    .child(format!("{count} / 280 characters · Send button posts")),
+                    .child({
+                        let read = termy_x::trends_desk::read_composer(&pop.draft);
+                        format!(
+                            "{count} / 280{} · {} mentions · {} links · Send button posts",
+                            if read.over { " over limit" } else { "" },
+                            read.mentions,
+                            read.links
+                        )
+                    }),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(8.0))
                     .flex_wrap()
-                    .child(tone_button(
-                        "desk-tone-reply",
-                        "Reply",
-                        &pop.tone,
-                        Tone::Reply,
-                        cx,
-                    ))
-                    .child(tone_button(
-                        "desk-tone-punchy",
-                        "Punchy",
-                        &pop.tone,
-                        Tone::Punchy,
-                        cx,
-                    ))
-                    .child(tone_button(
-                        "desk-tone-info",
-                        "Informative",
-                        &pop.tone,
-                        Tone::Informative,
-                        cx,
-                    )),
+                    .children(TakeTone::all().map(|tone| {
+                        tone_button(
+                            &format!("desk-tone-{}", tone.label()),
+                            tone.label(),
+                            &pop.tone,
+                            tone,
+                            cx,
+                        )
+                    })),
             );
         for (index, variant) in pop.variants.iter().enumerate() {
             let text = variant.clone();
@@ -156,6 +151,31 @@ impl TrendsDesk {
                         }
                         cx.notify();
                     }))
+                    .child(pop_button(
+                        "desk-variant-next",
+                        "Next variant",
+                        cx,
+                        |this, cx| {
+                            if let Some(pop) = this.popout.as_mut() {
+                                let index = pop
+                                    .variants
+                                    .iter()
+                                    .position(|item| item == &pop.draft)
+                                    .unwrap_or(0);
+                                let next = termy_x::trends_desk::flip_variant(
+                                    index,
+                                    1,
+                                    pop.variants.len(),
+                                );
+                                if let Some(text) = pop.variants.get(next).cloned() {
+                                    pop.draft = text.clone();
+                                    this.pop_caret =
+                                        termy_x::draft_edit::DraftCaret::at_end(text.len());
+                                }
+                            }
+                            cx.notify();
+                        },
+                    ))
                     .child(pop_button("desk-pop-send", "Send", cx, |this, cx| {
                         this.send_from_popout(cx);
                     }))
@@ -172,11 +192,11 @@ fn tone_button(
     id: &str,
     label: &str,
     current: &str,
-    tone: Tone,
+    tone: TakeTone,
     cx: &mut Context<TrendsDesk>,
 ) -> gpui_kit::AnyElement {
-    let active = current == tone.as_str();
-    let name = tone.as_str().to_string();
+    let active = current.eq_ignore_ascii_case(tone.label());
+    let name = tone.label().to_string();
     pop_button(id, label, cx, move |this, cx| {
         if active {
             return;

@@ -30,7 +30,7 @@ pub struct DeskOptions {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Field {
+pub(crate) enum Field {
     Focus,
     Filter,
     TopicName,
@@ -48,17 +48,17 @@ pub(crate) struct ColumnUi {
 
 pub struct TrendsDesk {
     focus_handle: FocusHandle,
-    options: DeskOptions,
-    data_root: PathBuf,
+    pub(crate) options: DeskOptions,
+    pub(crate) data_root: PathBuf,
     config: XConfig,
     pub(crate) store: DeskStore,
     pub(crate) writable: bool,
     pub(crate) settings: DeskSettings,
     pub(crate) columns: Vec<ColumnUi>,
-    surface: Surface,
-    field: Option<Field>,
+    pub(crate) surface: Surface,
+    pub(crate) field: Option<Field>,
     focus_text: String,
-    filter_text: String,
+    pub(crate) filter_text: String,
     topic_name: String,
     topic_desc: String,
     draft_text: String,
@@ -75,10 +75,14 @@ pub struct TrendsDesk {
     pub(crate) scroll_handles: HashMap<String, gpui_kit::ScrollHandle>,
     pub(crate) popout: Option<EditPopout>,
     pub(crate) pop_caret: termy_x::draft_edit::DraftCaret,
-    session: SessionStatus,
+    pub(crate) pack: termy_x::trends_desk::PackFile,
+    pub(crate) palette: bool,
+    pub(crate) palette_query: String,
+    pub(crate) board: String,
+    pub(crate) session: SessionStatus,
     generation: u64,
     cancel: Arc<AtomicBool>,
-    busy: bool,
+    pub(crate) busy: bool,
     started: bool,
     pub(crate) frame: DeskFrame,
     pub(crate) anim_target: Option<f32>,
@@ -100,6 +104,11 @@ impl TrendsDesk {
             store.load_settings()
         } else {
             DeskSettings::default()
+        };
+        let pack = if writable {
+            termy_x::trends_desk::load_pack(&data_root)
+        } else {
+            termy_x::trends_desk::PackFile::default()
         };
         let frame = frame_from_parts(
             settings.docked,
@@ -156,6 +165,10 @@ impl TrendsDesk {
             scroll_handles: HashMap::new(),
             popout: None,
             pop_caret: termy_x::draft_edit::DraftCaret::collapsed(0),
+            pack,
+            palette: false,
+            palette_query: String::new(),
+            board: "subject".into(),
             session: SessionStatus {
                 state: SessionState::ProbeFailed,
                 label: "Checking OpenCLI…".into(),
@@ -233,7 +246,7 @@ impl TrendsDesk {
         self.start_run(&ids, cx);
     }
 
-    fn start_run(&mut self, ids: &[String], cx: &mut Context<Self>) {
+    pub(crate) fn start_run(&mut self, ids: &[String], cx: &mut Context<Self>) {
         if self.options.fixture {
             self.draft_note = "Fixture mode does not call OpenCLI.".into();
             cx.notify();
@@ -429,7 +442,7 @@ impl TrendsDesk {
         cx.notify();
     }
 
-    fn page_ids(&self) -> Vec<String> {
+    pub(crate) fn page_ids(&self) -> Vec<String> {
         let index = self
             .columns
             .iter()
@@ -493,9 +506,11 @@ impl TrendsDesk {
         let Some(pop) = self.popout.as_mut() else {
             return;
         };
-        let parsed = termy_x::model::Tone::parse(tone).unwrap_or(termy_x::model::Tone::Reply);
-        pop.tone = parsed.as_str().to_string();
-        pop.variants = termy_x::trends_desk::tone_variants(&pop.draft, parsed);
+        let parsed = termy_x::trends_desk::TakeTone::parse(tone);
+        pop.tone = parsed.label().to_string();
+        pop.variants = termy_x::trends_desk::three_variants(&pop.draft, parsed);
+        self.pack.tone = parsed.label().to_ascii_lowercase();
+        self.save_pack_file();
     }
 
     pub(crate) fn open_popout(&mut self, id: &str) {
@@ -597,6 +612,7 @@ impl TrendsDesk {
                 cx.notify();
                 let bin = self.config.opencli_bin.clone();
                 let url = post.url.clone();
+                let receipt_url = url.clone();
                 cx.spawn(async move |this, cx| {
                     let result = cx
                         .background_executor()
@@ -607,6 +623,18 @@ impl TrendsDesk {
                         .await;
                     let _ = this.update(cx, |desk, cx| {
                         let pending = desk.card_replies.get(&id).cloned().unwrap_or(pending);
+                        desk.pack.receipts.push(termy_x::trends_desk::ReplyMark {
+                            card_id: id.clone(),
+                            url: receipt_url.clone(),
+                            at_unix: TrendsDesk::now_unix(),
+                            status: if result.is_ok() {
+                                "confirmed".into()
+                            } else {
+                                "failed".into()
+                            },
+                            text: pending.text().to_string(),
+                        });
+                        desk.save_pack_file();
                         desk.card_replies
                             .insert(id, apply_send_result(&pending, result));
                         cx.notify();
@@ -702,30 +730,12 @@ impl TrendsDesk {
             cx.stop_propagation();
             return;
         }
-        if self.surface == Surface::Columns && self.field.is_none() {
-            match key {
-                "left" | "pageup" => {
-                    self.turn_subject(-1);
-                    cx.notify();
-                    return;
-                }
-                "right" | "pagedown" => {
-                    self.turn_subject(1);
-                    cx.notify();
-                    return;
-                }
-                "up" | "down" => {
-                    let ids = self.page_ids();
-                    self.selected = move_selection(
-                        &ids,
-                        self.selected.as_deref(),
-                        if key == "down" { 1 } else { -1 },
-                    );
-                    cx.notify();
-                    return;
-                }
-                _ => {}
-            }
+        if self.palette && key != "escape" && key != "backspace" && !(mods.control && key == "k") {
+            self.note_key(&event.keystroke);
+        }
+        if self.pack_key(key, mods.control || mods.platform, mods.shift, window, cx) {
+            cx.stop_propagation();
+            return;
         }
         if key == "escape" {
             if self.field.is_some() {
@@ -893,6 +903,7 @@ impl Render for TrendsDesk {
         self.ensure_started(cx);
         self.ensure_close_hook(window, cx);
         self.ensure_scrolls();
+        self.maybe_refresh(cx);
         let width: f32 = window.viewport_size().width.into();
         let mut root = div()
             .id("trends-desk")
@@ -933,12 +944,15 @@ impl Render for TrendsDesk {
         if self.popout.as_ref().is_some_and(|pop| pop.open) {
             root = root.child(self.reply_popout(cx));
         }
+        if self.palette {
+            root = root.child(self.palette_view(cx));
+        }
         root
     }
 }
 
 impl TrendsDesk {
-    fn header(&self, per_row: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    fn header(&self, _per_row: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .flex()
             .items_center()
@@ -977,21 +991,28 @@ impl TrendsDesk {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(0x8e8e93))
-                            .child(format!(
-                                "{} columns across · focus {}",
-                                per_row,
-                                if self.focus_text.is_empty() {
-                                    "none"
-                                } else {
-                                    self.focus_text.as_str()
-                                }
-                            )),
+                            .child(self.hud()),
                     ),
             )
             .child(
                 div()
                     .flex()
                     .gap(px(8.0))
+                    .child(button(
+                        "desk-refresh",
+                        "Refresh",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.pack.last_refresh = Some(TrendsDesk::now_unix());
+                            this.save_pack_file();
+                            let ids: Vec<String> = this
+                                .columns
+                                .iter()
+                                .map(|column| column.topic.id.clone())
+                                .collect();
+                            this.start_run(&ids, cx);
+                        }),
+                    ))
                     .child(button(
                         "desk-run-all",
                         "Run all",
@@ -1101,7 +1122,7 @@ impl TrendsDesk {
         }
     }
 
-    fn turn_subject(&mut self, delta: i32) {
+    pub(crate) fn turn_subject(&mut self, delta: i32) {
         let count = self.columns.len();
         let index = self
             .columns
@@ -1115,138 +1136,6 @@ impl TrendsDesk {
                 let _ = self.store.save_settings(&self.settings);
             }
         }
-    }
-
-    fn columns_view(
-        &self,
-        width: f32,
-        _per_row: usize,
-        cx: &mut Context<Self>,
-    ) -> gpui_kit::AnyElement {
-        let index = self
-            .columns
-            .iter()
-            .position(|column| column.topic.id == self.settings.subject_id)
-            .unwrap_or(0);
-        let Some(column) = self.columns.get(index) else {
-            return div().child("No subjects yet.").into_any_element();
-        };
-        let label = page_label(index, self.columns.len(), &column.topic.name);
-        let subject_key = format!("subject:{}", column.topic.id);
-        let subject_selected = self.selected.as_deref() == Some(subject_key.as_str());
-        let visible = filter_posts(&column.view.posts, &self.filter_text);
-        let ids: Vec<String> = visible.iter().map(|post| post.id.clone()).collect();
-        let frames = layout_takes(width, &ids);
-        let mut page = div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .p(px(WINDOW_PAD))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.selected = None;
-                    cx.notify();
-                }),
-            )
-            .child(
-                div()
-                    .id("desk-subject-page")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .w_full()
-                    .rounded(px(16.0))
-                    .border_1()
-                    .border_color(if subject_selected {
-                        rgb(0xffe56a)
-                    } else {
-                        rgb(0xffd60a)
-                    })
-                    .bg(if subject_selected {
-                        rgb(0x2a2410)
-                    } else {
-                        rgb(0x12100a)
-                    })
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .p(px(12.0))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener({
-                            let subject_key = subject_key.clone();
-                            move |this, _, _, cx| {
-                                this.selected = Some(subject_key.clone());
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(button(
-                                "desk-page-prev",
-                                "Prev",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(-1);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(div().text_size(px(16.0)).child(label))
-                            .child(button(
-                                "desk-page-next",
-                                "Next",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(1);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x8e8e93))
-                            .child(column.topic.desc.clone()),
-                    ),
-            );
-        let mut list = div()
-            .id("desk-take-list")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(10.0));
-        for (post, frame) in visible.iter().zip(frames.iter()) {
-            let _ = frame.right();
-            list = list.child(self.tweet_card(post, column, cx));
-        }
-        if visible.is_empty() {
-            list = list.child("No takes in this subject.");
-        }
-        page = page.child(list);
-        let mut rows: Vec<gpui_kit::AnyElement> = vec![page.into_any_element()];
-        if self.session.state == SessionState::Missing {
-            rows.insert(
-                0,
-                div()
-                    .mb(px(12.0))
-                    .p(px(12.0))
-                    .rounded(px(12.0))
-                    .bg(rgb(0x3a1d1d))
-                    .text_size(px(13.0))
-                    .child(self.session.detail.clone())
-                    .into_any_element(),
-            );
-        }
-        div().flex().flex_col().children(rows).into_any_element()
     }
 
     fn history_view(&self) -> gpui_kit::AnyElement {

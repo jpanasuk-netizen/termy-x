@@ -154,7 +154,19 @@ impl TrendsDesk {
                     .text_color(rgb(0x7af6ff))
                     .child(wrap_token(&card.url)),
             )
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xffd60a))
+                    .child(self.heat_for(post)),
+            )
             .child(div().text_size(px(12.0)).child(status))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x30d158))
+                    .child(self.badge_for(&card.id).unwrap_or_default()),
+            )
             .child(div().text_size(px(12.0)).child(if reply_text.is_empty() {
                 "Reply composer is empty.".to_string()
             } else {
@@ -187,6 +199,43 @@ impl TrendsDesk {
                             this.open_popout(&edit_id);
                             cx.stop_propagation();
                             cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-star-{id}")),
+                        "Star",
+                        false,
+                        cx.listener({
+                            let star_id = id.clone();
+                            move |this, _, _, cx| {
+                                this.toggle_star(&star_id);
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-copy-link-{id}")),
+                        "Copy link",
+                        false,
+                        cx.listener({
+                            let link = card.url.clone();
+                            move |this, _, _, cx| {
+                                this.copy_text(&link, cx);
+                                cx.stop_propagation();
+                            }
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-copy-text-{id}")),
+                        "Copy text",
+                        false,
+                        cx.listener({
+                            let body = card.text.clone();
+                            move |this, _, _, cx| {
+                                this.copy_text(&body, cx);
+                                cx.stop_propagation();
+                            }
                         }),
                     ))
                     .child(button(

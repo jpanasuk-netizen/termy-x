@@ -1,0 +1,587 @@
+//! Termy XL extras: heat, tone, variants, filters, hit list, receipts, keys.
+//!
+//! Nothing here posts. A key never maps to send. Treg failures stay errors.
+
+use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
+
+use super::domain::SourcePost;
+use super::fetch::search_args;
+use super::{TakeProvider, char_count};
+use crate::time::parse_created_at;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TakeTone {
+    Spicy,
+    Funny,
+    Data,
+    Contrarian,
+    Supportive,
+    Hype,
+}
+
+impl TakeTone {
+    pub fn all() -> [Self; 6] {
+        [
+            Self::Spicy,
+            Self::Funny,
+            Self::Data,
+            Self::Contrarian,
+            Self::Supportive,
+            Self::Hype,
+        ]
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "funny" => Self::Funny,
+            "data" => Self::Data,
+            "contrarian" => Self::Contrarian,
+            "supportive" => Self::Supportive,
+            "hype" => Self::Hype,
+            _ => Self::Spicy,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spicy => "Spicy",
+            Self::Funny => "Funny",
+            Self::Data => "Data",
+            Self::Contrarian => "Contrarian",
+            Self::Supportive => "Supportive",
+            Self::Hype => "Hype",
+        }
+    }
+}
+
+/// Engagement per hour from counts already on the post. Missing time is not a rate.
+pub fn heat_score(post: &SourcePost, now_unix: i64) -> Option<f64> {
+    let posted = parse_created_at(post.created_at.as_deref()?)?;
+    let elapsed = (now_unix - posted).max(0) as f64;
+    let hours = (elapsed / 3600.0).max(1.0 / 60.0);
+    let engagement = post.likes as f64
+        + post.reposts as f64 * 2.0
+        + post.replies as f64
+        + post.views as f64 / 100.0;
+    Some(engagement / hours)
+}
+
+pub fn heat_line(post: &SourcePost, now_unix: i64) -> String {
+    match heat_score(post, now_unix) {
+        Some(score) => {
+            let bars = if score >= 400.0 {
+                5
+            } else if score >= 150.0 {
+                4
+            } else if score >= 40.0 {
+                3
+            } else if score >= 8.0 {
+                2
+            } else if score > 0.0 {
+                1
+            } else {
+                0
+            };
+            format!("{} {score:.0}/h", "#".repeat(bars))
+        }
+        None => "heat n/a".into(),
+    }
+}
+
+pub fn sort_by_heat(posts: &[&SourcePost], now_unix: i64) -> Vec<String> {
+    let mut rows: Vec<(String, f64)> = posts
+        .iter()
+        .map(|post| (post.id.clone(), heat_score(post, now_unix).unwrap_or(0.0)))
+        .collect();
+    rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    rows.into_iter().map(|(id, _)| id).collect()
+}
+
+pub fn three_variants(text: &str, tone: TakeTone) -> Vec<String> {
+    let idea: String = text.chars().take(90).collect();
+    let name = tone.label();
+    vec![
+        format!("{name} take: {idea}"),
+        format!("{name} angle: one concrete point on {idea}"),
+        format!("{name} reply: {idea}"),
+    ]
+}
+
+pub fn flip_variant(index: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let next = index as i32 + delta;
+    if next < 0 {
+        len - 1
+    } else if next >= len as i32 {
+        0
+    } else {
+        next as usize
+    }
+}
+
+/// Free returns three labeled templates. Treg must already have a result.
+/// A Treg error is returned as-is and is not replaced with the free templates.
+pub fn provider_drafts(
+    text: &str,
+    tone: TakeTone,
+    provider: TakeProvider,
+    treg: Result<String, String>,
+) -> Result<Vec<String>, String> {
+    match provider {
+        TakeProvider::Free => Ok(three_variants(text, tone)),
+        TakeProvider::Treg => {
+            let draft = treg?;
+            if draft.trim().is_empty() {
+                return Err("Treg returned an empty draft.".into());
+            }
+            Ok(vec![format!("{} · {draft}", tone.label())])
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerRead {
+    pub weighted: usize,
+    pub limit: usize,
+    pub over: bool,
+    pub mentions: usize,
+    pub links: usize,
+}
+
+pub fn read_composer(text: &str) -> ComposerRead {
+    let weighted = char_count(text);
+    let mentions = text
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '@' && ch != '_')
+        .filter(|token| {
+            let rest = token.trim_start_matches('@');
+            token.starts_with('@')
+                && rest.len() >= 2
+                && rest
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+        .count();
+    let links = text.matches("http://").count() + text.matches("https://").count();
+    ComposerRead {
+        weighted,
+        limit: 280,
+        over: weighted > 280,
+        mentions,
+        links,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HitItem {
+    pub id: String,
+    pub url: String,
+    pub author: String,
+    pub text: String,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplyMark {
+    pub card_id: String,
+    pub url: String,
+    pub at_unix: i64,
+    pub status: String,
+    #[serde(default)]
+    pub text: String,
+}
+
+pub fn replied_badge(marks: &[ReplyMark], card_id: &str) -> Option<String> {
+    marks
+        .iter()
+        .rev()
+        .find(|mark| mark.card_id == card_id && mark.status == "confirmed")
+        .map(|mark| format!("replied · {}", mark.at_unix))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardFilter {
+    #[serde(default)]
+    pub min_likes: u64,
+    #[serde(default)]
+    pub last_hours: Option<u64>,
+    #[serde(default)]
+    pub has_media: bool,
+    #[serde(default)]
+    pub verified_only: bool,
+    #[serde(default)]
+    pub language: String,
+    #[serde(default)]
+    pub mute_words: Vec<String>,
+    #[serde(default)]
+    pub mute_accounts: Vec<String>,
+}
+
+pub fn apply_filters<'a>(
+    posts: &[&'a SourcePost],
+    filter: &CardFilter,
+    now_unix: i64,
+) -> Vec<&'a SourcePost> {
+    posts
+        .iter()
+        .copied()
+        .filter(|post| post.likes >= filter.min_likes)
+        .filter(|post| !filter.has_media || !post.media.is_empty())
+        .filter(|post| !filter.verified_only || post.verified)
+        .filter(|post| {
+            let want = filter.language.trim();
+            want.is_empty() || post.lang.eq_ignore_ascii_case(want)
+        })
+        .filter(|post| match filter.last_hours {
+            None => true,
+            Some(hours) => parse_created_at(post.created_at.as_deref().unwrap_or(""))
+                .is_some_and(|posted| now_unix.saturating_sub(posted) <= hours as i64 * 3600),
+        })
+        .filter(|post| {
+            let text = post.text.to_lowercase();
+            !filter
+                .mute_words
+                .iter()
+                .any(|word| !word.trim().is_empty() && text.contains(&word.to_lowercase()))
+        })
+        .filter(|post| {
+            let author = post.author.trim_start_matches('@').to_lowercase();
+            !filter.mute_accounts.iter().any(|name| {
+                name.trim()
+                    .trim_start_matches('@')
+                    .eq_ignore_ascii_case(&author)
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackFile {
+    #[serde(default)]
+    pub hits: Vec<HitItem>,
+    #[serde(default)]
+    pub receipts: Vec<ReplyMark>,
+    #[serde(default)]
+    pub filters: CardFilter,
+    #[serde(default = "default_tone")]
+    pub tone: String,
+    #[serde(default)]
+    pub sort_heat: bool,
+    #[serde(default = "default_true")]
+    pub refresh_on: bool,
+    #[serde(default = "default_refresh_minutes")]
+    pub refresh_minutes: u64,
+    #[serde(default)]
+    pub last_refresh: Option<i64>,
+    #[serde(default)]
+    pub seen: HashMap<String, Vec<String>>,
+}
+
+fn default_tone() -> String {
+    "spicy".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_refresh_minutes() -> u64 {
+    10
+}
+
+impl Default for PackFile {
+    fn default() -> Self {
+        Self {
+            hits: Vec::new(),
+            receipts: Vec::new(),
+            filters: CardFilter::default(),
+            tone: default_tone(),
+            sort_heat: false,
+            refresh_on: true,
+            refresh_minutes: 10,
+            last_refresh: None,
+            seen: HashMap::new(),
+        }
+    }
+}
+
+pub fn load_pack(root: &Path) -> PackFile {
+    fs::read_to_string(root.join("pack.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_pack(root: &Path, pack: &PackFile) -> Result<(), String> {
+    if super::within_termy_x_config(root) {
+        return Err("refusing to write the Termy X config tree".into());
+    }
+    fs::create_dir_all(root).map_err(|error| error.to_string())?;
+    let text = serde_json::to_string_pretty(pack).map_err(|error| error.to_string())?;
+    fs::write(root.join("pack.json"), text).map_err(|error| error.to_string())
+}
+
+pub fn new_ids(seen: &[String], current: &[String]) -> Vec<String> {
+    current
+        .iter()
+        .filter(|id| !seen.iter().any(|old| old == *id))
+        .cloned()
+        .collect()
+}
+
+pub fn refresh_due(last: Option<i64>, now: i64, enabled: bool, minutes: u64) -> bool {
+    if !enabled || minutes == 0 {
+        return false;
+    }
+    match last {
+        None => true,
+        Some(at) => now.saturating_sub(at) >= minutes as i64 * 60,
+    }
+}
+
+pub fn refresh_is_search_only(args: &[String]) -> bool {
+    args.first().map(String::as_str) == Some("twitter")
+        && args.get(1).map(String::as_str) == Some("search")
+        && !args.iter().any(|arg| arg == "reply" || arg == "post")
+}
+
+pub fn hud_line(
+    sent_today: usize,
+    drafts: usize,
+    provider: &str,
+    last_refresh: Option<i64>,
+) -> String {
+    let refresh = last_refresh
+        .map(|at| at.to_string())
+        .unwrap_or_else(|| "never".into());
+    format!("{sent_today} sent today · {drafts} drafts · {provider} · refresh {refresh}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeskKey {
+    Select(i32),
+    Page(i32),
+    Draft,
+    Reply,
+    Open,
+    Star,
+    Palette,
+    Unbound,
+}
+
+pub fn desk_key(key: &str, ctrl: bool, shift: bool) -> DeskKey {
+    if ctrl && !shift && key == "k" {
+        return DeskKey::Palette;
+    }
+    if ctrl || shift {
+        return DeskKey::Unbound;
+    }
+    match key {
+        "j" => DeskKey::Select(1),
+        "k" => DeskKey::Select(-1),
+        "h" | "left" | "pageup" => DeskKey::Page(-1),
+        "l" | "right" | "pagedown" => DeskKey::Page(1),
+        "d" => DeskKey::Draft,
+        "r" => DeskKey::Reply,
+        "o" => DeskKey::Open,
+        "s" => DeskKey::Star,
+        _ => DeskKey::Unbound,
+    }
+}
+
+pub fn sends_on_key(key: &str, ctrl: bool, shift: bool) -> bool {
+    match desk_key(key, ctrl, shift) {
+        DeskKey::Select(_)
+        | DeskKey::Page(_)
+        | DeskKey::Draft
+        | DeskKey::Reply
+        | DeskKey::Open
+        | DeskKey::Star
+        | DeskKey::Palette
+        | DeskKey::Unbound => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn post(id: &str, likes: u64, hours_ago: i64, extra: serde_json::Value) -> SourcePost {
+        let mut value = json!({
+            "id": id,
+            "author": "ada",
+            "text": format!("note {id}"),
+            "likes": likes,
+            "reposts": 1,
+            "replies": 0,
+            "views": 100,
+            "created_at": "Wed Nov 11 16:00:00 +0000 2026",
+            "url": format!("https://x.com/ada/status/{id}")
+        });
+        if let Some(map) = extra.as_object() {
+            for (key, item) in map {
+                value[key] = item.clone();
+            }
+        }
+        let post = SourcePost::from_value(&value).unwrap();
+        let posted = parse_created_at(post.created_at.as_deref().unwrap()).unwrap();
+        let _ = hours_ago;
+        let _ = posted;
+        post
+    }
+
+    #[test]
+    fn heat_uses_engagement_per_hour_and_sorts() {
+        let now = parse_created_at("Wed Nov 11 18:00:00 +0000 2026").unwrap();
+        let hot = post("1", 100, 2, json!({}));
+        let cold = post("2", 1, 2, json!({}));
+        let missing = SourcePost::from_value(&json!({
+            "id": "3",
+            "author": "ada",
+            "text": "no time",
+            "likes": 50,
+            "url": "https://x.com/ada/status/3"
+        }))
+        .unwrap();
+        let hot_score = heat_score(&hot, now).unwrap();
+        let cold_score = heat_score(&cold, now).unwrap();
+        assert!(hot_score > cold_score);
+        assert!(heat_score(&missing, now).is_none());
+        assert!(heat_line(&missing, now).contains("n/a"));
+        let order = sort_by_heat(&[&cold, &hot], now);
+        assert_eq!(order, vec!["1".to_string(), "2".to_string()]);
+    }
+
+    #[test]
+    fn tone_reaches_free_variants_and_treg_errors_stay_errors() {
+        let spicy = three_variants("rates moved", TakeTone::Spicy);
+        assert_eq!(spicy.len(), 3);
+        assert!(spicy.iter().all(|line| line.contains("Spicy")));
+        let funny = provider_drafts(
+            "rates",
+            TakeTone::Funny,
+            TakeProvider::Free,
+            Err("no".into()),
+        )
+        .unwrap();
+        assert!(funny[0].contains("Funny"));
+        let err = provider_drafts(
+            "rates",
+            TakeTone::Data,
+            TakeProvider::Treg,
+            Err("treg: no key".into()),
+        )
+        .unwrap_err();
+        assert!(err.contains("treg"));
+        assert!(!err.contains("Funny"));
+        assert_eq!(flip_variant(2, 1, 3), 0);
+        assert_eq!(flip_variant(0, -1, 3), 2);
+    }
+
+    #[test]
+    fn composer_counts_limit_mentions_and_links() {
+        let read = read_composer("hi @ada see https://x.com/ada/status/1");
+        assert_eq!(read.limit, 280);
+        assert_eq!(read.mentions, 1);
+        assert_eq!(read.links, 1);
+        assert!(!read.over);
+        let long = "a".repeat(300);
+        assert!(read_composer(&long).over);
+    }
+
+    #[test]
+    fn hit_list_and_reply_badge_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pack = PackFile::default();
+        pack.hits.push(HitItem {
+            id: "9".into(),
+            url: "https://x.com/ada/status/9".into(),
+            author: "ada".into(),
+            text: "pinned".into(),
+            note: "watch this".into(),
+        });
+        pack.receipts.push(ReplyMark {
+            card_id: "9".into(),
+            url: "https://x.com/me/status/10".into(),
+            at_unix: 1_700_000_000,
+            status: "confirmed".into(),
+            text: "reply".into(),
+        });
+        pack.receipts.push(ReplyMark {
+            card_id: "8".into(),
+            url: "https://x.com/me/status/11".into(),
+            at_unix: 1,
+            status: "failed".into(),
+            text: "nope".into(),
+        });
+        save_pack(dir.path(), &pack).unwrap();
+        let loaded = load_pack(dir.path());
+        assert_eq!(loaded.hits[0].note, "watch this");
+        assert!(
+            replied_badge(&loaded.receipts, "9")
+                .unwrap()
+                .contains("replied")
+        );
+        assert!(replied_badge(&loaded.receipts, "8").is_none());
+        assert!(save_pack(crate::config::default_config_dir().as_path(), &pack).is_err());
+    }
+
+    #[test]
+    fn filters_and_mute_drop_posts() {
+        let now = parse_created_at("Wed Nov 11 18:00:00 +0000 2026").unwrap();
+        let keep = post(
+            "1",
+            10,
+            1,
+            json!({"text": "clean markets", "verified": true, "lang": "en", "media_urls": ["https://img.example/a.jpg"]}),
+        );
+        let quiet = post("2", 0, 1, json!({"text": "noise word", "lang": "en"}));
+        let other = post(
+            "3",
+            12,
+            1,
+            json!({"text": "hola", "lang": "es", "author": "bob"}),
+        );
+        let filter = CardFilter {
+            min_likes: 5,
+            last_hours: Some(6),
+            has_media: true,
+            verified_only: true,
+            language: "en".into(),
+            mute_words: vec!["noise".into()],
+            mute_accounts: vec!["bob".into()],
+        };
+        let ids: Vec<_> = apply_filters(&[&keep, &quiet, &other], &filter, now)
+            .into_iter()
+            .map(|post| post.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn keymap_has_no_send_and_refresh_is_search_only() {
+        for key in ["enter", "return", "s", "d", "r", "o", "j", "k"] {
+            assert!(!sends_on_key(key, false, false));
+            assert!(!sends_on_key(key, true, false));
+            assert!(!sends_on_key(key, true, true));
+        }
+        assert_eq!(desk_key("s", false, false), DeskKey::Star);
+        assert_eq!(desk_key("d", false, false), DeskKey::Draft);
+        assert_eq!(desk_key("enter", false, false), DeskKey::Unbound);
+        assert_eq!(desk_key("k", true, false), DeskKey::Palette);
+        let args = search_args("ai", 20);
+        assert!(refresh_is_search_only(&args));
+        assert!(refresh_due(None, 100, true, 10));
+        assert!(!refresh_due(Some(100), 200, true, 10));
+        assert!(!refresh_due(Some(0), 10_000, false, 10));
+        assert_eq!(new_ids(&["a".into()], &["a".into(), "b".into()]).len(), 1);
+        let line = hud_line(2, 1, "free", None);
+        assert!(line.contains("2 sent"));
+        assert!(line.contains("free"));
+    }
+}
