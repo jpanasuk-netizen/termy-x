@@ -20,8 +20,8 @@ pub use cards::{
     collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_locked, expand_right,
     expand_to_full, frame_from_parts, layout_takes, move_selection, offline_take, open_editor,
     open_width, page_index, page_label, remember_width, request_send, scroll_by, scroll_of,
-    subject_pages, take_column_count, takes_for_posts, toggle_dock, tone_variants, turn_page,
-    wrap_token,
+    short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock, tone_variants,
+    turn_page, wrap_token,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,

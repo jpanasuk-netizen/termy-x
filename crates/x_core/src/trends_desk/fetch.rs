@@ -278,11 +278,11 @@ pub fn prepare_draft_file(
         created_at: timestamp(),
         reply_to: reply_to.clone(),
     };
-    match drafts::upsert_drafts(path, vec![draft.clone()]) {
-        Ok(_) => DraftPrep {
+    match drafts::replace_draft_for_target(path, draft.clone()) {
+        Ok(kept) => DraftPrep {
             text,
             reply_to,
-            saved_id: Some(draft.id),
+            saved_id: Some(kept.id),
             save_error: None,
         },
         Err(error) => DraftPrep {
@@ -778,5 +778,12 @@ mod tests {
             crate::config::default_config_dir().join("x-drafts.json")
         );
         assert_eq!(drafts[0].text, prep.text);
+        let again = prepare_draft(
+            &config,
+            "Markets open later",
+            Some("https://x.com/a/status/5"),
+        );
+        assert_eq!(again.saved_id.as_deref(), Some(id.as_str()));
+        assert_eq!(crate::drafts::load_drafts(&config.drafts_path()).len(), 1);
     }
 }

@@ -68,6 +68,9 @@ pub struct TrendsDesk {
     ai_base_text: String,
     ai_model_text: String,
     ai_key_text: String,
+    pub(crate) model_notice: String,
+    pub(crate) model_detail: String,
+    free_halted: bool,
     draft_text: String,
     draft_reply_to: Option<String>,
     draft_note: String,
@@ -171,6 +174,9 @@ impl TrendsDesk {
             ai_base_text,
             ai_model_text,
             ai_key_text,
+            model_notice: String::new(),
+            model_detail: String::new(),
+            free_halted: false,
             draft_text: String::new(),
             draft_reply_to: None,
             draft_note: "Drafts stay in the Termy XL data folder. Copy to Termy X is a separate step and does not post.".into(),
@@ -247,6 +253,19 @@ impl TrendsDesk {
             }
             return;
         }
+        if self.free_halted
+            && TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Free
+        {
+            let detail = self.model_detail.clone();
+            for post in &posts {
+                let mut draft = offline_take(post);
+                if !detail.is_empty() {
+                    draft.note = detail.clone();
+                }
+                self.takes.insert(post.id.clone(), draft);
+            }
+            return;
+        }
         for post in &posts {
             self.takes.insert(
                 post.id.clone(),
@@ -266,6 +285,8 @@ impl TrendsDesk {
         cx.spawn(async move |this, cx| {
             let mut model_down = false;
             let mut shared_offline: Option<String> = None;
+            let mut later = Vec::new();
+            let mut tried_next = false;
             if provider == TakeProvider::Free {
                 let listed = config.clone();
                 let picked = cx
@@ -289,6 +310,7 @@ impl TrendsDesk {
                         };
                         termy_x::trends_desk::append_desk_log(&data_root, &line);
                         config.ai_model = choice.model;
+                        later = choice.later;
                     }
                     Err(reason) => {
                         termy_x::trends_desk::append_desk_log(&data_root, &reason);
@@ -301,7 +323,7 @@ impl TrendsDesk {
             let mut logged_offline = false;
             for post in posts {
                 let post_id = post.id.clone();
-                let draft = if let Some(error) = shared_error.clone() {
+                let mut draft = if let Some(error) = shared_error.clone() {
                     TakeDraft {
                         text: error.clone(),
                         source: "error",
@@ -333,8 +355,60 @@ impl TrendsDesk {
                         })
                         .await
                 };
-                if draft.source == "offline" {
-                    if shared_offline.is_none() && draft.note.starts_with("free model") {
+                if provider == TakeProvider::Free && termy_x::ai::blocks_free_model(&draft.note) {
+                    termy_x::trends_desk::append_desk_log(&data_root, &draft.note);
+                    if !tried_next {
+                        tried_next = true;
+                        if let Some(next) = later.first().cloned() {
+                            termy_x::trends_desk::append_desk_log(
+                                &data_root,
+                                &format!("model returned 401 or 402; trying {next} once"),
+                            );
+                            let mut retry_config = config.clone();
+                            retry_config.ai_model = next.clone();
+                            let retry_post = post.clone();
+                            let retry = cx
+                                .background_executor()
+                                .spawn(async move {
+                                    let http = termy_x::io::UreqHttp::with_timeout(
+                                        std::time::Duration::from_secs(30),
+                                    );
+                                    match draft_take(
+                                        TakeProvider::Free,
+                                        &retry_config,
+                                        &retry_post,
+                                        &http,
+                                    ) {
+                                        Ok(draft) => draft,
+                                        Err(error) => TakeDraft {
+                                            text: error.clone(),
+                                            source: "error",
+                                            note: error,
+                                        },
+                                    }
+                                })
+                                .await;
+                            termy_x::trends_desk::append_desk_log(&data_root, &retry.note);
+                            if retry.source == "model"
+                                && !termy_x::ai::blocks_free_model(&retry.note)
+                            {
+                                config.ai_model = next;
+                                draft = retry;
+                            } else {
+                                draft = retry;
+                                model_down = true;
+                                shared_offline = Some(draft.note.clone());
+                            }
+                        } else {
+                            model_down = true;
+                            shared_offline = Some(draft.note.clone());
+                        }
+                    } else {
+                        model_down = true;
+                        shared_offline = Some(draft.note.clone());
+                    }
+                } else if draft.source == "offline" {
+                    if shared_offline.is_none() {
                         shared_offline = Some(draft.note.clone());
                     }
                     model_down = true;
@@ -354,12 +428,14 @@ impl TrendsDesk {
                             &format!("take failed: {}", draft.note),
                         );
                     }
-                    if draft.source == "offline"
-                        && !logged_offline
-                        && draft.note.starts_with("free model")
-                    {
+                    if draft.source == "offline" && !logged_offline && !draft.note.is_empty() {
                         logged_offline = true;
                         termy_x::trends_desk::append_desk_log(&desk.data_root, &draft.note);
+                        desk.model_detail = draft.note.clone();
+                        desk.model_notice = termy_x::trends_desk::short_take_note(&draft.note);
+                        if termy_x::ai::blocks_free_model(&draft.note) {
+                            desk.free_halted = true;
+                        }
                     }
                     desk.takes.insert(post_id, draft);
                     cx.notify();
@@ -738,6 +814,9 @@ impl TrendsDesk {
         let provider = TakeProvider::parse(&self.settings.take_provider);
         self.selected = Some(format!("take:{id}"));
         self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
+        self.card_replies
+            .entry(id.to_string())
+            .or_insert_with(|| ReplyPhase::Editing { text: text.clone() });
         self.popout = Some(open_editor(id, &text, provider));
     }
 
@@ -867,6 +946,9 @@ impl TrendsDesk {
         self.config.ai_model = self.ai_model_text.trim().to_string();
         self.config.ai_api_key = self.ai_key_text.trim().to_string();
         self.config.ai_explicit = !self.config.ai_base_url.is_empty();
+        self.free_halted = false;
+        self.model_notice.clear();
+        self.model_detail.clear();
         match self.config.save_ai(
             &self.config.ai_base_url,
             &self.config.ai_model,
@@ -1278,8 +1360,8 @@ impl TrendsDesk {
     fn header(&self, _per_row: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .flex()
+            .flex_wrap()
             .items_center()
-            .justify_between()
             .gap(px(12.0))
             .px(px(16.0))
             .py(px(12.0))
@@ -1315,11 +1397,31 @@ impl TrendsDesk {
                             .text_size(px(11.0))
                             .text_color(rgb(0x8e8e93))
                             .child(self.hud()),
-                    ),
+                    )
+                    .children((!self.model_notice.is_empty()).then(|| {
+                        let notice = self.model_notice.clone();
+                        let full = self.model_detail.clone();
+                        div()
+                            .id("desk-model-notice")
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xffd60a))
+                            .child(notice)
+                            .tooltip({
+                                let full = full.clone();
+                                move |_, cx| {
+                                    cx.new(|_| HintView {
+                                        text: full.clone().into(),
+                                    })
+                                    .into()
+                                }
+                            })
+                    })),
             )
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
+                    .flex_shrink_0()
                     .gap(px(8.0))
                     .child(button(
                         "desk-refresh",
@@ -1761,5 +1863,22 @@ fn phase_color(phase: Phase) -> Rgba {
 pub(crate) fn open_status(url: &str) {
     if url.starts_with("https://x.com/") && url.contains("/status/") {
         let _ = webbrowser::open(url);
+    }
+}
+
+pub(crate) struct HintView {
+    pub(crate) text: SharedString,
+}
+
+impl Render for HintView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(360.0))
+            .p(px(8.0))
+            .rounded(px(8.0))
+            .bg(rgb(0x1c1c1e))
+            .text_size(px(12.0))
+            .text_color(rgb(0xe5e5ea))
+            .child(self.text.clone())
     }
 }

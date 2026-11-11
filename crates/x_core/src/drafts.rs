@@ -25,6 +25,27 @@ pub fn upsert_drafts(path: &Path, new_drafts: Vec<Draft>) -> Result<Vec<Draft>, 
     Ok(drafts)
 }
 
+/// One draft per reply target. A second save for the same post replaces the text.
+pub fn replace_draft_for_target(path: &Path, draft: Draft) -> Result<Draft, String> {
+    let mut drafts = load_drafts(path);
+    if let Some(target) = draft.reply_to.clone().filter(|value| !value.is_empty())
+        && let Some(existing) = drafts
+            .iter_mut()
+            .find(|item| item.reply_to.as_ref() == Some(&target))
+    {
+        existing.text = draft.text;
+        existing.tone = draft.tone;
+        existing.created_at = draft.created_at;
+        let kept = existing.clone();
+        save_drafts(path, &drafts)?;
+        return Ok(kept);
+    }
+    let kept = draft.clone();
+    drafts.push(draft);
+    save_drafts(path, &drafts)?;
+    Ok(kept)
+}
+
 pub fn find_draft<'a>(drafts: &'a [Draft], id: &str) -> Option<&'a Draft> {
     drafts
         .iter()

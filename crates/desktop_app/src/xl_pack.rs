@@ -56,18 +56,11 @@ impl TrendsDesk {
             .iter()
             .filter(|mark| mark.status == "confirmed")
             .count();
-        let mut draft_ids = std::collections::HashSet::new();
-        for (id, take) in &self.takes {
-            if take.source != "pending" && !take.text.trim().is_empty() {
-                draft_ids.insert(id.clone());
-            }
-        }
-        for (id, phase) in &self.card_replies {
-            if !phase.text().trim().is_empty() {
-                draft_ids.insert(id.clone());
-            }
-        }
-        let drafts = draft_ids.len();
+        let drafts = self
+            .card_replies
+            .values()
+            .filter(|phase| !phase.text().trim().is_empty())
+            .count();
         let line = hud_line(
             sent,
             drafts,

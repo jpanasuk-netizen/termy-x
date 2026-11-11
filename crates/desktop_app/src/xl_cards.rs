@@ -1,8 +1,8 @@
 //! Gold take cards for a Termy XL subject page.
 
 use gpui_kit::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
-    StatefulInteractiveElement, Styled, div, px, rgb,
+    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
 use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
@@ -55,15 +55,14 @@ impl TrendsDesk {
         };
         let reply_text = wrap_token(phase.text());
         let shown = self.takes.get(&card.id);
+        let full_note = shown
+            .filter(|take| take.source == "offline" && !take.note.is_empty())
+            .map(|take| take.note.clone());
         let (take_line, take_tag) = match shown {
             Some(take) if take.source == "pending" => ("Drafting take…".to_string(), None),
             Some(take) if take.source == "offline" => (
                 take.text.clone(),
-                Some(if take.note.is_empty() || take.note == "offline take" {
-                    "offline take".to_string()
-                } else {
-                    take.note.clone()
-                }),
+                Some(termy_x::trends_desk::short_take_note(&take.note)),
             ),
             Some(take) => (take.text.clone(), None),
             None => (
@@ -96,11 +95,8 @@ impl TrendsDesk {
             .id(SharedString::from(format!("desk-card-{id}")))
             .w_full()
             .min_w(px(0.0))
-            .max_h(px(280.0))
             .p(px(10.0))
             .rounded(px(10.0))
-            .overflow_y_scroll()
-            .scrollbar_width(px(4.0))
             .track_scroll(&handle)
             .bg(if selected {
                 rgb(0x2a2410)
@@ -160,10 +156,19 @@ impl TrendsDesk {
                     .child(take_line),
             )
             .children(take_tag.map(|tag| {
+                let full = full_note.clone().unwrap_or_else(|| tag.clone());
+                let note_id = id.clone();
                 div()
+                    .id(SharedString::from(format!("desk-take-note-{note_id}")))
                     .text_size(px(11.0))
                     .text_color(rgb(0x8e8e93))
                     .child(tag)
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::trends_desk::HintView {
+                            text: full.clone().into(),
+                        })
+                        .into()
+                    })
             }))
             .child(div().text_size(px(14.0)).whitespace_normal().child(format!(
                 "{}{} · @{}",

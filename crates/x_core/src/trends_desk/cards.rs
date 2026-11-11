@@ -562,6 +562,21 @@ pub struct TakeDraft {
     pub note: String,
 }
 
+pub fn short_take_note(note: &str) -> String {
+    let lower = note.to_lowercase();
+    if lower.contains("402") || lower.contains("credit") || lower.contains("payment required") {
+        "Free model needs credits (402) · fallback angle".into()
+    } else if lower.contains("401") || lower.contains("unauthorized") {
+        "Free model needs a key (401) · fallback angle".into()
+    } else if lower.contains("not installed") {
+        "Free model is not installed · fallback angle".into()
+    } else if lower.contains("unreachable") {
+        "Free model unreachable · fallback angle".into()
+    } else {
+        "fallback angle".into()
+    }
+}
+
 pub fn offline_take(post: &SourcePost) -> TakeDraft {
     TakeDraft {
         text: super::domain::idea_from(post),
@@ -1077,6 +1092,10 @@ mod tests {
         assert!(free.note.contains("127.0.0.1:11434"));
         assert!(free.text.contains("Courts") || free.text.contains("Ada"));
         assert!(!free.text.starts_with("Ada Lovelace:"));
+        assert_eq!(
+            short_take_note("http 402: payment required"),
+            "Free model needs credits (402) · fallback angle"
+        );
         let mut other = post();
         other.text =
             "Quarterly earnings beat estimates after the finance desk revised guidance.".into();

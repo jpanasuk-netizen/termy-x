@@ -28,6 +28,8 @@ pub fn draft_variants(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatModelChoice {
     pub model: String,
+    /// Models still unused, local names before `:cloud` names.
+    pub later: Vec<String>,
     pub substituted: bool,
 }
 
@@ -43,25 +45,66 @@ pub fn choose_chat_model(config: &XConfig, http: &dyn Http) -> Result<ChatModelC
     if !config.ai_model.trim().is_empty() {
         return Ok(ChatModelChoice {
             model: preferred,
+            later: Vec::new(),
             substituted: false,
         });
     }
     let Ok(models) = list_model_ids(http, &base) else {
         return Err(format!("free model unreachable at {host}"));
     };
-    if let Some(found) = models.iter().find(|name| model_matches(name, &preferred)) {
-        return Ok(ChatModelChoice {
-            model: found.clone(),
-            substituted: false,
-        });
+    let ordered = prefer_local_models(models, &preferred);
+    let Some(model) = ordered.first().cloned() else {
+        return Err(format!("model {preferred} not installed"));
+    };
+    Ok(ChatModelChoice {
+        substituted: !model_matches(&model, &preferred),
+        later: ordered.into_iter().skip(1).collect(),
+        model,
+    })
+}
+
+/// Local names first. A `:cloud` model is used only when nothing local is listed.
+pub fn prefer_local_models(models: Vec<String>, preferred: &str) -> Vec<String> {
+    let mut local = Vec::new();
+    let mut cloud = Vec::new();
+    for name in models {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if is_cloud_model(&name) {
+            cloud.push(name);
+        } else {
+            local.push(name);
+        }
     }
-    if let Some(first) = models.into_iter().find(|name| !name.trim().is_empty()) {
-        return Ok(ChatModelChoice {
-            model: first,
-            substituted: true,
-        });
+    let mut ordered = Vec::new();
+    if let Some(index) = local.iter().position(|name| model_matches(name, preferred)) {
+        ordered.push(local.remove(index));
     }
-    Err(format!("model {preferred} not installed"))
+    ordered.append(&mut local);
+    if ordered.is_empty()
+        && let Some(index) = cloud.iter().position(|name| model_matches(name, preferred))
+    {
+        ordered.push(cloud.remove(index));
+    }
+    ordered.append(&mut cloud);
+    ordered
+}
+
+pub fn is_cloud_model(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains(":cloud") || name.ends_with("-cloud")
+}
+
+/// A paid or unauthorized model. The caller may try one other model, then stop.
+pub fn blocks_free_model(note: &str) -> bool {
+    let note = note.to_lowercase();
+    note.contains("402")
+        || note.contains("401")
+        || note.contains("payment required")
+        || note.contains("insufficient")
+        || note.contains("unauthorized")
 }
 
 fn endpoint_host(base: &str) -> String {
@@ -396,6 +439,37 @@ mod tests {
         let choice = choose_chat_model(&config, &http).unwrap();
         assert!(choice.substituted);
         assert_eq!(choice.model, "qwen2.5:latest");
+    }
+
+    #[test]
+    fn a_local_model_is_chosen_ahead_of_cloud_models() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(
+                r#"{"data":[{"id":"minimax-m3:cloud"},{"id":"llama3.2"},{"id":"glm-5.2:cloud"}]}"#
+                    .into(),
+            ),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert_eq!(choice.model, "llama3.2");
+        assert!(choice.later.iter().all(|name| is_cloud_model(name)));
+    }
+
+    #[test]
+    fn only_cloud_models_leave_one_backup() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(r#"{"data":[{"id":"minimax-m3:cloud"},{"id":"glm-5.2:cloud"}]}"#.into()),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert_eq!(choice.model, "minimax-m3:cloud");
+        assert_eq!(choice.later, vec!["glm-5.2:cloud".to_string()]);
+        assert!(blocks_free_model("http 402: payment required"));
+        assert!(!blocks_free_model("connection refused"));
     }
 
     #[test]
