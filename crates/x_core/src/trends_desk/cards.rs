@@ -12,6 +12,97 @@ use super::domain::{SourcePost, draft_text_from_title};
 /// and the same height. The window stays resizable.
 pub const COMPANION_WIDTH: f32 = 2560.0;
 pub const COMPANION_HEIGHT: f32 = 820.0;
+/// Slim dock that sits beside Termy X until XL is opened.
+pub const DOCK_WIDTH: f32 = 72.0;
+/// One animation step. The left edge stays put; only the width changes.
+pub const WIDTH_STEP: f32 = 240.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeskFrame {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub expanded: bool,
+    pub expanded_width: f32,
+}
+
+pub fn frame_from_parts(
+    docked: bool,
+    x: f32,
+    y: f32,
+    expanded_width: f32,
+    height: f32,
+) -> DeskFrame {
+    let expanded_width = if expanded_width <= DOCK_WIDTH {
+        COMPANION_WIDTH
+    } else {
+        expanded_width
+    };
+    let height = if height < 240.0 {
+        COMPANION_HEIGHT
+    } else {
+        height
+    };
+    DeskFrame {
+        x,
+        y,
+        width: if docked { DOCK_WIDTH } else { expanded_width },
+        height,
+        expanded: !docked,
+        expanded_width,
+    }
+}
+
+/// Grow to the right. `x` and `y` are the left and top edges.
+pub fn expand_right(frame: DeskFrame) -> DeskFrame {
+    let width = if frame.expanded_width <= DOCK_WIDTH {
+        COMPANION_WIDTH
+    } else {
+        frame.expanded_width
+    };
+    DeskFrame {
+        x: frame.x,
+        y: frame.y,
+        width,
+        height: frame.height,
+        expanded: true,
+        expanded_width: width,
+    }
+}
+
+pub fn collapse_dock(frame: DeskFrame) -> DeskFrame {
+    let expanded_width = if frame.width > DOCK_WIDTH {
+        frame.width
+    } else {
+        frame.expanded_width
+    };
+    DeskFrame {
+        x: frame.x,
+        y: frame.y,
+        width: DOCK_WIDTH,
+        height: frame.height,
+        expanded: false,
+        expanded_width,
+    }
+}
+
+pub fn toggle_dock(frame: DeskFrame) -> DeskFrame {
+    if frame.expanded {
+        collapse_dock(frame)
+    } else {
+        expand_right(frame)
+    }
+}
+
+pub fn step_width(current: f32, target: f32) -> f32 {
+    let delta = target - current;
+    if delta.abs() <= WIDTH_STEP {
+        target
+    } else {
+        current + delta.signum() * WIDTH_STEP
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TweetCard {
@@ -297,6 +388,68 @@ mod tests {
         assert_eq!(COMPANION_HEIGHT, 820.0);
         assert_eq!(card_columns(COMPANION_WIDTH), 2);
         assert_eq!(card_columns(900.0), 1);
+    }
+
+    #[test]
+    fn dock_expands_right_and_the_left_edge_stays() {
+        let dock = frame_from_parts(true, 40.0, 80.0, 2560.0, 820.0);
+        assert!(!dock.expanded);
+        assert_eq!(dock.width, DOCK_WIDTH);
+        let open = expand_right(dock);
+        assert_eq!(open.x, dock.x);
+        assert_eq!(open.y, dock.y);
+        assert_eq!(open.width, COMPANION_WIDTH);
+        let resized = DeskFrame {
+            width: 1800.0,
+            expanded_width: 1800.0,
+            ..open
+        };
+        let shut = collapse_dock(resized);
+        assert_eq!(shut.x, 40.0);
+        assert_eq!(shut.y, 80.0);
+        assert_eq!(shut.width, DOCK_WIDTH);
+        assert_eq!(shut.expanded_width, 1800.0);
+        let again = toggle_dock(shut);
+        assert_eq!(again.x, shut.x);
+        assert_eq!(again.width, 1800.0);
+        let mut width = DOCK_WIDTH;
+        while width < COMPANION_WIDTH {
+            let next = step_width(width, COMPANION_WIDTH);
+            assert!(next > width);
+            assert!(next <= COMPANION_WIDTH);
+            width = next;
+        }
+        assert_eq!(width, COMPANION_WIDTH);
+    }
+
+    #[test]
+    fn dock_state_round_trips_in_settings() {
+        use crate::trends_desk::DeskSettings;
+        let mut settings = DeskSettings::default();
+        assert!(settings.docked);
+        settings.docked = false;
+        settings.frame_x = 40;
+        settings.frame_y = 80;
+        settings.expanded_width = 1800;
+        settings.frame_height = 820;
+        let loaded: DeskSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        let frame = frame_from_parts(
+            loaded.docked,
+            loaded.frame_x as f32,
+            loaded.frame_y as f32,
+            loaded.expanded_width as f32,
+            loaded.frame_height as f32,
+        );
+        assert!(frame.expanded);
+        assert_eq!(frame.x, 40.0);
+        assert_eq!(frame.width, 1800.0);
+        let docked: DeskSettings = serde_json::from_str("{}").unwrap();
+        assert!(docked.docked);
+        assert_eq!(
+            frame_from_parts(true, docked.frame_x as f32, docked.frame_y as f32, 0.0, 0.0).width,
+            DOCK_WIDTH
+        );
     }
 
     #[test]

@@ -651,6 +651,17 @@ pub struct DeskSettings {
     /// `free` or `treg`. Draft takes never post.
     #[serde(default = "default_take_provider")]
     pub take_provider: String,
+    /// Starts as the slim dock. False means the workspace is open.
+    #[serde(default = "default_true")]
+    pub docked: bool,
+    #[serde(default = "default_frame_origin")]
+    pub frame_x: i32,
+    #[serde(default = "default_frame_origin")]
+    pub frame_y: i32,
+    #[serde(default = "default_expanded_width")]
+    pub expanded_width: u32,
+    #[serde(default = "default_frame_height")]
+    pub frame_height: u32,
 }
 
 fn default_focus() -> String {
@@ -673,6 +684,18 @@ fn default_take_provider() -> String {
     "free".into()
 }
 
+fn default_frame_origin() -> i32 {
+    24
+}
+
+fn default_expanded_width() -> u32 {
+    2560
+}
+
+fn default_frame_height() -> u32 {
+    820
+}
+
 impl Default for DeskSettings {
     fn default() -> Self {
         Self {
@@ -684,6 +707,11 @@ impl Default for DeskSettings {
             daily_at: default_daily_at(),
             daily_done: None,
             take_provider: default_take_provider(),
+            docked: true,
+            frame_x: default_frame_origin(),
+            frame_y: default_frame_origin(),
+            expanded_width: default_expanded_width(),
+            frame_height: default_frame_height(),
         }
     }
 }

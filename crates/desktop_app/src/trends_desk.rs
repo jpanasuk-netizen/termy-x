@@ -19,13 +19,14 @@ use gpui_kit::{
 use termy_x::XConfig;
 use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
-    COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DeskSettings, DeskStore, GPU_NOTE,
-    IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk, OutcomeKind, Phase, ReplyPhase, RunOutcome,
-    SessionState, SessionStatus, Surface, TakeProvider, Topic, VISIBLE_NAME, apply_send_result,
-    card_columns, card_from_post, column_count_for_width, column_from_cache, column_from_outcome,
-    column_loading, daily_due, draft_take, drafts_file, edit_reply, filter_posts, fixture_column,
-    isolated_opencli_config, post_reply_opencli, prepare_draft_file, request_send,
-    surface_after_nav, synthetic_fixture_posts, termy_xl_data_root, within_termy_x_config,
+    COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DOCK_WIDTH, DeskFrame, DeskSettings,
+    DeskStore, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk, OutcomeKind, Phase,
+    ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeProvider, Topic,
+    VISIBLE_NAME, apply_send_result, card_columns, card_from_post, column_count_for_width,
+    column_from_cache, column_from_outcome, column_loading, daily_due, draft_take, drafts_file,
+    edit_reply, filter_posts, fixture_column, frame_from_parts, isolated_opencli_config,
+    post_reply_opencli, prepare_draft_file, request_send, surface_after_nav,
+    synthetic_fixture_posts, termy_xl_data_root, within_termy_x_config,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -55,9 +56,9 @@ pub struct TrendsDesk {
     options: DeskOptions,
     data_root: PathBuf,
     config: XConfig,
-    store: DeskStore,
-    writable: bool,
-    settings: DeskSettings,
+    pub(crate) store: DeskStore,
+    pub(crate) writable: bool,
+    pub(crate) settings: DeskSettings,
     columns: Vec<ColumnUi>,
     surface: Surface,
     field: Option<Field>,
@@ -79,6 +80,9 @@ pub struct TrendsDesk {
     cancel: Arc<AtomicBool>,
     busy: bool,
     started: bool,
+    pub(crate) frame: DeskFrame,
+    pub(crate) anim_target: Option<f32>,
+    pub(crate) close_hooked: bool,
 }
 
 impl TrendsDesk {
@@ -97,6 +101,13 @@ impl TrendsDesk {
         } else {
             DeskSettings::default()
         };
+        let frame = frame_from_parts(
+            settings.docked,
+            settings.frame_x as f32,
+            settings.frame_y as f32,
+            settings.expanded_width as f32,
+            settings.frame_height as f32,
+        );
         let history = store.all_reports();
         let columns = store
             .load_topics()
@@ -149,6 +160,9 @@ impl TrendsDesk {
             cancel: Arc::new(AtomicBool::new(false)),
             busy: false,
             started: false,
+            frame,
+            anim_target: None,
+            close_hooked: false,
         }
     }
 
@@ -676,9 +690,14 @@ impl TrendsDesk {
         cx.notify();
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+        if key == "x" && mods.shift && (mods.control || mods.platform) {
+            self.toggle_frame(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if let Some(id) = self.editing_card.clone() {
             let phase = self
                 .card_replies
@@ -707,7 +726,11 @@ impl TrendsDesk {
             return;
         }
         if key == "escape" {
-            self.field = None;
+            if self.field.is_some() {
+                self.field = None;
+            } else if self.frame.expanded {
+                self.toggle_frame(window, cx);
+            }
             cx.notify();
             return;
         }
@@ -791,7 +814,7 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
             })
             .map_err(|error| error.to_string());
     }
-    cx.open_window(desk_window_options(), move |window, cx| {
+    cx.open_window(desk_window_options(&saved_frame()), move |window, cx| {
         window.set_window_title(VISIBLE_NAME);
         cx.new(|cx| TrendsDesk::new(options, cx))
     })
@@ -827,11 +850,25 @@ fn set_standalone_app_id() {
 #[cfg(not(target_os = "windows"))]
 fn set_standalone_app_id() {}
 
-fn desk_window_options() -> WindowOptions {
+fn saved_frame() -> DeskFrame {
+    let root = termy_xl_data_root();
+    let settings = DeskStore::open_isolated(&root)
+        .map(|store| store.load_settings())
+        .unwrap_or_default();
+    frame_from_parts(
+        settings.docked,
+        settings.frame_x as f32,
+        settings.frame_y as f32,
+        settings.expanded_width as f32,
+        settings.frame_height as f32,
+    )
+}
+
+fn desk_window_options(frame: &DeskFrame) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(24.0), px(24.0)),
-            size: size(px(COMPANION_WIDTH), px(COMPANION_HEIGHT)),
+            origin: point(px(frame.x), px(frame.y)),
+            size: size(px(frame.width), px(frame.height)),
         })),
         titlebar: Some(gpui_kit::TitlebarOptions {
             title: Some(VISIBLE_NAME.into()),
@@ -842,7 +879,7 @@ fn desk_window_options() -> WindowOptions {
         window_decorations: Some(gpui_kit::WindowDecorations::Server),
         kind: WindowKind::Normal,
         is_resizable: true,
-        window_min_size: Some(size(px(960.0), px(640.0))),
+        window_min_size: Some(size(px(DOCK_WIDTH), px(320.0))),
         ..Default::default()
     }
 }
@@ -850,36 +887,45 @@ fn desk_window_options() -> WindowOptions {
 impl Render for TrendsDesk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_started(cx);
+        self.ensure_close_hook(window, cx);
         let width: f32 = window.viewport_size().width.into();
-        let per_row = column_count_for_width(width).min(self.columns.len().max(1));
-        let surface = self.surface;
-        div()
+        let mut root = div()
             .id("trends-desk")
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| this.on_key(event, cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                this.on_key(event, window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
             .bg(rgb(0x070b14))
-            .text_color(rgb(0xe5e5ea))
-            .child(self.header(per_row, cx))
-            .child(self.nav_bar(cx))
-            .child(
-                div()
-                    .id("trends-desk-body")
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_y_scroll()
-                    .p(px(16.0))
-                    .child(match surface {
-                        Surface::Columns => self.columns_view(width, per_row, cx),
-                        Surface::History => self.history_view(),
-                        Surface::Replies => self.replies_view(cx),
-                        Surface::Draft => self.draft_view(cx),
-                        Surface::Settings => self.settings_view(cx),
-                    }),
-            )
-            .child(self.footer())
+            .text_color(rgb(0xe5e5ea));
+        if width <= DOCK_WIDTH + 8.0 {
+            root = root.items_center().justify_center().child(self.xl_mark(cx));
+        } else {
+            let per_row = column_count_for_width(width).min(self.columns.len().max(1));
+            let surface = self.surface;
+            root = root
+                .child(self.header(per_row, cx))
+                .child(self.nav_bar(cx))
+                .child(
+                    div()
+                        .id("trends-desk-body")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .p(px(16.0))
+                        .child(match surface {
+                            Surface::Columns => self.columns_view(width, per_row, cx),
+                            Surface::History => self.history_view(),
+                            Surface::Replies => self.replies_view(cx),
+                            Surface::Draft => self.draft_view(cx),
+                            Surface::Settings => self.settings_view(cx),
+                        }),
+                )
+                .child(self.footer());
+        }
+        root
     }
 }
 
@@ -895,6 +941,7 @@ impl TrendsDesk {
             .bg(rgb(0x10141c))
             .border_b_1()
             .border_color(rgb(0x2c2c2e))
+            .child(self.xl_mark(cx))
             .child(
                 div()
                     .flex()
@@ -1028,7 +1075,7 @@ impl TrendsDesk {
             ))
             .child(self.field_chip(
                 "desk-filter",
-                "Filter",
+                "Search",
                 &self.filter_text,
                 Field::Filter,
                 cx,

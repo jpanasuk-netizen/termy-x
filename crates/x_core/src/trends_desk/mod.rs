@@ -11,9 +11,9 @@ mod parse;
 mod store;
 
 pub use cards::{
-    COMPANION_HEIGHT, COMPANION_WIDTH, ReplyPhase, TakeDraft, TakeProvider, TweetCard,
-    apply_send_result, card_columns, card_from_post, commit_send, draft_take, edit_reply,
-    request_send,
+    COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, ReplyPhase, TakeDraft, TakeProvider,
+    TweetCard, apply_send_result, card_columns, card_from_post, collapse_dock, commit_send,
+    draft_take, edit_reply, expand_right, frame_from_parts, request_send, step_width, toggle_dock,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
