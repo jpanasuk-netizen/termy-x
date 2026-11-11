@@ -7112,6 +7112,27 @@ impl XPanel {
                 .child("Trends \u{b7} worldwide \u{b7} click any trend to search it on X")
                 .into_any_element(),
         );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .items_center()
+                .child(x_button!(
+                    "x-open-trends-desk",
+                    "Open Trends Desk",
+                    cx.listener(|_, _, _, cx| {
+                        if let Err(error) = crate::trends_desk::open_in(
+                            cx,
+                            crate::trends_desk::DeskOptions::default(),
+                        ) {
+                            log::error!("Trends Desk did not open: {error}");
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
+                .into_any_element(),
+        );
         rows.push(self.single_line_field(TextField::Trends, cx));
         let total = self.trends.len();
         if total == 0 {

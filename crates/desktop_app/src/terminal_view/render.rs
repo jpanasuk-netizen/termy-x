@@ -4019,6 +4019,7 @@ impl Render for TerminalView {
                     .on_action(cx.listener(Self::handle_open_x_lookup_action))
                     .on_action(cx.listener(Self::handle_open_x_compose_action))
                     .on_action(cx.listener(Self::handle_open_x_research_action))
+                    .on_action(cx.listener(Self::handle_open_trends_desk_action))
                     .on_action(cx.listener(Self::handle_inline_backspace_action))
                     .on_action(cx.listener(Self::handle_inline_delete_action))
                     .on_action(cx.listener(Self::handle_inline_move_left_action))

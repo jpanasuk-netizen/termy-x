@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "_comment": "SYNTHETIC FIXTURE. Shape of OpenCLI 2.0.2 twitter search -f json. Not real posts.",
+  "data": [
+    {
+      "id": "1000000000000000001",
+      "author": "example_user_a",
+      "text": "SYNTHETIC FIXTURE: example discussion of court procedure. Not a real post.",
+      "created_at": "Wed Nov 11 16:00:00 +0000 2026",
+      "likes": 12,
+      "views": "100",
+      "url": "https://x.com/example_user_a/status/1000000000000000001"
+    },
+    {
+      "id": "1000000000000000002",
+      "author": "example_user_b",
+      "text": "SYNTHETIC FIXTURE: example markets comment. Not a real post.",
+      "created_at": "Wed Nov 11 16:05:00 +0000 2026",
+      "likes": 7,
+      "views": "80",
+      "url": "https://x.com/example_user_b/status/1000000000000000002"
+    }
+  ]
+}

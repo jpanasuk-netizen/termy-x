@@ -57,6 +57,8 @@ same command set as the standalone `x` binary.
 - `crates/x_cli`: the `x` executable. Behavior stays in `termy_x`.
 - `crates/desktop_app/src/x_panel`: the side panel. Background art is `assets/x/termy-x-bird.svg`.
 - `crates/desktop_app/src/bin/x_panel_preview.rs`: opens the panel on fixture data for review.
+- `crates/x_core/src/trends_desk`: Law, Finance, and AI desk. OpenCLI reads, local history, and drafts. No GPUI.
+- `crates/desktop_app/src/trends_desk.rs` and `src/bin/trends_desk.rs`: the GPU window. It does not post.
 
 ## Web: `crates/wasm` (`termy_wasm`) and `packages/`
 

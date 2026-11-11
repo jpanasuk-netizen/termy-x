@@ -95,6 +95,11 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Law, Finance, and AI desk. Live OpenCLI only. Never posts.
+    TrendsDesk {
+        #[command(subcommand)]
+        action: TrendsDeskAction,
+    },
     /// Top posts for a topic, ranked by engagement
     Popular {
         topic: String,
@@ -586,6 +591,116 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum TrendsDeskAction {
+    /// Show OpenCLI readiness, focus, and columns. Does not search.
+    Status,
+    /// Run one column or `all`. Saves a report only when OpenCLI returns source links.
+    Run {
+        /// Column id, or `all`.
+        #[arg(long, default_value = "all")]
+        topic: String,
+        /// Focus kept in the search when it is not already in the column text.
+        #[arg(long)]
+        focus: Option<String>,
+    },
+    /// Add a custom column. Does not search.
+    Add { name: String, desc: String },
+}
+
+fn trends_desk_cmd(action: TrendsDeskAction, json: bool, io: &CliIo) -> i32 {
+    let store = crate::trends_desk::DeskStore::new(&io.config.config_dir);
+    match action {
+        TrendsDeskAction::Status => {
+            let settings = store.load_settings();
+            let topics = store.load_topics();
+            let desk = crate::trends_desk::OpenCliDesk::new(&io.config, io.runner.clone());
+            let session = desk.probe(&std::sync::atomic::AtomicBool::new(false));
+            if json {
+                let body = serde_json::json!({
+                    "ok": true,
+                    "session": session.label,
+                    "detail": session.detail,
+                    "focus": settings.focus,
+                    "topics": topics.iter().map(|topic| {
+                        serde_json::json!({"id": topic.id, "name": topic.name, "desc": topic.desc})
+                    }).collect::<Vec<_>>(),
+                    "gpu": crate::trends_desk::GPU_NOTE,
+                    "posts": false,
+                });
+                println!("{body}");
+            } else {
+                println!("{}", session.label);
+                println!("{}", session.detail);
+                println!("focus: {}", settings.focus);
+                for topic in &topics {
+                    println!("column {} — {}", topic.id, topic.name);
+                }
+                println!("{}", crate::trends_desk::GPU_NOTE);
+                println!("Nothing is posted from this command.");
+            }
+            0
+        }
+        TrendsDeskAction::Add { name, desc } => {
+            let Some(id) = crate::trends_desk::slug_id(&name) else {
+                eprintln!("column name needs a letter or number");
+                return 2;
+            };
+            let mut topics = store.load_topics();
+            if topics.iter().any(|topic| topic.id == id) {
+                eprintln!("column `{id}` already exists");
+                return 2;
+            }
+            topics.push(crate::trends_desk::Topic {
+                id: id.clone(),
+                name,
+                desc,
+            });
+            if let Err(error) = store.save_topics(&topics) {
+                eprintln!("{error}");
+                return 1;
+            }
+            println!("added column {id}");
+            0
+        }
+        TrendsDeskAction::Run { topic, focus } => {
+            match crate::trends_desk::run_saved_topic(
+                &io.config,
+                io.runner.clone(),
+                &topic,
+                focus.as_deref(),
+            ) {
+                Ok(outcomes) => {
+                    let failed = outcomes
+                        .iter()
+                        .any(|item| item.kind != crate::trends_desk::OutcomeKind::Fresh);
+                    if json {
+                        let body = serde_json::json!({
+                            "ok": !failed,
+                            "runs": outcomes.iter().map(|item| serde_json::json!({
+                                "topic": item.topic_id,
+                                "kind": item.kind.as_str(),
+                                "wrote_report": item.kind.writes_report(),
+                                "query": item.query,
+                                "message": item.message,
+                                "urls": item.posts.iter().map(|post| post.url.clone()).collect::<Vec<_>>(),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{body}");
+                    } else {
+                        print!("{}", crate::trends_desk::format_outcomes(&outcomes));
+                    }
+                    if failed { 1 } else { 0 }
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
+    }
+}
+
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
@@ -645,6 +760,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                     .map(|served| (served.status.render(), json_value(served))),
             )
         }
+        Cmd::TrendsDesk { action } => trends_desk_cmd(action, json, io),
         Cmd::Trends { place, limit } => emit(
             json,
             service

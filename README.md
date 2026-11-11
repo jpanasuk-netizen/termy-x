@@ -284,6 +284,19 @@ cargo run -p termy --bin x_panel_preview -- --mock --width 1600 --height 1000
 cargo run -p termy --bin x_panel_preview -- --splash
 ```
 
+### Trends Desk
+
+Trends Desk is a separate GPU window for Law, Finance, AI, and custom columns. Open it from the command palette (`X: Trends Desk`), the View menu, or the Trends tab's **Open Trends Desk** button. It can also start on its own:
+
+```bash
+cargo run -p termy --bin trends_desk
+cargo run -p termy --bin trends_desk -- --fixture
+termy-xcli trends-desk status
+termy-xcli trends-desk run --topic law --focus AI
+```
+
+Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts are saved for the existing compose confirm; Run does not post. The window is drawn on the GPU. That does not make the search faster. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
+
 ## Sync across PCs
 
 In the X panel Help tab, **Account sync (optional)** takes an email and password. Sign in or Create account copies likes, follows, reposts, and receipts to your other signed-in PCs. The password is not saved. Sync stays off until you sign in, and this PC keeps working from its local database either way. Details are in [crates/x_core/README.md](crates/x_core/README.md#sync-across-pcs).

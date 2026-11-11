@@ -85,6 +85,7 @@ macro_rules! termy_command_catalog {
             (OpenXLookup, "open_x_lookup"),
             (OpenXCompose, "open_x_compose"),
             (OpenXResearch, "open_x_research"),
+            (OpenTrendsDesk, "open_trends_desk"),
         }
     };
 }

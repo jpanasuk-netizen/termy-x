@@ -41,6 +41,7 @@ pub mod supabase_sync;
 pub mod text;
 pub mod thread;
 pub mod time;
+pub mod trends_desk;
 
 pub use bulk::{
     BulkKind, BulkPlan, BulkTarget, DEFAULT_BULK_CAP, MAX_BULK_CAP, MIN_BULK_CAP, clamp_bulk_cap,

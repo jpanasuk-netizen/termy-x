@@ -762,6 +762,11 @@ fn main() {
         let _ = crate::native_sdk::unregister_open_tab_here();
         std::process::exit(0);
     }
+    if cli_args.iter().any(|arg| arg == "--trends-desk") {
+        let fixture = cli_args.iter().any(|arg| arg == "--fixture");
+        termy::trends_desk::run_standalone(fixture);
+        return;
+    }
     if cli_args
         .first()
         .is_some_and(|arg| arg == "--multiplexer-host")
