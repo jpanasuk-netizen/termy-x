@@ -579,7 +579,7 @@ fn title_from(post: &SourcePost) -> String {
     }
 }
 
-fn idea_from(post: &SourcePost) -> String {
+pub fn idea_from(post: &SourcePost) -> String {
     let text = take_chars(&collapse_ws(&post.text), 160);
     let lower = text.to_lowercase();
     if ["launch", "introduc", "ship", "releas", "announc"]

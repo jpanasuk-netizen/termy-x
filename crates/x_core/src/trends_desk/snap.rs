@@ -4,7 +4,7 @@
 //! right from that edge. If Termy X is not found, XL uses the right half of
 //! the monitor.
 
-use super::{COMPANION_WIDTH, DOCK_WIDTH};
+use super::{DOCK_WIDTH, LOCKED_OPEN_WIDTH};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WindowRect {
@@ -43,39 +43,28 @@ pub fn snap_beside(
     host: Option<WindowRect>,
     monitor: WindowRect,
     expanded: bool,
-    preferred_width: f32,
+    _saved_width: f32,
 ) -> Snap {
-    let preferred = if preferred_width <= DOCK_WIDTH {
-        COMPANION_WIDTH
+    let x = if let Some(host) = host {
+        host.x + host.width
     } else {
-        preferred_width
+        monitor.x + monitor.width / 2.0
     };
-    let (x, y, height, source) = if let Some(host) = host {
-        (
-            host.x + host.width,
-            host.y,
-            host.height.max(240.0),
-            SnapSource::HostEdge,
-        )
+    let source = if host.is_some() {
+        SnapSource::HostEdge
     } else {
-        (
-            monitor.x + monitor.width / 2.0,
-            monitor.y,
-            monitor.height.max(240.0),
-            SnapSource::MonitorHalf,
-        )
+        SnapSource::MonitorHalf
     };
-    let room = (monitor.x + monitor.width - x).max(DOCK_WIDTH);
     let width = if expanded {
-        preferred.min(room)
+        LOCKED_OPEN_WIDTH
     } else {
-        DOCK_WIDTH.min(room)
+        DOCK_WIDTH
     };
     Snap {
         x,
-        y,
+        y: monitor.y,
         width,
-        height,
+        height: monitor.height.max(240.0),
         source,
     }
 }
@@ -133,6 +122,8 @@ pub fn termy_areas() -> &'static [XlArea] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::*;
+    use crate::trends_desk::LOCKED_OPEN_WIDTH;
 
     fn monitor() -> WindowRect {
         WindowRect {
@@ -157,20 +148,16 @@ mod tests {
         let dock = snap_beside(Some(host()), monitor(), false, 2560.0);
         assert_eq!(dock.source, SnapSource::HostEdge);
         assert_eq!(dock.x, 1320.0);
-        assert_eq!(dock.y, 20.0);
+        assert_eq!(dock.y, monitor().y);
         assert_eq!(dock.width, DOCK_WIDTH);
-        assert_eq!(dock.height, 820.0);
+        assert_eq!(dock.height, monitor().height);
         let open = snap_beside(Some(host()), monitor(), true, 2560.0);
         assert_eq!(open.x, dock.x);
-        assert_eq!(open.y, dock.y);
-        assert_eq!(open.width, 3440.0 - 1320.0);
-        let wide = WindowRect {
-            width: 5000.0,
-            ..monitor()
-        };
-        let full = snap_beside(Some(host()), wide, true, 2560.0);
-        assert_eq!(full.x, 1320.0);
-        assert_eq!(full.width, 2560.0);
+        assert_eq!(open.y, monitor().y);
+        assert_eq!(open.width, LOCKED_OPEN_WIDTH);
+        assert_eq!(open.height, monitor().height);
+        let stale = snap_beside(Some(host()), monitor(), true, 1800.0);
+        assert_eq!(stale.width, LOCKED_OPEN_WIDTH);
     }
 
     #[test]
@@ -181,7 +168,7 @@ mod tests {
         assert_eq!(dock.width, DOCK_WIDTH);
         let open = snap_beside(None, monitor(), true, 2560.0);
         assert_eq!(open.x, 1720.0);
-        assert!(open.width <= 3440.0 - 1720.0);
+        assert_eq!(open.width, LOCKED_OPEN_WIDTH);
     }
 
     #[test]
@@ -192,7 +179,8 @@ mod tests {
         host.height = 900.0;
         let after = snap_beside(Some(host), monitor(), false, 2560.0);
         assert_eq!(after.x, before.x + 80.0);
-        assert_eq!(after.height, 900.0);
+        assert_eq!(after.height, monitor().height);
+        assert_eq!(after.y, monitor().y);
     }
 
     #[test]

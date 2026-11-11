@@ -43,6 +43,26 @@ fn rect_from_bounds(bounds: gpui_kit::Bounds<gpui_kit::Pixels>) -> WindowRect {
     }
 }
 
+pub(crate) fn focus_existing() {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SW_RESTORE, SetForegroundWindow, ShowWindow,
+        };
+        use windows::core::PCWSTR;
+        let title: Vec<u16> = "Termy XL"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) } {
+            unsafe {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                let _ = SetForegroundWindow(hwnd);
+            }
+        }
+    }
+}
+
 pub(crate) fn find_termy_x() -> Option<WindowRect> {
     #[cfg(target_os = "windows")]
     {

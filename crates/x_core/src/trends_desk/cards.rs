@@ -14,6 +14,12 @@ pub const COMPANION_WIDTH: f32 = 2560.0;
 pub const COMPANION_HEIGHT: f32 = 820.0;
 /// Slim dock that sits beside Termy X until XL is opened.
 pub const DOCK_WIDTH: f32 = 72.0;
+/// Logical width Jeremy measured on the 125% display (843 physical px).
+/// Launch and re-expand always use this. A saved width does not replace it.
+pub const LOCKED_OPEN_WIDTH: f32 = 687.0;
+/// Nominal take-card width. Wider windows add columns instead of stretching one card.
+pub const TAKE_CARD_WIDTH: f32 = 480.0;
+pub const TAKE_CARD_MAX: f32 = 520.0;
 /// Inset between the window edge and a take card's outer border.
 pub const WINDOW_PAD: f32 = 16.0;
 
@@ -213,13 +219,47 @@ impl TakeFrame {
 /// One frame per take. Every card shares the same inset so its right edge
 /// stays inside the window at any width.
 pub fn layout_takes(viewport: f32, ids: &[impl AsRef<str>]) -> Vec<TakeFrame> {
-    let width = (viewport - WINDOW_PAD * 2.0).max(0.0);
+    let gap = 12.0;
+    let inner = (viewport - WINDOW_PAD * 2.0).max(0.0);
+    let mut columns = ((inner / TAKE_CARD_WIDTH).floor() as usize).max(1);
+    while columns > 1 && columns as f32 * 420.0 + (columns - 1) as f32 * gap > inner {
+        columns -= 1;
+    }
+    let width = if columns == 1 {
+        inner.min(TAKE_CARD_MAX)
+    } else {
+        ((inner - gap * (columns as f32 - 1.0)) / columns as f32).min(TAKE_CARD_MAX)
+    };
     ids.iter()
-        .map(|id| TakeFrame {
-            id: id.as_ref().to_string(),
-            x: WINDOW_PAD,
-            width,
+        .enumerate()
+        .map(|(index, id)| {
+            let column = index % columns;
+            TakeFrame {
+                id: id.as_ref().to_string(),
+                x: WINDOW_PAD + column as f32 * (width + gap),
+                width,
+            }
         })
+        .collect()
+}
+
+pub fn take_column_count(viewport: f32) -> usize {
+    let frames = layout_takes(viewport, &["a"]);
+    let _ = frames;
+    let gap = 12.0;
+    let inner = (viewport - WINDOW_PAD * 2.0).max(0.0);
+    let mut columns = ((inner / TAKE_CARD_WIDTH).floor() as usize).max(1);
+    while columns > 1 && columns as f32 * 420.0 + (columns - 1) as f32 * gap > inner {
+        columns -= 1;
+    }
+    columns
+}
+
+/// One free-template take per saved post. Empty input stays empty. Not a fixture.
+pub fn takes_for_posts(posts: &[super::domain::SourcePost]) -> Vec<(String, String)> {
+    posts
+        .iter()
+        .map(|post| (post.id.clone(), super::domain::idea_from(post)))
         .collect()
 }
 
@@ -512,9 +552,9 @@ pub struct TakeDraft {
 
 pub fn free_take(post: &SourcePost) -> TakeDraft {
     TakeDraft {
-        text: draft_text_from_title(&post.text),
+        text: super::domain::idea_from(post),
         source: "free-template",
-        note: "Free template. Not a paid model.".into(),
+        note: "Free take from the post. Not a paid model.".into(),
     }
 }
 
@@ -526,11 +566,72 @@ pub fn treg_take(post: &SourcePost, http: &dyn Http) -> Result<TakeDraft, String
     let Some(token) = reply_guy::load_secret(&config, Secret::Treg) else {
         return Err("No Treg key is saved in Termy X.".into());
     };
-    reply_guy::test_treg(http, &token).map_err(|error| redact_token(&error, &token))?;
-    let mut draft = free_take(post);
-    draft.note =
-        "Treg key accepted. This draft is the free template, not a paid generation.".into();
-    Ok(draft)
+    treg_take_with_token(&token, http, post)
+}
+
+pub fn treg_take_with_token(
+    token: &str,
+    http: &dyn Http,
+    post: &SourcePost,
+) -> Result<TakeDraft, String> {
+    let prompt = format!(
+        "Write one short X reply under 240 characters. No hashtags. Post by @{}: {}",
+        post.author, post.text
+    );
+    let body = serde_json::json!({
+        "messages": [{"role": "user", "content": prompt}]
+    })
+    .to_string();
+    let response = http
+        .request(reply_guy::treg_request(
+            "POST",
+            "https://treg.to/call/openai.chat.completions",
+            token,
+            Some(body),
+        ))
+        .map_err(|error| redact_token(&error, token))?;
+    let text = parse_treg_draft(&response).map_err(|error| redact_token(&error, token))?;
+    Ok(TakeDraft {
+        text,
+        source: "treg",
+        note: "Treg draft. Not posted.".into(),
+    })
+}
+
+pub fn parse_treg_draft(body: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|error| format!("treg: bad response ({error})"))?;
+    if let Some(text) = value
+        .pointer("/error/message")
+        .and_then(|item| item.as_str())
+        .or_else(|| value.get("detail").and_then(|item| item.as_str()))
+        .or_else(|| value.get("error").and_then(|item| item.as_str()))
+        .or_else(|| value.get("message").and_then(|item| item.as_str()))
+    {
+        if value.pointer("/choices/0/message/content").is_none()
+            && value.pointer("/output/data/text").is_none()
+            && value.pointer("/output/text").is_none()
+        {
+            return Err(format!("treg: {text}"));
+        }
+    }
+    let text = value
+        .pointer("/choices/0/message/content")
+        .and_then(|item| item.as_str())
+        .or_else(|| {
+            value
+                .pointer("/output/data/text")
+                .and_then(|item| item.as_str())
+        })
+        .or_else(|| value.pointer("/output/text").and_then(|item| item.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        Err("treg returned an empty draft".into())
+    } else {
+        Ok(text)
+    }
 }
 
 pub fn draft_take(
@@ -677,9 +778,14 @@ mod tests {
             let frames = layout_takes(viewport, &["law-1", "law-2", "law-3"]);
             assert_eq!(frames.len(), 3);
             let mut ids = Vec::new();
+            let columns = take_column_count(viewport);
+            assert!(columns >= 1);
+            if viewport >= 1600.0 {
+                assert!(columns > 1, "wider windows add columns");
+            }
             for frame in &frames {
                 ids.push(frame.id.clone());
-                assert!((frame.x - WINDOW_PAD).abs() < 0.01);
+                assert!(frame.width <= TAKE_CARD_MAX + 0.01);
                 assert!(frame.right() <= viewport - WINDOW_PAD + 0.01);
                 assert!(frame.width > 0.0);
             }
@@ -690,6 +796,24 @@ mod tests {
         }
         let broken = wrap_token("https://x.com/a-very-long-handle/status/123456789012345678901234");
         assert!(broken.contains('\u{200b}'));
+    }
+
+    #[test]
+    fn a_saved_report_makes_one_take_card_per_post() {
+        let mut second = post();
+        second.id = "56".into();
+        let posts = vec![post(), second];
+        let takes = takes_for_posts(&posts);
+        assert_eq!(takes.len(), posts.len());
+        assert!(takes.iter().all(|(_, text)| !text.is_empty()));
+        assert!(takes_for_posts(&[]).is_empty());
+        let frames = layout_takes(
+            687.0,
+            &takes.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        );
+        assert_eq!(frames.len(), 2);
+        assert_eq!(take_column_count(687.0), 1);
+        assert!(take_column_count(2560.0) > take_column_count(687.0));
     }
 
     #[test]
@@ -834,14 +958,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(free.source, "free-template");
-        assert!(free.text.starts_with("Worth watching:"));
+        assert!(!free.text.is_empty());
+        assert_ne!(free.source, "treg");
         let http = ScriptHttp {
             body: Err("treg: no".into()),
             calls: std::sync::Mutex::new(Vec::new()),
         };
         let err = draft_take(TakeProvider::Treg, &post, &http).unwrap_err();
         assert!(err.contains("Treg") || err.contains("treg") || err.contains("key"));
-        assert!(!err.contains("Worth watching"));
+        assert!(!err.contains("Hot take"));
+        let http = ScriptHttp {
+            body: Ok(r#"{"choices":[{"message":{"content":"A real Treg take"}}]}"#.into()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let drafted = treg_take_with_token("secret-token", &http, &post).unwrap();
+        assert_eq!(drafted.text, "A real Treg take");
+        assert_eq!(drafted.source, "treg");
+        let failed = treg_take_with_token(
+            "secret-token",
+            &ScriptHttp {
+                body: Ok(r#"{"detail":"no tool"}"#.into()),
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+            &post,
+        )
+        .unwrap_err();
+        assert!(failed.contains("treg"));
+        assert!(!failed.contains("secret-token"));
+        assert!(!failed.contains("Hot take"));
         assert!(
             http.calls.lock().unwrap().is_empty() || err.contains("key") || err.contains("Treg")
         );

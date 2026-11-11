@@ -114,10 +114,10 @@ impl TrendsDesk {
             termy_x::trends_desk::PackFile::default()
         };
         let frame = frame_from_parts(
-            settings.docked,
+            false,
             settings.frame_x as f32,
             settings.frame_y as f32,
-            settings.expanded_width as f32,
+            termy_x::trends_desk::LOCKED_OPEN_WIDTH,
             settings.frame_height as f32,
         );
         let history = store.all_reports();
@@ -199,8 +199,36 @@ impl TrendsDesk {
             return;
         }
         self.started = true;
+        self.seed_takes();
+        self.fetch_empty_subjects(cx);
         self.spawn_probe(cx);
         self.spawn_daily(cx);
+    }
+
+    fn seed_takes(&mut self) {
+        for column in &self.columns {
+            for (id, text) in termy_x::trends_desk::takes_for_posts(&column.view.posts) {
+                self.card_replies
+                    .entry(id)
+                    .or_insert(ReplyPhase::Editing { text });
+            }
+        }
+    }
+
+    fn fetch_empty_subjects(&mut self, cx: &mut Context<Self>) {
+        if self.options.fixture {
+            return;
+        }
+        let ids: Vec<String> = self
+            .columns
+            .iter()
+            .filter(|column| column.view.posts.is_empty() && column.view.phase != Phase::Loading)
+            .map(|column| column.topic.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.start_run(&ids, cx);
     }
 
     fn spawn_probe(&mut self, cx: &mut Context<Self>) {
@@ -357,6 +385,7 @@ impl TrendsDesk {
                 }
             }
         }
+        self.seed_takes();
     }
 
     fn cancel_run(&mut self, cx: &mut Context<Self>) {
@@ -847,6 +876,12 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
 
 pub fn run_standalone(fixture: bool) {
     set_standalone_app_id();
+    let root = termy_xl_data_root();
+    let Some(_instance) = crate::xl_instance::claim(&root) else {
+        crate::xl_host::focus_existing();
+        eprintln!("{VISIBLE_NAME} is already open.");
+        return;
+    };
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         if let Err(error) = open_in(cx, DeskOptions { fixture }) {
@@ -874,21 +909,20 @@ fn set_standalone_app_id() {
 fn set_standalone_app_id() {}
 
 fn snapped_frame(cx: &App) -> DeskFrame {
-    let saved = saved_frame();
     let monitor = crate::xl_host::monitor_rect_app(cx);
     let snap = termy_x::trends_desk::snap_beside(
         crate::xl_host::find_termy_x(),
         monitor,
-        saved.expanded,
-        saved.expanded_width,
+        true,
+        termy_x::trends_desk::LOCKED_OPEN_WIDTH,
     );
     DeskFrame {
         x: snap.x,
         y: snap.y,
         width: snap.width,
         height: snap.height,
-        expanded: saved.expanded,
-        expanded_width: saved.expanded_width,
+        expanded: true,
+        expanded_width: termy_x::trends_desk::LOCKED_OPEN_WIDTH,
     }
 }
 
@@ -953,21 +987,23 @@ impl Render for TrendsDesk {
             root = root
                 .child(self.header(per_row, cx))
                 .child(self.nav_bar(cx))
-                .child(
-                    div()
+                .child({
+                    let mut body = div()
                         .id("trends-desk-body")
                         .flex_1()
                         .min_h(px(0.0))
-                        .overflow_y_scroll()
-                        .p(px(16.0))
-                        .child(match surface {
-                            Surface::Columns => self.columns_view(width, per_row, cx),
-                            Surface::History => self.history_view(),
-                            Surface::Replies => self.replies_view(cx),
-                            Surface::Draft => self.draft_view(cx),
-                            Surface::Settings => self.settings_view(cx),
-                        }),
-                )
+                        .p(px(16.0));
+                    if surface != Surface::Columns {
+                        body = body.overflow_y_scroll();
+                    }
+                    body.child(match surface {
+                        Surface::Columns => self.columns_view(width, per_row, cx),
+                        Surface::History => self.history_view(),
+                        Surface::Replies => self.replies_view(cx),
+                        Surface::Draft => self.draft_view(cx),
+                        Surface::Settings => self.settings_view(cx),
+                    })
+                })
                 .child(self.footer());
         }
         if self.popout.as_ref().is_some_and(|pop| pop.open) {

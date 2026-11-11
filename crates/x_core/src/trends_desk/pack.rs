@@ -349,14 +349,58 @@ pub fn refresh_is_search_only(args: &[String]) -> bool {
         && !args.iter().any(|arg| arg == "reply" || arg == "post")
 }
 
+pub fn local_offset_secs(now: i64) -> i32 {
+    #[cfg(unix)]
+    {
+        #[repr(C)]
+        struct Tm {
+            tm_sec: i32,
+            tm_min: i32,
+            tm_hour: i32,
+            tm_mday: i32,
+            tm_mon: i32,
+            tm_year: i32,
+            tm_wday: i32,
+            tm_yday: i32,
+            tm_isdst: i32,
+            tm_gmtoff: i64,
+            tm_zone: *const i8,
+        }
+        unsafe extern "C" {
+            fn localtime_r(time: *const i64, result: *mut Tm) -> *mut Tm;
+        }
+        let mut tm = std::mem::MaybeUninit::<Tm>::zeroed();
+        let ptr = unsafe { localtime_r(&now, tm.as_mut_ptr()) };
+        if ptr.is_null() {
+            0
+        } else {
+            unsafe { tm.assume_init().tm_gmtoff as i32 }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = now;
+        0
+    }
+}
+
+pub fn format_clock(unix: i64, offset_secs: i32) -> String {
+    let local = unix + offset_secs as i64;
+    let rem = local.rem_euclid(86_400);
+    let hour = rem / 3600;
+    let minute = (rem % 3600) / 60;
+    format!("{hour:02}:{minute:02}")
+}
+
 pub fn hud_line(
     sent_today: usize,
     drafts: usize,
     provider: &str,
     last_refresh: Option<i64>,
+    offset_secs: i32,
 ) -> String {
     let refresh = last_refresh
-        .map(|at| at.to_string())
+        .map(|at| format_clock(at, offset_secs))
         .unwrap_or_else(|| "never".into());
     format!("{sent_today} sent today · {drafts} drafts · {provider} · refresh {refresh}")
 }
@@ -580,7 +624,10 @@ mod tests {
         assert!(!refresh_due(Some(100), 200, true, 10));
         assert!(!refresh_due(Some(0), 10_000, false, 10));
         assert_eq!(new_ids(&["a".into()], &["a".into(), "b".into()]).len(), 1);
-        let line = hud_line(2, 1, "free", None);
+        let line = hud_line(2, 1, "free", None, 0);
+        let stamped = hud_line(0, 0, "free", Some(1_794_432_658), 0);
+        assert!(!stamped.contains("1794432658"));
+        assert!(stamped.contains(':'));
         assert!(line.contains("2 sent"));
         assert!(line.contains("free"));
     }

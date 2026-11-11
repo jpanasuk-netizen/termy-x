@@ -119,6 +119,17 @@ impl TrendsDesk {
                     }
                 }
             }))
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .whitespace_normal()
+                    .text_color(rgb(0xffe56a))
+                    .child(if reply_text.trim().is_empty() {
+                        termy_x::trends_desk::idea_from(post)
+                    } else {
+                        reply_text.clone()
+                    }),
+            )
             .child(div().text_size(px(14.0)).whitespace_normal().child(format!(
                 "{}{} · @{}",
                 tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
@@ -167,11 +178,12 @@ impl TrendsDesk {
                     .text_color(rgb(0x30d158))
                     .child(self.badge_for(&card.id).unwrap_or_default()),
             )
-            .child(div().text_size(px(12.0)).child(if reply_text.is_empty() {
-                "Reply composer is empty.".to_string()
-            } else {
-                reply_text
-            }))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .whitespace_normal()
+                    .child(reply_text),
+            )
             .child(
                 div()
                     .flex()

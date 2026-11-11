@@ -11,9 +11,9 @@ use gpui_kit::{
 
 use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
 use termy_x::trends_desk::{
-    DeskKey, PackFile, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters, desk_key,
-    heat_line, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label, refresh_due,
-    replied_badge, save_pack,
+    DeskKey, PackFile, Phase, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters,
+    desk_key, heat_line, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label,
+    refresh_due, replied_badge, save_pack,
 };
 
 impl TrendsDesk {
@@ -66,6 +66,7 @@ impl TrendsDesk {
             drafts,
             &self.settings.take_provider,
             self.pack.last_refresh,
+            termy_x::trends_desk::local_offset_secs(Self::now_unix()),
         )
     }
 
@@ -458,7 +459,7 @@ impl TrendsDesk {
         );
         let ids: Vec<String> = visible.iter().map(|post| post.id.clone()).collect();
         let frames = layout_takes(width, &ids);
-        let mut page = div()
+        let page = div()
             .size_full()
             .flex()
             .flex_col()
@@ -535,24 +536,50 @@ impl TrendsDesk {
                             .text_size(px(12.0))
                             .text_color(rgb(0x8e8e93))
                             .child(column.topic.desc.clone()),
-                    ),
+                    )
+                    .child({
+                        let topic_id = column.topic.id.clone();
+                        let mut list = div()
+                            .id("desk-take-list")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(12.0));
+                        if column.view.phase == Phase::Loading && visible.is_empty() {
+                            list = list
+                                .child("Loading takes…")
+                                .child(refresh_button(topic_id.clone(), cx));
+                        } else if column.view.phase == Phase::Error && visible.is_empty() {
+                            list = list
+                                .child(
+                                    div()
+                                        .p(px(12.0))
+                                        .rounded(px(10.0))
+                                        .border_1()
+                                        .border_color(rgb(0xff5d8f))
+                                        .bg(rgb(0x3a1d1d))
+                                        .child(column.view.banner.clone()),
+                                )
+                                .child(refresh_button(topic_id.clone(), cx));
+                        } else if visible.is_empty() {
+                            list = list
+                                .child("Not run yet.")
+                                .child(refresh_button(topic_id.clone(), cx));
+                        }
+                        for (post, frame) in visible.iter().zip(frames.iter()) {
+                            list = list.child(
+                                div()
+                                    .w(px(frame.width))
+                                    .min_w(px(0.0))
+                                    .child(self.tweet_card(post, column, cx)),
+                            );
+                        }
+                        list
+                    }),
             );
-        let mut list = div()
-            .id("desk-take-list")
-            .flex_1()
-            .min_h(px(0.0))
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap(px(10.0));
-        for (post, frame) in visible.iter().zip(frames.iter()) {
-            let _ = frame.right();
-            list = list.child(self.tweet_card(post, column, cx));
-        }
-        if visible.is_empty() {
-            list = list.child("No takes in this subject.");
-        }
-        page = page.child(list);
         let mut rows: Vec<gpui_kit::AnyElement> = vec![page.into_any_element()];
         if self.session.state == SessionState::Missing {
             rows.insert(
@@ -567,6 +594,23 @@ impl TrendsDesk {
                     .into_any_element(),
             );
         }
-        div().flex().flex_col().children(rows).into_any_element()
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(rows)
+            .into_any_element()
     }
+}
+
+fn refresh_button(topic_id: String, cx: &mut Context<TrendsDesk>) -> gpui_kit::AnyElement {
+    button(
+        format!("desk-refresh-{topic_id}"),
+        "Refresh",
+        false,
+        cx.listener(move |this, _, _, cx| {
+            this.start_run(std::slice::from_ref(&topic_id), cx);
+            cx.stop_propagation();
+        }),
+    )
 }
