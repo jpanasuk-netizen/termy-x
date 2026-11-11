@@ -79,6 +79,7 @@ pub struct TrendsDesk {
     pub(crate) palette: bool,
     pub(crate) palette_query: String,
     pub(crate) board: String,
+    pub(crate) x_panel: Option<gpui_kit::Entity<crate::x_panel::XPanel>>,
     pub(crate) last_host: Option<termy_x::trends_desk::WindowRect>,
     pub(crate) last_follow: Option<Instant>,
     pub(crate) session: SessionStatus,
@@ -171,6 +172,7 @@ impl TrendsDesk {
             palette: false,
             palette_query: String::new(),
             board: "subject".into(),
+            x_panel: None,
             last_host: None,
             last_follow: None,
             session: SessionStatus {

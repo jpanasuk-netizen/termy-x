@@ -162,13 +162,14 @@ impl XPanel {
         self.list_scroll.set_offset(point(px(0.0), px(0.0)));
         self.status = format!("thread \u{b7} @{author} \u{b7} loading replies\u{2026}");
         let live = self.live;
+        let config_dir = self.config_dir.clone();
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().thread(&display_id)
+                        XPanel::service_free(&config_dir).thread(&display_id)
                     } else {
                         MockProvider.thread(&display_id)
                     }
@@ -408,6 +409,7 @@ impl XPanel {
         });
         cx.notify();
         let live = self.live;
+        let config_dir = self.config_dir.clone();
         let mock = self.mock_writes.clone();
         let cap = plan.cap;
         let capped = plan.capped;
@@ -446,7 +448,10 @@ impl XPanel {
                 let write_target = target.clone();
                 let result = cx
                     .background_executor()
-                    .spawn(async move { bulk_write(live, &mock, kind, &write_target) })
+                    .spawn({
+                        let config_dir = config_dir.clone();
+                        async move { bulk_write(live, &mock, kind, &write_target, &config_dir) }
+                    })
                     .await;
                 match result {
                     Ok(_) => {
@@ -820,9 +825,10 @@ fn bulk_write(
     mock: &termy_x::bulk::MockWriteLog,
     kind: BulkKind,
     target: &BulkTarget,
+    config_dir: &std::path::Path,
 ) -> Result<String, String> {
     if live {
-        let service = XPanel::service_free();
+        let service = XPanel::service_free(config_dir);
         let publishers = service.publishers;
         let Some(publisher) = termy_x::publish::first_available(publishers.as_slice()) else {
             return Err("No in-app posting path found. Connect X first, then try again.".into());

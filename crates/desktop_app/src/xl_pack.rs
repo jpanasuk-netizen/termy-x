@@ -5,8 +5,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui_kit::{
-    ClipboardItem, Context, InteractiveElement, IntoElement, Keystroke, MouseButton, ParentElement,
-    StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    AppContext, ClipboardItem, Context, InteractiveElement, IntoElement, Keystroke, MouseButton,
+    ParentElement, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
 use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
@@ -307,10 +307,27 @@ impl TrendsDesk {
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
-                .child("Termy areas. Posts, replies, reposts, quotes, and follows still need an explicit click. Image quotes stay unsupported. The live Termy X panel is not mounted here, because that panel writes the Termy X config directory.");
-            for area in termy_x::trends_desk::termy_areas() {
-                let gate = termy_x::trends_desk::area_gate(*area, false);
-                list = list.child(format!("{area:?} · {gate:?}"));
+                .child("Termy areas use the existing panel, writing only in the Termy XL data folder. Sends still need a click. Image quotes stay unsupported.");
+            let areas = [
+                (crate::x_panel::XSection::Timeline, "Timeline"),
+                (crate::x_panel::XSection::Search, "Search"),
+                (crate::x_panel::XSection::Trends, "Trends"),
+                (crate::x_panel::XSection::Compose, "Compose"),
+                (crate::x_panel::XSection::ReplyGuy, "Reply"),
+                (crate::x_panel::XSection::Followers, "Follow"),
+                (crate::x_panel::XSection::Queue, "Receipts"),
+            ];
+            for (section, label) in areas {
+                list = list.child(button(
+                    format!("desk-x-{label}"),
+                    label,
+                    false,
+                    cx.listener(move |this, _, _, cx| {
+                        this.open_x_section(section, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ));
             }
             list = list.child(button(
                 "desk-board-back-3",
@@ -374,12 +391,46 @@ impl TrendsDesk {
             self.start_run(std::slice::from_ref(&id), cx);
         }
     }
+    pub(crate) fn open_x_section(
+        &mut self,
+        section: crate::x_panel::XSection,
+        cx: &mut Context<Self>,
+    ) {
+        let root = self.data_root.clone();
+        if self.x_panel.is_none() {
+            self.x_panel = Some(cx.new(|cx| crate::x_panel::XPanel::new_in(cx, false, root)));
+        }
+        if let Some(panel) = &self.x_panel {
+            panel.update(cx, |panel, cx| panel.open_section(section, cx));
+        }
+        self.board = "xpanel".into();
+    }
+
     pub(crate) fn columns_view(
         &self,
         width: f32,
         _per_row: usize,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
+        if self.board == "xpanel" {
+            if let Some(panel) = &self.x_panel {
+                return div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(button(
+                        "desk-x-back",
+                        "Back to XL",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.board = "subject".into();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().flex_1().min_h(px(0.0)).child(panel.clone()))
+                    .into_any_element();
+            }
+        }
         let index = self
             .columns
             .iter()

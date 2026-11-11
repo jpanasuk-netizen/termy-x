@@ -375,6 +375,20 @@ impl XConfig {
         fs::write(path, text).map_err(|error| error.to_string())
     }
 
+    /// Files this config is allowed to create or rewrite.
+    pub fn writable_paths(&self) -> Vec<PathBuf> {
+        vec![
+            self.config_dir.join("x.toml"),
+            self.drafts_path(),
+            self.inbox_path(),
+            self.feeds_path(),
+            self.followers_path(),
+            self.queue_path(),
+            self.token_path(),
+            self.action_state_path(),
+        ]
+    }
+
     pub fn drafts_path(&self) -> PathBuf {
         self.config_dir.join("x-drafts.json")
     }
@@ -654,5 +668,25 @@ mod tests {
         config.save_list_sort().expect("rewrite list_sort");
         let loaded = XConfig::load(dir.path());
         assert_eq!(loaded.list_sort, ResultSort::Popular);
+    }
+
+    #[test]
+    fn writes_stay_inside_the_given_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = XConfig::load(dir.path());
+        let termy = default_config_dir();
+        assert_ne!(dir.path(), termy.as_path());
+        for path in config.writable_paths() {
+            assert!(
+                path.starts_with(dir.path()),
+                "{} is outside the XL root",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(&termy),
+                "{} would write the Termy X config",
+                path.display()
+            );
+        }
     }
 }
