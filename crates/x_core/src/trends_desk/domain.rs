@@ -10,7 +10,11 @@ use crate::model::{post_url, strip_handle};
 use crate::time::{parse_created_at, ymd};
 
 pub const QUERY_LIMIT: usize = 180;
-pub const GPU_NOTE: &str = "The Trends Desk window is drawn with Termy's GPU renderer. An OpenCLI search still waits on the network and the browser bridge; the GPU does not make that search faster.";
+/// Window title and shortcut label for the standalone desk.
+/// The Termy X app, its installer, and its shortcut stay named Termy.
+pub const VISIBLE_NAME: &str = "Termy XL";
+
+pub const GPU_NOTE: &str = "The Termy XL window is drawn with Termy's GPU renderer. An OpenCLI search still waits on the network and the browser bridge; the GPU does not make that search faster.";
 pub const IMAGE_QUOTE_NOTE: &str = "Image-only quote posts are not shown. Open the status link; photos and video stay in the X panel.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1151,6 +1155,14 @@ mod tests {
         assert!(!daily_due(morning, &settings));
         let summer = utc_unix(2026, 7, 15, 17, 0, 0);
         assert_eq!(chicago_stamp(summer).1, 12);
+    }
+
+    #[test]
+    fn visible_name_is_termy_xl_and_not_the_main_app() {
+        assert_eq!(VISIBLE_NAME, "Termy XL");
+        assert!(VISIBLE_NAME.contains("XL"));
+        assert_ne!(VISIBLE_NAME, "Termy");
+        assert_ne!(VISIBLE_NAME, "Termy X");
     }
 
     #[test]

@@ -284,9 +284,9 @@ cargo run -p termy --bin x_panel_preview -- --mock --width 1600 --height 1000
 cargo run -p termy --bin x_panel_preview -- --splash
 ```
 
-### Trends Desk
+### Termy XL
 
-Trends Desk is a separate GPU window for Law, Finance, AI, and custom columns. Open it from the command palette (`X: Trends Desk`), the View menu, or the Trends tab's **Open Trends Desk** button. It can also start on its own:
+Termy XL is the standalone Trends Desk window. Termy X, its installer, and its shortcut stay named Termy. Inside Termy, open Termy XL from the command palette (`Termy XL`), the View menu, or the Trends tab's **Open Termy XL** button. It can also start on its own:
 
 ```bash
 cargo run -p termy --bin trends_desk
@@ -295,7 +295,7 @@ termy-xcli trends-desk status
 termy-xcli trends-desk run --topic law --focus AI
 ```
 
-Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts are saved for the existing compose confirm; Run does not post. The window is drawn on the GPU. That does not make the search faster. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
+Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts stay in the Termy XL data folder. Copying a draft into Termy X is explicit, and Run does not post. The window is drawn on the GPU. That does not make the search faster. Windows install uses a separate folder and a `Termy XL.lnk` shortcut; it does not edit a shortcut that launches `termy-7154b8a5.exe`. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
 
 ## Sync across PCs
 

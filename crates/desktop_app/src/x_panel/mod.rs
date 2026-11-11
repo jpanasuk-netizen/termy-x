@@ -7119,13 +7119,13 @@ impl XPanel {
                 .items_center()
                 .child(x_button!(
                     "x-open-trends-desk",
-                    "Open Trends Desk",
+                    "Open Termy XL",
                     cx.listener(|_, _, _, cx| {
                         if let Err(error) = crate::trends_desk::open_in(
                             cx,
                             crate::trends_desk::DeskOptions::default(),
                         ) {
-                            log::error!("Trends Desk did not open: {error}");
+                            log::error!("Termy XL did not open: {error}");
                         }
                         cx.stop_propagation();
                         cx.notify();

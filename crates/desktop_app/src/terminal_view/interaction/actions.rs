@@ -218,7 +218,7 @@ impl TerminalView {
                 if let Err(error) =
                     termy::trends_desk::open_in(cx, termy::trends_desk::DeskOptions::default())
                 {
-                    log::error!("Trends Desk did not open: {error}");
+                    log::error!("Termy XL did not open: {error}");
                 }
             }
             _ if shortcuts_suspended => {}

@@ -31,3 +31,5 @@ Settings examples in code use `@YourHandle`. The paid model id from the old sett
 Synthetic rows used by `--fixture` and the unit tests contain the text `SYNTHETIC FIXTURE` and are not written as reports.
 
 A second scan of the new desk sources should show no user-home paths, no live handles, and no credential literals. Loading a key from the environment is not implemented on this path.
+
+The build source for a Windows machine is the GitHub archive of this commit (`https://github.com/jpanasuk-netizen/termy-x/archive/<FULL_SHA>.zip`). That archive is the repository tree at that SHA, including `Cargo.lock`. It does not contain a browser session, cookies, or a local checkout.

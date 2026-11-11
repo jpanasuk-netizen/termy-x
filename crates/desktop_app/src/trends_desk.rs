@@ -5,6 +5,7 @@
 //! The GPU does not speed that up. `--fixture` draws labeled sample cards and
 //! does not save them.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -19,8 +20,10 @@ use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
     ChangeTag, ColumnView, DeskSettings, DeskStore, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav,
     OpenCliDesk, OutcomeKind, Phase, RunOutcome, SessionState, SessionStatus, Surface, Topic,
-    column_count_for_width, column_from_cache, column_from_outcome, column_loading, daily_due,
-    filter_posts, fixture_column, prepare_draft, surface_after_nav, synthetic_fixture_posts,
+    VISIBLE_NAME, column_count_for_width, column_from_cache, column_from_outcome, column_loading,
+    daily_due, drafts_file, filter_posts, fixture_column, handoff_draft_to_termy_x,
+    isolated_opencli_config, prepare_draft_file, surface_after_nav, synthetic_fixture_posts,
+    termy_xl_data_root, within_termy_x_config,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -48,8 +51,10 @@ struct ColumnUi {
 pub struct TrendsDesk {
     focus_handle: FocusHandle,
     options: DeskOptions,
+    data_root: PathBuf,
     config: XConfig,
     store: DeskStore,
+    writable: bool,
     settings: DeskSettings,
     columns: Vec<ColumnUi>,
     surface: Surface,
@@ -74,9 +79,20 @@ pub struct TrendsDesk {
 
 impl TrendsDesk {
     pub fn new(options: DeskOptions, cx: &mut Context<Self>) -> Self {
-        let config = XConfig::load(&termy_x::config::default_config_dir());
-        let store = DeskStore::new(&config.config_dir);
-        let settings = store.load_settings();
+        let data_root = termy_xl_data_root();
+        let (store, writable) = match DeskStore::open_isolated(&data_root) {
+            Ok(store) => (store, true),
+            Err(_) => (
+                DeskStore::new(&std::env::temp_dir().join("termy-xl-blocked")),
+                false,
+            ),
+        };
+        let config = isolated_opencli_config(&data_root);
+        let settings = if writable {
+            store.load_settings()
+        } else {
+            DeskSettings::default()
+        };
         let history = store.all_reports();
         let columns = store
             .load_topics()
@@ -99,8 +115,10 @@ impl TrendsDesk {
         Self {
             focus_handle: cx.focus_handle(),
             options,
+            data_root,
             config,
             store,
+            writable,
             focus_text: settings.focus.clone(),
             settings,
             columns,
@@ -111,7 +129,7 @@ impl TrendsDesk {
             topic_desc: String::new(),
             draft_text: String::new(),
             draft_reply_to: None,
-            draft_note: "Drafts stay on this machine until you publish from X compose.".into(),
+            draft_note: "Drafts stay in the Termy XL data folder. Copy to Termy X is a separate step and does not post.".into(),
             replies: Vec::new(),
             reply_note: "Inspect replies reads a thread. It does not post.".into(),
             history,
@@ -214,7 +232,8 @@ impl TrendsDesk {
         cx.notify();
         let config = self.config.clone();
         let cancel = self.cancel.clone();
-        let store_dir = self.config.config_dir.clone();
+        let data_root = self.data_root.clone();
+        let writable = self.writable;
         cx.spawn(async move |this, cx| {
             let outcomes = cx
                 .background_executor()
@@ -235,11 +254,17 @@ impl TrendsDesk {
                         }
                         outcomes.push(desk.run_topic(&topic, &focus, &cancel));
                     }
-                    let store = DeskStore::new(&store_dir);
+                    let store = if writable {
+                        DeskStore::open_isolated(&data_root).ok()
+                    } else {
+                        None
+                    };
                     let now = termy_x::time::unix_now();
                     let mut saved = Vec::new();
                     for outcome in &outcomes {
-                        if outcome.kind.writes_report() {
+                        if outcome.kind.writes_report()
+                            && let Some(store) = &store
+                        {
                             saved.push(store.write_fresh(outcome, now).ok());
                         } else {
                             saved.push(None);
@@ -354,18 +379,48 @@ impl TrendsDesk {
             cx.notify();
             return;
         }
-        let prep = prepare_draft(&self.config, title, reply_to.as_deref());
+        let path = drafts_file(&self.data_root);
+        if !self.writable || within_termy_x_config(&path) {
+            self.draft_text = termy_x::trends_desk::draft_text_from_title(title);
+            self.draft_reply_to = reply_to;
+            self.draft_note = "Draft kept in this window. It was not written into Termy X.".into();
+            self.surface = Surface::Draft;
+            self.field = Some(Field::Draft);
+            cx.notify();
+            return;
+        }
+        let prep = prepare_draft_file(&path, title, reply_to.as_deref());
         self.draft_text = prep.text;
         self.draft_reply_to = prep.reply_to;
         self.draft_note = match (prep.saved_id, prep.save_error) {
             (Some(id), None) => format!(
-                "Saved draft {id}. It is not posted. Publish it from X compose, or `termy-xcli publish {id} --dry-run`, and type yes only when you mean to send."
+                "Saved draft {id} in the Termy XL data folder. It was not copied to Termy X and it was not posted."
             ),
             (_, Some(error)) => format!("Draft kept in this window. Save failed: {error}"),
             (None, None) => "Draft kept in this window.".into(),
         };
         self.surface = Surface::Draft;
         self.field = Some(Field::Draft);
+        cx.notify();
+    }
+
+    fn handoff_to_termy_x(&mut self, cx: &mut Context<Self>) {
+        if self.draft_text.trim().is_empty() {
+            self.draft_note = "Prepare a draft first. Nothing was copied.".into();
+            cx.notify();
+            return;
+        }
+        match handoff_draft_to_termy_x(&self.draft_text, self.draft_reply_to.as_deref()) {
+            Ok(id) => {
+                self.draft_note = format!(
+                    "Copied to the Termy X draft file as {id}. The Termy XL copy is unchanged. Nothing was posted."
+                );
+            }
+            Err(error) => {
+                self.draft_note =
+                    format!("Termy X copy failed. The Termy XL draft is unchanged. {error}");
+            }
+        }
         cx.notify();
     }
 
@@ -503,7 +558,7 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
             .map_err(|error| error.to_string());
     }
     cx.open_window(desk_window_options(), move |window, cx| {
-        window.set_window_title("Trends Desk");
+        window.set_window_title(VISIBLE_NAME);
         cx.new(|cx| TrendsDesk::new(options, cx))
     })
     .map(|_| ())
@@ -511,16 +566,32 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
 }
 
 pub fn run_standalone(fixture: bool) {
+    set_standalone_app_id();
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         if let Err(error) = open_in(cx, DeskOptions { fixture }) {
-            eprintln!("Trends Desk did not open: {error}");
+            eprintln!("{VISIBLE_NAME} did not open: {error}");
             eprintln!("The same desk can run without this window:");
             eprintln!("  termy-xcli trends-desk status");
             eprintln!("  termy-xcli trends-desk run --topic all");
         }
     });
 }
+
+/// Taskbar identity for the standalone window only.
+/// The Termy process keeps `lassejlv.Termy`, so the two shortcuts stay separate.
+#[cfg(target_os = "windows")]
+fn set_standalone_app_id() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    if let Err(error) =
+        unsafe { SetCurrentProcessExplicitAppUserModelID(windows::core::w!("lassejlv.TermyXL")) }
+    {
+        log::warn!("Failed to set the Termy XL AppUserModelID: {error}");
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn set_standalone_app_id() {}
 
 fn desk_window_options() -> WindowOptions {
     WindowOptions {
@@ -529,7 +600,7 @@ fn desk_window_options() -> WindowOptions {
             size: size(px(3440.0), px(1400.0)),
         })),
         titlebar: Some(gpui_kit::TitlebarOptions {
-            title: Some("Trends Desk".into()),
+            title: Some(VISIBLE_NAME.into()),
             appears_transparent: false,
             traffic_light_position: None,
         }),
@@ -599,12 +670,18 @@ impl TrendsDesk {
                         div()
                             .text_size(px(22.0))
                             .text_color(rgb(0x7af6ff))
-                            .child("Trends Desk"),
+                            .child(VISIBLE_NAME),
                     )
                     .child(
                         div()
                             .text_size(px(12.0))
                             .text_color(rgb(0xc7c7cc))
+                            .child("Trends Desk"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x8e8e93))
                             .child(self.session.label.clone()),
                     )
                     .child(
@@ -940,6 +1017,12 @@ impl TrendsDesk {
                 &self.draft_text,
                 Field::Draft,
                 cx,
+            ))
+            .child(button(
+                "desk-handoff-termy-x",
+                "Copy draft to Termy X",
+                false,
+                cx.listener(|this, _, _, cx| this.handoff_to_termy_x(cx)),
             ))
             .child(
                 div().text_size(px(12.0)).text_color(rgb(0x8e8e93)).child(

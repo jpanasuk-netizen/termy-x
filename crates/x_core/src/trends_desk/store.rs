@@ -1,4 +1,5 @@
-//! Local Trends Desk files under the Termy config directory.
+//! Termy XL files. The store root is the Termy XL data directory, never
+//! the Termy X config directory (`%APPDATA%\termy` or `~/.config/termy`).
 //!
 //! Reports are written only for a fresh OpenCLI run. History is never deleted
 //! by a failed run, and nothing here is a credential.
@@ -11,6 +12,33 @@ use super::domain::{
 };
 
 pub const DIR_NAME: &str = "trends-desk";
+pub const DATA_DIR_ENV: &str = "TERMY_XL_DATA_DIR";
+pub const DATA_FOLDER: &str = "Termy XL";
+
+/// Termy XL settings root. `TERMY_XL_DATA_DIR` wins. Otherwise this is
+/// `%APPDATA%\Termy XL` on Windows, not `%APPDATA%\termy`.
+pub fn termy_xl_data_root() -> PathBuf {
+    if let Some(overridden) = std::env::var(DATA_DIR_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(overridden);
+    }
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(DATA_FOLDER)
+}
+
+pub fn drafts_file(data_root: &Path) -> PathBuf {
+    data_root.join("drafts.json")
+}
+
+/// True when `path` is the Termy X config directory or a child of it.
+pub fn within_termy_x_config(path: &Path) -> bool {
+    let termy = crate::config::default_config_dir();
+    path == termy || path.starts_with(&termy)
+}
 
 #[derive(Debug, Clone)]
 pub struct DeskStore {
@@ -18,10 +46,21 @@ pub struct DeskStore {
 }
 
 impl DeskStore {
-    pub fn new(config_dir: &Path) -> Self {
+    pub fn new(parent: &Path) -> Self {
         Self {
-            root: config_dir.join(DIR_NAME),
+            root: parent.join(DIR_NAME),
         }
+    }
+
+    /// Open a store under a Termy XL data root. Refuses the Termy X config tree.
+    pub fn open_isolated(data_root: &Path) -> Result<Self, String> {
+        if within_termy_x_config(data_root) || within_termy_x_config(&data_root.join(DIR_NAME)) {
+            return Err(
+                "Refusing to write Termy XL data inside the Termy X config directory. Set TERMY_XL_DATA_DIR to a separate folder."
+                    .into(),
+            );
+        }
+        Ok(Self::new(data_root))
     }
 
     pub fn root(&self) -> &Path {
@@ -192,6 +231,18 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].fetched_at_unix, 10);
         assert!(!history[0].markdown.starts_with("# Fixture"));
+    }
+
+    #[test]
+    fn isolated_store_refuses_the_termy_x_config_tree() {
+        let termy = crate::config::default_config_dir();
+        assert!(DeskStore::open_isolated(&termy).is_err());
+        assert!(DeskStore::open_isolated(&termy.join("nested")).is_err());
+        let xl = termy.parent().unwrap_or(&termy).join(super::DATA_FOLDER);
+        assert!(!super::within_termy_x_config(&xl));
+        let store = DeskStore::open_isolated(&xl).unwrap();
+        assert!(!super::within_termy_x_config(store.root()));
+        assert_ne!(store.root(), termy.join(super::DIR_NAME));
     }
 
     #[test]

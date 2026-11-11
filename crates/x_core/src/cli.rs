@@ -97,6 +97,9 @@ enum Cmd {
     },
     /// Law, Finance, and AI desk. Live OpenCLI only. Never posts.
     TrendsDesk {
+        /// Termy XL data directory. Defaults to the Termy XL app folder, not Termy X AppData.
+        #[arg(long, global = true)]
+        data_dir: Option<PathBuf>,
         #[command(subcommand)]
         action: TrendsDeskAction,
     },
@@ -606,15 +609,35 @@ enum TrendsDeskAction {
     },
     /// Add a custom column. Does not search.
     Add { name: String, desc: String },
+    /// Copy one saved Termy XL draft into the Termy X draft file. Does not post.
+    Handoff {
+        /// Draft id saved in the Termy XL data directory.
+        id: String,
+    },
 }
 
-fn trends_desk_cmd(action: TrendsDeskAction, json: bool, io: &CliIo) -> i32 {
-    let store = crate::trends_desk::DeskStore::new(&io.config.config_dir);
+fn trends_desk_cmd(
+    data_dir: Option<PathBuf>,
+    action: TrendsDeskAction,
+    json: bool,
+    io: &CliIo,
+) -> i32 {
+    let data_root = data_dir.unwrap_or_else(crate::trends_desk::termy_xl_data_root);
+    let store = match crate::trends_desk::DeskStore::open_isolated(&data_root) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
     match action {
         TrendsDeskAction::Status => {
             let settings = store.load_settings();
             let topics = store.load_topics();
-            let desk = crate::trends_desk::OpenCliDesk::new(&io.config, io.runner.clone());
+            let desk = crate::trends_desk::OpenCliDesk::new(
+                &crate::trends_desk::isolated_opencli_config(&data_root),
+                io.runner.clone(),
+            );
             let session = desk.probe(&std::sync::atomic::AtomicBool::new(false));
             if json {
                 let body = serde_json::json!({
@@ -625,11 +648,13 @@ fn trends_desk_cmd(action: TrendsDeskAction, json: bool, io: &CliIo) -> i32 {
                     "topics": topics.iter().map(|topic| {
                         serde_json::json!({"id": topic.id, "name": topic.name, "desc": topic.desc})
                     }).collect::<Vec<_>>(),
+                    "data": data_root.display().to_string(),
                     "gpu": crate::trends_desk::GPU_NOTE,
                     "posts": false,
                 });
                 println!("{body}");
             } else {
+                println!("data: {}", data_root.display());
                 println!("{}", session.label);
                 println!("{}", session.detail);
                 println!("focus: {}", settings.focus);
@@ -663,12 +688,34 @@ fn trends_desk_cmd(action: TrendsDeskAction, json: bool, io: &CliIo) -> i32 {
             println!("added column {id}");
             0
         }
+        TrendsDeskAction::Handoff { id } => {
+            let drafts = crate::drafts::load_drafts(&crate::trends_desk::drafts_file(&data_root));
+            let Some(draft) = crate::drafts::find_draft(&drafts, &id) else {
+                eprintln!("no Termy XL draft `{id}`");
+                return 2;
+            };
+            match crate::trends_desk::handoff_draft_to_termy_x(
+                &draft.text,
+                draft.reply_to.as_deref(),
+            ) {
+                Ok(new_id) => {
+                    println!(
+                        "copied draft {new_id} into the Termy X draft file. Nothing was posted."
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
         TrendsDeskAction::Run { topic, focus } => {
             match crate::trends_desk::run_saved_topic(
-                &io.config,
                 io.runner.clone(),
                 &topic,
                 focus.as_deref(),
+                &data_root,
             ) {
                 Ok(outcomes) => {
                     let failed = outcomes
@@ -760,7 +807,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                     .map(|served| (served.status.render(), json_value(served))),
             )
         }
-        Cmd::TrendsDesk { action } => trends_desk_cmd(action, json, io),
+        Cmd::TrendsDesk { data_dir, action } => trends_desk_cmd(data_dir, action, json, io),
         Cmd::Trends { place, limit } => emit(
             json,
             service

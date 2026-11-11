@@ -1242,14 +1242,14 @@ define_commands!(
         OpenTrendsDesk,
         TERMINAL_CONTEXT,
         Some(palette(
-            "X: Trends Desk",
-            "x trends desk law finance ai columns reports opencli",
+            "Termy XL",
+            "x trends desk termy xl law finance ai columns reports opencli",
             CommandPaletteVisibility::Always
         )),
         Some(menu(
             MenuRoot::View,
             0,
-            "Trends Desk",
+            "Termy XL",
             MenuVisibility::Always,
             MenuActionRole::Normal
         ))

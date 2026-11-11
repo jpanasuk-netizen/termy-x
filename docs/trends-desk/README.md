@@ -1,6 +1,8 @@
-# Trends Desk
+# Termy XL
 
-Trends Desk is a Termy X add-on for Law, Finance, AI, and custom columns. The window is a normal GPUI surface, the same GPU renderer as the rest of Termy. Searches run on a background thread through OpenCLI. The GPU draws the window. It does not make the search faster.
+Termy XL is the standalone Trends Desk: Law, Finance, AI, and custom columns. The window is a normal GPUI surface. Searches run on a background thread through OpenCLI. The GPU draws the window. It does not make the search faster.
+
+Termy X stays a separate app. Its shortcut, installer, and process name are unchanged, including a shortcut that launches `termy-7154b8a5.exe`. Termy XL is also opened from inside Termy (command palette, View menu, Trends tab) as the same window. Its settings, history, and drafts stay in the Termy XL data folder (`%APPDATA%\Termy XL`, or `TERMY_XL_DATA_DIR`). They are not written into Termy X AppData unless you use **Copy draft to Termy X** or `termy-xcli trends-desk handoff`.
 
 The browser desk at `http://127.0.0.1:3489/` is a separate local app. This add-on does not start it, proxy it, or require it.
 
@@ -16,11 +18,11 @@ Run, inspect, and draft preparation do not publish. A draft is stored in the exi
 
 ## Open it
 
-Inside Termy:
+Inside Termy X (the existing app):
 
-- Command palette: **X: Trends Desk** (`open_trends_desk`)
-- View menu: **Trends Desk**
-- X panel, Trends tab: **Open Trends Desk**
+- Command palette: **Termy XL** (`open_trends_desk`)
+- View menu: **Termy XL**
+- X panel, Trends tab: **Open Termy XL**
 
 On its own:
 

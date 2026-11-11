@@ -11,19 +11,23 @@ mod store;
 
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
-    RunOutcome, SourcePost, StoredReport, Surface, Topic, chicago_stamp, column_count_for_width,
-    column_from_cache, column_from_outcome, column_loading, daily_due, default_topics, diff_urls,
-    draft_text_from_title, filter_posts, fixture_column, outcome_error, reply_dry_run_args,
-    search_query, slug_id, surface_after_nav, topic_id_ok,
+    RunOutcome, SourcePost, StoredReport, Surface, Topic, VISIBLE_NAME, chicago_stamp,
+    column_count_for_width, column_from_cache, column_from_outcome, column_loading, daily_due,
+    default_topics, diff_urls, draft_text_from_title, filter_posts, fixture_column, outcome_error,
+    reply_dry_run_args, search_query, slug_id, surface_after_nav, topic_id_ok,
 };
 pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
-    SessionStatus, prepare_draft, refuse_unsafe_cli_name, run_topics, search_args,
+    SessionStatus, handoff_draft_to_termy_x, prepare_draft, prepare_draft_file,
+    refuse_unsafe_cli_name, run_topics, search_args,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
 };
-pub use store::{DIR_NAME, DeskStore};
+pub use store::{
+    DATA_DIR_ENV, DATA_FOLDER, DIR_NAME, DeskStore, drafts_file, termy_xl_data_root,
+    within_termy_x_config,
+};
 
 const SYNTHETIC_OPENCLI: &str = include_str!("synthetic_opencli.json");
 
@@ -58,13 +62,22 @@ use std::sync::atomic::AtomicBool;
 use crate::config::XConfig;
 use crate::io::CommandRunner;
 
+pub fn isolated_opencli_config(data_root: &std::path::Path) -> XConfig {
+    XConfig {
+        config_dir: data_root.to_path_buf(),
+        official_enabled: false,
+        ..XConfig::default()
+    }
+}
+
 pub fn run_saved_topic(
-    config: &XConfig,
     runner: Arc<dyn CommandRunner>,
     topic_id: &str,
     focus: Option<&str>,
+    data_root: &std::path::Path,
 ) -> Result<Vec<RunOutcome>, String> {
-    let store = DeskStore::new(&config.config_dir);
+    let store = DeskStore::open_isolated(data_root)?;
+    let config = isolated_opencli_config(data_root);
     let mut settings = store.load_settings();
     if let Some(focus) = focus.map(str::trim).filter(|value| !value.is_empty()) {
         settings.focus = focus.to_string();
@@ -82,7 +95,7 @@ pub fn run_saved_topic(
     if selected.is_empty() {
         return Err(format!("unknown column `{topic_id}`"));
     }
-    let desk = OpenCliDesk::new(config, runner);
+    let desk = OpenCliDesk::new(&config, runner);
     let cancel = AtomicBool::new(false);
     let outcomes = run_topics(&desk, &selected, &settings, &cancel);
     let now = crate::time::unix_now();

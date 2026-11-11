@@ -258,8 +258,13 @@ pub struct DraftPrep {
     pub save_error: Option<String>,
 }
 
-/// Save a draft in the existing Termy X draft file. This never publishes.
-pub fn prepare_draft(config: &XConfig, title: &str, reply_to: Option<&str>) -> DraftPrep {
+/// Save a draft in the Termy XL data directory. This never publishes and
+/// does not write the Termy X draft file.
+pub fn prepare_draft_file(
+    path: &std::path::Path,
+    title: &str,
+    reply_to: Option<&str>,
+) -> DraftPrep {
     let text = draft_text_from_title(title);
     let reply_to = reply_to
         .map(str::trim)
@@ -269,11 +274,11 @@ pub fn prepare_draft(config: &XConfig, title: &str, reply_to: Option<&str>) -> D
         id: new_id(),
         text: text.clone(),
         tone: Some("reply".into()),
-        source: "trends-desk".into(),
+        source: "termy-xl".into(),
         created_at: timestamp(),
         reply_to: reply_to.clone(),
     };
-    match drafts::upsert_drafts(&config.drafts_path(), vec![draft.clone()]) {
+    match drafts::upsert_drafts(path, vec![draft.clone()]) {
         Ok(_) => DraftPrep {
             text,
             reply_to,
@@ -287,6 +292,33 @@ pub fn prepare_draft(config: &XConfig, title: &str, reply_to: Option<&str>) -> D
             save_error: Some(error),
         },
     }
+}
+
+pub fn prepare_draft(config: &XConfig, title: &str, reply_to: Option<&str>) -> DraftPrep {
+    prepare_draft_file(&config.drafts_path(), title, reply_to)
+}
+
+/// Explicit copy into the Termy X draft file. Nothing else in Termy XL calls this.
+pub fn handoff_draft_to_termy_x(text: &str, reply_to: Option<&str>) -> Result<String, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("draft text is empty".into());
+    }
+    let reply_to = reply_to
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let draft = Draft {
+        id: new_id(),
+        text: text.to_string(),
+        tone: Some("reply".into()),
+        source: "termy-xl-handoff".into(),
+        created_at: timestamp(),
+        reply_to,
+    };
+    let path = crate::config::default_config_dir().join("x-drafts.json");
+    drafts::upsert_drafts(&path, vec![draft.clone()])?;
+    Ok(draft.id)
 }
 
 pub fn search_args(query: &str, limit: usize) -> Vec<String> {
@@ -699,7 +731,11 @@ mod tests {
         let drafts = crate::drafts::load_drafts(&config.drafts_path());
         assert_eq!(drafts.len(), 1);
         assert_eq!(drafts[0].id, id);
-        assert_eq!(drafts[0].source, "trends-desk");
+        assert_eq!(drafts[0].source, "termy-xl");
+        assert_ne!(
+            config.drafts_path(),
+            crate::config::default_config_dir().join("x-drafts.json")
+        );
         assert_eq!(drafts[0].text, prep.text);
     }
 }

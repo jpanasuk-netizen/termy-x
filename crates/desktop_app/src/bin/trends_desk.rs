@@ -2,7 +2,8 @@
     all(target_os = "windows", not(debug_assertions)),
     windows_subsystem = "windows"
 )]
-//! Opens the Trends Desk window. It does not publish.
+//! Opens the Termy XL window (the standalone Trends Desk). It does not publish.
+//! The Termy X app and its shortcut are a different program.
 //!
 //! ```sh
 //! cargo run -p termy --bin trends_desk
