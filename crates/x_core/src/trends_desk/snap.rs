@@ -337,7 +337,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn ultrawide_termy_still_attaches_when_docked_is_false() {
         let host = SeenWindow {
             title: r"C:\Windows\System32\cmd.exe - Termy".into(),

@@ -216,7 +216,11 @@ impl TrendsDesk {
                 .spawn(async move {
                     let http = termy_x::io::UreqHttp::default();
                     termy_x::trends_desk::run_take_chain(
-                        provider, &config, &post, &http, &draft_tone,
+                        provider,
+                        &config,
+                        &post,
+                        &http,
+                        &draft_tone,
                     )
                 })
                 .await;
