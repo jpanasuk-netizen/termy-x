@@ -78,7 +78,25 @@ pub fn handle_from_status(url: &str) -> String {
 }
 
 pub fn draft_post_label(url: &str) -> String {
-    format!("Post reply → @{}", handle_from_status(url))
+    draft_reply_label(url, "")
+}
+
+pub fn draft_reply_label(url: &str, author: &str) -> String {
+    let author = author.trim().trim_start_matches('@');
+    let named = !author.is_empty()
+        && author != "i"
+        && !author.eq_ignore_ascii_case("post")
+        && !author.eq_ignore_ascii_case("status");
+    let handle = if named {
+        author.to_string()
+    } else {
+        handle_from_status(url)
+    };
+    if handle.is_empty() || handle == "post" || handle == "i" {
+        "Post reply".into()
+    } else {
+        format!("Post reply → @{handle}")
+    }
 }
 
 /// Tweet plus a short instruction. CLI takes stay near 400 characters.
@@ -162,6 +180,10 @@ mod tests {
         assert_eq!(
             draft_post_label("https://x.com/Ada/status/9"),
             "Post reply → @Ada"
+        );
+        assert_eq!(
+            draft_reply_label("https://x.com/i/status/9", "jeremy"),
+            "Post reply → @jeremy"
         );
         assert_eq!(
             next_providers(TakeProvider::Grok),

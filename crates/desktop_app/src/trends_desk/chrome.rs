@@ -985,6 +985,32 @@ pub(crate) fn button(
         .into_any_element()
 }
 
+fn parent_author(desk: &TrendsDesk, url: &str) -> String {
+    if let Some(name) = desk.pack.authors.get(url) {
+        let name = name.trim().trim_start_matches('@');
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    let wanted = termy_x::trends_desk::status_id(url);
+    for column in &desk.columns {
+        for post in &column.view.posts {
+            let same = post.url == url
+                || wanted
+                    .as_ref()
+                    .is_some_and(|id| post.id == *id || post.url.contains(id));
+            if !same {
+                continue;
+            }
+            let name = post.author.trim().trim_start_matches('@');
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
 fn draft_post_control(
     id: &str,
     url: &str,
@@ -1030,7 +1056,7 @@ fn draft_post_control(
     } else if error.is_some() {
         "Retry".to_string()
     } else {
-        termy_x::trends_desk::draft_post_label(url)
+        termy_x::trends_desk::draft_reply_label(url, &parent_author(desk, url))
     };
     let post_id = id.to_string();
     let mut column = div().flex().flex_col().gap(px(6.0));

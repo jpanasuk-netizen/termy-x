@@ -416,7 +416,7 @@ pub fn canonical_provider(saved: &str) -> String {
     let saved = saved.trim();
     if let Some((kind, model)) = saved.split_once(':') {
         let model = model.trim();
-        if !model.is_empty() && matches!(kind, "hermes" | "vyce" | "custom") {
+        if !model.is_empty() && matches!(kind, "hermes" | "vyce" | "custom" | "grok") {
             return format!("{kind}:{model}");
         }
     }
@@ -452,7 +452,10 @@ pub fn provider_label(saved: &str) -> String {
                 model.unwrap_or_else(|| super::agents::VYCE_MODEL.to_string())
             )
         }
-        super::TakeProvider::Grok => "Grok".into(),
+        super::TakeProvider::Grok => match model {
+            Some(model) => format!("Grok · {model}"),
+            None => "Grok".into(),
+        },
         super::TakeProvider::Muse => "Muse".into(),
         super::TakeProvider::Agy => "Agy".into(),
         super::TakeProvider::Custom => {
@@ -1366,6 +1369,10 @@ mod tests {
         );
         assert_eq!(provider_kind("free"), super::super::TakeProvider::Hermes);
         assert_eq!(canonical_provider("grok"), "grok");
+        assert_eq!(canonical_provider("grok:grok-3"), "grok:grok-3");
+        assert_eq!(provider_model("grok:grok-3").as_deref(), Some("grok-3"));
+        assert_eq!(provider_label("grok:grok-3"), "Grok · grok-3");
+        assert_eq!(provider_model("grok"), None);
         assert_eq!(provider_kind("Grok"), super::super::TakeProvider::Grok);
         let picked = canonical_provider("grok");
         assert_eq!(picked, "grok");

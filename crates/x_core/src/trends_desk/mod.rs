@@ -47,8 +47,8 @@ pub use cards::{
     text_to_post, toggle_dock, tone_variants, turn_page, wrap_token,
 };
 pub use carousel::{
-    Slide, cli_take_prompt, draft_post_label, failure_banner, handle_from_status, indicator,
-    next_providers, run_take_fallback, slide,
+    Slide, cli_take_prompt, draft_post_label, draft_reply_label, failure_banner,
+    handle_from_status, indicator, next_providers, run_take_fallback, slide,
 };
 pub use desk_cmd::{
     find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
@@ -67,7 +67,10 @@ pub use fetch::{
     SessionStatus, engage_opencli, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft,
     prepare_draft_file, refuse_unsafe_cli_name, run_topics, search_args,
 };
-pub use grok_take::bind_grok_stream;
+pub use grok_take::{
+    bind_grok_model, bind_grok_stream, parse_grok_models, refresh_grok_models,
+    take_cleared_grok_model,
+};
 pub use hermes_draft::{hermes_take, hermes_take_toned};
 pub use lifecycle::{
     DeskSession, EscapeEffect, OffUiRequest, PruneLog, RefreshPress, child_is_gone,

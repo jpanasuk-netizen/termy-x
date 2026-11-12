@@ -437,6 +437,9 @@ pub struct PackFile {
     /// Generated takes for one tweet, oldest first. The carousel reads this.
     #[serde(default)]
     pub takes: HashMap<String, Vec<SavedTake>>,
+    /// Parent status URL to the author's handle, without the @.
+    #[serde(default)]
+    pub authors: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -469,6 +472,7 @@ impl Default for PackFile {
             last_refresh: None,
             seen: HashMap::new(),
             takes: HashMap::new(),
+            authors: HashMap::new(),
         }
     }
 }

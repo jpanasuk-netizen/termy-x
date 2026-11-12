@@ -102,6 +102,10 @@ impl TrendsDesk {
             )
             .child(self.provider_dropdown(cx))
             .child(self.take_carousel(cx))
+            .children(
+                (self.take_generating || drafting)
+                    .then(|| crate::xl_mark::drafting_mark(self.elapsed_secs())),
+            )
             .children((!self.take_banner.is_empty()).then(|| self.failure_banner(cx)))
             .children((drafting || self.take_generating).then(|| self.cancel_row(cx)))
             .child(
@@ -130,9 +134,9 @@ impl TrendsDesk {
                         .size_full(),
                     )
                     .child(if drafting {
-                        drafting_mark(self.elapsed_secs())
+                        crate::xl_mark::drafting_mark(self.elapsed_secs())
                     } else {
-                        reply_surface(&shown, &caret)
+                        crate::xl_mark::reply_surface(&shown, &caret)
                     })
                     .children((!drafting).then(|| {
                         div()
@@ -280,15 +284,25 @@ impl TrendsDesk {
             } else {
                 model_ids(&http, termy_x::trends_desk::VYCE_DIRECT_BASE, &vyce_key)
             };
+            let grok_models = termy_x::trends_desk::refresh_grok_models(
+                &termy_x::trends_desk::termy_xl_data_root(),
+            );
             let menu = termy_x::trends_desk::menu_with_models(
                 &hermes_models,
                 &vyce_models,
                 &custom_models,
             );
-            let extras: Vec<_> = menu
+            let mut extras: Vec<_> = menu
                 .into_iter()
                 .filter(|(id, _)| id.contains(':'))
                 .collect();
+            for model in grok_models {
+                let id = format!("grok:{model}");
+                let label = format!("Grok · {model}");
+                if !extras.iter().any(|(have, _)| have == &id) {
+                    extras.push((id, label));
+                }
+            }
             let _ = this.update(cx, |desk, cx| {
                 desk.extra_models = extras;
                 cx.notify();
@@ -497,6 +511,13 @@ impl TrendsDesk {
             return;
         }
         let path = termy_x::trends_desk::drafts_file(&self.data_root);
+        let author = post.author.trim().trim_start_matches('@');
+        if !author.is_empty() && !post.url.is_empty() {
+            self.pack
+                .authors
+                .insert(post.url.clone(), author.to_string());
+            self.save_pack_file();
+        }
         if let Ok(count) = termy_x::trends_desk::remember_take(
             &path,
             &pop.card_id,
@@ -762,6 +783,11 @@ impl TrendsDesk {
         ))
         .to_string();
         let fallback = self.settings.auto_fallback && provider != TakeProvider::Grok;
+        let grok_model = if provider == TakeProvider::Grok {
+            termy_x::trends_desk::provider_model(&saved)
+        } else {
+            None
+        };
         self.take_epoch = self.take_epoch.wrapping_add(1);
         let epoch = self.take_epoch;
         if self.take_started.is_none() {
@@ -781,6 +807,7 @@ impl TrendsDesk {
             std::thread::spawn(move || {
                 let _guard = termy_x::trends_desk::bind_retry_notice(Some(note_tx));
                 let _stream = termy_x::trends_desk::bind_grok_stream(Some(part_tx));
+                let _model = termy_x::trends_desk::bind_grok_model(grok_model);
                 let limit = if provider == TakeProvider::Grok {
                     termy_x::trends_desk::GROK_TAKE_TIMEOUT
                 } else if provider == TakeProvider::Hermes {
@@ -868,8 +895,24 @@ impl TrendsDesk {
             &result.text,
             &result.note,
         );
+        let cleared =
+            termy_x::trends_desk::take_cleared_grok_model().filter(|_| result.source == "grok");
+        if cleared.is_some() && self.settings.take_provider.starts_with("grok:") {
+            self.settings.take_provider = "grok".into();
+            self.config.take_provider = "grok".into();
+            if self.writable {
+                let _ = self.store.save_settings(&self.settings);
+                let _ = self.config.save_take_provider("grok");
+            }
+        }
         if next.trim().is_empty() {
-            let banner = termy_x::trends_desk::failure_banner(result.source, &result.note);
+            let mut banner = termy_x::trends_desk::failure_banner(result.source, &result.note);
+            if let Some(id) = &cleared
+                && !banner.contains("Cleared unknown")
+            {
+                banner =
+                    format!("Cleared unknown Grok model '{id}'. Used the CLI default. {banner}");
+            }
             self.take_banner = banner.clone();
             self.action_note = banner;
             if let Some(pop) = self.popout.as_mut().filter(|pop| pop.card_id == id) {
@@ -880,7 +923,15 @@ impl TrendsDesk {
             self.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(""));
             return;
         }
-        self.take_banner.clear();
+        let author = post.author.trim().trim_start_matches('@');
+        if !author.is_empty() && !post.url.is_empty() {
+            self.pack
+                .authors
+                .insert(post.url.clone(), author.to_string());
+        }
+        self.take_banner = cleared
+            .map(|id| format!("Cleared unknown Grok model '{id}'. Used the CLI default."))
+            .unwrap_or_default();
         let label = if result.note.trim().is_empty() {
             result.source.to_string()
         } else {
@@ -1401,61 +1452,6 @@ fn model_ids(http: &termy_x::io::UreqHttp, base: &str, key: &str) -> Vec<String>
         Ok(body) => termy_x::trends_desk::models_from_openai(&body),
         Err(_) => Vec::new(),
     }
-}
-
-fn breath_animation() -> Animation {
-    Animation::new(std::time::Duration::from_millis(1600))
-        .repeat()
-        .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
-}
-
-fn drafting_mark(secs: u64) -> gpui_kit::AnyElement {
-    div()
-        .text_size(px(28.0))
-        .text_color(rgb(0xffe56a))
-        .child(format!("… {secs}s"))
-        .with_animation("desk-drafting-breath", breath_animation(), |el, value| {
-            el.opacity(0.2 + 0.8 * value)
-        })
-        .into_any_element()
-}
-
-fn reply_surface(text: &str, caret: &termy_x::draft_edit::DraftCaret) -> gpui_kit::AnyElement {
-    let len = text.len();
-    let (start, end) = caret
-        .selection()
-        .unwrap_or((caret.caret.min(len), caret.caret.min(len)));
-    let start = start.min(len);
-    let end = end.min(len).max(start);
-    let before = text.get(..start).unwrap_or("");
-    let middle = text.get(start..end).unwrap_or("");
-    let after = text.get(end..).unwrap_or("");
-    let mut row = div().flex().flex_wrap();
-    if !before.is_empty() {
-        row = row.child(before.to_string());
-    }
-    if middle.is_empty() {
-        row = row.child(
-            div()
-                .w(px(2.0))
-                .h(px(18.0))
-                .bg(rgb(0xffe56a))
-                .with_animation("desk-caret", breath_animation(), |el, value| {
-                    el.opacity(0.15 + 0.85 * value)
-                }),
-        );
-    } else {
-        row = row.child(
-            div()
-                .bg(rgb(0xff4fa3))
-                .text_color(rgb(0x070b14))
-                .child(middle.to_string()),
-        );
-    }
-    if !after.is_empty() {
-        row = row.child(after.to_string());
-    }
-    row.into_any_element()
 }
 
 fn remember_editor_box(x: f32, y: f32, width: f32) {
