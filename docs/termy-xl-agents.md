@@ -94,6 +94,60 @@ hermes_model = "hermes-agent"
 
 Grok, Agy, and Muse draft through their CLI unless a future command override says otherwise. Hermes drafts through the gateway above, so a missing `hermes.exe` does not block **Draft with Hermes** when the gateway and key are available. **Open Hermes** still needs the CLI.
 
+## Hermes takes provider
+
+The header offers **Free takes**, **Treg takes**, and **Hermes takes**. The choice is saved as `desk.provider` in `%APPDATA%\Termy XL\x.toml` only. Termy X's config is not written.
+
+Hermes takes call the OpenAI-compatible gateway. The default base URL is `http://127.0.0.1:8642/v1`. Change `agents.hermes_base_url` when the gateway is published somewhere else, including when Hermes Agent runs in WSL and the reachable address is not that default. The URL is a setting. It is not the only address the code can call.
+
+On select, Termy XL sends `GET {base}/models`. The status line is one of:
+
+- `Hermes · hermes-agent @ http://127.0.0.1:8642/v1`
+- `Hermes · needs a key (401)`
+- `Hermes · needs credits (402)`
+- `Hermes · unreachable (connection refused)`
+
+A 401 or 402 stops further Hermes calls for that session. The card still gets three different fallback replies from the post. Nothing is posted.
+
+## termy-xcli desk
+
+Agents call `termy-xcli` (never `x.exe`). `desk` is the short name of `trends-desk`. Every command below prints JSON and sets `"posted": false`. They read and write `%APPDATA%\Termy XL` (override with `--data-dir` or `TERMY_XL_DATA_DIR`). They do not post. Posting stays on the compose card's **Send** button.
+
+```text
+termy-xcli desk search --subject Law --json
+termy-xcli desk takes --tweet 77 --provider hermes --n 3 --json
+termy-xcli desk takes --tweet https://x.com/ada/status/77 --provider free --n 3 --json
+termy-xcli desk drafts list --json
+termy-xcli desk drafts save --text "A queued reply" --tweet 77 --json
+termy-xcli desk queue-reply --tweet 77 --text "A queued reply" --json
+```
+
+`--provider` is `free`, `treg`, or `hermes`. `takes` uses a tweet already stored by a desk search. `queue-reply` and `drafts save` replace the one draft for that tweet. The draft shows up in Termy XL. It is not sent.
+
+Search:
+
+```json
+{"ok":true,"posted":false,"subject":"Law","topic":"law","kind":"fresh","message":"1 source-linked post(s)","posts":[{"id":"77","author":"ada","text":"Courts are testing models","url":"https://x.com/ada/status/77","likes":4}]}
+```
+
+Takes:
+
+```json
+{"ok":true,"posted":false,"provider":"hermes","tweet":"77","url":"https://x.com/ada/status/77","note":"Hermes draft (http://127.0.0.1:8642/v1). Not posted.","variants":["Agree, and one thing to add.","What changes if this is only half true?","The cost is the part left out."]}
+```
+
+Queue:
+
+```json
+{"ok":true,"posted":false,"id":"ab12cd34","text":"A queued reply","reply_to":"77"}
+```
+
+Draft list:
+
+```json
+{"ok":true,"posted":false,"drafts":[{"id":"ab12cd34","text":"A queued reply","reply_to":"77","source":"termy-xl-queue","created_at":"1730000000"}]}
+```
+
 ## What posts
 
-Only the compose card's **Send** button posts, and only for that card. Esc, Close, **Use as draft**, opening a pane, and **Draft with …** leave the text on the card.
+Only the compose card's **Send** button posts, and only for that card. Esc, Close, **Use as draft**, opening a pane, **Draft with …**, and every `termy-xcli desk` command leave the text unsent.

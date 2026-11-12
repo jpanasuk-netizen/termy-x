@@ -6,6 +6,7 @@
 
 mod agents;
 mod cards;
+mod desk_cmd;
 mod domain;
 mod fetch;
 mod log;
@@ -16,10 +17,11 @@ mod store;
 
 pub use agents::{
     AgentPane, DraftRoute, HERMES_BASE, HERMES_HEALTH_PATH, HERMES_MODEL, HermesAuth, Launch,
-    PromptCli, api_server_key_from_env_file, choose_hermes_key, default_command, execute_draft,
-    hermes_auth, hermes_body, hermes_health_request, hermes_health_url, hermes_pill,
-    known_hermes_exe, missing_line, plan_agent_draft, plan_hermes_draft, redact_secret,
-    reply_prompt, resolve_launch, seed_agent_block, variants_from_draft, write_hermes_settings,
+    PromptCli, api_server_key_from_env_file, choose_hermes_key, default_command,
+    draft_hermes_variants, execute_draft, hermes_auth, hermes_body, hermes_health_request,
+    hermes_health_url, hermes_models_line, hermes_models_request, hermes_pill, known_hermes_exe,
+    missing_line, plan_agent_draft, plan_hermes_draft, redact_secret, reply_prompt, resolve_launch,
+    seed_agent_block, variants_from_draft, write_hermes_settings,
 };
 pub use cards::{
     COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, EditPopout, LOCKED_OPEN_WIDTH,
@@ -30,6 +32,10 @@ pub use cards::{
     open_width, page_index, page_label, remember_width, request_send, scroll_by, scroll_of,
     select_take, short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock,
     tone_variants, turn_page, wrap_token,
+};
+pub use desk_cmd::{
+    find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
+    topic_by_subject,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,

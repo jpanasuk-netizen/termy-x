@@ -285,8 +285,9 @@ impl TrendsDesk {
                     self.pack.sort_heat = !self.pack.sort_heat;
                     self.save_pack_file();
                 }
-                "free" => self.settings.take_provider = "free".into(),
-                "treg" => self.settings.take_provider = "treg".into(),
+                "free" => self.remember_provider("free"),
+                "treg" => self.remember_provider("treg"),
+                "hermes" => self.remember_provider("hermes"),
                 _ => {}
             }
         }

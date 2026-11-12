@@ -60,6 +60,8 @@ pub struct XConfig {
     pub hermes_base_url: String,
     pub hermes_model: String,
     pub hermes_api_key: String,
+    /// `free`, `treg`, or `hermes`. Empty means the desk settings file decides.
+    pub take_provider: String,
     /// WSL distro/user tried when an agent is not on the Windows PATH.
     pub wsl_distro: String,
     pub wsl_user: String,
@@ -109,6 +111,7 @@ impl Default for XConfig {
             hermes_base_url: String::new(),
             hermes_model: String::new(),
             hermes_api_key: String::new(),
+            take_provider: String::new(),
             wsl_distro: "Ubuntu".to_string(),
             wsl_user: String::new(),
             config_dir: default_config_dir(),
@@ -243,6 +246,7 @@ impl XConfig {
             "agents.hermes_base_url" => self.hermes_base_url = value.to_string(),
             "agents.hermes_model" => self.hermes_model = value.to_string(),
             "agents.hermes_api_key" => self.hermes_api_key = value.to_string(),
+            "desk.provider" | "takes.provider" => self.take_provider = value.to_string(),
             "agents.wsl_distro" => self.wsl_distro = value.to_string(),
             "agents.wsl_user" => self.wsl_user = value.to_string(),
             "supabase_url" | "supabase.url" => self.supabase_url = value.to_string(),
@@ -386,6 +390,20 @@ impl XConfig {
         Ok(())
     }
 
+    /// Writes the takes provider into this config directory only.
+    pub fn save_take_provider(&self, provider: &str) -> Result<(), String> {
+        let provider = provider.trim();
+        fs::create_dir_all(&self.config_dir).map_err(|error| error.to_string())?;
+        let path = self.config_dir.join("x.toml");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let text = upsert_root_assignment(
+            &text,
+            "desk.provider",
+            &format!("desk.provider = \"{provider}\""),
+        );
+        fs::write(path, text).map_err(|error| error.to_string())
+    }
+
     pub fn save_list_sort(&self) -> Result<(), String> {
         self.upsert_config_assignment(
             "list_sort",
@@ -512,6 +530,36 @@ fn toml_string(value: &str) -> String {
 fn nonempty_owned(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Keep a root key out of a later `[section]`.
+fn upsert_root_assignment(text: &str, key: &str, line: &str) -> String {
+    let mut out = String::new();
+    let mut found = false;
+    let mut in_section = false;
+    for raw in text.lines() {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        if code.starts_with('[') && code.ends_with(']') {
+            in_section = true;
+        }
+        let matches = !in_section
+            && code
+                .split_once('=')
+                .is_some_and(|(left, _)| left.trim() == key);
+        if matches {
+            out.push_str(line);
+            found = true;
+        } else {
+            out.push_str(raw);
+        }
+        out.push('\n');
+    }
+    if found {
+        return out;
+    }
+    let mut prefixed = format!("{line}\n");
+    prefixed.push_str(&out);
+    prefixed
 }
 
 fn upsert_assignment(text: &mut String, key: &str, line: &str) {

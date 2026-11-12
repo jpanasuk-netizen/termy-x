@@ -122,12 +122,7 @@ impl TrendsDesk {
                         "Free takes",
                         TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Free,
                         cx.listener(|this, _, _, cx| {
-                            this.settings.take_provider = "free".into();
-                            if this.writable {
-                                let _ = this.store.save_settings(&this.settings);
-                            }
-                            this.begin_take_stream(cx);
-                            cx.notify();
+                            this.set_take_provider("free", cx);
                         }),
                     ))
                     .child(button(
@@ -135,12 +130,15 @@ impl TrendsDesk {
                         "Treg takes",
                         TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Treg,
                         cx.listener(|this, _, _, cx| {
-                            this.settings.take_provider = "treg".into();
-                            if this.writable {
-                                let _ = this.store.save_settings(&this.settings);
-                            }
-                            this.begin_take_stream(cx);
-                            cx.notify();
+                            this.set_take_provider("treg", cx);
+                        }),
+                    ))
+                    .child(button(
+                        "desk-take-hermes",
+                        "Hermes takes",
+                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Hermes,
+                        cx.listener(|this, _, _, cx| {
+                            this.set_take_provider("hermes", cx);
                         }),
                     )),
             )

@@ -128,10 +128,10 @@ impl TrendsDesk {
         box_el
             .child(div().text_size(px(12.0)).child(format!(
                 "Provider · {}",
-                if pop.provider == TakeProvider::Treg {
-                    "Treg"
-                } else {
-                    "Free"
+                match pop.provider {
+                    TakeProvider::Treg => "Treg",
+                    TakeProvider::Hermes => "Hermes",
+                    TakeProvider::Free => "Free",
                 }
             )))
             .child(
@@ -139,17 +139,16 @@ impl TrendsDesk {
                     .flex()
                     .gap(px(8.0))
                     .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
-                        this.settings.take_provider = "free".into();
-                        if let Some(pop) = this.popout.as_mut() {
-                            pop.provider = TakeProvider::Free;
-                        }
+                        this.remember_provider("free");
                         cx.notify();
                     }))
                     .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
-                        this.settings.take_provider = "treg".into();
-                        if let Some(pop) = this.popout.as_mut() {
-                            pop.provider = TakeProvider::Treg;
-                        }
+                        this.remember_provider("treg");
+                        cx.notify();
+                    }))
+                    .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
+                        this.remember_provider("hermes");
+                        this.probe_hermes_models(cx);
                         cx.notify();
                     }))
                     .child(pop_button(

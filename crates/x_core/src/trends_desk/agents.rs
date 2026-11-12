@@ -320,6 +320,85 @@ pub fn hermes_health_url(base: &str) -> String {
     format!("{}{HERMES_HEALTH_PATH}", hermes_origin(base))
 }
 
+pub fn hermes_models_request(base: &str, key: &str) -> HttpRequest {
+    let base = if base.trim().is_empty() {
+        HERMES_BASE
+    } else {
+        base.trim().trim_end_matches('/')
+    };
+    HttpRequest {
+        method: "GET",
+        url: format!("{base}/models"),
+        body: None,
+        bearer: {
+            let key = key.trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some(key.to_string())
+            }
+        },
+        content_type: None,
+        headers: Vec::new(),
+    }
+}
+
+/// One line for the Hermes status pill. The base URL is whatever was configured.
+pub fn hermes_models_line(base: &str, result: Result<&str, &str>) -> String {
+    let base = if base.trim().is_empty() {
+        HERMES_BASE
+    } else {
+        base.trim().trim_end_matches('/')
+    };
+    match result {
+        Err(error) => {
+            let lower = error.to_lowercase();
+            if lower.contains("401") || lower.contains("unauthorized") {
+                format!("Hermes · needs a key (401)")
+            } else if lower.contains("402")
+                || lower.contains("payment required")
+                || lower.contains("insufficient")
+            {
+                format!("Hermes · needs credits (402)")
+            } else {
+                let short = one_line(error);
+                let short: String = short.chars().take(80).collect();
+                if short.is_empty() {
+                    format!("Hermes · unreachable at {base}")
+                } else {
+                    format!("Hermes · unreachable ({short})")
+                }
+            }
+        }
+        Ok(body) => {
+            let names = model_ids(body);
+            if names.is_empty() {
+                format!("Hermes · no models listed at {base}")
+            } else {
+                format!("Hermes · {} @ {base}", names.join(", "))
+            }
+        }
+    }
+}
+
+fn model_ids(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/data")
+        .and_then(|item| item.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("id").and_then(|id| id.as_str()))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn hermes_health_request(base: &str) -> HttpRequest {
     HttpRequest {
         method: "GET",
@@ -431,6 +510,36 @@ pub fn plan_agent_draft(
 
 pub trait PromptCli {
     fn run(&self, program: &str, args: &[String], stdin: &str) -> Result<String, String>;
+}
+
+/// Ask Hermes for `n` replies. Failure, including 401 and 402, still returns
+/// three different fallback lines and a one-line note. Nothing is posted.
+pub fn draft_hermes_variants(
+    auth: &HermesAuth,
+    http: &dyn Http,
+    author: &str,
+    tweet: &str,
+    tone: &str,
+    n: usize,
+) -> (Vec<String>, String) {
+    let n = n.clamp(1, 3);
+    let prompt = reply_prompt(author, tweet, tone);
+    let result = match plan_hermes_draft(auth, &prompt) {
+        Ok(request) => {
+            let secret = auth.key.clone();
+            match http.request(request) {
+                Ok(body) => parse_chat_text(&body).map_err(|error| redact_secret(&error, &secret)),
+                Err(error) => Err(redact_secret(&error, &secret)),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let (mut lines, note) = variants_from_draft(tweet, result);
+    lines.truncate(n);
+    while lines.len() < n {
+        lines.push(format!("Take {}: {tweet}", lines.len() + 1));
+    }
+    (lines, note)
 }
 
 pub fn execute_draft(
@@ -736,6 +845,24 @@ mod tests {
         assert_eq!(health.method, "GET");
         assert_eq!(health.url, "http://127.0.0.1:8642/health");
         assert!(health.bearer.is_none());
+        let models = hermes_models_request("http://10.0.0.8:8642/v1", "");
+        assert_eq!(models.url, "http://10.0.0.8:8642/v1/models");
+        assert!(models.bearer.is_none());
+        assert_eq!(
+            hermes_models_line("http://10.0.0.8:8642/v1", Err("connection refused")),
+            "Hermes · unreachable (connection refused)"
+        );
+        assert_eq!(
+            hermes_models_line("", Err("http 401 unauthorized")),
+            "Hermes · needs a key (401)"
+        );
+        assert_eq!(
+            hermes_models_line(
+                "http://10.0.0.8:8642/v1",
+                Ok(r#"{"data":[{"id":"hermes-agent"}]}"#)
+            ),
+            "Hermes · hermes-agent @ http://10.0.0.8:8642/v1"
+        );
         assert_eq!(hermes_pill(Ok(())), "Hermes · up");
         assert!(hermes_pill(Err("connection refused".into())).starts_with("Hermes · unreachable"));
     }

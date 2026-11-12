@@ -15,9 +15,10 @@ use termy_x::io::Http;
 use crate::trends_desk::TrendsDesk;
 use termy_x::agents::Agent;
 use termy_x::trends_desk::{
-    AgentPane, HermesAuth, Launch, PromptCli, execute_draft, hermes_auth, hermes_health_request,
-    hermes_pill, known_hermes_exe, plan_agent_draft, reply_prompt, resolve_launch,
-    seed_agent_block, variants_from_draft, write_hermes_settings,
+    AgentPane, HermesAuth, Launch, PromptCli, TakeProvider, choose_hermes_key, execute_draft,
+    hermes_auth, hermes_models_line, hermes_models_request, known_hermes_exe, plan_agent_draft,
+    redact_secret, reply_prompt, resolve_launch, seed_agent_block, variants_from_draft,
+    write_hermes_settings,
 };
 
 pub(crate) struct AgentProc {
@@ -161,23 +162,55 @@ impl TrendsDesk {
         }
     }
 
-    pub(crate) fn spawn_hermes_health(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn probe_hermes_models(&mut self, cx: &mut Context<Self>) {
         let base = self.hermes_base_text.clone();
+        let saved = self.hermes_key_text.clone();
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let line = cx
                 .background_executor()
                 .spawn(async move {
+                    let env = hermes_env_text();
+                    let key = choose_hermes_key(&saved, &env).unwrap_or_default();
                     let http =
                         termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(3));
-                    http.request(hermes_health_request(&base)).map(|_| ())
+                    let response = http
+                        .request(hermes_models_request(&base, &key))
+                        .map_err(|error| redact_secret(&error, &key));
+                    match &response {
+                        Ok(body) => hermes_models_line(&base, Ok(body)),
+                        Err(error) => hermes_models_line(&base, Err(error)),
+                    }
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
-                desk.hermes_pill = hermes_pill(result);
+                desk.hermes_pill = line;
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    pub(crate) fn remember_provider(&mut self, name: &str) {
+        let name = TakeProvider::parse(name).as_str();
+        self.settings.take_provider = name.into();
+        self.config.take_provider = name.into();
+        if let Some(pop) = self.popout.as_mut() {
+            pop.provider = TakeProvider::parse(name);
+        }
+        if self.writable {
+            let _ = self.store.save_settings(&self.settings);
+            let _ = self.config.save_take_provider(name);
+        }
+    }
+
+    pub(crate) fn set_take_provider(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.remember_provider(name);
+        self.free_halted = false;
+        if TakeProvider::parse(name) == TakeProvider::Hermes {
+            self.probe_hermes_models(cx);
+        }
+        self.begin_take_stream(cx);
+        cx.notify();
     }
 
     pub(crate) fn save_hermes(&mut self, cx: &mut Context<Self>) {
@@ -200,7 +233,7 @@ impl TrendsDesk {
             }
         }
         self.draft_note = "Saved Hermes settings in Termy XL. The key is not logged.".into();
-        self.spawn_hermes_health(cx);
+        self.probe_hermes_models(cx);
         cx.notify();
     }
 

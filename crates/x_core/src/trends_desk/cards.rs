@@ -540,14 +540,15 @@ pub fn commit_send(
 pub enum TakeProvider {
     Treg,
     Free,
+    Hermes,
 }
 
 impl TakeProvider {
     pub fn parse(value: &str) -> Self {
-        if value.trim().eq_ignore_ascii_case("treg") {
-            Self::Treg
-        } else {
-            Self::Free
+        match value.trim().to_ascii_lowercase().as_str() {
+            "treg" => Self::Treg,
+            "hermes" => Self::Hermes,
+            _ => Self::Free,
         }
     }
 
@@ -555,6 +556,7 @@ impl TakeProvider {
         match self {
             Self::Treg => "treg",
             Self::Free => "free",
+            Self::Hermes => "hermes",
         }
     }
 }
@@ -564,6 +566,9 @@ pub struct TakeDraft {
     pub text: String,
     pub source: &'static str,
     pub note: String,
+    /// Model replies when the provider returned more than one. Empty means
+    /// the editor builds three distinct lines from `text`.
+    pub variants: Vec<String>,
 }
 
 pub fn short_take_note(note: &str) -> String {
@@ -586,6 +591,7 @@ pub fn offline_take(post: &SourcePost) -> TakeDraft {
         text: super::domain::idea_from(post),
         source: "offline",
         note: "offline take".into(),
+        variants: Vec::new(),
     }
 }
 
@@ -613,6 +619,7 @@ pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &Source
             text,
             source: "model",
             note: format!("Free model draft ({where_from}). Not posted."),
+            variants: Vec::new(),
         },
         Ok(_) => offline_with(
             post,
@@ -697,7 +704,53 @@ pub fn treg_take_with_token(
         text,
         source: "treg",
         note: "Treg draft. Not posted.".into(),
+        variants: Vec::new(),
     })
+}
+
+/// Hermes gateway draft. A 401 or 402 becomes three different fallback lines
+/// and a one-line note. This does not post.
+pub fn hermes_take(
+    config: &crate::config::XConfig,
+    http: &dyn Http,
+    post: &SourcePost,
+) -> TakeDraft {
+    let env_text = hermes_env_file_text();
+    let auth = super::hermes_auth(
+        &config.hermes_base_url,
+        &config.hermes_model,
+        &config.hermes_api_key,
+        &env_text,
+    );
+    let (lines, note) =
+        super::draft_hermes_variants(&auth, http, &post.author, &post.text, "Reply", 3);
+    let text = lines
+        .first()
+        .cloned()
+        .unwrap_or_else(|| super::domain::idea_from(post));
+    if note.is_empty() {
+        TakeDraft {
+            text,
+            source: "hermes",
+            note: format!("Hermes draft ({}). Not posted.", auth.base),
+            variants: lines,
+        }
+    } else {
+        TakeDraft {
+            text,
+            source: "offline",
+            note,
+            variants: lines,
+        }
+    }
+}
+
+fn hermes_env_file_text() -> String {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return String::new();
+    };
+    let path = std::path::PathBuf::from(root).join("hermes").join(".env");
+    std::fs::read_to_string(path).unwrap_or_default()
 }
 
 pub fn parse_treg_draft(body: &str) -> Result<String, String> {
@@ -745,6 +798,7 @@ pub fn draft_take(
     match provider {
         TakeProvider::Free => Ok(free_take(config, http, post)),
         TakeProvider::Treg => treg_take(config, http, post),
+        TakeProvider::Hermes => Ok(hermes_take(config, http, post)),
     }
 }
 

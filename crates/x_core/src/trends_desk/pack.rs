@@ -183,7 +183,7 @@ pub fn provider_drafts(
     treg: Result<String, String>,
 ) -> Result<Vec<String>, String> {
     match provider {
-        TakeProvider::Free => Ok(three_variants(text, tone)),
+        TakeProvider::Free | TakeProvider::Hermes => Ok(three_variants(text, tone)),
         TakeProvider::Treg => {
             let draft = treg?;
             if draft.trim().is_empty() {

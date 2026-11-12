@@ -96,6 +96,8 @@ enum Cmd {
         limit: usize,
     },
     /// Law, Finance, and AI desk. Live OpenCLI only. Never posts.
+    /// `desk` is the short name agents should call.
+    #[command(alias = "desk")]
     TrendsDesk {
         /// Termy XL data directory. Defaults to the Termy XL app folder, not Termy X AppData.
         #[arg(long, global = true)]
@@ -614,6 +616,51 @@ enum TrendsDeskAction {
         /// Draft id saved in the Termy XL data directory.
         id: String,
     },
+    /// Search one column. JSON lists posts. Nothing is posted.
+    Search {
+        /// Column name or id, such as Law.
+        #[arg(long)]
+        subject: String,
+    },
+    /// Draft reply variants for a cached tweet. Nothing is posted.
+    Takes {
+        /// Status id or https://x.com/.../status/ id.
+        #[arg(long)]
+        tweet: String,
+        /// free, treg, or hermes.
+        #[arg(long, default_value = "free")]
+        provider: String,
+        /// How many distinct replies to return. Clamped to 1..=3.
+        #[arg(long, default_value_t = 3)]
+        n: usize,
+    },
+    /// List or save Termy XL drafts. Saving does not post.
+    Drafts {
+        #[command(subcommand)]
+        action: DeskDrafts,
+    },
+    /// Queue a reply draft in Termy XL. Does not post.
+    QueueReply {
+        /// Status id or URL the draft replies to.
+        #[arg(long)]
+        tweet: String,
+        /// Reply text stored in the Termy XL draft file.
+        #[arg(long)]
+        text: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeskDrafts {
+    /// List drafts saved in the Termy XL data folder.
+    List,
+    /// Save a draft. A second save for the same tweet replaces it.
+    Save {
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        tweet: Option<String>,
+    },
 }
 
 fn trends_desk_cmd(
@@ -708,6 +755,53 @@ fn trends_desk_cmd(
                     eprintln!("{error}");
                     1
                 }
+            }
+        }
+        TrendsDeskAction::Search { subject } => {
+            let body = crate::trends_desk::search_subject(&data_root, &subject, io.runner.clone());
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::Takes { tweet, provider, n } => {
+            let body = crate::trends_desk::takes_for_tweet(
+                &data_root,
+                &tweet,
+                &provider,
+                n,
+                io.http.as_ref(),
+            );
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::Drafts { action } => {
+            let body = match action {
+                DeskDrafts::List => crate::trends_desk::list_drafts(&data_root),
+                DeskDrafts::Save { text, tweet } => {
+                    crate::trends_desk::save_draft(&data_root, &text, tweet.as_deref())
+                }
+            };
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::QueueReply { tweet, text } => {
+            let body = crate::trends_desk::queue_reply(&data_root, &tweet, &text);
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
             }
         }
         TrendsDeskAction::Run { topic, focus } => {

@@ -128,11 +128,17 @@ impl TrendsDesk {
             ),
         };
         let config = isolated_opencli_config(&data_root);
-        let settings = if writable {
+        let mut settings = if writable {
             store.load_settings()
         } else {
             DeskSettings::default()
         };
+        if !config.take_provider.trim().is_empty() {
+            settings.take_provider =
+                termy_x::trends_desk::TakeProvider::parse(&config.take_provider)
+                    .as_str()
+                    .into();
+        }
         let pack = if writable {
             termy_x::trends_desk::load_pack(&data_root)
         } else {
@@ -261,7 +267,7 @@ impl TrendsDesk {
         self.spawn_probe(cx);
         self.spawn_daily(cx);
         self.spawn_refresh(cx);
-        self.spawn_hermes_health(cx);
+        self.probe_hermes_models(cx);
         self.seed_agent_file();
     }
 
@@ -287,7 +293,10 @@ impl TrendsDesk {
             return;
         }
         if self.free_halted
-            && TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Free
+            && matches!(
+                TakeProvider::parse(&self.settings.take_provider),
+                TakeProvider::Free | TakeProvider::Hermes
+            )
         {
             let detail = self.model_detail.clone();
             for post in &posts {
@@ -306,6 +315,7 @@ impl TrendsDesk {
                     text: String::new(),
                     source: "pending",
                     note: String::new(),
+                    variants: Vec::new(),
                 },
             );
         }
@@ -361,8 +371,11 @@ impl TrendsDesk {
                         text: error.clone(),
                         source: "error",
                         note: error,
+                        variants: Vec::new(),
                     }
-                } else if model_down && provider == TakeProvider::Free {
+                } else if model_down
+                    && matches!(provider, TakeProvider::Free | TakeProvider::Hermes)
+                {
                     let mut draft = offline_take(&post);
                     if let Some(reason) = &shared_offline {
                         draft.note = reason.clone();
@@ -383,12 +396,15 @@ impl TrendsDesk {
                                     text: error.clone(),
                                     source: "error",
                                     note: error,
+                                    variants: Vec::new(),
                                 },
                             }
                         })
                         .await
                 };
-                if provider == TakeProvider::Free && termy_x::ai::blocks_free_model(&draft.note) {
+                if matches!(provider, TakeProvider::Free | TakeProvider::Hermes)
+                    && termy_x::ai::blocks_free_model(&draft.note)
+                {
                     if !tried_next {
                         tried_next = true;
                         if let Some(next) = later.first().cloned() {
@@ -416,6 +432,7 @@ impl TrendsDesk {
                                             text: error.clone(),
                                             source: "error",
                                             note: error,
+                                            variants: Vec::new(),
                                         },
                                     }
                                 })
@@ -892,7 +909,16 @@ impl TrendsDesk {
         self.card_replies
             .entry(id.to_string())
             .or_insert_with(|| ReplyPhase::Editing { text: text.clone() });
-        self.popout = Some(open_editor(id, &text, provider));
+        let stored = self
+            .takes
+            .get(id)
+            .map(|take| take.variants.clone())
+            .unwrap_or_default();
+        let mut editor = open_editor(id, &text, provider);
+        if !stored.is_empty() {
+            editor.variants = termy_x::trends_desk::distinct_variants(&text, &stored);
+        }
+        self.popout = Some(editor);
     }
 
     pub(crate) fn close_popout(&mut self) {
@@ -938,7 +964,14 @@ impl TrendsDesk {
                             .insert(id.clone(), edit_reply(&current, draft.text.clone()));
                         desk.draft_note = draft.note;
                         desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(draft.text.len());
-                        desk.popout = Some(open_editor(&id, &draft.text, provider));
+                        let mut editor = open_editor(&id, &draft.text, provider);
+                        if !draft.variants.is_empty() {
+                            editor.variants = termy_x::trends_desk::distinct_variants(
+                                &draft.text,
+                                &draft.variants,
+                            );
+                        }
+                        desk.popout = Some(editor);
                         desk.selected = Some(format!("take:{id}"));
                     }
                     Err(error) => {
