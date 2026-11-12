@@ -4,6 +4,7 @@
 //! A failed fetch keeps the last saved report labeled cached and does not
 //! write a fixture success. Publishing stays on the existing confirm path.
 
+mod agents;
 mod cards;
 mod domain;
 mod fetch;
@@ -13,6 +14,13 @@ mod parse;
 mod snap;
 mod store;
 
+pub use agents::{
+    AgentPane, DraftRoute, HERMES_BASE, HERMES_HEALTH_PATH, HERMES_MODEL, HermesAuth, Launch,
+    PromptCli, api_server_key_from_env_file, choose_hermes_key, default_command, execute_draft,
+    hermes_auth, hermes_body, hermes_health_request, hermes_health_url, hermes_pill,
+    known_hermes_exe, missing_line, plan_agent_draft, plan_hermes_draft, redact_secret,
+    reply_prompt, resolve_launch, seed_agent_block, variants_from_draft, write_hermes_settings,
+};
 pub use cards::{
     COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, EditPopout, LOCKED_OPEN_WIDTH,
     ReplyPhase, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame, TakeProvider, TweetCard,
@@ -20,8 +28,8 @@ pub use cards::{
     collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_locked, expand_right,
     expand_to_full, frame_from_parts, layout_takes, move_selection, offline_take, open_editor,
     open_width, page_index, page_label, remember_width, request_send, scroll_by, scroll_of,
-    short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock, tone_variants,
-    turn_page, wrap_token,
+    select_take, short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock,
+    tone_variants, turn_page, wrap_token,
 };
 pub use domain::{
     ChangeTag, ColumnView, DeskSettings, GPU_NOTE, IMAGE_QUOTE_NOTE, Nav, OutcomeKind, Phase,
@@ -39,10 +47,10 @@ pub use fetch::{
 pub use log::{append_desk_log, redact_log, should_log_model_failure};
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, TakeTone, apply_filters,
-    desk_key, flip_variant, format_clock, format_post_time, heat_badge, heat_line, heat_score,
-    hud_line, load_pack, local_offset_secs, new_ids, next_refresh_text, provider_drafts,
-    read_composer, refresh_due, refresh_is_search_only, replied_badge, save_pack, sends_on_key,
-    should_auto_refresh, sort_by_heat, three_variants,
+    desk_key, distinct_variants, fallback_angles, flip_variant, format_clock, format_post_time,
+    heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
+    next_refresh_text, provider_drafts, read_composer, refresh_due, refresh_is_search_only,
+    replied_badge, save_pack, sends_on_key, should_auto_refresh, sort_by_heat, three_variants,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

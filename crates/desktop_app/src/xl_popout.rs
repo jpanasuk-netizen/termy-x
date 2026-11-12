@@ -96,7 +96,8 @@ impl TrendsDesk {
                             cx,
                         )
                     })),
-            );
+            )
+            .child(self.agent_controls(cx));
         for (index, variant) in pop.variants.iter().enumerate() {
             let text = variant.clone();
             box_el = box_el.child(

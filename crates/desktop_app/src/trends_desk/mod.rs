@@ -41,6 +41,9 @@ pub(crate) enum Field {
     AiBase,
     AiModel,
     AiKey,
+    HermesBase,
+    HermesModel,
+    HermesKey,
 }
 
 pub(crate) struct ColumnUi {
@@ -68,6 +71,14 @@ pub struct TrendsDesk {
     ai_base_text: String,
     ai_model_text: String,
     ai_key_text: String,
+    hermes_base_text: String,
+    hermes_model_text: String,
+    hermes_key_text: String,
+    pub(crate) hermes_pill: String,
+    pub(crate) agent_pane: Option<termy_x::trends_desk::AgentPane>,
+    pub(crate) agent_input: bool,
+    agent_proc: Option<xl_agents::AgentProc>,
+    agent_seen: usize,
     pub(crate) model_notice: String,
     pub(crate) model_detail: String,
     pub(crate) free_halted: bool,
@@ -156,6 +167,17 @@ impl TrendsDesk {
         let ai_base_text = config.ai_base_url.clone();
         let ai_model_text = config.ai_model.clone();
         let ai_key_text = config.ai_api_key.clone();
+        let hermes_base_text = if config.hermes_base_url.trim().is_empty() {
+            termy_x::trends_desk::HERMES_BASE.to_string()
+        } else {
+            config.hermes_base_url.clone()
+        };
+        let hermes_model_text = if config.hermes_model.trim().is_empty() {
+            termy_x::trends_desk::HERMES_MODEL.to_string()
+        } else {
+            config.hermes_model.clone()
+        };
+        let hermes_key_text = config.hermes_api_key.clone();
         Self {
             focus_handle: cx.focus_handle(),
             options,
@@ -174,6 +196,14 @@ impl TrendsDesk {
             ai_base_text,
             ai_model_text,
             ai_key_text,
+            hermes_base_text,
+            hermes_model_text,
+            hermes_key_text,
+            hermes_pill: "Hermes · checking".into(),
+            agent_pane: None,
+            agent_input: false,
+            agent_proc: None,
+            agent_seen: 0,
             model_notice: String::new(),
             model_detail: String::new(),
             free_halted: false,
@@ -231,6 +261,8 @@ impl TrendsDesk {
         self.spawn_probe(cx);
         self.spawn_daily(cx);
         self.spawn_refresh(cx);
+        self.spawn_hermes_health(cx);
+        self.seed_agent_file();
     }
 
     fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
@@ -763,6 +795,36 @@ impl TrendsDesk {
 
     fn popout_key(&mut self, key: &str, event: &KeyDownEvent, cx: &mut Context<Self>) {
         use termy_x::draft_edit::Motion;
+        if self.agent_input {
+            if key == "escape" {
+                self.agent_input = false;
+                cx.notify();
+                return;
+            }
+            if key == "enter" {
+                self.submit_agent_line();
+                cx.notify();
+                return;
+            }
+            if key == "backspace" {
+                if let Some(pane) = self.agent_pane.as_mut() {
+                    pane.backspace();
+                }
+                cx.notify();
+                return;
+            }
+            if let Some(ch) = event.keystroke.key_char.as_deref()
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.platform
+                && !ch.is_empty()
+            {
+                if let Some(pane) = self.agent_pane.as_mut() {
+                    pane.push_str(ch);
+                }
+                cx.notify();
+            }
+            return;
+        }
         if key == "escape" {
             self.close_popout();
             cx.notify();
@@ -825,7 +887,7 @@ impl TrendsDesk {
             .or_else(|| self.takes.get(id).map(|take| take.text.clone()))
             .unwrap_or_default();
         let provider = TakeProvider::parse(&self.settings.take_provider);
-        self.selected = Some(format!("take:{id}"));
+        self.selected = Some(termy_x::trends_desk::select_take(id));
         self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
         self.card_replies
             .entry(id.to_string())
@@ -1169,6 +1231,9 @@ impl TrendsDesk {
             Field::AiBase => &mut self.ai_base_text,
             Field::AiModel => &mut self.ai_model_text,
             Field::AiKey => &mut self.ai_key_text,
+            Field::HermesBase => &mut self.hermes_base_text,
+            Field::HermesModel => &mut self.hermes_model_text,
+            Field::HermesKey => &mut self.hermes_key_text,
         }
     }
 
@@ -1317,6 +1382,7 @@ impl Render for TrendsDesk {
         self.ensure_scrolls();
         self.maybe_refresh(cx);
         self.follow_host(window, cx);
+        self.pull_agent_output();
         if !self.fitted {
             self.fitted = crate::xl_host::fit_window(window);
         }
@@ -1370,4 +1436,6 @@ impl Render for TrendsDesk {
 }
 
 mod chrome;
+#[path = "../xl_agents.rs"]
+mod xl_agents;
 pub(crate) use chrome::{HintView, button, open_status};

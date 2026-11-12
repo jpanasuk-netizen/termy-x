@@ -55,6 +55,11 @@ pub struct XConfig {
     pub agent_hermes: Option<String>,
     pub agent_grok: Option<String>,
     pub agent_muse: Option<String>,
+    /// Hermes gateway. Empty means the Windows default
+    /// `http://127.0.0.1:8642/v1`. The key is written only when the user saves it.
+    pub hermes_base_url: String,
+    pub hermes_model: String,
+    pub hermes_api_key: String,
     /// WSL distro/user tried when an agent is not on the Windows PATH.
     pub wsl_distro: String,
     pub wsl_user: String,
@@ -101,6 +106,9 @@ impl Default for XConfig {
             agent_hermes: None,
             agent_grok: None,
             agent_muse: None,
+            hermes_base_url: String::new(),
+            hermes_model: String::new(),
+            hermes_api_key: String::new(),
             wsl_distro: "Ubuntu".to_string(),
             wsl_user: String::new(),
             config_dir: default_config_dir(),
@@ -232,6 +240,9 @@ impl XConfig {
             "agents.hermes" | "agent_hermes" => self.agent_hermes = nonempty_owned(value),
             "agents.grok" | "agent_grok" => self.agent_grok = nonempty_owned(value),
             "agents.muse" | "agent_muse" => self.agent_muse = nonempty_owned(value),
+            "agents.hermes_base_url" => self.hermes_base_url = value.to_string(),
+            "agents.hermes_model" => self.hermes_model = value.to_string(),
+            "agents.hermes_api_key" => self.hermes_api_key = value.to_string(),
             "agents.wsl_distro" => self.wsl_distro = value.to_string(),
             "agents.wsl_user" => self.wsl_user = value.to_string(),
             "supabase_url" | "supabase.url" => self.supabase_url = value.to_string(),

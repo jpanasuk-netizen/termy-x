@@ -395,6 +395,10 @@ pub struct EditPopout {
     pub provider: TakeProvider,
 }
 
+pub fn select_take(card_id: &str) -> String {
+    format!("take:{card_id}")
+}
+
 pub fn open_editor(card_id: &str, draft: &str, provider: TakeProvider) -> EditPopout {
     let tone = crate::model::Tone::Reply;
     EditPopout {
@@ -402,7 +406,7 @@ pub fn open_editor(card_id: &str, draft: &str, provider: TakeProvider) -> EditPo
         open: true,
         draft: draft.to_string(),
         tone: tone.as_str().to_string(),
-        variants: tone_variants(draft, tone),
+        variants: crate::trends_desk::distinct_variants(draft, &[]),
         provider,
     }
 }
@@ -992,6 +996,9 @@ mod tests {
         let open = open_editor("55", "hello take", TakeProvider::Free);
         assert!(open.open);
         assert_eq!(open.variants.len(), 3);
+        assert_ne!(open.variants[0], open.variants[1]);
+        assert_ne!(open.variants[1], open.variants[2]);
+        assert_ne!(open.variants[0], open.variants[2]);
         assert_eq!(char_count("hi"), 2);
         let closed = close_editor(&open);
         assert!(!closed.open);

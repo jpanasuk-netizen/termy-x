@@ -52,6 +52,12 @@ impl TrendsDesk {
                             .text_color(rgb(0x8e8e93))
                             .child(self.hud()),
                     )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x9ad7ff))
+                            .child(self.hermes_pill.clone()),
+                    )
                     .children((!self.model_notice.is_empty()).then(|| {
                         let notice = self.model_notice.clone();
                         let full = self.model_detail.clone();
@@ -341,6 +347,34 @@ impl TrendsDesk {
                 false,
                 cx.listener(|this, _, _, cx| this.save_model(cx)),
             ))
+            .child(div().text_size(px(12.0)).child(self.hermes_pill.clone()))
+            .child(self.field_chip(
+                "desk-hermes-base",
+                "Hermes URL",
+                &self.hermes_base_text,
+                Field::HermesBase,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-hermes-model",
+                "Hermes model",
+                &self.hermes_model_text,
+                Field::HermesModel,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-hermes-key",
+                "Hermes key",
+                &hermes_key_label(&self.hermes_key_text, self.field == Some(Field::HermesKey)),
+                Field::HermesKey,
+                cx,
+            ))
+            .child(button(
+                "desk-save-hermes",
+                "Save Hermes",
+                false,
+                cx.listener(|this, _, _, cx| this.save_hermes(cx)),
+            ))
             .child(self.field_chip("desk-focus", "Focus", &self.focus_text, Field::Focus, cx))
             .child(self.field_chip(
                 "desk-daily-at",
@@ -451,6 +485,17 @@ impl TrendsDesk {
             .bg(rgb(0x10141c))
             .child(format!("{GPU_NOTE} {IMAGE_QUOTE_NOTE}"))
             .into_any_element()
+    }
+}
+
+fn hermes_key_label(key: &str, editing: bool) -> String {
+    if editing {
+        return key.to_string();
+    }
+    if key.trim().is_empty() {
+        String::new()
+    } else {
+        "saved".into()
     }
 }
 

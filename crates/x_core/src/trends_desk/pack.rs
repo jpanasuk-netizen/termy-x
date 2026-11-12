@@ -111,13 +111,53 @@ pub fn sort_by_heat(posts: &[&SourcePost], now_unix: i64) -> Vec<String> {
 }
 
 pub fn three_variants(text: &str, tone: TakeTone) -> Vec<String> {
-    let idea: String = text.chars().take(90).collect();
     let name = tone.label();
+    fallback_angles(text)
+        .into_iter()
+        .map(|line| format!("{name} · {line}"))
+        .collect()
+}
+
+/// Three fallback replies that are never the same sentence.
+pub fn fallback_angles(text: &str) -> Vec<String> {
+    let claim = text
+        .split_whitespace()
+        .filter(|word| !word.starts_with("http://") && !word.starts_with("https://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let claim: String = claim.chars().take(140).collect();
+    let claim = claim.trim();
+    let claim = if claim.is_empty() { "this post" } else { claim };
     vec![
-        format!("{name} take: {idea}"),
-        format!("{name} angle: one concrete point on {idea}"),
-        format!("{name} reply: {idea}"),
+        format!("Agree, and one thing to add: {claim}"),
+        format!("Question: what changes if \"{claim}\" is only half true?"),
+        format!("Contrarian: {claim} still skips who pays the cost."),
     ]
+}
+
+/// Keep model lines that differ, then fill from the fallback angles.
+pub fn distinct_variants(seed: &str, generated: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in generated {
+        let line = line.trim();
+        if line.is_empty() || out.iter().any(|have: &String| have == line) {
+            continue;
+        }
+        out.push(line.to_string());
+        if out.len() == 3 {
+            return out;
+        }
+    }
+    for line in fallback_angles(seed) {
+        if out.iter().any(|have| have == &line) {
+            continue;
+        }
+        out.push(line);
+        if out.len() == 3 {
+            break;
+        }
+    }
+    out
 }
 
 pub fn flip_variant(index: usize, delta: i32, len: usize) -> usize {
@@ -634,6 +674,21 @@ mod tests {
         let spicy = three_variants("rates moved", TakeTone::Spicy);
         assert_eq!(spicy.len(), 3);
         assert!(spicy.iter().all(|line| line.contains("Spicy")));
+        assert_ne!(spicy[0], spicy[1]);
+        assert_ne!(spicy[1], spicy[2]);
+        assert_ne!(spicy[0], spicy[2]);
+        let fallback = fallback_angles("Courts are testing whether models can write opinions");
+        assert_ne!(fallback[0], fallback[1]);
+        assert_ne!(fallback[1], fallback[2]);
+        assert_ne!(fallback[0], fallback[2]);
+        let repeated = distinct_variants(
+            "Courts are testing whether models can write opinions",
+            &["same line".into(), "same line".into(), "same line".into()],
+        );
+        assert_eq!(repeated.len(), 3);
+        assert_ne!(repeated[0], repeated[1]);
+        assert_ne!(repeated[1], repeated[2]);
+        assert_ne!(repeated[0], repeated[2]);
         let funny = provider_drafts(
             "rates",
             TakeTone::Funny,
