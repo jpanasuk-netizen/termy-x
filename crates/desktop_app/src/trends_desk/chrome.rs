@@ -58,6 +58,13 @@ impl TrendsDesk {
                             .text_color(rgb(0x9ad7ff))
                             .child(self.hermes_pill.clone()),
                     )
+                    .children((!self.action_note.is_empty()).then(|| {
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xffd60a))
+                            .whitespace_normal()
+                            .child(self.action_note.clone())
+                    }))
                     .children((!self.model_notice.is_empty()).then(|| {
                         let notice = self.model_notice.clone();
                         let full = self.model_detail.clone();
@@ -85,37 +92,66 @@ impl TrendsDesk {
                     .gap(px(8.0))
                     .child(button(
                         "desk-refresh",
-                        "Refresh",
-                        false,
+                        if self.busy {
+                            "Refreshing…"
+                        } else {
+                            "Refresh"
+                        },
+                        self.busy,
                         cx.listener(|this, _, _, cx| {
+                            if this.busy {
+                                this.action_note = "Already loading.".into();
+                                cx.notify();
+                                return;
+                            }
                             this.pack.last_refresh = Some(TrendsDesk::now_unix());
                             this.save_pack_file();
-                            let ids: Vec<String> = this
-                                .columns
-                                .iter()
-                                .map(|column| column.topic.id.clone())
-                                .collect();
-                            this.start_run(&ids, cx);
+                            let id = this.settings.subject_id.clone();
+                            this.action_note = "Refreshing this page…".into();
+                            this.start_run(std::slice::from_ref(&id), cx);
                         }),
                     ))
                     .child(button(
                         "desk-run-all",
-                        "Run all",
-                        false,
+                        if self.busy { "Running…" } else { "Run all" },
+                        self.busy,
                         cx.listener(|this, _, _, cx| {
+                            if this.busy {
+                                this.action_note = "Already loading.".into();
+                                cx.notify();
+                                return;
+                            }
                             let ids: Vec<String> = this
                                 .columns
                                 .iter()
                                 .map(|column| column.topic.id.clone())
                                 .collect();
+                            this.action_note = "Running every subject…".into();
                             this.start_run(&ids, cx);
+                        }),
+                    ))
+                    .child(button(
+                        "desk-open-grok",
+                        "Open Grok",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.action_note = "Opening Grok in a terminal…".into();
+                            this.open_agent(termy_x::agents::Agent::Grok, cx);
+                            cx.notify();
                         }),
                     ))
                     .child(button(
                         "desk-cancel",
                         "Cancel",
                         false,
-                        cx.listener(|this, _, _, cx| this.cancel_run(cx)),
+                        cx.listener(|this, _, _, cx| {
+                            if !this.busy {
+                                this.action_note = "Nothing is running.".into();
+                                cx.notify();
+                                return;
+                            }
+                            this.cancel_run(cx);
+                        }),
                     ))
                     .child(button(
                         "desk-take-free",
@@ -158,6 +194,7 @@ impl TrendsDesk {
         let current = self.surface;
         div()
             .flex()
+            .flex_wrap()
             .gap(px(8.0))
             .px(px(16.0))
             .py(px(8.0))
@@ -491,8 +528,11 @@ impl TrendsDesk {
                 rgb(0x2c2c2e)
             })
             .text_size(px(12.0))
-            .min_w(px(180.0))
+            .min_w(px(160.0))
+            .min_h(px(36.0))
+            .flex_shrink_0()
             .cursor_text()
+            .hover(|style| style.border_color(rgb(0xff4fa3)))
             .child(termy_x::trends_desk::search_label(
                 editing,
                 &self.filter_text,
@@ -602,14 +642,29 @@ pub(crate) fn button(
 ) -> gpui_kit::AnyElement {
     div()
         .id(id.into())
-        .px(px(10.0))
-        .py(px(6.0))
+        .flex_shrink_0()
+        .min_h(px(36.0))
+        .px(px(12.0))
+        .py(px(8.0))
         .rounded(px(8.0))
         .border_1()
-        .border_color(if active { rgb(0x0a84ff) } else { rgb(0x3a3a3c) })
-        .bg(if active { rgb(0x1a2a44) } else { rgb(0x2c2c2e) })
-        .text_size(px(12.0))
+        .border_color(if active { rgb(0xff4fa3) } else { rgb(0x3a3a3c) })
+        .bg(if active { rgb(0x2a1020) } else { rgb(0x2c2c2e) })
+        .text_size(px(13.0))
+        .text_color(if active { rgb(0x7af6ff) } else { rgb(0xe5e5ea) })
         .cursor_pointer()
+        .hover(|style| {
+            style
+                .bg(rgb(0x3a2430))
+                .border_color(rgb(0xff4fa3))
+                .text_color(rgb(0xffe56a))
+        })
+        .active(|style| {
+            style
+                .bg(rgb(0xff4fa3))
+                .border_color(rgb(0xff4fa3))
+                .text_color(rgb(0x070b14))
+        })
         .child(label.into())
         .on_mouse_down(MouseButton::Left, handler)
         .into_any_element()
@@ -636,15 +691,26 @@ pub(crate) fn page_button(
         .border_color(rgb(0x3a3a3c))
         .bg(rgb(0x2c2c2e))
         .text_size(px(14.0))
+        .text_color(rgb(0xe5e5ea))
         .cursor_pointer()
+        .hover(|style| {
+            style
+                .bg(rgb(0x3a2430))
+                .border_color(rgb(0xff4fa3))
+                .text_color(rgb(0xffe56a))
+        })
+        .active(|style| style.bg(rgb(0xff4fa3)).text_color(rgb(0x070b14)))
         .child(label.into())
         .on_mouse_down(MouseButton::Left, handler)
         .into_any_element()
 }
 
-pub(crate) fn open_status(url: &str) {
+pub(crate) fn open_status(url: &str) -> &'static str {
     if url.starts_with("https://x.com/") && url.contains("/status/") {
         let _ = webbrowser::open(url);
+        "Opened the post in the browser."
+    } else {
+        "That link is not an X post."
     }
 }
 

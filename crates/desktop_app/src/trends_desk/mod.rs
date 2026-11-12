@@ -82,6 +82,7 @@ pub struct TrendsDesk {
     agent_seen: usize,
     pub(crate) model_notice: String,
     pub(crate) model_detail: String,
+    pub(crate) action_note: String,
     pub(crate) free_halted: bool,
     draft_text: String,
     draft_reply_to: Option<String>,
@@ -218,6 +219,7 @@ impl TrendsDesk {
             agent_seen: 0,
             model_notice: String::new(),
             model_detail: String::new(),
+            action_note: String::new(),
             free_halted: false,
             draft_text: String::new(),
             draft_reply_to: None,
@@ -383,10 +385,11 @@ impl TrendsDesk {
 
     pub(crate) fn start_run(&mut self, ids: &[String], cx: &mut Context<Self>) {
         if self.options.fixture {
-            self.draft_note = "Fixture mode does not call OpenCLI.".into();
+            self.action_note = "Fixture mode does not call OpenCLI.".into();
             cx.notify();
             return;
         }
+        self.action_note = "Loading…".into();
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.cancel.store(false, Ordering::Relaxed);
@@ -506,6 +509,7 @@ impl TrendsDesk {
         termy_x::trends_desk::halt_takes();
         self.takes.retain(|_, take| take.source != "pending");
         self.busy = false;
+        self.action_note = "Cancelled.".into();
         for column in &mut self.columns {
             if column.view.phase == Phase::Loading {
                 column.view = column_from_cache(column.cached.as_ref());
@@ -641,6 +645,15 @@ impl TrendsDesk {
         }
         if key == "escape" {
             self.close_popout();
+            self.action_note = "Closed the draft. The text is still on the card.".into();
+            cx.notify();
+            return;
+        }
+        if key == "c" && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) {
+            if let Some(pop) = self.popout.clone() {
+                self.copy_text(&pop.draft, cx);
+                self.action_note = "Copied the reply.".into();
+            }
             cx.notify();
             return;
         }
@@ -676,13 +689,14 @@ impl TrendsDesk {
             .get(&pop.card_id)
             .is_some_and(termy_x::trends_desk::send_is_busy)
         {
-            self.draft_note = "Send is already in progress.".into();
+            self.action_note = "Sending…".into();
             cx.notify();
             return;
         }
         match editor_send(&pop, true) {
-            Err(error) => self.draft_note = error,
+            Err(error) => self.action_note = error,
             Ok(text) => {
+                self.action_note = "Sending…".into();
                 self.card_replies
                     .insert(pop.card_id.clone(), ReplyPhase::Editing { text });
                 self.send_reply(pop.card_id, cx);
@@ -798,13 +812,6 @@ impl TrendsDesk {
                     let drafted = termy_x::trends_desk::run_take_chain(
                         provider, &config, &post, &http, &tone,
                     );
-                    if open_compose && !drafted.text.trim().is_empty() {
-                        let _ = termy_x::trends_desk::queue_reply(
-                            &config.config_dir,
-                            &post.id,
-                            &drafted.text,
-                        );
-                    }
                     drafted
                 })
                 .await;
@@ -868,6 +875,7 @@ impl TrendsDesk {
         };
         match request_send(&phase, true) {
             Err(error) => {
+                self.action_note = error.clone();
                 let text = phase.text().to_string();
                 if !text.is_empty() {
                     self.card_replies
@@ -904,6 +912,10 @@ impl TrendsDesk {
                             text: pending.text().to_string(),
                         });
                         desk.save_pack_file();
+                        desk.action_note = match &result {
+                            Ok(_) => "Sent.".into(),
+                            Err(error) => error.clone(),
+                        };
                         desk.card_replies
                             .insert(id, apply_send_result(&pending, result));
                         cx.notify();

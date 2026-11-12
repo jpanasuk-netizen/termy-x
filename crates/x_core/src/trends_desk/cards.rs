@@ -445,6 +445,16 @@ pub fn close_editor(pop: &EditPopout) -> EditPopout {
 /// Shown in the reply box until the one take for this card is ready.
 pub const DRAFTING_PLACEHOLDER: &str = "Drafting…";
 
+/// The pink box holds the reply, three voice chips, Copy, and Send.
+pub fn pink_box_controls() -> [&'static str; 5] {
+    ["Funny", "Smart", "Spicy", "Copy", "Send"]
+}
+
+/// Draft take shows the box. It does not write a draft file in the background.
+pub fn draft_click_queues_a_file() -> bool {
+    false
+}
+
 /// Draft take opens the in-card editor on the click, before any provider runs.
 pub fn editor_on_draft_click(card_id: &str, provider: TakeProvider) -> EditPopout {
     open_editor(card_id, DRAFTING_PLACEHOLDER, provider)
@@ -1219,6 +1229,11 @@ mod tests {
         assert_eq!(DRAFTING_PLACEHOLDER, "Drafting…");
         let opened = editor_on_draft_click("42", TakeProvider::Grok);
         assert!(opened.open);
+        assert!(!draft_click_queues_a_file());
+        assert_eq!(
+            pink_box_controls(),
+            ["Funny", "Smart", "Spicy", "Copy", "Send"]
+        );
         assert_eq!(opened.card_id, "42");
         assert_eq!(opened.draft, DRAFTING_PLACEHOLDER);
         let missing = text_after_take(DRAFTING_PLACEHOLDER, "", "grok: not installed");

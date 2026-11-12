@@ -319,7 +319,9 @@ impl TrendsDesk {
         self.free_halted = false;
         self.takes_halted = false;
         termy_x::trends_desk::resume_takes();
-        if TakeProvider::parse(name) == TakeProvider::Hermes {
+        let provider = TakeProvider::parse(name);
+        self.action_note = format!("Next take uses {}.", provider.as_str());
+        if provider == TakeProvider::Hermes {
             self.probe_hermes_models(cx);
         }
         cx.notify();

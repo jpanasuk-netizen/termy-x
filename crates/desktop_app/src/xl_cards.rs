@@ -254,14 +254,16 @@ impl TrendsDesk {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap(px(8.0))
                     .child(button(
                         SharedString::from(format!("desk-open-{id}")),
                         "Open source",
                         false,
-                        cx.listener(move |_, _, _, cx| {
-                            open_status(&url);
+                        cx.listener(move |this, _, _, cx| {
+                            this.action_note = open_status(&url).into();
                             cx.stop_propagation();
+                            cx.notify();
                         }),
                     ))
                     .child(button(
@@ -283,8 +285,10 @@ impl TrendsDesk {
                             false,
                             cx.listener(move |this, _, window, cx| {
                                 this.focus_root_after_click(window, cx);
-                                this.draft_card_take(retry_id.clone(), cx);
+                                this.action_note = "Drafting again…".into();
+                                this.draft_take_for(retry_id.clone(), cx);
                                 cx.stop_propagation();
+                                cx.notify();
                             }),
                         )
                     })
@@ -306,6 +310,12 @@ impl TrendsDesk {
                             let star_id = id.clone();
                             move |this, _, _, cx| {
                                 this.toggle_star(&star_id);
+                                let starred = this.pack.hits.iter().any(|hit| hit.id == star_id);
+                                this.action_note = if starred {
+                                    "Starred.".into()
+                                } else {
+                                    "Unstarred.".into()
+                                };
                                 cx.stop_propagation();
                                 cx.notify();
                             }
@@ -319,7 +329,9 @@ impl TrendsDesk {
                             let link = card.url.clone();
                             move |this, _, _, cx| {
                                 this.copy_text(&link, cx);
+                                this.action_note = "Copied the link.".into();
                                 cx.stop_propagation();
+                                cx.notify();
                             }
                         }),
                     ))
@@ -331,7 +343,9 @@ impl TrendsDesk {
                             let body = card.text.clone();
                             move |this, _, _, cx| {
                                 this.copy_text(&body, cx);
+                                this.action_note = "Copied the post.".into();
                                 cx.stop_propagation();
+                                cx.notify();
                             }
                         }),
                     ))

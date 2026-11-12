@@ -406,6 +406,8 @@ impl TrendsDesk {
                     .text_size(px(28.0))
                     .text_color(rgb(0x070b14))
                     .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0xffe56a)))
+                    .active(|style| style.bg(rgb(0x7af6ff)))
                     .child(termy_x::trends_desk::CLOSE_ICON)
                     .on_mouse_down(
                         MouseButton::Left,

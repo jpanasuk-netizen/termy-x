@@ -150,12 +150,20 @@ impl TrendsDesk {
             }
             DeskKey::Open => {
                 if let Some(url) = self.selected_url() {
-                    open_status(&url);
+                    self.action_note = open_status(&url).into();
+                } else {
+                    self.action_note = "No card selected.".into();
                 }
             }
             DeskKey::Star => {
                 if let Some(id) = self.selected_take() {
                     self.toggle_star(&id);
+                    let starred = self.pack.hits.iter().any(|hit| hit.id == id);
+                    self.action_note = if starred {
+                        "Starred.".into()
+                    } else {
+                        "Unstarred.".into()
+                    };
                 }
             }
             DeskKey::Unbound => return false,
