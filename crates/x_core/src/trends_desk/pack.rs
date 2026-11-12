@@ -184,9 +184,13 @@ pub fn provider_drafts(
 ) -> Result<Vec<String>, String> {
     let _ = (text, tone);
     match provider {
-        TakeProvider::Free | TakeProvider::Hermes | TakeProvider::Grok => {
-            Err("model reply required".into())
-        }
+        TakeProvider::Free
+        | TakeProvider::Hermes
+        | TakeProvider::Grok
+        | TakeProvider::Vyce
+        | TakeProvider::Muse
+        | TakeProvider::Agy
+        | TakeProvider::Custom => Err("model reply required".into()),
         TakeProvider::Treg => {
             let draft = treg?;
             if draft.trim().is_empty() {

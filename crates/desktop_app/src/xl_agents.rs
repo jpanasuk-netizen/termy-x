@@ -206,8 +206,9 @@ impl TrendsDesk {
         let config = self.config.clone();
         let tone = pop.tone.clone();
         let previous = pop.variants.clone();
-        let provider = pop.provider;
+        let provider = TakeProvider::parse(&self.settings.take_provider);
         let id = pop.card_id.clone();
+        let previous_text = pop.draft.clone();
         if let Some(open) = self.popout.as_mut() {
             open.draft = termy_x::trends_desk::DRAFTING_PLACEHOLDER.into();
         }
@@ -220,7 +221,8 @@ impl TrendsDesk {
             let draft = cx
                 .background_executor()
                 .spawn(async move {
-                    let http = termy_x::io::UreqHttp::default();
+                    let http =
+                        termy_x::io::UreqHttp::with_timeout(termy_x::trends_desk::TAKE_TIMEOUT);
                     termy_x::trends_desk::run_take_chain(
                         provider,
                         &config,
@@ -230,25 +232,44 @@ impl TrendsDesk {
                     )
                 })
                 .await;
-            let (variants, error) =
-                termy_x::trends_desk::settle_variants(&previous, &[draft.variants], &tone);
+            let _ = previous;
             let _ = this.update(cx, |desk, cx| {
+                let next = if !draft.text.trim().is_empty() {
+                    draft.text.clone()
+                } else if previous_text != termy_x::trends_desk::DRAFTING_PLACEHOLDER
+                    && !previous_text.trim().is_empty()
+                {
+                    previous_text.clone()
+                } else {
+                    String::new()
+                };
                 if let Some(open) = desk.popout.as_mut().filter(|item| item.card_id == id) {
-                    open.variants = variants.clone();
-                    let generated = variants.first().cloned().unwrap_or_default();
-                    let next = termy_x::trends_desk::fill_reply_if_waiting(&open.draft, &generated);
+                    open.variants = draft.variants.clone();
                     open.draft = next.clone();
                     desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
+                    desk.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&next));
                     desk.card_replies.insert(
                         id.clone(),
                         termy_x::trends_desk::ReplyPhase::Editing { text: next },
                     );
                 }
-                desk.model_notice = if error.is_empty() {
-                    format!("{} ready. Not posted.", provider.as_str())
+                desk.action_note = if draft.text.trim().is_empty() {
+                    draft.note.clone()
                 } else {
-                    error
+                    draft.note.clone()
                 };
+                desk.model_notice = desk.action_note.clone();
+                termy_x::trends_desk::append_desk_log(
+                    &desk.data_root,
+                    &termy_x::trends_desk::take_log_line(
+                        draft.source,
+                        if draft.text.trim().is_empty() {
+                            draft.note.as_str()
+                        } else {
+                            "ok"
+                        },
+                    ),
+                );
                 cx.notify();
             });
         })

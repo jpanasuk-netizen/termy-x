@@ -460,22 +460,28 @@ pub fn editor_on_draft_click(card_id: &str, provider: TakeProvider) -> EditPopou
     open_editor(card_id, DRAFTING_PLACEHOLDER, provider)
 }
 
-/// A finished take replaces Drafting…. An empty result shows the error in the box.
-pub fn text_after_take(waiting: &str, generated: &str, error: &str) -> String {
-    if waiting != DRAFTING_PLACEHOLDER && !waiting.trim().is_empty() {
+fn reply_is_status(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.is_empty()
+        || trimmed == DRAFTING_PLACEHOLDER
+        || trimmed.starts_with(super::takes::HONEST_PREFIX)
+        || trimmed.starts_with("Hermes ·")
+        || trimmed.starts_with("Vyce ·")
+        || trimmed.starts_with("Grok ·")
+        || trimmed.starts_with("Muse ")
+        || trimmed.starts_with("Agy ")
+}
+
+/// A finished take replaces Drafting…. Errors stay out of the reply.
+pub fn text_after_take(waiting: &str, generated: &str, _error: &str) -> String {
+    if !reply_is_status(waiting) {
         return waiting.to_string();
     }
     let generated = generated.trim();
-    if !generated.is_empty() {
-        return generated.to_string();
-    }
-    let error = error.trim();
-    if error.is_empty() {
-        format!("{}: no provider answered", super::takes::HONEST_PREFIX)
-    } else if error.starts_with(super::takes::HONEST_PREFIX) {
-        error.to_string()
+    if generated.is_empty() || reply_is_status(generated) {
+        String::new()
     } else {
-        format!("{}: {error}", super::takes::HONEST_PREFIX)
+        generated.to_string()
     }
 }
 
@@ -635,6 +641,10 @@ pub enum TakeProvider {
     Free,
     Hermes,
     Grok,
+    Vyce,
+    Muse,
+    Agy,
+    Custom,
 }
 
 impl TakeProvider {
@@ -643,6 +653,10 @@ impl TakeProvider {
             "treg" => Self::Treg,
             "hermes" => Self::Hermes,
             "grok" => Self::Grok,
+            "vyce" | "vyce-direct" => Self::Vyce,
+            "muse" => Self::Muse,
+            "agy" | "antigravity" => Self::Agy,
+            "custom" => Self::Custom,
             _ => Self::Free,
         }
     }
@@ -651,8 +665,12 @@ impl TakeProvider {
         match self {
             Self::Treg => "Provider · Treg",
             Self::Free => "Provider · Free",
-            Self::Hermes => "Provider · Hermes",
+            Self::Hermes => "Hermes · Vyce glm-5.3-flash",
             Self::Grok => "Provider · Grok",
+            Self::Vyce => "Vyce · glm-5.3-flash",
+            Self::Muse => "Provider · Muse",
+            Self::Agy => "Provider · Agy",
+            Self::Custom => "Provider · Custom",
         }
     }
 
@@ -662,6 +680,10 @@ impl TakeProvider {
             Self::Free => "free",
             Self::Hermes => "hermes",
             Self::Grok => "grok",
+            Self::Vyce => "vyce",
+            Self::Muse => "muse",
+            Self::Agy => "agy",
+            Self::Custom => "custom",
         }
     }
 }
@@ -910,7 +932,18 @@ pub fn draft_take(
     match provider {
         TakeProvider::Free => Ok(free_take(config, http, post)),
         TakeProvider::Treg => treg_take(config, http, post),
-        TakeProvider::Hermes => Ok(hermes_take(config, http, post)),
+        TakeProvider::Hermes | TakeProvider::Vyce | TakeProvider::Custom => {
+            Ok(hermes_take(config, http, post))
+        }
+        TakeProvider::Muse | TakeProvider::Agy => Ok(TakeDraft {
+            text: String::new(),
+            source: "offline",
+            note: format!(
+                "{} drafts through its hidden CLI. Nothing was posted.",
+                provider.as_str()
+            ),
+            variants: Vec::new(),
+        }),
         TakeProvider::Grok => {
             if let Some(stub) = super::takes::grok_stub_output() {
                 return Ok(super::takes::grok_draft_from_output(post, &stub));
@@ -1182,7 +1215,7 @@ mod tests {
         assert!(selection_after_empty().is_none());
         assert_eq!(selection_colors(true), (SELECT_PINK, SELECT_CYAN));
         let open = open_editor("55", "Courts are testing models", TakeProvider::Hermes);
-        assert_eq!(open.provider.caption(), "Provider · Hermes");
+        assert_eq!(open.provider.caption(), "Hermes · Vyce glm-5.3-flash");
         assert_eq!(TakeProvider::parse("grok").caption(), "Provider · Grok");
         assert!(open.open);
         assert_eq!(open.card_id, "55");
@@ -1237,8 +1270,7 @@ mod tests {
         assert_eq!(opened.card_id, "42");
         assert_eq!(opened.draft, DRAFTING_PLACEHOLDER);
         let missing = text_after_take(DRAFTING_PLACEHOLDER, "", "grok: not installed");
-        assert!(missing.contains("grok: not installed"));
-        assert!(missing.starts_with(crate::trends_desk::HONEST_PREFIX));
+        assert!(missing.is_empty(), "errors stay out of the reply");
         assert!(
             editor_send(
                 &EditPopout {

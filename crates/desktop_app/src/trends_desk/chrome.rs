@@ -153,39 +153,12 @@ impl TrendsDesk {
                             this.cancel_run(cx);
                         }),
                     ))
-                    .child(button(
-                        "desk-take-free",
-                        "Free takes",
-                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Free,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_take_provider("free", cx);
-                        }),
-                    ))
-                    .child(button(
-                        "desk-take-treg",
-                        "Treg takes",
-                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Treg,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_take_provider("treg", cx);
-                        }),
-                    ))
-                    .child(button(
-                        "desk-take-grok",
-                        "Grok takes",
-                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Grok,
-                        cx.listener(|this, _, window, cx| {
-                            this.focus_root_after_click(window, cx);
-                            this.set_take_provider("grok", cx);
-                        }),
-                    ))
-                    .child(button(
-                        "desk-take-hermes",
-                        "Hermes takes",
-                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Hermes,
-                        cx.listener(|this, _, _, cx| {
-                            this.set_take_provider("hermes", cx);
-                        }),
-                    )),
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .whitespace_normal()
+                            .child(TakeProvider::parse(&self.settings.take_provider).caption()),
+                    ),
             )
             .into_any_element()
     }
@@ -454,6 +427,8 @@ impl TrendsDesk {
                         cx.listener(move |this, _, _, cx| {
                             this.list_pick = Some(format!("draft:{select_id}"));
                             this.draft_text = select_text.clone();
+                            this.reply_edit =
+                                Some(termy_x::draft_edit::ReplyEditor::new(&select_text));
                             this.draft_reply_to = Some(select_url.clone());
                             this.action_note = "Selected a draft. Ctrl+C copies it.".into();
                             cx.notify();
@@ -642,6 +617,33 @@ impl TrendsDesk {
                 "Save Hermes",
                 false,
                 cx.listener(|this, _, _, cx| this.save_hermes(cx)),
+            ))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .whitespace_normal()
+                    .child("Default take provider"),
+            )
+            .child(self.field_chip(
+                "desk-custom-base",
+                "Custom base URL",
+                &self.settings.custom_base,
+                Field::CustomBase,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-custom-model",
+                "Custom model",
+                &self.settings.custom_model,
+                Field::CustomModel,
+                cx,
+            ))
+            .child(self.field_chip(
+                "desk-custom-key-env",
+                "Custom key env name",
+                &self.settings.custom_key_env,
+                Field::CustomKeyEnv,
+                cx,
             ))
             .child(self.field_chip("desk-focus", "Focus", &self.focus_text, Field::Focus, cx))
             .child(self.field_chip(

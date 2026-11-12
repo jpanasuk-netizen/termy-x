@@ -235,8 +235,23 @@ pub fn is_termy_x_image(path: &str) -> bool {
         || lower.contains("\\termy x\\")
 }
 
-pub fn take_chain_order() -> [&'static str; 4] {
-    ["vyce", "hermes", "grok", "treg"]
+pub const TAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+pub fn take_chain_order() -> [&'static str; 6] {
+    ["hermes", "vyce", "grok", "muse", "agy", "custom"]
+}
+
+pub fn migrate_saved_provider(saved: &str) -> &'static str {
+    match saved.trim().to_ascii_lowercase().as_str() {
+        "" | "free" | "treg" => "hermes",
+        "vyce" | "vyce-direct" => "vyce",
+        "grok" => "grok",
+        "muse" => "muse",
+        "agy" | "antigravity" => "agy",
+        "custom" => "custom",
+        "hermes" => "hermes",
+        _ => "hermes",
+    }
 }
 
 pub fn run_take_chain(
@@ -246,78 +261,227 @@ pub fn run_take_chain(
     http: &dyn crate::io::Http,
     tone: &str,
 ) -> super::TakeDraft {
-    let _ = preferred;
+    let choice = match preferred {
+        super::TakeProvider::Free | super::TakeProvider::Treg => super::TakeProvider::Hermes,
+        other => other,
+    };
+    let env_text = read_hermes_env();
+    let yaml_text = read_hermes_yaml();
+    let mut process = Vec::new();
+    for name in [
+        "VYCE_API_KEY",
+        "VYCE_BASE_URL",
+        "VYCE_API_BASE",
+        "OPENAI_API_KEY",
+    ] {
+        if let Ok(value) = std::env::var(name)
+            && !value.trim().is_empty()
+        {
+            process.push((name, value));
+        }
+    }
+    let mut user = Vec::new();
+    if let Some(value) = super::agents::user_env_value("VYCE_API_KEY") {
+        user.push(("VYCE_API_KEY".to_string(), value));
+    }
+    let process_ref: Vec<(&str, &str)> = process.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let user_ref: Vec<(&str, &str)> = user.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     run_take_chain_with(
+        choice,
         config,
         post,
         http,
         tone,
-        &read_hermes_env(),
-        &read_hermes_yaml(),
+        TakeSources {
+            env_text: &env_text,
+            yaml_text: &yaml_text,
+            process: &process_ref,
+            user: &user_ref,
+        },
     )
 }
 
+pub struct TakeSources<'a> {
+    pub env_text: &'a str,
+    pub yaml_text: &'a str,
+    pub process: &'a [(&'a str, &'a str)],
+    pub user: &'a [(&'a str, &'a str)],
+}
+
 pub fn run_take_chain_with(
+    choice: super::TakeProvider,
     config: &crate::config::XConfig,
     post: &super::SourcePost,
     http: &dyn crate::io::Http,
     tone: &str,
-    env_text: &str,
-    yaml_text: &str,
+    sources: TakeSources<'_>,
 ) -> super::TakeDraft {
-    let mut reasons = Vec::new();
-    let auth = super::agents::vyce_auth(
-        &config.ai_base_url,
-        &config.ai_model,
-        &config.ai_api_key,
-        env_text,
-        yaml_text,
+    let choice = match choice {
+        super::TakeProvider::Free | super::TakeProvider::Treg => super::TakeProvider::Hermes,
+        other => other,
+    };
+    match choice {
+        super::TakeProvider::Hermes => hermes_vyce_take(config, post, http, tone),
+        super::TakeProvider::Vyce => vyce_direct_take(post, http, tone, &sources),
+        super::TakeProvider::Grok => cli_take("grok", "Grok", post, tone),
+        super::TakeProvider::Muse => cli_take("muse", "Muse", post, tone),
+        super::TakeProvider::Agy => cli_take("agy", "Agy", post, tone),
+        super::TakeProvider::Custom => custom_take(config, post, http, tone, &sources),
+        super::TakeProvider::Free | super::TakeProvider::Treg => {
+            hermes_vyce_take(config, post, http, tone)
+        }
+    }
+}
+
+fn hermes_vyce_take(
+    config: &crate::config::XConfig,
+    post: &super::SourcePost,
+    http: &dyn crate::io::Http,
+    tone: &str,
+) -> super::TakeDraft {
+    let mut config = config.clone();
+    config.hermes_model = super::agents::VYCE_MODEL.to_string();
+    if config.hermes_base_url.trim().is_empty() {
+        config.hermes_base_url = super::agents::HERMES_BASE.to_string();
+    }
+    match hermes_raced(&config, post, tone, http) {
+        Ok(text) => labeled_take("hermes", super::agents::HERMES_VYCE_LABEL, &text, &[]),
+        Err(error) => failed_take(
+            "hermes",
+            &format!("Hermes · {error}. Vyce direct is one click away."),
+        ),
+    }
+}
+
+fn vyce_direct_take(
+    post: &super::SourcePost,
+    http: &dyn crate::io::Http,
+    tone: &str,
+    sources: &TakeSources<'_>,
+) -> super::TakeDraft {
+    let auth = super::agents::vyce_direct_auth(
+        sources.env_text,
+        sources.yaml_text,
+        sources.process,
+        sources.user,
     );
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
     match super::agents::vyce_complete(&auth, http, &prompt) {
-        Ok(text) => return labeled_take("vyce", super::agents::VYCE_LABEL, &text, &reasons),
-        Err(error) => reasons.push(format!("Vyce · {error}")),
+        Ok(text) => labeled_take("vyce", super::agents::VYCE_LABEL, &text, &[]),
+        Err(error) => failed_take("vyce", &format!("Vyce · {error}")),
     }
-    match hermes_raced(config, post, tone, http) {
-        Ok(text) => {
-            let model = if config.hermes_model.trim().is_empty() {
-                super::agents::HERMES_MODEL
-            } else {
-                config.hermes_model.trim()
-            };
-            return labeled_take("hermes", &format!("Hermes · {model}"), &text, &reasons);
-        }
-        Err(error) => reasons.push(format!("Hermes · {error}")),
+}
+
+fn custom_take(
+    config: &crate::config::XConfig,
+    post: &super::SourcePost,
+    http: &dyn crate::io::Http,
+    tone: &str,
+    sources: &TakeSources<'_>,
+) -> super::TakeDraft {
+    let env_text = sources.env_text;
+    let process = sources.process;
+    let user = sources.user;
+    let base = config.ai_base_url.trim().trim_end_matches('/').to_string();
+    let model = if config.ai_model.trim().is_empty() {
+        super::agents::VYCE_MODEL.to_string()
+    } else {
+        config.ai_model.trim().to_string()
+    };
+    let key_name = if config.ai_key_env.trim().is_empty() {
+        "OPENAI_API_KEY"
+    } else {
+        config.ai_key_env.trim()
+    };
+    let key = if config.ai_api_key.trim().is_empty() {
+        super::agents::lookup_named_env(key_name, env_text, process, user).unwrap_or_default()
+    } else {
+        config.ai_api_key.trim().to_string()
+    };
+    let auth = super::agents::VyceAuth {
+        base,
+        model: model.clone(),
+        key,
+    };
+    let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
+    match super::agents::vyce_complete(&auth, http, &prompt) {
+        Ok(text) => labeled_take("custom", &format!("Custom · {model}"), &text, &[]),
+        Err(error) => failed_take("custom", &format!("Custom · {error}")),
     }
-    match grok_cli(post, tone) {
-        Ok(text) => return labeled_take("grok", "Grok", &text, &reasons),
-        Err(error) => reasons.push(format!("Grok · {error}")),
+}
+
+fn cli_take(program: &str, label: &str, post: &super::SourcePost, tone: &str) -> super::TakeDraft {
+    match hidden_agent_draft(program, label, post, tone) {
+        Ok(text) => labeled_take(cli_source(program), label, &text, &[]),
+        Err(error) => failed_take(cli_source(program), &format!("{label} · {error}")),
     }
-    for provider in [super::TakeProvider::Treg] {
-        match super::cards::draft_take(provider, config, post, http) {
-            Ok(draft)
-                if !draft.text.trim().is_empty()
-                    && !is_provider_failure(&draft.text)
-                    && !is_provider_failure(&draft.note) =>
-            {
-                return labeled_take("treg", "Treg", &draft.text, &reasons);
-            }
-            Ok(draft) => {
-                let why = if draft.note.is_empty() {
-                    draft.text
-                } else {
-                    draft.note
-                };
-                reasons.push(format!("{}: {why}", provider.as_str()));
-            }
-            Err(error) => reasons.push(format!("{}: {error}", provider.as_str())),
-        }
+}
+
+fn cli_source(program: &str) -> &'static str {
+    match program {
+        "grok" => "grok",
+        "muse" => "muse",
+        "agy" => "agy",
+        _ => "none",
     }
+}
+
+fn failed_take(source: &'static str, note: &str) -> super::TakeDraft {
     super::TakeDraft {
         text: String::new(),
-        source: "none",
-        note: honest_failure(&reasons),
+        source,
+        note: note.to_string(),
         variants: Vec::new(),
+    }
+}
+
+pub fn hidden_agent_draft(
+    program: &str,
+    label: &str,
+    post: &super::SourcePost,
+    tone: &str,
+) -> Result<String, String> {
+    if program == "grok" {
+        return grok_cli(post, tone);
+    }
+    let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
+    let mut command = std::process::Command::new(program);
+    apply_hidden_command(&mut command);
+    let Ok(mut child) = command.spawn() else {
+        return Err(format!("{label} CLI was not found. Nothing was drafted."));
+    };
+    let pid = child.id();
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(prompt.as_bytes());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    if let Ok(Ok(output)) = rx.recv_timeout(TAKE_TIMEOUT) {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if text.is_empty() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if err.is_empty() {
+                Err(format!(
+                    "{label} did not return text. Its CLI stays interactive, so this draft was not written."
+                ))
+            } else if label == "Agy" && agy_credit_error(&err).is_some() {
+                Err(agy_credit_error(&err).unwrap_or(err))
+            } else if label == "Muse" && muse_needs_trust(&err) {
+                Err(muse_trust_line(std::path::Path::new("agent-work")))
+            } else {
+                Err(err)
+            }
+        } else {
+            Ok(text)
+        }
+    } else {
+        kill_pid(pid);
+        Err(format!(
+            "{label} did not return text within 45s. Its CLI stays interactive, so this draft was not written."
+        ))
     }
 }
 
@@ -444,7 +608,7 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    let result = if let Ok(Ok(output)) = rx.recv_timeout(std::time::Duration::from_secs(20)) {
+    let result = if let Ok(Ok(output)) = rx.recv_timeout(TAKE_TIMEOUT) {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if takes_halted() {
             Err("takes stopped".into())
@@ -457,7 +621,7 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
         }
     } else {
         kill_pid(pid);
-        Err("grok timed out".into())
+        Err("grok timed out after 45s".into())
     };
     unregister_job(&post.id);
     result
@@ -678,7 +842,11 @@ mod tests {
 
     #[test]
     fn the_take_chain_tries_vyce_before_hermes_grok_and_treg() {
-        assert_eq!(take_chain_order(), ["vyce", "hermes", "grok", "treg"]);
+        assert_eq!(
+            take_chain_order(),
+            ["hermes", "vyce", "grok", "muse", "agy", "custom"]
+        );
+        assert_eq!(migrate_saved_provider("free"), "hermes");
         assert!(HERMES_TAKE_TIMEOUT >= std::time::Duration::from_secs(60));
     }
 
@@ -701,14 +869,17 @@ mod tests {
         assert_eq!(fresh, lines);
         assert!(quiet.is_empty());
         let (fallback, error) = settle_variants(&[], &[Vec::new(), Vec::new()], "Spicy");
-        assert_eq!(fallback.len(), 1);
-        assert!(!fallback[0].is_empty());
+        assert!(fallback.is_empty());
         assert!(error.contains("Spicy"));
     }
 
     #[test]
     fn vyce_503_falls_through_to_hermes_and_the_key_stays_out() {
-        assert_eq!(take_chain_order(), ["vyce", "hermes", "grok", "treg"]);
+        assert_eq!(
+            take_chain_order(),
+            ["hermes", "vyce", "grok", "muse", "agy", "custom"]
+        );
+        assert_eq!(migrate_saved_provider("free"), "hermes");
         let post = super::super::domain::SourcePost::from_value(&serde_json::json!({
             "id": "9",
             "author": "ada",
@@ -746,13 +917,94 @@ mod tests {
             }
         }
         let http = RouteHttp;
-        let draft = run_take_chain_with(&config, &post, &http, "Funny", "", "");
+        let empty = TakeSources {
+            env_text: "",
+            yaml_text: "",
+            process: &[],
+            user: &[],
+        };
+        let draft = run_take_chain_with(
+            super::super::TakeProvider::Hermes,
+            &config,
+            &post,
+            &http,
+            "Funny",
+            empty,
+        );
         assert_eq!(draft.source, "hermes");
         assert!(draft.text.contains("Hermes"));
-        assert!(draft.note.contains("503"));
-        assert!(draft.note.contains("Hermes · hermes-agent"));
+        assert_eq!(draft.note, super::super::agents::HERMES_VYCE_LABEL);
+        assert!(!draft.note.contains("treg"));
         assert!(!draft.note.contains("vyce-secret-key"));
         assert!(!draft.note.contains("hermes-secret"));
+        struct Down;
+        impl crate::io::Http for Down {
+            fn request(&self, request: crate::io::HttpRequest) -> Result<String, String> {
+                assert!(request.url.contains("hermes.test"));
+                assert!(!request.url.contains("treg"));
+                let body = request.body.unwrap_or_default();
+                assert!(body.contains("glm-5.3-flash"));
+                assert!(!body.contains("hermes-secret"));
+                Err("503 Service Unavailable".into())
+            }
+        }
+        let down = run_take_chain_with(
+            super::super::TakeProvider::Free,
+            &config,
+            &post,
+            &Down,
+            "Funny",
+            TakeSources {
+                env_text: "",
+                yaml_text: "",
+                process: &[],
+                user: &[],
+            },
+        );
+        assert!(down.text.is_empty());
+        assert!(down.note.contains("503"));
+        assert!(down.note.contains("Vyce direct"));
+        assert!(!down.note.to_lowercase().contains("treg"));
+        assert!(!down.note.contains("hermes-secret"));
+        let yaml =
+            "providers:\n  vyce:\n    api: https://vyceai.com/v1\n    key_env: VYCE_API_KEY\n";
+        struct Direct;
+        impl crate::io::Http for Direct {
+            fn request(&self, request: crate::io::HttpRequest) -> Result<String, String> {
+                assert!(
+                    request
+                        .url
+                        .starts_with("https://vyceai.com/v1/chat/completions")
+                );
+                assert_eq!(request.bearer.as_deref(), Some("from-user-env"));
+                let body = request.body.unwrap_or_default();
+                assert!(body.contains("glm-5.3-flash"));
+                assert!(!body.contains("from-user-env"));
+                Err("http 503".into())
+            }
+        }
+        let direct = run_take_chain_with(
+            super::super::TakeProvider::Vyce,
+            &config,
+            &post,
+            &Direct,
+            "Funny",
+            TakeSources {
+                env_text: "",
+                yaml_text: yaml,
+                process: &[("VYCE_API_KEY", "from-user-env")],
+                user: &[],
+            },
+        );
+        assert!(direct.note.contains("Vyce"));
+        assert!(!direct.note.contains("from-user-env"));
+        let log = super::super::agents::take_log_line("hermes", "http 503");
+        assert_eq!(log, "INFO take: hermes http 503");
+        assert!(!log.contains("from-user-env"));
+        let missing =
+            hidden_agent_draft("agy-not-a-real-binary", "Agy", &post, "Funny").unwrap_err();
+        assert!(missing.contains("not found"));
+        assert!(missing.contains("Nothing was drafted"));
     }
 }
 
@@ -771,9 +1023,9 @@ pub fn settle_variants(
             return (kept, String::new());
         }
     }
-    let error = format!("{tone} draft failed after {tries} tries");
+    let error = format!("{tone} timed out or failed after {tries} tries");
     if previous.is_empty() {
-        (vec![error.clone()], error)
+        (Vec::new(), error)
     } else {
         (previous.to_vec(), error)
     }

@@ -691,6 +691,144 @@ pub fn uniform_stops(
     stops
 }
 
+/// The pink-box reply. Undo, selection, and a live character count.
+#[derive(Clone, Debug)]
+pub struct ReplyEditor {
+    pub text: String,
+    pub caret: DraftCaret,
+    undo: Vec<(String, usize, Option<usize>)>,
+    redo: Vec<(String, usize, Option<usize>)>,
+}
+
+impl ReplyEditor {
+    pub fn new(text: &str) -> Self {
+        Self {
+            text: text.to_string(),
+            caret: DraftCaret::at_end(text.len()),
+            undo: Vec::new(),
+            redo: Vec::new(),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    pub fn lines(&self) -> Vec<(usize, usize)> {
+        hard_lines(&self.text)
+    }
+
+    fn remember(&mut self) {
+        self.undo
+            .push((self.text.clone(), self.caret.caret, self.caret.anchor));
+        if self.undo.len() > 50 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    pub fn insert(&mut self, extra: &str) {
+        if extra.is_empty() {
+            return;
+        }
+        self.remember();
+        self.caret.insert(&mut self.text, extra);
+    }
+
+    pub fn backspace(&mut self) {
+        self.remember();
+        let before = self.text.clone();
+        self.caret.backspace(&mut self.text);
+        if self.text == before {
+            self.undo.pop();
+        }
+    }
+
+    pub fn delete(&mut self) {
+        self.remember();
+        let before = self.text.clone();
+        self.caret.delete_forward(&mut self.text);
+        if self.text == before {
+            self.undo.pop();
+        }
+    }
+
+    pub fn move_key(&mut self, motion: Motion, extend: bool) {
+        let lines = self.lines();
+        self.caret.move_by(&self.text, &lines, motion, extend);
+    }
+
+    pub fn select_all(&mut self) {
+        self.caret.select_all(&self.text);
+    }
+
+    pub fn selected(&self) -> String {
+        self.caret
+            .selected_text(&self.text)
+            .unwrap_or("")
+            .to_string()
+    }
+
+    pub fn copy_text(&self) -> String {
+        let selected = self.selected();
+        if selected.is_empty() {
+            self.text.clone()
+        } else {
+            selected
+        }
+    }
+
+    pub fn cut(&mut self) -> String {
+        let selected = self.selected();
+        if selected.is_empty() {
+            return String::new();
+        }
+        self.remember();
+        if let Some((start, end)) = self.caret.selection() {
+            self.text.replace_range(start..end.min(self.text.len()), "");
+            self.caret = DraftCaret::collapsed(start.min(self.text.len()));
+        }
+        selected
+    }
+
+    pub fn paste(&mut self, clip: &str) {
+        self.insert(clip);
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some((text, caret, anchor)) = self.undo.pop() else {
+            return false;
+        };
+        self.redo
+            .push((self.text.clone(), self.caret.caret, self.caret.anchor));
+        self.text = text;
+        self.caret.caret = caret;
+        self.caret.anchor = anchor;
+        true
+    }
+
+    pub fn click_at(&mut self, x: f32, y: f32, origin_x: f32, origin_y: f32, width: f32) {
+        let lines = self.lines();
+        let advance = (width / 48.0).clamp(6.0, 14.0);
+        let index = hit_test_uniform(&self.text, &lines, origin_x, origin_y, x, y, 18.0, advance);
+        self.caret.place(&self.text, index, false);
+    }
+
+    pub fn shift_click(&mut self, x: f32, y: f32, origin_x: f32, origin_y: f32, width: f32) {
+        let lines = self.lines();
+        let advance = (width / 48.0).clamp(6.0, 14.0);
+        let index = hit_test_uniform(&self.text, &lines, origin_x, origin_y, x, y, 18.0, advance);
+        self.caret.place(&self.text, index, true);
+    }
+
+    pub fn drag_to(&mut self, x: f32, y: f32, origin_x: f32, origin_y: f32, width: f32) {
+        let lines = self.lines();
+        let advance = (width / 48.0).clamp(6.0, 14.0);
+        let index = hit_test_uniform(&self.text, &lines, origin_x, origin_y, x, y, 18.0, advance);
+        self.caret.drag_to(&self.text, index);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -949,5 +1087,29 @@ mod tests {
         let real = map.display_to_real(mid_bullet);
         assert!(real == family_at || real == secret.len() || real == 1 + FAMILY.len());
         assert!(secret.is_char_boundary(real));
+    }
+
+    #[test]
+    fn the_reply_editor_types_selects_and_undoes() {
+        let mut editor = ReplyEditor::new("");
+        editor.insert("Hello");
+        editor.backspace();
+        assert_eq!(editor.text, "Hell");
+        editor.move_key(Motion::Home, false);
+        editor.delete();
+        assert_eq!(editor.text, "ell");
+        editor.select_all();
+        assert_eq!(editor.selected(), "ell");
+        let cut = editor.cut();
+        assert_eq!(cut, "ell");
+        assert!(editor.text.is_empty());
+        editor.paste("typed reply");
+        assert_eq!(editor.count(), "typed reply".chars().count());
+        editor.move_key(Motion::End, false);
+        editor.move_key(Motion::Left, true);
+        assert!(!editor.selected().is_empty());
+        assert!(editor.undo());
+        editor.click_at(0.0, 0.0, 0.0, 0.0, 320.0);
+        assert!(editor.selected().is_empty());
     }
 }

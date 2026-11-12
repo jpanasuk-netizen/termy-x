@@ -578,6 +578,7 @@ impl TrendsDesk {
                         }
                         list
                     })
+                    .child(self.pinned_post_button(cx))
                     .child(page_bar(label, cx)),
             );
         let mut rows: Vec<gpui_kit::AnyElement> = vec![page.into_any_element()];

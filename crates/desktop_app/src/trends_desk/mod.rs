@@ -44,6 +44,9 @@ pub(crate) enum Field {
     HermesBase,
     HermesModel,
     HermesKey,
+    CustomBase,
+    CustomModel,
+    CustomKeyEnv,
 }
 
 pub(crate) struct ColumnUi {
@@ -84,7 +87,7 @@ pub struct TrendsDesk {
     pub(crate) model_detail: String,
     pub(crate) action_note: String,
     pub(crate) free_halted: bool,
-    draft_text: String,
+    pub(crate) draft_text: String,
     draft_reply_to: Option<String>,
     draft_note: String,
     replies: Vec<InspectedPost>,
@@ -121,6 +124,8 @@ pub struct TrendsDesk {
     pub(crate) media: xl_media::MediaDesk,
     pub(crate) take_epoch: u64,
     pub(crate) takes_halted: bool,
+    pub(crate) reply_edit: Option<termy_x::draft_edit::ReplyEditor>,
+    pub(crate) reply_drag: bool,
     pub(crate) draft_count: usize,
     pub(crate) saved_urls: std::collections::HashSet<String>,
     pub(crate) list_pick: Option<String>,
@@ -151,10 +156,14 @@ impl TrendsDesk {
             DeskSettings::default()
         };
         if !config.take_provider.trim().is_empty() {
-            settings.take_provider =
-                termy_x::trends_desk::TakeProvider::parse(&config.take_provider)
-                    .as_str()
-                    .into();
+            settings.take_provider = config.take_provider.clone();
+        }
+        let migrated = termy_x::trends_desk::migrate_saved_provider(&settings.take_provider);
+        if settings.take_provider != migrated {
+            settings.take_provider = migrated.to_string();
+            if writable {
+                let _ = store.save_settings(&settings);
+            }
         }
         let pack = if writable {
             termy_x::trends_desk::load_pack(&data_root)
@@ -280,6 +289,8 @@ impl TrendsDesk {
             media: xl_media::MediaDesk::default(),
             take_epoch: 0,
             takes_halted: false,
+            reply_edit: None,
+            reply_drag: false,
             draft_count,
             saved_urls,
             list_pick: None,
@@ -679,35 +690,7 @@ impl TrendsDesk {
             self.send_from_popout(cx);
             return;
         }
-        if key == "c" && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) {
-            if let Some(pop) = self.popout.clone() {
-                self.copy_text(&pop.draft, cx);
-                self.action_note = termy_x::trends_desk::copied_mark().into();
-            }
-            cx.notify();
-            return;
-        }
-        let Some(mut pop) = self.popout.clone() else {
-            return;
-        };
-        let mut caret = self.pop_caret;
-        let lines = [(0, pop.draft.len())];
-        if key == "backspace" {
-            caret.backspace(&mut pop.draft);
-        } else if key == "left" {
-            caret.move_by(&pop.draft, &lines, Motion::Left, false);
-        } else if key == "right" {
-            caret.move_by(&pop.draft, &lines, Motion::Right, false);
-        } else if let Some(ch) = event.keystroke.key_char.as_deref()
-            && !event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.platform
-            && !ch.is_empty()
-        {
-            caret.insert(&mut pop.draft, ch);
-        }
-        self.pop_caret = caret;
-        self.popout = Some(pop);
-        cx.notify();
+        self.edit_reply_key(key, event, cx);
     }
 
     pub(crate) fn send_from_popout(&mut self, cx: &mut Context<Self>) {
@@ -819,7 +802,13 @@ impl TrendsDesk {
             },
         );
         let provider = TakeProvider::parse(&self.settings.take_provider);
-        let config = self.config.clone();
+        let mut config = self.config.clone();
+        if provider == TakeProvider::Custom {
+            config.ai_base_url = self.settings.custom_base.clone();
+            config.ai_model = self.settings.custom_model.clone();
+            config.ai_key_env = self.settings.custom_key_env.clone();
+            config.ai_api_key.clear();
+        }
         let tone = termy_x::trends_desk::panel_tone_name(termy_x::trends_desk::TakeTone::parse(
             &self.pack.tone,
         ))
@@ -831,7 +820,8 @@ impl TrendsDesk {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let http = termy_x::io::UreqHttp::default();
+                    let http =
+                        termy_x::io::UreqHttp::with_timeout(termy_x::trends_desk::TAKE_TIMEOUT);
                     let drafted = termy_x::trends_desk::run_take_chain(
                         provider, &config, &post, &http, &tone,
                     );
@@ -840,6 +830,15 @@ impl TrendsDesk {
                 .await;
             let _ = this.update(cx, |desk, cx| {
                 desk.takes.insert(id.clone(), result.clone());
+                let status = if result.text.trim().is_empty() {
+                    result.note.clone()
+                } else {
+                    "ok".into()
+                };
+                termy_x::trends_desk::append_desk_log(
+                    &desk.data_root,
+                    &termy_x::trends_desk::take_log_line(result.source, &status),
+                );
                 if open_compose {
                     let current = if desk
                         .popout
@@ -869,6 +868,7 @@ impl TrendsDesk {
                                 termy_x::trends_desk::distinct_variants(&next, &result.variants);
                         }
                         desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
+                        desk.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&next));
                     }
                     desk.card_replies
                         .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next.clone()));
@@ -1327,6 +1327,16 @@ impl TrendsDesk {
     fn on_key_rest(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+        if self.surface == Surface::Draft
+            && self
+                .list_pick
+                .as_deref()
+                .is_some_and(|pick| pick.starts_with("draft:"))
+            && !self.popout.as_ref().is_some_and(|pop| pop.open)
+        {
+            self.edit_saved_draft_key(key, event, cx);
+            return;
+        }
         if key == "escape" && self.close_media() {
             cx.stop_propagation();
             cx.notify();
@@ -1450,6 +1460,9 @@ impl TrendsDesk {
             Field::HermesBase => &mut self.hermes_base_text,
             Field::HermesModel => &mut self.hermes_model_text,
             Field::HermesKey => &mut self.hermes_key_text,
+            Field::CustomBase => &mut self.settings.custom_base,
+            Field::CustomModel => &mut self.settings.custom_model,
+            Field::CustomKeyEnv => &mut self.settings.custom_key_env,
         }
     }
 

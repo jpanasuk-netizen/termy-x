@@ -13,6 +13,8 @@ pub const HERMES_MODEL: &str = "hermes-agent";
 pub const HERMES_HEALTH_PATH: &str = "/health";
 pub const VYCE_MODEL: &str = "glm-5.3-flash";
 pub const VYCE_LABEL: &str = "Vyce · glm-5.3-flash";
+pub const HERMES_VYCE_LABEL: &str = "Hermes · Vyce glm-5.3-flash";
+pub const VYCE_DIRECT_BASE: &str = "https://vyceai.com/v1";
 
 /// Command line used when Termy XL's x.toml does not set one.
 /// Hermes is the Windows-native CLI, not `wsl.exe`.
@@ -605,7 +607,7 @@ pub fn vyce_auth(
         env_value(env_text, "VYCE_BASE_URL").or_else(|| env_value(env_text, "VYCE_API_BASE"));
     let env_key = env_value(env_text, "VYCE_API_KEY").or_else(|| env_value(env_text, "VYCE_KEY"));
     let env_model = env_value(env_text, "VYCE_MODEL");
-    let yaml_base = yaml_value_in_vyce(yaml_text, &["base_url", "api_base", "base", "url"]);
+    let yaml_base = yaml_value_in_vyce(yaml_text, &["api", "base_url", "api_base", "base", "url"]);
     let yaml_key = yaml_value_in_vyce(yaml_text, &["api_key", "key", "token"]);
     let yaml_model = yaml_value_in_vyce(yaml_text, &["model"]);
     let model = first_filled(&[
@@ -655,6 +657,93 @@ pub fn vyce_request(auth: &VyceAuth, prompt: &str) -> Result<HttpRequest, String
         content_type: Some("application/json".into()),
         headers: Vec::new(),
     })
+}
+
+pub fn lookup_named_env(
+    name: &str,
+    file: &str,
+    process: &[(&str, &str)],
+    user: &[(&str, &str)],
+) -> Option<String> {
+    env_value(file, name)
+        .or_else(|| {
+            process
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .or_else(|| {
+            user.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_string())
+        })
+        .filter(|value| !value.is_empty())
+}
+
+/// Vyce's direct OpenAI endpoint. `key_env` in the Hermes yaml names the variable.
+pub fn vyce_direct_auth(
+    env_text: &str,
+    yaml_text: &str,
+    process: &[(&str, &str)],
+    user: &[(&str, &str)],
+) -> VyceAuth {
+    let mut auth = vyce_auth("", "", "", env_text, yaml_text);
+    let key_name =
+        yaml_value_in_vyce(yaml_text, &["key_env"]).unwrap_or_else(|| "VYCE_API_KEY".into());
+    if auth.key.is_empty()
+        && let Some(key) = lookup_named_env(&key_name, env_text, process, user)
+    {
+        auth.key = key;
+    }
+    if auth.base.is_empty() {
+        auth.base = VYCE_DIRECT_BASE.to_string();
+    }
+    if auth.model.trim().is_empty() {
+        auth.model = VYCE_MODEL.to_string();
+    }
+    auth
+}
+
+pub fn user_env_value(name: &str) -> Option<String> {
+    parse_reg_sz(&read_user_env_raw(name)?)
+}
+
+fn read_user_env_raw(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("reg")
+            .args(["query", r"HKCU\Environment", "/v", name])
+            .output()
+            .ok()?;
+        return Some(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = name;
+        None
+    }
+}
+
+pub fn parse_reg_sz(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let Some(at) = line.find("REG_SZ") else {
+            continue;
+        };
+        let value = line[at + "REG_SZ".len()..].trim();
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+pub fn take_log_line(provider: &str, status: &str) -> String {
+    let status = status
+        .split_whitespace()
+        .take(8)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("INFO take: {provider} {status}")
 }
 
 pub fn vyce_complete(auth: &VyceAuth, http: &dyn Http, prompt: &str) -> Result<String, String> {
@@ -1285,5 +1374,12 @@ mod tests {
         assert!(!body.contains("settings-secret"));
         let leaked = redact_secret("503 settings-secret", "settings-secret");
         assert!(!leaked.contains("settings-secret"));
+        assert_eq!(
+            parse_reg_sz("    VYCE_API_KEY    REG_SZ    from-the-user\r\n"),
+            Some("from-the-user".into())
+        );
+        let log = take_log_line("hermes", "http 503 from-the-user");
+        assert!(log.starts_with("INFO take: hermes"));
+        assert!(!log.contains("sk-"));
     }
 }

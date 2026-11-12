@@ -691,9 +691,15 @@ pub struct DeskSettings {
     pub daily_at: String,
     #[serde(default)]
     pub daily_done: Option<String>,
-    /// `free` or `treg`. Draft takes never post.
+    /// Hermes, Vyce direct, Grok, Muse, Agy, or Custom. Draft takes never post.
     #[serde(default = "default_take_provider")]
     pub take_provider: String,
+    #[serde(default)]
+    pub custom_base: String,
+    #[serde(default)]
+    pub custom_model: String,
+    #[serde(default = "default_custom_key_env")]
+    pub custom_key_env: String,
     /// Starts as the slim dock. False means the workspace is open.
     #[serde(default = "default_true")]
     pub docked: bool,
@@ -727,7 +733,11 @@ fn default_daily_at() -> String {
 }
 
 fn default_take_provider() -> String {
-    "free".into()
+    "hermes".into()
+}
+
+fn default_custom_key_env() -> String {
+    "OPENAI_API_KEY".into()
 }
 
 fn default_frame_origin() -> i32 {
@@ -753,6 +763,9 @@ impl Default for DeskSettings {
             daily_at: default_daily_at(),
             daily_done: None,
             take_provider: default_take_provider(),
+            custom_base: String::new(),
+            custom_model: String::new(),
+            custom_key_env: default_custom_key_env(),
             docked: true,
             frame_x: default_frame_origin(),
             frame_y: default_frame_origin(),
