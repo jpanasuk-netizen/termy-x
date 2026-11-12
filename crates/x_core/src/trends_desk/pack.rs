@@ -672,6 +672,42 @@ pub fn page_after_key(index: usize, count: usize, key: &str) -> Option<usize> {
     }
 }
 
+/// Ctrl+Enter posts the open reply. Plain Enter does not.
+pub fn posts_on_ctrl_enter(key: &str, ctrl: bool) -> bool {
+    ctrl && matches!(key, "enter" | "return")
+}
+
+pub fn post_reply_label(handle: &str) -> String {
+    let handle = handle.trim().trim_start_matches('@');
+    let handle = if handle.is_empty() { "author" } else { handle };
+    format!("Post reply → @{handle}")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostFace {
+    Ready,
+    Posting,
+    Posted,
+    Retry,
+}
+
+pub fn post_button_text(face: PostFace, handle: &str) -> String {
+    match face {
+        PostFace::Ready => post_reply_label(handle),
+        PostFace::Posting => "Posting…".into(),
+        PostFace::Posted => "Posted ✓".into(),
+        PostFace::Retry => "Retry".into(),
+    }
+}
+
+/// A status URL inside a send receipt, when OpenCLI returned one.
+pub fn reply_link(receipt: &str) -> Option<String> {
+    receipt.split_whitespace().find_map(|word| {
+        let word = word.trim_matches(|ch: char| matches!(ch, ',' | '·' | '"' | '\''));
+        (word.starts_with("http") && word.contains("/status/")).then(|| word.to_string())
+    })
+}
+
 pub fn sends_on_key(key: &str, ctrl: bool, shift: bool) -> bool {
     match desk_key(key, ctrl, shift) {
         DeskKey::Select(_)
@@ -689,6 +725,21 @@ pub fn sends_on_key(key: &str, ctrl: bool, shift: bool) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    struct OkPoster;
+    impl super::super::cards::ReplyPoster for OkPoster {
+        fn post_reply(&self, url: &str, text: &str) -> Result<String, String> {
+            assert!(url.contains("/status/"));
+            assert_eq!(text, "a joke");
+            Ok("https://x.com/ada/status/99".into())
+        }
+    }
+    struct ErrPoster;
+    impl super::super::cards::ReplyPoster for ErrPoster {
+        fn post_reply(&self, _: &str, _: &str) -> Result<String, String> {
+            Err("login required".into())
+        }
+    }
 
     fn post(id: &str, likes: u64, hours_ago: i64, extra: serde_json::Value) -> SourcePost {
         let mut value = json!({
@@ -867,7 +918,48 @@ mod tests {
             assert!(!sends_on_key(key, false, false));
             assert!(!sends_on_key(key, true, false));
             assert!(!sends_on_key(key, true, true));
+            assert!(!posts_on_ctrl_enter(key, false));
         }
+        assert!(posts_on_ctrl_enter("enter", true));
+        assert!(posts_on_ctrl_enter("return", true));
+        assert!(!posts_on_ctrl_enter("enter", false));
+        assert!(!posts_on_ctrl_enter("s", true));
+        assert_eq!(post_reply_label("ada"), "Post reply → @ada");
+        assert_eq!(post_reply_label("@ada"), "Post reply → @ada");
+        assert_eq!(post_button_text(PostFace::Posting, "ada"), "Posting…");
+        assert_eq!(post_button_text(PostFace::Posted, "ada"), "Posted ✓");
+        assert_eq!(post_button_text(PostFace::Retry, "ada"), "Retry");
+        assert_eq!(
+            reply_link("reply receipt · https://x.com/ada/status/99"),
+            Some("https://x.com/ada/status/99".into())
+        );
+        let phase = crate::trends_desk::ReplyPhase::Editing {
+            text: "a joke".into(),
+        };
+        let posted =
+            crate::trends_desk::commit_send(&phase, true, "https://x.com/bob/status/1", &OkPoster);
+        match posted {
+            crate::trends_desk::ReplyPhase::Confirmed { receipt, .. } => {
+                assert_eq!(
+                    reply_link(&receipt).as_deref(),
+                    Some("https://x.com/ada/status/99")
+                );
+            }
+            other => panic!("expected a posted reply, got {other:?}"),
+        }
+        let failed =
+            crate::trends_desk::commit_send(&phase, true, "https://x.com/bob/status/1", &ErrPoster);
+        match failed {
+            crate::trends_desk::ReplyPhase::Failed { error, text } => {
+                assert_eq!(text, "a joke");
+                assert!(error.contains("login"));
+            }
+            other => panic!("expected a failed reply, got {other:?}"),
+        }
+        assert!(
+            crate::trends_desk::commit_send(&phase, false, "https://x.com/bob/status/1", &OkPoster)
+                == phase
+        );
         assert_eq!(desk_key("s", false, false), DeskKey::Star);
         assert_eq!(desk_key("d", false, false), DeskKey::Draft);
         assert_eq!(desk_key("enter", false, false), DeskKey::Unbound);

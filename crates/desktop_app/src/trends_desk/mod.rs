@@ -649,6 +649,14 @@ impl TrendsDesk {
             cx.notify();
             return;
         }
+        if termy_x::trends_desk::posts_on_ctrl_enter(
+            key,
+            event.keystroke.modifiers.control || event.keystroke.modifiers.platform,
+        ) {
+            self.action_note = "Posting…".into();
+            self.send_from_popout(cx);
+            return;
+        }
         if key == "c" && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) {
             if let Some(pop) = self.popout.clone() {
                 self.copy_text(&pop.draft, cx);
@@ -750,13 +758,6 @@ impl TrendsDesk {
             pop.card_id.clone(),
             edit_reply(&ReplyPhase::Idle, closed.draft),
         );
-    }
-
-    pub(crate) fn draft_card_take(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.media_blocks_card_click() {
-            return;
-        }
-        self.spawn_one_take(id, false, cx);
     }
 
     pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {

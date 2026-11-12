@@ -447,7 +447,7 @@ pub const DRAFTING_PLACEHOLDER: &str = "Drafting…";
 
 /// The pink box holds the reply, three voice chips, Copy, and Send.
 pub fn pink_box_controls() -> [&'static str; 5] {
-    ["Funny", "Smart", "Spicy", "Copy", "Send"]
+    ["Funny", "Smart", "Spicy", "Copy", "Post reply"]
 }
 
 /// Draft take shows the box. It does not write a draft file in the background.
@@ -1232,7 +1232,7 @@ mod tests {
         assert!(!draft_click_queues_a_file());
         assert_eq!(
             pink_box_controls(),
-            ["Funny", "Smart", "Spicy", "Copy", "Send"]
+            ["Funny", "Smart", "Spicy", "Copy", "Post reply"]
         );
         assert_eq!(opened.card_id, "42");
         assert_eq!(opened.draft, DRAFTING_PLACEHOLDER);

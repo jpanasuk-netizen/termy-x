@@ -72,13 +72,14 @@ pub use media::{
     read_cached, tile_grid, write_cached,
 };
 pub use pack::{
-    CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, ReplyMark,
-    SearchEdit, TakeTone, apply_filters, desk_key, distinct_variants, flip_variant, format_clock,
-    format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs,
-    new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key, panel_tone_name,
-    panel_tones, provider_drafts, read_composer, refresh_due, refresh_is_search_only,
-    replied_badge, save_pack, search_edit, search_label, search_page_name, sends_on_key,
-    should_auto_refresh, sort_by_heat,
+    CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, PostFace,
+    ReplyMark, SearchEdit, TakeTone, apply_filters, desk_key, distinct_variants, flip_variant,
+    format_clock, format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack,
+    local_offset_secs, new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key,
+    panel_tone_name, panel_tones, post_button_text, post_reply_label, posts_on_ctrl_enter,
+    provider_drafts, read_composer, refresh_due, refresh_is_search_only, replied_badge, reply_link,
+    save_pack, search_edit, search_label, search_page_name, sends_on_key, should_auto_refresh,
+    sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

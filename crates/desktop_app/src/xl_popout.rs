@@ -9,14 +9,13 @@ use gpui_kit::{
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{
-    TakeTone, apply_variant, panel_tone_name, panel_tones, pink_box_controls,
-};
+use termy_x::trends_desk::{TakeTone, panel_tone_name, panel_tones, pink_box_controls};
 
 impl TrendsDesk {
     pub(crate) fn inline_editor(
         &self,
         card_id: &str,
+        handle: &str,
         cx: &mut Context<Self>,
     ) -> Option<gpui_kit::AnyElement> {
         let pop = self.popout.clone()?;
@@ -32,10 +31,34 @@ impl TrendsDesk {
         } else {
             format!("{head}|{tail}")
         };
-        let sending = self
-            .card_replies
-            .get(&pop.card_id)
-            .is_some_and(termy_x::trends_desk::send_is_busy);
+        let phase = self.card_replies.get(&pop.card_id).cloned().unwrap_or(
+            termy_x::trends_desk::ReplyPhase::Editing {
+                text: pop.draft.clone(),
+            },
+        );
+        let face = match &phase {
+            termy_x::trends_desk::ReplyPhase::Pending { .. } => {
+                termy_x::trends_desk::PostFace::Posting
+            }
+            termy_x::trends_desk::ReplyPhase::Confirmed { .. } => {
+                termy_x::trends_desk::PostFace::Posted
+            }
+            termy_x::trends_desk::ReplyPhase::Failed { .. } => {
+                termy_x::trends_desk::PostFace::Retry
+            }
+            _ => termy_x::trends_desk::PostFace::Ready,
+        };
+        let post_label = termy_x::trends_desk::post_button_text(face, handle);
+        let posted_url = match &phase {
+            termy_x::trends_desk::ReplyPhase::Confirmed { receipt, .. } => {
+                termy_x::trends_desk::reply_link(receipt)
+            }
+            _ => None,
+        };
+        let failure = match &phase {
+            termy_x::trends_desk::ReplyPhase::Failed { error, .. } => Some(error.clone()),
+            _ => None,
+        };
         let mut box_el = div()
             .id("desk-inline-editor")
             .w_full()
@@ -69,7 +92,15 @@ impl TrendsDesk {
             chips = chips.child(variant_chip(panel_tone_name(tone), index, cx));
         }
         box_el = box_el.child(chips);
-        if !self.action_note.is_empty() {
+        if let Some(error) = failure {
+            box_el = box_el.child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(0x070b14))
+                    .whitespace_normal()
+                    .child(error),
+            );
+        } else if !self.action_note.is_empty() {
             box_el = box_el.child(
                 div()
                     .text_size(px(12.0))
@@ -78,37 +109,52 @@ impl TrendsDesk {
                     .child(self.action_note.clone()),
             );
         }
-        let send_label = if sending { "Sending…" } else { controls[4] };
+        box_el = box_el.child(box_button(
+            "desk-reply-copy",
+            controls[3],
+            cx,
+            |this, cx| {
+                if let Some(pop) = this.popout.clone() {
+                    this.copy_text(&pop.draft, cx);
+                    this.action_note = "Copied the reply.".into();
+                }
+                cx.notify();
+            },
+        ));
+        if let Some(url) = posted_url.clone() {
+            box_el = box_el.child(box_button(
+                "desk-posted-link",
+                "Open the reply",
+                cx,
+                move |this, cx| {
+                    this.action_note = crate::trends_desk::open_status(&url).into();
+                    cx.notify();
+                },
+            ));
+        }
         Some(
             box_el
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap(px(8.0))
-                        .child(box_button(
-                            "desk-reply-copy",
-                            controls[3],
-                            cx,
-                            |this, cx| {
-                                if let Some(pop) = this.popout.clone() {
-                                    this.copy_text(&pop.draft, cx);
-                                    this.action_note = "Copied the reply.".into();
-                                }
-                                cx.notify();
-                            },
-                        ))
-                        .child(box_button("desk-pop-send", send_label, cx, |this, cx| {
-                            this.send_from_popout(cx);
+                .child(post_button(
+                    "desk-post-reply",
+                    &post_label,
+                    cx,
+                    |this, cx| {
+                        if this
+                            .popout
+                            .as_ref()
+                            .and_then(|pop| this.card_replies.get(&pop.card_id))
+                            .is_some_and(|phase| {
+                                matches!(phase, termy_x::trends_desk::ReplyPhase::Confirmed { .. })
+                            })
+                        {
                             cx.notify();
-                        }))
-                        .child(box_button("desk-inline-close", "Close", cx, |this, cx| {
-                            this.close_popout();
-                            this.action_note =
-                                "Closed the draft. The text is still on the card.".into();
-                            cx.notify();
-                        })),
-                )
+                            return;
+                        }
+                        this.action_note = "Posting…".into();
+                        this.send_from_popout(cx);
+                        cx.notify();
+                    },
+                ))
                 .into_any_element(),
         )
     }
@@ -170,22 +216,46 @@ fn variant_chip(
     cx: &mut Context<TrendsDesk>,
 ) -> gpui_kit::AnyElement {
     box_button(&format!("desk-tone-{label}"), label, cx, move |this, cx| {
-        let missing = format!("No {label} line yet.");
-        if let Some(pop) = this.popout.as_mut() {
-            let variants = pop.variants.clone();
-            if apply_variant(&mut pop.draft, &variants, index) {
-                let text = pop.draft.clone();
-                let id = pop.card_id.clone();
-                this.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
-                this.card_replies
-                    .insert(id, termy_x::trends_desk::ReplyPhase::Editing { text });
-                this.action_note = format!("Showing {label}.");
-            } else {
-                this.action_note = missing;
-            }
-        }
+        let _ = index;
+        this.action_note = format!("Drafting {label}…");
+        this.set_pop_tone(label);
+        this.regenerate_open_variants(cx);
         cx.notify();
     })
+}
+
+fn post_button(
+    id: &str,
+    label: &str,
+    cx: &mut Context<TrendsDesk>,
+    handler: impl Fn(&mut TrendsDesk, &mut Context<TrendsDesk>) + 'static,
+) -> gpui_kit::AnyElement {
+    div()
+        .id(SharedString::from(id.to_string()))
+        .w_full()
+        .flex_shrink_0()
+        .min_h(px(56.0))
+        .px(px(16.0))
+        .py(px(12.0))
+        .rounded(px(10.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(0x7af6ff))
+        .text_size(px(16.0))
+        .text_color(rgb(0x070b14))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgb(0xffe56a)))
+        .active(|style| style.bg(rgb(0xff4fa3)).text_color(rgb(0x070b14)))
+        .child(label.to_string())
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                handler(this, cx);
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
 }
 
 fn box_button(

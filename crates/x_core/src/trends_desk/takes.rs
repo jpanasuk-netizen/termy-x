@@ -153,16 +153,17 @@ pub enum DeskEvent {
     TonePill,
 }
 
-/// Search, flip, scroll, and refresh never call a provider. A card action calls once.
+/// A take starts only from Draft take, Reply, Edit, or a chip on an open box.
+/// Clicking the card body only selects it.
 pub fn take_spawns(event: DeskEvent) -> usize {
     match event {
         DeskEvent::Load
         | DeskEvent::Search
         | DeskEvent::Flip
         | DeskEvent::Scroll
-        | DeskEvent::Refresh => 0,
-        DeskEvent::CardClick
-        | DeskEvent::DraftTake
+        | DeskEvent::Refresh
+        | DeskEvent::CardClick => 0,
+        DeskEvent::DraftTake
         | DeskEvent::Reply
         | DeskEvent::Edit
         | DeskEvent::ProviderPill
@@ -602,11 +603,11 @@ mod tests {
             DeskEvent::Flip,
             DeskEvent::Scroll,
             DeskEvent::Refresh,
+            DeskEvent::CardClick,
         ] {
             assert_eq!(take_spawns(event), 0, "{event:?}");
         }
         for event in [
-            DeskEvent::CardClick,
             DeskEvent::DraftTake,
             DeskEvent::Reply,
             DeskEvent::Edit,

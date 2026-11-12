@@ -108,7 +108,6 @@ impl TrendsDesk {
                 MouseButton::Left,
                 cx.listener({
                     let take_key = take_key.clone();
-                    let click_id = id.clone();
                     move |this, _, window, cx| {
                         if this.media_blocks_card_click() {
                             cx.stop_propagation();
@@ -116,7 +115,6 @@ impl TrendsDesk {
                         }
                         this.selected = Some(take_key.clone());
                         this.focus_root_after_click(window, cx);
-                        this.draft_card_take(click_id.clone(), cx);
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -297,7 +295,7 @@ impl TrendsDesk {
                         "Reply",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.open_inline_for(edit_id.clone(), cx);
+                            this.draft_take_for(edit_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -354,16 +352,13 @@ impl TrendsDesk {
                         "Edit",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.open_inline_for(send_id.clone(), cx);
+                            this.draft_take_for(send_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
                     )),
             )
-            .children(self.inline_editor(&id, cx));
-        if editing {
-            shell = shell.max_h(px(640.0)).overflow_y_scroll();
-        }
+            .children(self.inline_editor(&id, &card.handle, cx));
         shell.into_any_element()
     }
 }
