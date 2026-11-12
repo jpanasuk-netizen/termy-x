@@ -22,11 +22,21 @@ enum Load {
     Failed,
 }
 
+struct PendingPlay {
+    url: String,
+    hwnd: isize,
+    scale: f32,
+    rect: (f32, f32, f32, f32),
+    tries: u8,
+}
+
 pub(crate) struct MediaDesk {
     states: HashMap<String, Load>,
     inflight: RefCell<HashSet<String>>,
     viewer: Option<String>,
     player: Option<crate::x_panel::player::VideoPlayer>,
+    pending: Option<PendingPlay>,
+    needs_focus: bool,
     pub(crate) notice: String,
 }
 
@@ -37,6 +47,8 @@ impl Default for MediaDesk {
             inflight: RefCell::new(HashSet::new()),
             viewer: None,
             player: None,
+            pending: None,
+            needs_focus: false,
             notice: String::new(),
         }
     }
@@ -44,18 +56,36 @@ impl Default for MediaDesk {
 
 impl MediaDesk {
     fn close(&mut self) -> bool {
-        let open = self.viewer.is_some() || self.player.is_some();
+        let open = self.viewer.is_some() || self.player.is_some() || self.pending.is_some();
         self.viewer = None;
+        self.pending = None;
+        self.notice.clear();
         if let Some(player) = self.player.take() {
             player.stop();
         }
         open
+    }
+
+    fn player_open(&self) -> bool {
+        self.player.is_some() || self.viewer.is_some() || self.pending.is_some()
     }
 }
 
 impl TrendsDesk {
     pub(crate) fn close_media(&mut self) -> bool {
         self.media.close()
+    }
+
+    pub(crate) fn media_blocks_card_click(&self) -> bool {
+        !termy_x::trends_desk::card_click_drafts(self.media.player_open())
+    }
+
+    pub(crate) fn focus_open_media(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.media.needs_focus {
+            return;
+        }
+        self.media.needs_focus = false;
+        self.focus_root_after_click(window, cx);
     }
 
     pub(crate) fn media_block(
@@ -222,57 +252,172 @@ impl TrendsDesk {
         let size = window.viewport_size();
         let width: f32 = size.width.into();
         let height: f32 = size.height.into();
-        let rect = (
-            24.0,
-            72.0,
-            (width - 48.0).max(200.0),
-            (height - 140.0).max(160.0),
-        );
-        match crate::x_panel::player::VideoPlayer::start(hwnd, window.scale_factor(), rect, url, 80)
-        {
-            Ok(player) => {
-                self.media.player = Some(player);
-                self.media.notice = crate::x_panel::player::VLC_OPEN_NOTICE.into();
-            }
-            Err(error) => self.media.notice = error,
-        }
+        let (x, y) = termy_x::trends_desk::player_origin();
+        self.media.pending = Some(PendingPlay {
+            url: url.to_string(),
+            hwnd,
+            scale: window.scale_factor(),
+            rect: (x, y, (width - 48.0).max(200.0), (height - 140.0).max(160.0)),
+            tries: 0,
+        });
+        self.media.notice.clear();
+        self.open_pending_video(cx);
         self.focus_handle.focus(window, cx);
         self.focus_root_after_click(window, cx);
     }
 
-    pub(crate) fn media_close(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
-        if self.media.player.is_none() && self.media.viewer.is_none() {
+    /// Esc hides the host and releases libVLC on a worker thread. A second
+    /// play waits until that release finishes, then opens a new host.
+    fn open_pending_video(&mut self, cx: &mut Context<Self>) {
+        if self.media.pending.is_none() {
+            return;
+        }
+        if !crate::x_panel::player::engine_ready_for_replay() {
+            let tries = self
+                .media
+                .pending
+                .as_ref()
+                .map(|pending| pending.tries)
+                .unwrap_or(0);
+            if let Some(pending) = self.media.pending.as_mut() {
+                pending.tries = pending.tries.saturating_add(1);
+            }
+            if tries == 0 {
+                termy_x::trends_desk::append_desk_log(
+                    &self.data_root,
+                    "INFO media: waiting for the previous video host to release",
+                );
+            }
+            if tries >= 80 {
+                self.media.pending = None;
+                self.media.notice =
+                    "Video did not reopen. The previous player is still closing.".into();
+                termy_x::trends_desk::append_desk_log(
+                    &self.data_root,
+                    "INFO media: video did not reopen; the previous host was still closing",
+                );
+                cx.notify();
+                return;
+            }
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+                let _ = this.update(cx, |desk, cx| desk.open_pending_video(cx));
+            })
+            .detach();
+            return;
+        }
+        let Some(pending) = self.media.pending.take() else {
+            return;
+        };
+        crate::x_panel::player::reap_video_hosts();
+        match crate::x_panel::player::VideoPlayer::start(
+            pending.hwnd,
+            pending.scale,
+            pending.rect,
+            &pending.url,
+            80,
+        ) {
+            Ok(player) => {
+                self.media.player = Some(player);
+                self.media.notice = crate::x_panel::player::VLC_OPEN_NOTICE.into();
+                self.media.needs_focus = true;
+                termy_x::trends_desk::append_desk_log(
+                    &self.data_root,
+                    "INFO media: video host shown",
+                );
+            }
+            Err(error) => {
+                self.media.notice = error.clone();
+                termy_x::trends_desk::append_desk_log(
+                    &self.data_root,
+                    &format!("INFO media: video did not open: {error}"),
+                );
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn media_shield(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        if self.media.player.is_none() && self.media.pending.is_none() {
             return None;
         }
-        let label = if self.media.notice.is_empty() {
-            "X".to_string()
-        } else {
-            format!("X  {}", self.media.notice)
-        };
+        let (x, y) = termy_x::trends_desk::player_origin();
         Some(
             div()
-                .id("desk-media-close")
+                .id("desk-player-shield")
                 .absolute()
-                .top(px(8.0))
-                .right(px(8.0))
-                .px(px(10.0))
-                .py(px(6.0))
-                .rounded(px(8.0))
-                .bg(rgb(0xff4fa3))
-                .text_size(px(13.0))
-                .text_color(rgb(0x070b14))
-                .cursor_pointer()
-                .child(label)
+                .left(px(x))
+                .top(px(y))
+                .right(px(24.0))
+                .bottom(px(68.0))
+                .bg(rgb(0x070b14))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _, window, cx| {
-                        this.close_media();
-                        this.focus_handle.focus(window, cx);
+                    cx.listener(|_this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.notify();
                     }),
                 )
                 .into_any_element(),
+        )
+    }
+
+    pub(crate) fn media_close(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        let playing = self.media.player.is_some()
+            || self.media.viewer.is_some()
+            || self.media.pending.is_some();
+        if !playing && self.media.notice.is_empty() {
+            return None;
+        }
+        let note: String = if playing {
+            String::new()
+        } else {
+            self.media.notice.chars().take(80).collect()
+        };
+        let hit = termy_x::trends_desk::CLOSE_HIT;
+        let mut row = div()
+            .absolute()
+            .top(px(8.0))
+            .right(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0));
+        if !note.is_empty() {
+            row = row.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xe5e5ea))
+                    .child(note),
+            );
+        }
+        Some(
+            row.child(
+                div()
+                    .id("desk-media-close")
+                    .w(px(hit))
+                    .h(px(hit))
+                    .min_w(px(hit))
+                    .rounded(px(12.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0xff4fa3))
+                    .text_size(px(28.0))
+                    .text_color(rgb(0x070b14))
+                    .cursor_pointer()
+                    .child(termy_x::trends_desk::CLOSE_ICON)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.close_media();
+                            this.focus_handle.focus(window, cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .into_any_element(),
         )
     }
 

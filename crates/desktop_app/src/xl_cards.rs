@@ -110,6 +110,10 @@ impl TrendsDesk {
                     let take_key = take_key.clone();
                     let click_id = id.clone();
                     move |this, _, window, cx| {
+                        if this.media_blocks_card_click() {
+                            cx.stop_propagation();
+                            return;
+                        }
                         this.selected = Some(take_key.clone());
                         this.focus_root_after_click(window, cx);
                         this.draft_card_take(click_id.clone(), cx);

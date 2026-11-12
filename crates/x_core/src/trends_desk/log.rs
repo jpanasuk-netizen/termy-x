@@ -3,6 +3,7 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 
 const MAX_BYTES: u64 = 256 * 1024;
 
@@ -37,6 +38,34 @@ pub fn should_log_model_failure(already_logged: bool, note: &str) -> bool {
 
 pub fn panic_log_line(message: &str, location: &str) -> String {
     format!("INFO panic: {message} at {location}")
+}
+
+pub fn exit_log_line(reason: &str) -> String {
+    format!("INFO exit: {reason}")
+}
+
+/// The first reason wins. A later note does not hide the one that closed the window.
+pub fn remember_exit(current: &str, reason: &str) -> String {
+    if current.is_empty() {
+        reason.to_string()
+    } else {
+        current.to_string()
+    }
+}
+
+static EXIT_REASON: Mutex<String> = Mutex::new(String::new());
+
+pub fn note_exit_reason(reason: &str) {
+    if let Ok(mut slot) = EXIT_REASON.lock() {
+        *slot = remember_exit(&slot, reason);
+    }
+}
+
+pub fn exit_reason() -> String {
+    EXIT_REASON
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
 }
 
 pub fn install_panic_log(root: &Path) {
@@ -112,9 +141,21 @@ mod tests {
         assert!(dir.join("logs").join("termy-xl.log.2").is_file());
         let panic_line = panic_log_line("settings write then boom", "trends_desk/mod.rs:1");
         assert!(panic_line.starts_with("INFO panic:"));
+        let exit_line = exit_log_line("window close requested");
+        assert_eq!(exit_line, "INFO exit: window close requested");
+        assert_eq!(
+            remember_exit("", "window close requested"),
+            "window close requested"
+        );
+        assert_eq!(
+            remember_exit("window close requested", "process ending"),
+            "window close requested"
+        );
         append_desk_log(&dir, &panic_line);
+        append_desk_log(&dir, &exit_line);
         let kept = std::fs::read_to_string(dir.join("logs").join("termy-xl.log")).unwrap();
         assert!(kept.contains("INFO panic:"));
+        assert!(kept.contains("INFO exit: window close requested"));
         assert!(!kept.contains("super"));
         let _ = std::fs::remove_dir_all(&dir);
     }

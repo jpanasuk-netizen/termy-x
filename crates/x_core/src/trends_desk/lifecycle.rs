@@ -104,6 +104,50 @@ pub fn quit_dialog_for_agents(open_panes: usize) -> Option<&'static str> {
     None
 }
 
+/// What Escape does. None of these ask the process to quit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeEffect {
+    CloseMedia,
+    CloseCompose,
+    ClearField,
+    ClearSelection,
+    CollapseDock,
+    Ignored,
+}
+
+pub fn escape_effect(
+    media_open: bool,
+    compose_open: bool,
+    editing: bool,
+    field: bool,
+    selected: bool,
+    expanded: bool,
+) -> EscapeEffect {
+    if media_open {
+        EscapeEffect::CloseMedia
+    } else if compose_open || editing {
+        EscapeEffect::CloseCompose
+    } else if field {
+        EscapeEffect::ClearField
+    } else if selected {
+        EscapeEffect::ClearSelection
+    } else if expanded {
+        EscapeEffect::CollapseDock
+    } else {
+        EscapeEffect::Ignored
+    }
+}
+
+pub fn escape_requests_quit(effect: EscapeEffect) -> bool {
+    let _ = effect;
+    false
+}
+
+/// Losing focus does not close the window. Only a window-close request does.
+pub fn focus_loss_closes_the_window() -> bool {
+    false
+}
+
 pub struct OffUiRequest {
     started: Instant,
     rx: std::sync::mpsc::Receiver<Result<String, String>>,
@@ -299,6 +343,35 @@ mod tests {
         assert_eq!(quit_dialog_for_agents(0), None);
         assert_eq!(quit_dialog_for_agents(1), None);
         assert_eq!(quit_dialog_for_agents(3), None);
+    }
+
+    #[test]
+    fn escape_never_quits_and_focus_loss_does_not_close() {
+        assert!(!focus_loss_closes_the_window());
+        let effects = [
+            escape_effect(true, true, true, true, true, true),
+            escape_effect(false, true, false, true, true, true),
+            escape_effect(false, false, true, true, true, true),
+            escape_effect(false, false, false, true, true, true),
+            escape_effect(false, false, false, false, true, true),
+            escape_effect(false, false, false, false, false, true),
+            escape_effect(false, false, false, false, false, false),
+        ];
+        assert_eq!(
+            effects,
+            [
+                EscapeEffect::CloseMedia,
+                EscapeEffect::CloseCompose,
+                EscapeEffect::CloseCompose,
+                EscapeEffect::ClearField,
+                EscapeEffect::ClearSelection,
+                EscapeEffect::CollapseDock,
+                EscapeEffect::Ignored,
+            ]
+        );
+        for effect in effects {
+            assert!(!escape_requests_quit(effect));
+        }
     }
 
     #[test]

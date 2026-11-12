@@ -126,6 +126,52 @@ pub fn play_badge(kind: MediaKind) -> Option<&'static str> {
     }
 }
 
+/// Pink close control. Large enough to hit, and drawn as an icon.
+pub const CLOSE_HIT: f32 = 56.0;
+pub const CLOSE_ICON: &str = "✕";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaClick {
+    Close,
+    Player,
+    Card,
+}
+
+pub fn player_origin() -> (f32, f32) {
+    (24.0, 72.0)
+}
+
+pub fn close_hit_box(width: f32) -> (f32, f32, f32, f32) {
+    let size = CLOSE_HIT;
+    ((width - 8.0 - size).max(0.0), 8.0, size, size)
+}
+
+fn point_in(px: f32, py: f32, box_at: (f32, f32, f32, f32)) -> bool {
+    px >= box_at.0 && py >= box_at.1 && px < box_at.0 + box_at.2 && py < box_at.1 + box_at.3
+}
+
+/// Close wins over the player. A player hit is not a card hit.
+pub fn media_click(px: f32, py: f32, width: f32, height: f32) -> MediaClick {
+    if point_in(px, py, close_hit_box(width)) {
+        return MediaClick::Close;
+    }
+    let (x, y) = player_origin();
+    let player = (x, y, (width - 48.0).max(200.0), (height - 140.0).max(160.0));
+    if point_in(px, py, player) {
+        return MediaClick::Player;
+    }
+    MediaClick::Card
+}
+
+pub fn click_drafts_a_card(target: MediaClick) -> bool {
+    matches!(target, MediaClick::Card)
+}
+
+/// While a video or photo is open, a click that reaches a card does not draft.
+pub fn card_click_drafts(player_open: bool) -> bool {
+    !player_open
+}
+
 /// Tiles for one card. Every box stays inside `width`.
 pub fn tile_grid(width: f32, count: usize) -> Vec<TileBox> {
     let width = if width.is_finite() {
@@ -367,5 +413,30 @@ mod tests {
         assert!(read_cached(&root, "https://img.example/b.jpg").is_some());
         assert!(read_cached(&root, "https://img.example/a.jpg").is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn close_control_is_a_large_icon_and_player_clicks_do_not_draft() {
+        assert_eq!(CLOSE_ICON, "✕");
+        assert!(CLOSE_HIT >= 44.0);
+        let (x, y, w, h) = close_hit_box(687.0);
+        assert_eq!((w, h), (CLOSE_HIT, CLOSE_HIT));
+        assert!(x + w <= 687.0);
+        assert_eq!(
+            media_click(x + 4.0, y + 4.0, 687.0, 800.0),
+            MediaClick::Close
+        );
+        let (px, py) = player_origin();
+        assert!(y + h <= py);
+        assert_eq!(
+            media_click(px + 30.0, py + 30.0, 687.0, 800.0),
+            MediaClick::Player
+        );
+        assert!(!click_drafts_a_card(MediaClick::Player));
+        assert!(!click_drafts_a_card(MediaClick::Close));
+        assert!(click_drafts_a_card(MediaClick::Card));
+        assert!(!card_click_drafts(true));
+        assert!(card_click_drafts(false));
+        assert_eq!(media_click(8.0, 8.0, 687.0, 800.0), MediaClick::Card);
     }
 }

@@ -83,7 +83,14 @@ impl TrendsDesk {
         self.close_hooked = true;
         let entity = cx.entity().clone();
         window.on_window_should_close(cx, move |window, cx| {
+            termy_x::trends_desk::note_exit_reason("window close requested");
             let _ = entity.update(cx, |desk, _| {
+                termy_x::trends_desk::append_desk_log(
+                    &desk.data_root,
+                    &termy_x::trends_desk::exit_log_line(
+                        "window close requested; escape does not quit and focus loss does not close",
+                    ),
+                );
                 let bounds = window.bounds();
                 desk.frame.x = bounds.origin.x.into();
                 desk.frame.y = bounds.origin.y.into();

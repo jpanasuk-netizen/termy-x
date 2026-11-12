@@ -9,7 +9,7 @@ use gpui_kit::{
     ParentElement, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
-use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
+use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status, page_button};
 use termy_x::trends_desk::{
     DeskKey, PackFile, Phase, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters,
     desk_key, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label,
@@ -508,39 +508,14 @@ impl TrendsDesk {
                     .flex_col()
                     .gap(px(8.0))
                     .p(px(12.0))
+                    .relative()
+                    .pt(px(termy_x::trends_desk::PAGE_BAR_H))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
                             this.selected = None;
                             cx.notify();
                         }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(button(
-                                "desk-page-prev",
-                                "Prev",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(-1);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(div().text_size(px(16.0)).child(label))
-                            .child(button(
-                                "desk-page-next",
-                                "Next",
-                                false,
-                                cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(1);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            )),
                     )
                     .child(
                         div()
@@ -603,7 +578,8 @@ impl TrendsDesk {
                             );
                         }
                         list
-                    }),
+                    })
+                    .child(page_bar(label, cx)),
             );
         let mut rows: Vec<gpui_kit::AnyElement> = vec![page.into_any_element()];
         if self.session.state == SessionState::Missing {
@@ -626,6 +602,59 @@ impl TrendsDesk {
             .children(rows)
             .into_any_element()
     }
+}
+
+fn page_bar(label: String, cx: &mut Context<TrendsDesk>) -> gpui_kit::AnyElement {
+    // Painted last so a search result list cannot cover Next.
+    debug_assert!(termy_x::trends_desk::next_click_reaches(
+        true,
+        termy_x::trends_desk::PAGE_BAR_H
+    ));
+    div()
+        .id("desk-page-controls")
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .right(px(0.0))
+        .h(px(termy_x::trends_desk::PAGE_BAR_H))
+        .px(px(8.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .bg(rgb(0x12100a))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_this, _, _, cx| {
+                cx.stop_propagation();
+            }),
+        )
+        .child(page_button(
+            "desk-page-prev",
+            "Prev",
+            cx.listener(|this, _, _, cx| {
+                this.turn_subject(-1);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        ))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_size(px(16.0))
+                .child(label),
+        )
+        .child(page_button(
+            "desk-page-next",
+            "Next",
+            cx.listener(|this, _, _, cx| {
+                this.turn_subject(1);
+                cx.stop_propagation();
+                cx.notify();
+            }),
+        ))
+        .into_any_element()
 }
 
 fn status_row(label: &str, action: gpui_kit::AnyElement) -> gpui_kit::AnyElement {
