@@ -98,12 +98,14 @@ pub use store::{
 };
 pub use takes::{
     CLICK_TO_DRAFT, DeskEvent, HERMES_TAKE_TIMEOUT, HONEST_PREFIX, TAKE_CHAIN, TAKE_TIMEOUT,
-    TakeSources, accept_lines, admit_grok, agent_work_dir, agy_credit_error, apply_hidden_command,
-    background_grok_spawn, chain_order, choose_chain, halt_takes, hidden_agent_draft,
-    honest_failure, interactive_command, is_provider_failure, is_template_angle, is_termy_x_image,
-    merge_attempts, migrate_saved_provider, muse_needs_trust, muse_trust_line, resume_takes,
-    retain_grok_jobs, run_take_chain, run_take_chain_with, settle_variants, take_chain_order,
-    take_spawns, takes_halted, with_grok_stub,
+    TakeSources, accept_lines, admit_grok, agent_work_dir, agy_credit_error, agy_print_args,
+    agy_print_text, apply_hidden_command, background_grok_spawn, base_provider_menu,
+    canonical_provider, chain_order, choose_chain, halt_takes, hidden_agent_draft, honest_failure,
+    interactive_command, is_provider_failure, is_template_angle, is_termy_x_image,
+    menu_with_models, merge_attempts, migrate_saved_provider, models_from_openai, muse_needs_trust,
+    muse_trust_line, provider_kind, provider_label, provider_model, resume_takes, retain_grok_jobs,
+    run_take_chain, run_take_chain_with, settle_variants, take_chain_order, take_spawns,
+    takes_halted, with_grok_stub,
 };
 
 const SYNTHETIC_OPENCLI: &str = include_str!("synthetic_opencli.json");

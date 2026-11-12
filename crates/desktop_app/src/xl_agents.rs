@@ -176,15 +176,15 @@ impl TrendsDesk {
     }
 
     pub(crate) fn remember_provider(&mut self, name: &str) {
-        let name = TakeProvider::parse(name).as_str();
-        self.settings.take_provider = name.into();
-        self.config.take_provider = name.into();
+        let name = termy_x::trends_desk::canonical_provider(name);
+        self.settings.take_provider = name.clone();
+        self.config.take_provider = name.clone();
         if let Some(pop) = self.popout.as_mut() {
-            pop.provider = TakeProvider::parse(name);
+            pop.provider = termy_x::trends_desk::provider_kind(&name);
         }
         if self.writable {
             let _ = self.store.save_settings(&self.settings);
-            let _ = self.config.save_take_provider(name);
+            let _ = self.config.save_take_provider(&name);
         }
     }
 
@@ -203,10 +203,21 @@ impl TrendsDesk {
         else {
             return;
         };
-        let config = self.config.clone();
+        let saved = self.settings.take_provider.clone();
+        let mut config = self.config.clone();
+        let provider = termy_x::trends_desk::provider_kind(&saved);
+        if provider == TakeProvider::Hermes {
+            config.hermes_model = termy_x::trends_desk::provider_model(&saved)
+                .unwrap_or_else(|| termy_x::trends_desk::VYCE_MODEL.to_string());
+        }
+        if provider == TakeProvider::Vyce
+            && let Some(model) = termy_x::trends_desk::provider_model(&saved)
+        {
+            config.ai_model = model;
+            config.ai_explicit = true;
+        }
         let tone = pop.tone.clone();
         let previous = pop.variants.clone();
-        let provider = TakeProvider::parse(&self.settings.take_provider);
         let id = pop.card_id.clone();
         let previous_text = pop.draft.clone();
         if let Some(open) = self.popout.as_mut() {

@@ -8,6 +8,7 @@ use gpui_kit::{
     MouseDownEvent, MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, canvas, div, px, rgb,
 };
+use termy_x::io::Http;
 
 use crate::trends_desk::TrendsDesk;
 use termy_x::trends_desk::{TakeTone, panel_tone_name, panel_tones};
@@ -96,7 +97,7 @@ impl TrendsDesk {
                         status.clone()
                     }),
             )
-            .child(self.provider_row(cx))
+            .child(self.provider_dropdown(cx))
             .child(
                 div()
                     .id("desk-reply-editor")
@@ -249,29 +250,75 @@ impl TrendsDesk {
         })
     }
 
-    fn provider_row(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let current = termy_x::trends_desk::TakeProvider::parse(&self.settings.take_provider);
-        let mut row = div().flex().flex_wrap().gap(px(6.0));
-        for (id, name, label) in [
-            ("desk-prov-hermes", "hermes", "Hermes"),
-            ("desk-prov-vyce", "vyce", "Vyce direct"),
-            ("desk-prov-grok", "grok", "Grok"),
-            ("desk-prov-muse", "muse", "Muse"),
-            ("desk-prov-agy", "agy", "Agy"),
-            ("desk-prov-custom", "custom", "Custom"),
-        ] {
-            let active = current.as_str() == name;
-            let chosen = name.to_string();
-            let shown = if active {
-                format!("{label} · on")
+    pub(crate) fn load_provider_models(&mut self, cx: &mut Context<Self>) {
+        let (hermes, hermes_key, custom) = self.provider_probe();
+        cx.spawn(async move |this, cx| {
+            let http = termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(5));
+            let hermes_models = model_ids(&http, &hermes, &hermes_key);
+            let custom_models = if custom.trim().is_empty() {
+                Vec::new()
             } else {
-                label.to_string()
+                model_ids(&http, &custom, "")
             };
-            row = row.child(box_button(id, &shown, cx, move |this, cx| {
-                this.choose_provider(&chosen, cx);
-            }));
+            let vyce_key = std::env::var("VYCE_API_KEY").unwrap_or_default();
+            let vyce_models = if vyce_key.is_empty() {
+                Vec::new()
+            } else {
+                model_ids(&http, termy_x::trends_desk::VYCE_DIRECT_BASE, &vyce_key)
+            };
+            let menu = termy_x::trends_desk::menu_with_models(
+                &hermes_models,
+                &vyce_models,
+                &custom_models,
+            );
+            let extras: Vec<_> = menu
+                .into_iter()
+                .filter(|(id, _)| id.contains(':'))
+                .collect();
+            let _ = this.update(cx, |desk, cx| {
+                desk.extra_models = extras;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn provider_dropdown(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let current = termy_x::trends_desk::provider_label(&self.settings.take_provider);
+        let mut menu = termy_x::trends_desk::base_provider_menu();
+        for extra in &self.extra_models {
+            if !menu.iter().any(|(id, _)| id == &extra.0) {
+                menu.push(extra.clone());
+            }
         }
-        row.into_any_element()
+        let open = self.provider_menu;
+        let mut column = div().flex().flex_col().gap(px(4.0)).child(box_button(
+            "desk-provider-combo",
+            &format!("{current} ▾"),
+            cx,
+            |this, cx| {
+                this.provider_menu = !this.provider_menu;
+                if this.provider_menu {
+                    this.load_provider_models(cx);
+                }
+                cx.notify();
+            },
+        ));
+        if open {
+            for (id, label) in menu {
+                let chosen = id.clone();
+                column = column.child(box_button(
+                    &format!("desk-provider-{id}"),
+                    &label,
+                    cx,
+                    move |this, cx| {
+                        this.provider_menu = false;
+                        this.choose_provider(&chosen, cx);
+                    },
+                ));
+            }
+        }
+        column.into_any_element()
     }
 
     fn place_reply_cursor(&mut self, x: f32, y: f32, extend: bool) {
@@ -650,6 +697,29 @@ fn box_button(
             }),
         )
         .into_any_element()
+}
+
+fn model_ids(http: &termy_x::io::UreqHttp, base: &str, key: &str) -> Vec<String> {
+    let url = format!("{}/models", base.trim().trim_end_matches('/'));
+    let request = termy_x::io::HttpRequest {
+        method: "GET",
+        url,
+        body: None,
+        bearer: {
+            let key = key.trim();
+            if key.is_empty() {
+                None
+            } else {
+                Some(key.to_string())
+            }
+        },
+        content_type: None,
+        headers: Vec::new(),
+    };
+    match http.request(request) {
+        Ok(body) => termy_x::trends_desk::models_from_openai(&body),
+        Err(_) => Vec::new(),
+    }
 }
 
 fn breath_animation() -> Animation {

@@ -126,6 +126,8 @@ pub struct TrendsDesk {
     pub(crate) takes_halted: bool,
     pub(crate) reply_edit: Option<termy_x::draft_edit::ReplyEditor>,
     pub(crate) reply_drag: bool,
+    pub(crate) provider_menu: bool,
+    pub(crate) extra_models: Vec<(String, String)>,
     pub(crate) draft_count: usize,
     pub(crate) saved_urls: std::collections::HashSet<String>,
     pub(crate) list_pick: Option<String>,
@@ -291,6 +293,8 @@ impl TrendsDesk {
             takes_halted: false,
             reply_edit: None,
             reply_drag: false,
+            provider_menu: false,
+            extra_models: Vec::new(),
             draft_count,
             saved_urls,
             list_pick: None,
@@ -765,6 +769,19 @@ impl TrendsDesk {
         );
     }
 
+    pub(crate) fn provider_probe(&self) -> (String, String, String) {
+        let hermes = if self.config.hermes_base_url.trim().is_empty() {
+            termy_x::trends_desk::HERMES_BASE.to_string()
+        } else {
+            self.config.hermes_base_url.clone()
+        };
+        (
+            hermes,
+            self.config.hermes_api_key.clone(),
+            self.settings.custom_base.clone(),
+        )
+    }
+
     pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
         self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
         cx.notify();
@@ -801,8 +818,19 @@ impl TrendsDesk {
                 variants: Vec::new(),
             },
         );
-        let provider = TakeProvider::parse(&self.settings.take_provider);
+        let saved = self.settings.take_provider.clone();
+        let provider = termy_x::trends_desk::provider_kind(&saved);
         let mut config = self.config.clone();
+        if provider == TakeProvider::Hermes {
+            config.hermes_model = termy_x::trends_desk::provider_model(&saved)
+                .unwrap_or_else(|| termy_x::trends_desk::VYCE_MODEL.to_string());
+        }
+        if provider == TakeProvider::Vyce
+            && let Some(model) = termy_x::trends_desk::provider_model(&saved)
+        {
+            config.ai_model = model;
+            config.ai_explicit = true;
+        }
         if provider == TakeProvider::Custom {
             config.ai_base_url = self.settings.custom_base.clone();
             config.ai_model = self.settings.custom_model.clone();

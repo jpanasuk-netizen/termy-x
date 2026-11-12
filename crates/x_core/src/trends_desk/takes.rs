@@ -254,6 +254,158 @@ pub fn migrate_saved_provider(saved: &str) -> &'static str {
     }
 }
 
+pub fn canonical_provider(saved: &str) -> String {
+    let saved = saved.trim();
+    if let Some((kind, model)) = saved.split_once(':') {
+        let model = model.trim();
+        if !model.is_empty() && matches!(kind, "hermes" | "vyce" | "custom") {
+            return format!("{kind}:{model}");
+        }
+    }
+    migrate_saved_provider(saved).to_string()
+}
+
+pub fn provider_kind(saved: &str) -> super::TakeProvider {
+    let id = canonical_provider(saved);
+    let kind = id.split(':').next().unwrap_or("hermes");
+    match kind {
+        "vyce" => super::TakeProvider::Vyce,
+        "grok" => super::TakeProvider::Grok,
+        "muse" => super::TakeProvider::Muse,
+        "agy" => super::TakeProvider::Agy,
+        "custom" => super::TakeProvider::Custom,
+        _ => super::TakeProvider::Hermes,
+    }
+}
+
+pub fn provider_model(saved: &str) -> Option<String> {
+    canonical_provider(saved)
+        .split_once(':')
+        .map(|(_, model)| model.to_string())
+        .filter(|model| !model.is_empty())
+}
+
+pub fn provider_label(saved: &str) -> String {
+    let model = provider_model(saved);
+    match provider_kind(saved) {
+        super::TakeProvider::Vyce => {
+            format!(
+                "Vyce direct · {}",
+                model.unwrap_or_else(|| super::agents::VYCE_MODEL.to_string())
+            )
+        }
+        super::TakeProvider::Grok => "Grok".into(),
+        super::TakeProvider::Muse => "Muse".into(),
+        super::TakeProvider::Agy => "Agy".into(),
+        super::TakeProvider::Custom => {
+            format!("Custom · {}", model.unwrap_or_else(|| "model".into()))
+        }
+        _ => {
+            let model = model.unwrap_or_else(|| super::agents::VYCE_MODEL.to_string());
+            if model == super::agents::VYCE_MODEL {
+                super::agents::HERMES_VYCE_LABEL.to_string()
+            } else {
+                format!("Hermes · {model}")
+            }
+        }
+    }
+}
+
+pub fn base_provider_menu() -> Vec<(String, String)> {
+    vec![
+        ("hermes".into(), provider_label("hermes")),
+        ("vyce".into(), provider_label("vyce")),
+        ("grok".into(), "Grok".into()),
+        ("muse".into(), "Muse".into()),
+        ("agy".into(), "Agy".into()),
+        ("custom".into(), "Custom".into()),
+    ]
+}
+
+pub fn models_from_openai(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(data) = value.get("data").and_then(|item| item.as_array()) else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    for item in data {
+        let Some(id) = item.get("id").and_then(|id| id.as_str()) else {
+            continue;
+        };
+        let id = id.trim();
+        if !id.is_empty() && !models.iter().any(|have: &String| have == id) {
+            models.push(id.to_string());
+        }
+    }
+    models
+}
+
+pub fn menu_with_models(
+    hermes: &[String],
+    vyce: &[String],
+    custom: &[String],
+) -> Vec<(String, String)> {
+    let mut menu = base_provider_menu();
+    for (kind, models) in [("hermes", hermes), ("vyce", vyce), ("custom", custom)] {
+        for model in models {
+            let id = format!("{kind}:{model}");
+            let label = provider_label(&id);
+            if menu.iter().any(|(_, have)| have == &label) {
+                continue;
+            }
+            menu.push((id, label));
+        }
+    }
+    menu
+}
+
+/// Official Antigravity headless print mode. The prompt is an argument, not stdin.
+pub fn agy_print_args(prompt: &str) -> Vec<String> {
+    vec![
+        "-p".into(),
+        prompt.to_string(),
+        "--output-format".into(),
+        "json".into(),
+        "--print-timeout".into(),
+        "45s".into(),
+        "--dangerously-skip-permissions".into(),
+    ]
+}
+
+pub fn agy_print_text(stdout: &str) -> Result<String, String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+        let text = stdout.trim();
+        return if text.is_empty() {
+            Err("Agy returned no text.".into())
+        } else {
+            Ok(text.to_string())
+        };
+    };
+    let status = value
+        .get("status")
+        .and_then(|item| item.as_str())
+        .unwrap_or("");
+    if let Some(error) = value.get("error").and_then(|item| item.as_str())
+        && !error.is_empty()
+        && !status.eq_ignore_ascii_case("success")
+    {
+        return Err(error.to_string());
+    }
+    let response = value
+        .get("response")
+        .and_then(|item| item.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if response.is_empty() {
+        Err("Agy returned no text.".into())
+    } else {
+        Ok(response)
+    }
+}
+
 pub fn run_take_chain(
     preferred: super::TakeProvider,
     config: &crate::config::XConfig,
@@ -322,7 +474,7 @@ pub fn run_take_chain_with(
     };
     match choice {
         super::TakeProvider::Hermes => hermes_vyce_take(config, post, http, tone),
-        super::TakeProvider::Vyce => vyce_direct_take(post, http, tone, &sources),
+        super::TakeProvider::Vyce => vyce_direct_take(config, post, http, tone, &sources),
         super::TakeProvider::Grok => cli_take("grok", "Grok", post, tone),
         super::TakeProvider::Muse => cli_take("muse", "Muse", post, tone),
         super::TakeProvider::Agy => cli_take("agy", "Agy", post, tone),
@@ -340,12 +492,19 @@ fn hermes_vyce_take(
     tone: &str,
 ) -> super::TakeDraft {
     let mut config = config.clone();
-    config.hermes_model = super::agents::VYCE_MODEL.to_string();
+    if config.hermes_model.trim().is_empty() {
+        config.hermes_model = super::agents::VYCE_MODEL.to_string();
+    }
     if config.hermes_base_url.trim().is_empty() {
         config.hermes_base_url = super::agents::HERMES_BASE.to_string();
     }
+    let label = if config.hermes_model == super::agents::VYCE_MODEL {
+        super::agents::HERMES_VYCE_LABEL.to_string()
+    } else {
+        format!("Hermes · {}", config.hermes_model)
+    };
     match hermes_raced(&config, post, tone, http) {
-        Ok(text) => labeled_take("hermes", super::agents::HERMES_VYCE_LABEL, &text, &[]),
+        Ok(text) => labeled_take("hermes", &label, &text, &[]),
         Err(error) => failed_take(
             "hermes",
             &format!("Hermes · {error}. Vyce direct is one click away."),
@@ -354,20 +513,25 @@ fn hermes_vyce_take(
 }
 
 fn vyce_direct_take(
+    config: &crate::config::XConfig,
     post: &super::SourcePost,
     http: &dyn crate::io::Http,
     tone: &str,
     sources: &TakeSources<'_>,
 ) -> super::TakeDraft {
-    let auth = super::agents::vyce_direct_auth(
+    let mut auth = super::agents::vyce_direct_auth(
         sources.env_text,
         sources.yaml_text,
         sources.process,
         sources.user,
     );
+    if config.ai_explicit && !config.ai_model.trim().is_empty() {
+        auth.model = config.ai_model.trim().to_string();
+    }
+    let label = format!("Vyce direct · {}", auth.model);
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
     match super::agents::vyce_complete(&auth, http, &prompt) {
-        Ok(text) => labeled_take("vyce", super::agents::VYCE_LABEL, &text, &[]),
+        Ok(text) => labeled_take("vyce", &label, &text, &[]),
         Err(error) => failed_take("vyce", &format!("Vyce · {error}")),
     }
 }
@@ -435,6 +599,36 @@ fn failed_take(source: &'static str, note: &str) -> super::TakeDraft {
     }
 }
 
+fn agy_headless(program: &str, prompt: &str) -> Result<String, String> {
+    let mut command = std::process::Command::new(program);
+    command.args(agy_print_args(prompt));
+    apply_hidden_command(&mut command);
+    let Ok(child) = command.spawn() else {
+        return Err("Agy CLI was not found. Nothing was drafted.".into());
+    };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    if let Ok(Ok(output)) = rx.recv_timeout(TAKE_TIMEOUT) {
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        if stdout.trim().is_empty() {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            if err.is_empty() {
+                Err("Agy returned no text. Headless print mode produced an empty response.".into())
+            } else {
+                Err(err)
+            }
+        } else {
+            agy_print_text(&stdout)
+        }
+    } else {
+        kill_pid(pid);
+        Err("Agy did not return text within 45s. Nothing was drafted.".into())
+    }
+}
+
 pub fn hidden_agent_draft(
     program: &str,
     label: &str,
@@ -445,6 +639,9 @@ pub fn hidden_agent_draft(
         return grok_cli(post, tone);
     }
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
+    if label == "Agy" {
+        return agy_headless(program, &prompt);
+    }
     let mut command = std::process::Command::new(program);
     apply_hidden_command(&mut command);
     let Ok(mut child) = command.spawn() else {
@@ -893,7 +1090,7 @@ mod tests {
             ai_api_key: "vyce-secret-key".into(),
             ai_explicit: true,
             hermes_base_url: "http://hermes.test/v1".into(),
-            hermes_model: "hermes-agent".into(),
+            hermes_model: String::new(),
             hermes_api_key: "hermes-secret".into(),
             ..crate::config::XConfig::default()
         };
@@ -1005,6 +1202,41 @@ mod tests {
             hidden_agent_draft("agy-not-a-real-binary", "Agy", &post, "Funny").unwrap_err();
         assert!(missing.contains("not found"));
         assert!(missing.contains("Nothing was drafted"));
+        let args = agy_print_args("say hi");
+        assert_eq!(args[0], "-p");
+        assert_eq!(args[1], "say hi");
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--output-format" && pair[1] == "json"
+                || pair[0] == "--print-timeout" && pair[1] == "45s"
+        }));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--dangerously-skip-permissions")
+        );
+        let parsed =
+            agy_print_text(r#"{"status":"SUCCESS","response":"a real headless reply"}"#).unwrap();
+        assert_eq!(parsed, "a real headless reply");
+        assert!(agy_print_text(r#"{"status":"ERROR","error":"authentication required"}"#).is_err());
+        let menu = menu_with_models(
+            &["glm-5.3-flash".into(), "hermes-agent".into()],
+            &[],
+            &["my-model".into()],
+        );
+        assert_eq!(menu[0].1, "Hermes · Vyce glm-5.3-flash");
+        assert!(
+            menu.iter()
+                .any(|(id, label)| id == "hermes:hermes-agent" && label == "Hermes · hermes-agent")
+        );
+        assert!(menu.iter().any(|(id, _)| id == "custom:my-model"));
+        assert_eq!(
+            canonical_provider("hermes:hermes-agent"),
+            "hermes:hermes-agent"
+        );
+        assert_eq!(provider_kind("free"), super::super::TakeProvider::Hermes);
+        assert_eq!(
+            models_from_openai(r#"{"data":[{"id":"glm-5.3-flash"},{"id":"other"}]}"#),
+            vec!["glm-5.3-flash".to_string(), "other".to_string()]
+        );
     }
 }
 

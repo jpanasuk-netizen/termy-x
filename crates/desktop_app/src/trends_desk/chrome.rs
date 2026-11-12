@@ -153,12 +153,9 @@ impl TrendsDesk {
                             this.cancel_run(cx);
                         }),
                     ))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .whitespace_normal()
-                            .child(TakeProvider::parse(&self.settings.take_provider).caption()),
-                    ),
+                    .child(div().text_size(px(13.0)).whitespace_normal().child(
+                        termy_x::trends_desk::provider_label(&self.settings.take_provider),
+                    )),
             )
             .into_any_element()
     }
@@ -624,6 +621,7 @@ impl TrendsDesk {
                     .whitespace_normal()
                     .child("Default take provider"),
             )
+            .child(self.provider_dropdown(cx))
             .child(self.field_chip(
                 "desk-custom-base",
                 "Custom base URL",
