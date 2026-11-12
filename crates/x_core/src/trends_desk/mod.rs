@@ -85,10 +85,11 @@ pub use store::{
     within_termy_x_config,
 };
 pub use takes::{
-    HONEST_PREFIX, TAKE_CHAIN, accept_lines, agent_work_dir, agy_credit_error, chain_order,
-    choose_chain, honest_failure, interactive_command, is_provider_failure, is_template_angle,
-    is_termy_x_image, merge_attempts, muse_needs_trust, muse_trust_line, run_take_chain,
-    settle_variants, with_grok_stub,
+    HONEST_PREFIX, TAKE_CHAIN, TAKE_DEBOUNCE_MS, accept_lines, admit_grok, agent_work_dir,
+    agy_credit_error, apply_hidden_command, background_grok_spawn, chain_order, choose_chain,
+    halt_takes, honest_failure, interactive_command, is_provider_failure, is_template_angle,
+    is_termy_x_image, merge_attempts, muse_needs_trust, muse_trust_line, resume_takes,
+    retain_grok_jobs, run_take_chain, settle_variants, takes_halted, with_grok_stub,
 };
 
 const SYNTHETIC_OPENCLI: &str = include_str!("synthetic_opencli.json");

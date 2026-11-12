@@ -85,6 +85,32 @@ fn author_of(value: &Value) -> String {
     String::new()
 }
 
+pub fn items_from_urls(urls: &[String]) -> Vec<MediaItem> {
+    urls.iter()
+        .filter(|url| url.starts_with("http"))
+        .map(|url| {
+            let kind = crate::parse_borrowed::media_kind(url);
+            let (width, height) = match crate::model::dims_from_media_url(url) {
+                Some((w, h)) => (Some(w), Some(h)),
+                None => (None, None),
+            };
+            MediaItem {
+                kind,
+                poster: (kind == MediaKind::Photo).then(|| url.clone()),
+                url: url.clone(),
+                width,
+                height,
+            }
+        })
+        .collect()
+}
+
+pub fn hydrate_media(post: &mut super::domain::SourcePost) {
+    if post.media_items.is_empty() {
+        post.media_items = items_from_urls(&post.media);
+    }
+}
+
 pub fn preview_url(item: &MediaItem) -> Option<String> {
     match item.kind {
         MediaKind::Photo => Some(item.poster.clone().unwrap_or_else(|| item.url.clone())),
@@ -298,6 +324,16 @@ mod tests {
         let card = super::super::cards::card_from_post(&post);
         assert_eq!(card.media_items.len(), 2);
         assert!(card.quoted.is_some());
+        let raw = r#"{"id":"1","author":"a","text":"pic","url":"https://x.com/a/status/1","source_url":"https://x.com/a/status/1","likes":1,"reposts":0,"views":0,"media":["https://pbs.twimg.com/media/ABC.jpg"]}"#;
+        let mut stored: super::super::domain::SourcePost = serde_json::from_str(raw).unwrap();
+        assert!(stored.media_items.is_empty());
+        hydrate_media(&mut stored);
+        assert_eq!(stored.media_items.len(), 1);
+        assert_eq!(stored.media_items[0].kind, MediaKind::Photo);
+        assert_eq!(
+            stored.media_items[0].url,
+            "https://pbs.twimg.com/media/ABC.jpg"
+        );
     }
 
     #[test]

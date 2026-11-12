@@ -133,6 +133,52 @@ pub fn muse_needs_trust(output: &str) -> bool {
     lower.contains("trust") || lower.contains("workspace")
 }
 
+/// Windows flag that keeps a console subsystem child from opening a window.
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub const GROK_TAKE_CAP: usize = 2;
+pub const TAKE_DEBOUNCE_MS: u64 = 1500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BackgroundSpawn {
+    pub program: &'static str,
+    pub creation_flags: u32,
+    pub piped_stdio: bool,
+    pub console_wrapper: bool,
+}
+
+/// Background takes and drafts. Not the Open Grok button.
+pub fn background_grok_spawn() -> BackgroundSpawn {
+    BackgroundSpawn {
+        program: "grok",
+        creation_flags: CREATE_NO_WINDOW,
+        piped_stdio: true,
+        console_wrapper: false,
+    }
+}
+
+pub fn admit_grok(running: usize) -> bool {
+    running < GROK_TAKE_CAP
+}
+
+pub fn apply_hidden_command(command: &mut std::process::Command) {
+    let plan = background_grok_spawn();
+    if plan.piped_stdio {
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = command.creation_flags(plan.creation_flags);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = plan;
+    }
+}
+
 /// Visible console command. Windows opens cmd so the CLI has a real session.
 pub fn interactive_command(program: &str) -> Vec<String> {
     if cfg!(windows) {
@@ -309,13 +355,17 @@ pub fn grok_draft_from_output(post: &super::SourcePost, output: &str) -> super::
 }
 
 pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, String> {
+    if takes_halted() {
+        return Err("takes stopped".into());
+    }
+    let _permit = GrokPermit::acquire()?;
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
-    let mut child = std::process::Command::new("grok")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
+    let plan = background_grok_spawn();
+    let mut command = std::process::Command::new(plan.program);
+    apply_hidden_command(&mut command);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let pid = child.id();
+    register_job(&post.id, pid);
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         let _ = stdin.write_all(prompt.as_bytes());
@@ -324,18 +374,129 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(20)) {
-        Ok(Ok(output)) => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if text.is_empty() {
-                Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-            } else if is_provider_failure(&text) {
-                Err(text)
-            } else {
-                Ok(text)
-            }
+    let result = if let Ok(Ok(output)) = rx.recv_timeout(std::time::Duration::from_secs(20)) {
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if takes_halted() {
+            Err("takes stopped".into())
+        } else if text.is_empty() {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        } else if is_provider_failure(&text) {
+            Err(text)
+        } else {
+            Ok(text)
         }
-        _ => Err("grok timed out".into()),
+    } else {
+        kill_pid(pid);
+        Err("grok timed out".into())
+    };
+    unregister_job(&post.id);
+    result
+}
+
+struct GrokPermit;
+
+impl GrokPermit {
+    fn acquire() -> Result<Self, String> {
+        let started = std::time::Instant::now();
+        loop {
+            if takes_halted() {
+                return Err("takes stopped".into());
+            }
+            let mut running = grok_running().lock().unwrap_or_else(|err| err.into_inner());
+            if admit_grok(*running) {
+                *running += 1;
+                return Ok(Self);
+            }
+            drop(running);
+            if started.elapsed() > std::time::Duration::from_secs(45) {
+                return Err("grok is busy".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+    }
+}
+
+impl Drop for GrokPermit {
+    fn drop(&mut self) {
+        let mut running = grok_running().lock().unwrap_or_else(|err| err.into_inner());
+        *running = running.saturating_sub(1);
+    }
+}
+
+fn grok_running() -> &'static std::sync::Mutex<usize> {
+    static RUNNING: std::sync::OnceLock<std::sync::Mutex<usize>> = std::sync::OnceLock::new();
+    RUNNING.get_or_init(|| std::sync::Mutex::new(0))
+}
+
+fn grok_jobs() -> &'static std::sync::Mutex<Vec<(String, u32)>> {
+    static JOBS: std::sync::OnceLock<std::sync::Mutex<Vec<(String, u32)>>> =
+        std::sync::OnceLock::new();
+    JOBS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn takes_flag() -> &'static std::sync::atomic::AtomicBool {
+    static HALT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    &HALT
+}
+
+pub fn takes_halted() -> bool {
+    takes_flag().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn halt_takes() {
+    takes_flag().store(true, std::sync::atomic::Ordering::SeqCst);
+    kill_grok_jobs(&[]);
+}
+
+pub fn resume_takes() {
+    takes_flag().store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn retain_grok_jobs(keep: &[String]) {
+    kill_grok_jobs(keep);
+}
+
+fn register_job(id: &str, pid: u32) {
+    let mut jobs = grok_jobs().lock().unwrap_or_else(|err| err.into_inner());
+    jobs.retain(|(have, _)| have != id);
+    jobs.push((id.to_string(), pid));
+}
+
+fn unregister_job(id: &str) {
+    let mut jobs = grok_jobs().lock().unwrap_or_else(|err| err.into_inner());
+    jobs.retain(|(have, _)| have != id);
+}
+
+fn kill_grok_jobs(keep: &[String]) {
+    let mut jobs = grok_jobs().lock().unwrap_or_else(|err| err.into_inner());
+    let mut left = Vec::new();
+    for (id, pid) in jobs.drain(..) {
+        if keep.iter().any(|item| item == &id) {
+            left.push((id, pid));
+        } else {
+            kill_pid(pid);
+        }
+    }
+    *jobs = left;
+}
+
+fn kill_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new("taskkill");
+        command.args(["/PID", &pid.to_string(), "/T", "/F"]);
+        let _ = command.creation_flags(CREATE_NO_WINDOW);
+        let _ = command.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
     }
 }
 
@@ -391,6 +552,23 @@ mod tests {
             assert_eq!(cmd[1], "/k");
         }
         assert!(cmd.iter().any(|part| part == "grok"));
+    }
+
+    #[test]
+    fn background_grok_spawn_uses_create_no_window() {
+        let plan = background_grok_spawn();
+        assert_eq!(plan.creation_flags, 0x0800_0000);
+        assert_eq!(plan.program, "grok");
+        assert!(plan.piped_stdio);
+        assert!(!plan.console_wrapper);
+        assert!(!admit_grok(GROK_TAKE_CAP));
+        assert!(admit_grok(1));
+        assert_eq!(TAKE_DEBOUNCE_MS, 1500);
+        let visible = interactive_command("grok");
+        if cfg!(windows) {
+            assert_eq!(visible[0], "cmd.exe");
+            assert_ne!(visible[0], plan.program);
+        }
     }
 
     #[test]

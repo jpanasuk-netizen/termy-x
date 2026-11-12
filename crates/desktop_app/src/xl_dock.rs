@@ -93,6 +93,7 @@ impl TrendsDesk {
                     desk.frame.expanded_width = LOCKED_OPEN_WIDTH;
                 }
                 desk.write_frame();
+                termy_x::trends_desk::halt_takes();
                 let mut session = termy_x::trends_desk::DeskSession::running(None);
                 session.shutdown(&mut []);
             });

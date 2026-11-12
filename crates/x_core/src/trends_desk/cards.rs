@@ -332,19 +332,13 @@ pub fn page_index(pages: &[SubjectPage], saved_id: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Move one page. The index stays inside the book.
+/// Move one page. Next and Prev both wrap.
 pub fn turn_page(index: usize, count: usize, delta: i32) -> usize {
     if count == 0 {
         return 0;
     }
-    let next = index as i32 + delta;
-    if next < 0 {
-        0
-    } else if next >= count as i32 {
-        count - 1
-    } else {
-        next as usize
-    }
+    let count_i = count as i32;
+    (index as i32 + delta).rem_euclid(count_i) as usize
 }
 
 pub fn page_label(index: usize, count: usize, name: &str) -> String {
@@ -1071,8 +1065,8 @@ mod tests {
         let pages = subject_pages(&[("law", "Law"), ("finance", "Finance"), ("ai", "AI")]);
         assert_eq!(page_index(&pages, "finance"), 1);
         assert_eq!(page_index(&pages, "missing"), 0);
-        assert_eq!(turn_page(0, pages.len(), -1), 0);
-        assert_eq!(turn_page(2, pages.len(), 1), 2);
+        assert_eq!(turn_page(0, pages.len(), -1), 2);
+        assert_eq!(turn_page(2, pages.len(), 1), 0);
         assert_eq!(turn_page(1, pages.len(), 1), 2);
         assert_eq!(page_label(1, pages.len(), "Finance"), "2 / 3 · Finance");
         assert_eq!(pages[page_index(&pages, "ai")].id, "ai");

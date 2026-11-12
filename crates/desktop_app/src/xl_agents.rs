@@ -36,16 +36,8 @@ impl Drop for AgentProc {
 impl AgentProc {
     fn spawn(launch: &Launch) -> Result<Self, String> {
         let mut command = Command::new(&launch.program);
-        command
-            .args(&launch.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
+        command.args(&launch.args);
+        termy_x::trends_desk::apply_hidden_command(&mut command);
         let mut child = command.spawn().map_err(|error| {
             format!(
                 "{} is missing: `{}` was not found ({error}).",
@@ -119,17 +111,8 @@ struct SystemCli {
 impl PromptCli for SystemCli {
     fn run(&self, program: &str, args: &[String], stdin_text: &str) -> Result<String, String> {
         let mut command = Command::new(program);
-        command
-            .args(args)
-            .current_dir(&self.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
+        command.args(args).current_dir(&self.cwd);
+        termy_x::trends_desk::apply_hidden_command(&mut command);
         let mut child = command
             .spawn()
             .map_err(|error| format!("{program} is missing: {error}"))?;
@@ -269,8 +252,10 @@ impl TrendsDesk {
     pub(crate) fn retry_takes(&mut self, cx: &mut Context<Self>) {
         self.takes.clear();
         self.free_halted = false;
+        self.takes_halted = false;
+        termy_x::trends_desk::resume_takes();
         self.model_notice.clear();
-        self.begin_take_stream(cx);
+        self.schedule_takes(cx);
     }
 
     pub(crate) fn focus_root_after_click(
@@ -335,10 +320,12 @@ impl TrendsDesk {
     pub(crate) fn set_take_provider(&mut self, name: &str, cx: &mut Context<Self>) {
         self.remember_provider(name);
         self.free_halted = false;
+        self.takes_halted = false;
+        termy_x::trends_desk::resume_takes();
         if TakeProvider::parse(name) == TakeProvider::Hermes {
             self.probe_hermes_models(cx);
         }
-        self.begin_take_stream(cx);
+        self.schedule_takes(cx);
         cx.notify();
     }
 

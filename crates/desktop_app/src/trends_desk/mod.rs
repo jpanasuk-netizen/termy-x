@@ -118,6 +118,8 @@ pub struct TrendsDesk {
     fitted: bool,
     pub(crate) card_window: usize,
     pub(crate) media: xl_media::MediaDesk,
+    pub(crate) take_epoch: u64,
+    pub(crate) takes_halted: bool,
 }
 
 impl TrendsDesk {
@@ -256,6 +258,8 @@ impl TrendsDesk {
             fitted: false,
             card_window: 12,
             media: xl_media::MediaDesk::default(),
+            take_epoch: 0,
+            takes_halted: false,
         }
     }
 
@@ -268,7 +272,7 @@ impl TrendsDesk {
             return;
         }
         self.started = true;
-        self.begin_take_stream(cx);
+        self.schedule_takes(cx);
         self.fetch_empty_subjects(cx);
         self.spawn_probe(cx);
         self.spawn_daily(cx);
@@ -278,10 +282,16 @@ impl TrendsDesk {
         self.seed_agent_file();
     }
 
-    fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
+        if self.takes_halted {
+            return;
+        }
         self.take_wave = self.take_wave.saturating_add(1);
         let wave = self.take_wave;
         let posts = self.posts_for_takes();
+        termy_x::trends_desk::retain_grok_jobs(
+            &posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>(),
+        );
         if self.options.fixture {
             return;
         }
@@ -659,7 +669,7 @@ impl TrendsDesk {
                 }
                 desk.busy = false;
                 desk.apply_outcomes(outcomes.0, outcomes.1);
-                desk.begin_take_stream(cx);
+                desk.schedule_takes(cx);
                 cx.notify();
             });
         })
@@ -699,6 +709,11 @@ impl TrendsDesk {
     fn cancel_run(&mut self, cx: &mut Context<Self>) {
         self.cancel.store(true, Ordering::Relaxed);
         self.generation = self.generation.saturating_add(1);
+        self.takes_halted = true;
+        self.take_epoch = self.take_epoch.wrapping_add(1);
+        self.take_wave = self.take_wave.saturating_add(1);
+        termy_x::trends_desk::halt_takes();
+        self.takes.retain(|_, take| take.source != "pending");
         self.busy = false;
         for column in &mut self.columns {
             if column.view.phase == Phase::Loading {
@@ -1078,7 +1093,7 @@ impl TrendsDesk {
             }
             Err(error) => self.draft_note = error,
         }
-        self.begin_take_stream(cx);
+        self.schedule_takes(cx);
         cx.notify();
     }
 
@@ -1290,6 +1305,9 @@ impl TrendsDesk {
     }
 
     fn nav(&mut self, nav: Nav, cx: &mut Context<Self>) {
+        if self.popout.as_ref().is_some_and(|pop| pop.open) {
+            self.close_popout();
+        }
         self.surface = surface_after_nav(self.surface, nav);
         cx.notify();
     }
@@ -1331,7 +1349,7 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
             .map_err(|error| error.to_string());
     }
     cx.open_window(
-        desk_window_options(&snapped_frame(cx)),
+        crate::xl_host::desk_window_options(&crate::xl_host::snapped_frame(cx)),
         move |window, cx| {
             window.set_window_title(VISIBLE_NAME);
             cx.new(|cx| TrendsDesk::new(options, cx))
@@ -1384,46 +1402,6 @@ fn set_standalone_app_id() {
 
 #[cfg(not(target_os = "windows"))]
 fn set_standalone_app_id() {}
-
-fn snapped_frame(cx: &App) -> DeskFrame {
-    let monitor = crate::xl_host::monitor_rect_app(cx);
-    let root = termy_xl_data_root();
-    let docked = DeskStore::open_isolated(&root)
-        .map(|store| store.load_settings().docked)
-        .unwrap_or(true);
-    crate::xl_host::ensure_location_hook(&root);
-    let host = crate::xl_host::seen_host();
-    let (snap, line) = termy_x::trends_desk::attach_plan(host.as_ref(), monitor, true, docked);
-    termy_x::trends_desk::append_desk_log(&root, &line);
-    DeskFrame {
-        x: snap.x,
-        y: snap.y,
-        width: snap.width,
-        height: snap.height,
-        expanded: true,
-        expanded_width: termy_x::trends_desk::LOCKED_OPEN_WIDTH,
-    }
-}
-
-fn desk_window_options(frame: &DeskFrame) -> WindowOptions {
-    WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds {
-            origin: point(px(frame.x), px(frame.y)),
-            size: size(px(frame.width), px(frame.height)),
-        })),
-        titlebar: Some(gpui_kit::TitlebarOptions {
-            title: Some(VISIBLE_NAME.into()),
-            appears_transparent: false,
-            traffic_light_position: None,
-        }),
-        #[cfg(target_os = "linux")]
-        window_decorations: Some(gpui_kit::WindowDecorations::Server),
-        kind: WindowKind::Normal,
-        is_resizable: true,
-        window_min_size: Some(size(px(DOCK_WIDTH), px(320.0))),
-        ..Default::default()
-    }
-}
 
 impl Render for TrendsDesk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1484,6 +1462,9 @@ impl Render for TrendsDesk {
         }
         if let Some(overlay) = self.media_overlay(cx) {
             root = root.child(overlay);
+        }
+        if let Some(close) = self.media_close(cx) {
+            root = root.child(close);
         }
         root
     }

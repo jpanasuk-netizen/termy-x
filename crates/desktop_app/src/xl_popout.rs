@@ -31,10 +31,7 @@ impl TrendsDesk {
         let over = count > 280;
         let mut box_el = div()
             .id("desk-reply-popout")
-            .absolute()
-            .top(px(8.0))
-            .left(px(8.0))
-            .right(px(8.0))
+            .w_full()
             .max_h(px(520.0))
             .overflow_y_scroll()
             .p(px(12.0))
@@ -99,6 +96,35 @@ impl TrendsDesk {
                         )
                     })),
             )
+            .child(
+                div()
+                    .id("desk-provider-label")
+                    .flex_shrink_0()
+                    .text_size(px(12.0))
+                    .child(pop.provider.caption()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.0))
+                    .child(pop_button("desk-pop-grok", "Grok", cx, |this, cx| {
+                        this.set_take_provider("grok", cx);
+                        this.regenerate_open_variants(cx);
+                    }))
+                    .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
+                        this.set_take_provider("free", cx);
+                        this.regenerate_open_variants(cx);
+                    }))
+                    .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
+                        this.set_take_provider("treg", cx);
+                        this.regenerate_open_variants(cx);
+                    }))
+                    .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
+                        this.set_take_provider("hermes", cx);
+                        this.regenerate_open_variants(cx);
+                    })),
+            )
             .child(self.agent_controls(cx));
         for (index, variant) in pop.variants.iter().enumerate() {
             let text = variant.clone();
@@ -128,65 +154,33 @@ impl TrendsDesk {
             );
         }
         box_el
-            .child(
-                div()
-                    .id("desk-provider-label")
-                    .text_size(px(12.0))
-                    .child(pop.provider.caption()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(pop_button("desk-pop-grok", "Grok", cx, |this, cx| {
-                        this.set_take_provider("grok", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
-                        this.set_take_provider("free", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
-                        this.set_take_provider("treg", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
-                        this.set_take_provider("hermes", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button(
-                        "desk-variant-next",
-                        "Next variant",
-                        cx,
-                        |this, cx| {
-                            if let Some(pop) = this.popout.as_mut() {
-                                let index = pop
-                                    .variants
-                                    .iter()
-                                    .position(|item| item == &pop.draft)
-                                    .unwrap_or(0);
-                                let next = termy_x::trends_desk::flip_variant(
-                                    index,
-                                    1,
-                                    pop.variants.len(),
-                                );
-                                if let Some(text) = pop.variants.get(next).cloned() {
-                                    pop.draft = text.clone();
-                                    this.pop_caret =
-                                        termy_x::draft_edit::DraftCaret::at_end(text.len());
-                                }
-                            }
-                            cx.notify();
-                        },
-                    ))
-                    .child(pop_button("desk-pop-send", "Send", cx, |this, cx| {
-                        this.send_from_popout(cx);
-                    }))
-                    .child(pop_button("desk-pop-cancel", "Cancel", cx, |this, cx| {
-                        this.close_popout();
-                        cx.notify();
-                    })),
-            )
+            .child(pop_button(
+                "desk-variant-next",
+                "Next variant",
+                cx,
+                |this, cx| {
+                    if let Some(pop) = this.popout.as_mut() {
+                        let index = pop
+                            .variants
+                            .iter()
+                            .position(|item| item == &pop.draft)
+                            .unwrap_or(0);
+                        let next = termy_x::trends_desk::flip_variant(index, 1, pop.variants.len());
+                        if let Some(text) = pop.variants.get(next).cloned() {
+                            pop.draft = text.clone();
+                            this.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
+                        }
+                    }
+                    cx.notify();
+                },
+            ))
+            .child(pop_button("desk-pop-send", "Send", cx, |this, cx| {
+                this.send_from_popout(cx);
+            }))
+            .child(pop_button("desk-pop-cancel", "Cancel", cx, |this, cx| {
+                this.close_popout();
+                cx.notify();
+            }))
             .into_any_element()
     }
 }

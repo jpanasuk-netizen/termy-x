@@ -844,7 +844,9 @@ mod tests {
             assert_ne!(key, "escape");
             index = page_after_key(index, 4, key).unwrap();
         }
-        assert_eq!(index, 3);
+        assert_eq!(index, 0);
+        assert_eq!(page_after_key(0, 4, "left"), Some(3));
+        assert_eq!(page_after_key(3, 4, "right"), Some(0));
         assert_eq!(page_after_key(3, 4, "left"), Some(2));
         assert_eq!(page_after_key(2, 4, "pageup"), Some(1));
         assert_eq!(page_after_key(1, 4, "up"), Some(0));

@@ -18,6 +18,49 @@ mod tests {
     }
 }
 
+pub(crate) fn snapped_frame(cx: &App) -> termy_x::trends_desk::DeskFrame {
+    let monitor = monitor_rect_app(cx);
+    let root = termy_x::trends_desk::termy_xl_data_root();
+    let docked = termy_x::trends_desk::DeskStore::open_isolated(&root)
+        .map(|store| store.load_settings().docked)
+        .unwrap_or(true);
+    ensure_location_hook(&root);
+    let host = seen_host();
+    let (snap, line) = termy_x::trends_desk::attach_plan(host.as_ref(), monitor, true, docked);
+    termy_x::trends_desk::append_desk_log(&root, &line);
+    termy_x::trends_desk::DeskFrame {
+        x: snap.x,
+        y: snap.y,
+        width: snap.width,
+        height: snap.height,
+        expanded: true,
+        expanded_width: termy_x::trends_desk::LOCKED_OPEN_WIDTH,
+    }
+}
+
+pub(crate) fn desk_window_options(
+    frame: &termy_x::trends_desk::DeskFrame,
+) -> gpui_kit::WindowOptions {
+    use gpui_kit::{Bounds, WindowBounds, WindowKind, point, px, size};
+    gpui_kit::WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds {
+            origin: point(px(frame.x), px(frame.y)),
+            size: size(px(frame.width), px(frame.height)),
+        })),
+        titlebar: Some(gpui_kit::TitlebarOptions {
+            title: Some(termy_x::trends_desk::VISIBLE_NAME.into()),
+            appears_transparent: false,
+            traffic_light_position: None,
+        }),
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(gpui_kit::WindowDecorations::Server),
+        kind: WindowKind::Normal,
+        is_resizable: true,
+        window_min_size: Some(size(px(termy_x::trends_desk::DOCK_WIDTH), px(320.0))),
+        ..Default::default()
+    }
+}
+
 pub(crate) fn monitor_rect(window: &Window, cx: &App) -> WindowRect {
     window
         .display(cx)

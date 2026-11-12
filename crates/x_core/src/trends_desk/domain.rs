@@ -903,7 +903,13 @@ pub fn column_from_cache(report: Option<&StoredReport>) -> ColumnView {
         Some(report) => ColumnView {
             phase: Phase::Cached,
             banner: format!("Cached report from {}. Not a new run.", report.file),
-            posts: report.posts.clone(),
+            posts: {
+                let mut posts = report.posts.clone();
+                for post in &mut posts {
+                    super::media::hydrate_media(post);
+                }
+                posts
+            },
             posts_cached: true,
             query: report.query.clone(),
         },
@@ -1291,6 +1297,14 @@ mod tests {
         );
         assert!(nav_click_reaches(100.0, 80.0, 120.0, 120.0));
         assert!(!nav_click_reaches(100.0, 80.0, 120.0, 88.0));
+        assert_eq!(
+            surface_after_nav(Surface::Columns, Nav::Settings),
+            Surface::Settings
+        );
+        assert_eq!(
+            surface_after_nav(Surface::Columns, Nav::Draft),
+            Surface::Draft
+        );
     }
 
     #[test]

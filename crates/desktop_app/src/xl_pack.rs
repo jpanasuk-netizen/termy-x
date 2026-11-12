@@ -49,6 +49,27 @@ impl TrendsDesk {
         rows
     }
 
+    pub(crate) fn schedule_takes(&mut self, cx: &mut Context<Self>) {
+        if self.takes_halted {
+            return;
+        }
+        self.take_epoch = self.take_epoch.wrapping_add(1);
+        let epoch = self.take_epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    termy_x::trends_desk::TAKE_DEBOUNCE_MS,
+                ))
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                if desk.take_epoch == epoch && !desk.takes_halted {
+                    desk.begin_take_stream(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn posts_for_takes(&self) -> Vec<termy_x::trends_desk::SourcePost> {
         let index = self
             .columns
@@ -156,7 +177,7 @@ impl TrendsDesk {
         }
         match desk_key(key, ctrl, shift) {
             DeskKey::Palette => self.palette = true,
-            DeskKey::Page(delta) => self.turn_subject(delta),
+            DeskKey::Page(delta) => self.turn_subject(delta, cx),
             DeskKey::Select(delta) => {
                 let ids = self.page_ids();
                 self.selected = move_selection(&ids, self.selected.as_deref(), delta);
@@ -548,7 +569,7 @@ impl TrendsDesk {
                                 "Prev",
                                 false,
                                 cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(-1);
+                                    this.turn_subject(-1, cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 }),
@@ -559,7 +580,7 @@ impl TrendsDesk {
                                 "Next",
                                 false,
                                 cx.listener(|this, _, _, cx| {
-                                    this.turn_subject(1);
+                                    this.turn_subject(1, cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 }),
@@ -612,6 +633,7 @@ impl TrendsDesk {
                                 false,
                                 cx.listener(|this, _, _, cx| {
                                     this.card_window = this.card_window.saturating_add(12);
+                                    this.schedule_takes(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 }),

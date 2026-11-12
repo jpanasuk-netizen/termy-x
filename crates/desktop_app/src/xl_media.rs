@@ -202,7 +202,7 @@ impl TrendsDesk {
                 self.ensure_image(url.clone(), cx);
                 self.media.viewer = Some(url);
             }
-            MediaDispatch::Vlc => self.start_video(&item.url, window),
+            MediaDispatch::Vlc => self.start_video(&item.url, window, cx),
             MediaDispatch::Unplayable => {
                 self.media.notice = crate::x_panel::player::NO_PLAYABLE_MEDIA.into();
             }
@@ -210,7 +210,7 @@ impl TrendsDesk {
         cx.notify();
     }
 
-    fn start_video(&mut self, url: &str, window: &Window) {
+    fn start_video(&mut self, url: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(player) = self.media.player.take() {
             player.stop();
         }
@@ -236,6 +236,44 @@ impl TrendsDesk {
             }
             Err(error) => self.media.notice = error,
         }
+        self.focus_handle.focus(window, cx);
+        self.focus_root_after_click(window, cx);
+    }
+
+    pub(crate) fn media_close(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
+        if self.media.player.is_none() && self.media.viewer.is_none() {
+            return None;
+        }
+        let label = if self.media.notice.is_empty() {
+            "X".to_string()
+        } else {
+            format!("X  {}", self.media.notice)
+        };
+        Some(
+            div()
+                .id("desk-media-close")
+                .absolute()
+                .top(px(8.0))
+                .right(px(8.0))
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
+                .bg(rgb(0xff4fa3))
+                .text_size(px(13.0))
+                .text_color(rgb(0x070b14))
+                .cursor_pointer()
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.close_media();
+                        this.focus_handle.focus(window, cx);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     pub(crate) fn media_overlay(&self, cx: &mut Context<Self>) -> Option<gpui_kit::AnyElement> {
