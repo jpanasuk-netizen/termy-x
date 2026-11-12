@@ -401,7 +401,7 @@ fn scan_windows_win32() -> Vec<termy_x::trends_desk::SeenWindow> {
     let mut bag = Bag {
         windows: Vec::new(),
     };
-    unsafe { EnumWindows(Some(each), &mut bag as *mut Bag as isize) };
+    unsafe { EnumWindows(Some(each), std::ptr::from_mut(&mut bag) as isize) };
     bag.windows
 }
 
@@ -478,8 +478,9 @@ fn register_location_hook_win32() -> bool {
     if hook.is_null() {
         return false;
     }
-    // The hook has to stay alive for the process. Dropping it unhooks.
-    std::mem::forget(hook);
+    // The hook is a raw pointer. It stays installed until UnhookWinEvent,
+    // which this process never calls.
+    let _ = hook;
     let _ = MOVED.load(Ordering::Relaxed);
     true
 }
