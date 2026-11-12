@@ -112,7 +112,7 @@ impl TrendsDesk {
         } else {
             shell.border_2().border_color(rgb(0xffd60a))
         };
-        let mut shell = shell
+        let shell = shell
             .flex()
             .flex_col()
             .gap(px(4.0))

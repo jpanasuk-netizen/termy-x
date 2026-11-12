@@ -11,7 +11,10 @@ use gpui_kit::{
 use termy_x::io::Http;
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{TakeTone, panel_tone_name, panel_tones};
+use termy_x::trends_desk::{
+    ReplyPhase, TakeDraft, TakeProvider, TakeTone, apply_send_result, edit_reply, panel_tone_name,
+    panel_tones, post_reply_opencli, request_send,
+};
 
 impl TrendsDesk {
     pub(crate) fn inline_editor(
@@ -595,11 +598,21 @@ impl TrendsDesk {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let http =
-                        termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(8));
+                    let limit = if kind == termy_x::trends_desk::TakeProvider::Hermes {
+                        termy_x::trends_desk::HERMES_TAKE_TIMEOUT
+                    } else {
+                        termy_x::trends_desk::PROBE_TIMEOUT
+                    };
+                    let http = termy_x::io::UreqHttp::with_timeout(limit);
                     match kind {
                         termy_x::trends_desk::TakeProvider::Hermes => {
-                            termy_x::trends_desk::probe_openai(&http, &hermes, &model, &hermes_key)
+                            termy_x::trends_desk::probe_openai(
+                                &http,
+                                &hermes,
+                                termy_x::trends_desk::HERMES_MODEL,
+                                &hermes_key,
+                            )
+                            .map(|()| String::new())
                         }
                         termy_x::trends_desk::TakeProvider::Vyce => {
                             let key = std::env::var("VYCE_API_KEY").unwrap_or_default();
@@ -609,9 +622,11 @@ impl TrendsDesk {
                                 &model,
                                 &key,
                             )
+                            .map(|()| String::new())
                         }
                         termy_x::trends_desk::TakeProvider::Custom => {
                             termy_x::trends_desk::probe_openai(&http, &custom, &model, "")
+                                .map(|()| String::new())
                         }
                         termy_x::trends_desk::TakeProvider::Grok => probe_cli("grok"),
                         termy_x::trends_desk::TakeProvider::Muse => probe_cli("muse"),
@@ -629,10 +644,16 @@ impl TrendsDesk {
                     return;
                 }
                 let (ok, line) = match result {
-                    Ok(()) => (
-                        true,
-                        termy_x::trends_desk::verify_status(&label, true, millis, ""),
-                    ),
+                    Ok(reply) => {
+                        let mut line =
+                            termy_x::trends_desk::verify_status(&label, true, millis, "");
+                        let reply = reply.trim();
+                        if !reply.is_empty() {
+                            let short: String = reply.chars().take(80).collect();
+                            line = format!("{line} · {short}");
+                        }
+                        (true, line)
+                    }
                     Err(error) => (
                         false,
                         termy_x::trends_desk::verify_status(&label, false, millis, &error),
@@ -666,6 +687,258 @@ impl TrendsDesk {
             self.show_inline_editor(&id, &existing);
             self.action_note = "Draft is open in the card.".into();
             cx.notify();
+        }
+    }
+
+    pub(crate) fn spawn_one_take(
+        &mut self,
+        id: String,
+        open_compose: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.takes_halted = false;
+        termy_x::trends_desk::resume_takes();
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
+            if open_compose {
+                let message = termy_x::trends_desk::text_after_take(
+                    termy_x::trends_desk::DRAFTING_PLACEHOLDER,
+                    "",
+                    "this card has no post",
+                );
+                self.show_inline_editor(&id, &message);
+                cx.notify();
+            }
+            return;
+        };
+        self.takes.insert(
+            id.clone(),
+            TakeDraft {
+                text: String::new(),
+                source: "pending",
+                note: String::new(),
+                variants: Vec::new(),
+            },
+        );
+        let saved = self.settings.take_provider.clone();
+        let provider = termy_x::trends_desk::provider_kind(&saved);
+        let mut config = self.config.clone();
+        if provider == TakeProvider::Hermes {
+            config.hermes_model = termy_x::trends_desk::HERMES_MODEL.to_string();
+            config.hermes_api_key =
+                termy_x::trends_desk::hermes_key_resolved(&config.hermes_api_key);
+        }
+        if provider == TakeProvider::Vyce
+            && let Some(model) = termy_x::trends_desk::provider_model(&saved)
+        {
+            config.ai_model = model;
+            config.ai_explicit = true;
+        }
+        if provider == TakeProvider::Custom {
+            config.ai_base_url = self.settings.custom_base.clone();
+            config.ai_model = self.settings.custom_model.clone();
+            config.ai_key_env = self.settings.custom_key_env.clone();
+            config.ai_api_key.clear();
+        }
+        let tone = termy_x::trends_desk::panel_tone_name(termy_x::trends_desk::TakeTone::parse(
+            &self.pack.tone,
+        ))
+        .to_string();
+        if open_compose {
+            self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
+        }
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let limit =
+                        if provider == TakeProvider::Hermes || provider == TakeProvider::Grok {
+                            termy_x::trends_desk::HERMES_TAKE_TIMEOUT
+                        } else {
+                            termy_x::trends_desk::TAKE_TIMEOUT
+                        };
+                    let http = termy_x::io::UreqHttp::with_timeout(limit);
+                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.takes.insert(id.clone(), result.clone());
+                let status = if result.text.trim().is_empty() {
+                    result.note.clone()
+                } else {
+                    "ok".into()
+                };
+                termy_x::trends_desk::append_desk_log(
+                    &desk.data_root,
+                    &termy_x::trends_desk::take_log_line(result.source, &status),
+                );
+                if open_compose {
+                    let current = if desk
+                        .popout
+                        .as_ref()
+                        .is_some_and(|pop| pop.open && pop.card_id == id)
+                    {
+                        desk.popout
+                            .as_ref()
+                            .map(|pop| pop.draft.clone())
+                            .unwrap_or_default()
+                    } else {
+                        desk.card_replies
+                            .get(&id)
+                            .map(|phase| phase.text().to_string())
+                            .unwrap_or_default()
+                    };
+                    let next =
+                        termy_x::trends_desk::text_after_take(&current, &result.text, &result.note);
+                    if let Some(pop) = desk
+                        .popout
+                        .as_mut()
+                        .filter(|pop| pop.open && pop.card_id == id)
+                    {
+                        pop.draft = next.clone();
+                        if !result.variants.is_empty() {
+                            pop.variants =
+                                termy_x::trends_desk::distinct_variants(&next, &result.variants);
+                        }
+                        desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
+                        desk.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&next));
+                    }
+                    desk.card_replies
+                        .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next.clone()));
+                    desk.draft_note = result.note.clone();
+                    if !result.note.is_empty() {
+                        desk.action_note = result.note.clone();
+                    }
+                    if !next.trim().is_empty() && next != termy_x::trends_desk::DRAFTING_PLACEHOLDER
+                    {
+                        if let Some(post) = desk
+                            .columns
+                            .iter()
+                            .flat_map(|column| column.view.posts.iter())
+                            .find(|post| post.id == id)
+                        {
+                            let path = termy_x::trends_desk::drafts_file(&desk.data_root);
+                            if let Ok(count) = termy_x::trends_desk::remember_take(
+                                &path, &id, &post.text, &post.url, &next,
+                            ) {
+                                desk.saved_urls.insert(post.url.clone());
+                                desk.draft_count = count;
+                                let saved = termy_x::trends_desk::saved_drafts_label(count);
+                                desk.action_note = if desk.action_note.is_empty() {
+                                    saved
+                                } else {
+                                    format!("{}. {saved}", desk.action_note)
+                                };
+                            }
+                        }
+                    }
+                    desk.selected = Some(format!("take:{id}"));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn send_reply(&mut self, id: String, cx: &mut Context<Self>) {
+        let phase = self
+            .card_replies
+            .get(&id)
+            .cloned()
+            .unwrap_or(ReplyPhase::Idle);
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
+            return;
+        };
+        match request_send(&phase, true) {
+            Err(error) => {
+                self.action_note = error.clone();
+                let text = phase.text().to_string();
+                if !text.is_empty() {
+                    self.card_replies
+                        .insert(id, ReplyPhase::Failed { text, error });
+                }
+                cx.notify();
+            }
+            Ok(pending) => {
+                let text = termy_x::trends_desk::text_to_post(&pending.text());
+                let pending = ReplyPhase::Pending { text: text.clone() };
+                self.card_replies.insert(id.clone(), pending.clone());
+                cx.notify();
+                let bin = self.config.opencli_bin.clone();
+                let url = post.url.clone();
+                let parent_id = post.id.clone();
+                let provider = self.settings.take_provider.clone();
+                let receipt_url = url.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let runner = termy_x::io::SystemRunner;
+                            post_reply_opencli(&bin, &runner, &url, &text)
+                        })
+                        .await;
+                    let _ = this.update(cx, |desk, cx| {
+                        let pending = desk.card_replies.get(&id).cloned().unwrap_or(pending);
+                        let posted = termy_x::trends_desk::text_to_post(pending.text());
+                        let outcome = if result.is_ok() { "ok" } else { "failed" };
+                        termy_x::trends_desk::append_desk_log(
+                            &desk.data_root,
+                            &termy_x::trends_desk::post_log_line(
+                                &provider, &parent_id, outcome, &posted,
+                            ),
+                        );
+                        let mut mark = termy_x::trends_desk::reply_receipt(
+                            &parent_id,
+                            &receipt_url,
+                            result.as_deref().unwrap_or(""),
+                        );
+                        mark.at_unix = TrendsDesk::now_unix();
+                        mark.status = if result.is_ok() {
+                            "confirmed".into()
+                        } else {
+                            "failed".into()
+                        };
+                        mark.text = posted;
+                        desk.pack.receipts.push(mark);
+                        desk.save_pack_file();
+                        desk.action_note = match &result {
+                            Ok(receipt) => {
+                                if let Some(url) = termy_x::trends_desk::reply_link(receipt) {
+                                    format!("Posted ✓ {url}")
+                                } else {
+                                    "Posted ✓".into()
+                                }
+                            }
+                            Err(error) => error.clone(),
+                        };
+                        desk.card_replies
+                            .insert(id.clone(), apply_send_result(&pending, result));
+                        if desk
+                            .card_replies
+                            .get(&id)
+                            .is_some_and(|phase| matches!(phase, ReplyPhase::Confirmed { .. }))
+                        {
+                            if desk.popout.as_ref().is_some_and(|pop| pop.card_id == id) {
+                                desk.popout = None;
+                                desk.reply_edit = None;
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
         }
     }
 }
@@ -774,23 +1047,78 @@ fn box_button(
         .into_any_element()
 }
 
-fn probe_cli(program: &str) -> Result<(), String> {
+fn probe_cli(program: &str) -> Result<String, String> {
     let mut command = std::process::Command::new(program);
     command.args(termy_x::trends_desk::probe_cli_args(program));
     termy_x::trends_desk::apply_hidden_command(&mut command);
-    match command.output() {
-        Err(error) => Err(format!("{program} not found ({error})")),
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => {
-            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let detail = if !err.is_empty() { err } else { out };
-            if detail.is_empty() {
-                Err(format!("{program} --version failed"))
-            } else {
-                Err(detail)
+    let _ = command.stdin(std::process::Stdio::null());
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return Err(format!("{program} not found ({error})")),
+    };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let output = match rx.recv_timeout(termy_x::trends_desk::PROBE_TIMEOUT) {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(error.to_string()),
+        Err(_) => {
+            stop_probe(pid);
+            return Err(format!("{program} timed out after 30s"));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if program == "agy" {
+        if stdout.trim().is_empty() {
+            if let Some(credit) = termy_x::trends_desk::agy_credit_error(&stderr) {
+                return Err(credit);
+            }
+        } else {
+            match termy_x::trends_desk::agy_print_text(&stdout) {
+                Ok(text) => return Ok(text),
+                Err(error) => {
+                    return Err(termy_x::trends_desk::agy_credit_error(&error).unwrap_or(error));
+                }
             }
         }
+    }
+    if !output.status.success() {
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        if let Some(credit) = termy_x::trends_desk::agy_credit_error(&detail) {
+            return Err(credit);
+        }
+        return Err(if detail.is_empty() {
+            format!("{program} exited {}", output.status)
+        } else {
+            detail
+        });
+    }
+    let shown = if !stdout.is_empty() { stdout } else { stderr };
+    if shown.is_empty() {
+        Err(format!("{program} returned no text"))
+    } else {
+        Ok(shown)
+    }
+}
+
+fn stop_probe(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
     }
 }
 

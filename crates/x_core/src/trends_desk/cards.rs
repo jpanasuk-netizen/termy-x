@@ -848,57 +848,6 @@ pub fn treg_take_with_token(
     })
 }
 
-/// Hermes gateway draft. A 401 or 402 becomes three different fallback lines
-/// and a one-line note. This does not post.
-pub fn hermes_take(
-    config: &crate::config::XConfig,
-    http: &dyn Http,
-    post: &SourcePost,
-) -> TakeDraft {
-    hermes_take_toned(config, http, post, "Reply")
-}
-
-pub fn hermes_take_toned(
-    config: &crate::config::XConfig,
-    http: &dyn Http,
-    post: &SourcePost,
-    tone: &str,
-) -> TakeDraft {
-    let env_text = hermes_env_file_text();
-    let auth = super::hermes_auth(
-        &config.hermes_base_url,
-        &config.hermes_model,
-        &config.hermes_api_key,
-        &env_text,
-    );
-    let (lines, note) =
-        super::draft_hermes_variants(&auth, http, &post.author, &post.text, tone, 3);
-    let text = lines.first().cloned().unwrap_or_default();
-    if note.is_empty() && !text.is_empty() {
-        TakeDraft {
-            text,
-            source: "hermes",
-            note: format!("Hermes draft ({}). Not posted.", auth.base),
-            variants: lines,
-        }
-    } else {
-        TakeDraft {
-            text,
-            source: "offline",
-            note,
-            variants: lines,
-        }
-    }
-}
-
-fn hermes_env_file_text() -> String {
-    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
-        return String::new();
-    };
-    let path = std::path::PathBuf::from(root).join("hermes").join(".env");
-    std::fs::read_to_string(path).unwrap_or_default()
-}
-
 pub fn parse_treg_draft(body: &str) -> Result<String, String> {
     let value: serde_json::Value =
         serde_json::from_str(body).map_err(|error| format!("treg: bad response ({error})"))?;
@@ -943,7 +892,7 @@ pub fn draft_take(
         TakeProvider::Free => Ok(free_take(config, http, post)),
         TakeProvider::Treg => treg_take(config, http, post),
         TakeProvider::Hermes | TakeProvider::Vyce | TakeProvider::Custom => {
-            Ok(hermes_take(config, http, post))
+            Ok(super::hermes_draft::hermes_take(config, http, post))
         }
         TakeProvider::Muse | TakeProvider::Agy => Ok(TakeDraft {
             text: String::new(),

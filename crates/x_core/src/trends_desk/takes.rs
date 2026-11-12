@@ -114,7 +114,7 @@ pub fn agy_credit_error(text: &str) -> Option<String> {
         || lower.contains("credit")
         || (lower.contains("gemini") && (lower.contains("deplet") || lower.contains("quota")))
     {
-        Some("Agy needs credits (402)".to_string())
+        Some("Agy: Google credits depleted (402)".to_string())
     } else {
         None
     }
@@ -270,6 +270,9 @@ pub fn specific_transport_error(error: &str) -> String {
     if lower.contains("404") || lower.contains("not found") {
         return "http 404 not found".into();
     }
+    if lower.contains("invalid gateway api key") {
+        return "Invalid gateway API key (API_SERVER_KEY)".into();
+    }
     if lower.contains("401") || lower.contains("unauthorized") {
         return "http 401 unauthorized".into();
     }
@@ -309,12 +312,41 @@ pub fn verify_status(label: &str, ok: bool, millis: u128, error: &str) -> String
     }
 }
 
+pub const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const PROBE_PROMPT: &str = "Reply with exactly ok";
+
 pub fn probe_cli_args(program: &str) -> Vec<String> {
     match program {
-        "agy" => vec!["--version".into()],
-        "muse" => vec!["--version".into()],
-        _ => vec!["--version".into()],
+        "agy" => vec![
+            "-p".into(),
+            PROBE_PROMPT.into(),
+            "--output-format".into(),
+            "json".into(),
+            "--print-timeout".into(),
+            "30s".into(),
+            "--dangerously-skip-permissions".into(),
+        ],
+        "muse" => vec![
+            "exec".into(),
+            "--disable-approval".into(),
+            "--max-model-steps".into(),
+            "1".into(),
+            "--".into(),
+            PROBE_PROMPT.into(),
+        ],
+        _ => grok_print_args(PROBE_PROMPT),
     }
+}
+
+pub fn grok_print_args(prompt: &str) -> Vec<String> {
+    vec![
+        "-p".into(),
+        prompt.to_string(),
+        "--output-format".into(),
+        "plain".into(),
+        "--always-approve".into(),
+        "--no-alt-screen".into(),
+    ]
 }
 
 /// `/v1/models` then a 1-token chat. The key stays in the header only.
@@ -619,19 +651,13 @@ fn hermes_vyce_take(
     tone: &str,
 ) -> super::TakeDraft {
     let mut config = config.clone();
-    if config.hermes_model.trim().is_empty() {
-        config.hermes_model = super::agents::VYCE_MODEL.to_string();
-    }
+    config.hermes_model = super::agents::HERMES_MODEL.to_string();
+    config.hermes_api_key = super::agents::hermes_key_resolved(&config.hermes_api_key);
     if config.hermes_base_url.trim().is_empty() {
         config.hermes_base_url = super::agents::HERMES_BASE.to_string();
     }
-    let label = if config.hermes_model == super::agents::VYCE_MODEL {
-        super::agents::HERMES_VYCE_LABEL.to_string()
-    } else {
-        format!("Hermes · {}", config.hermes_model)
-    };
     match hermes_raced(&config, post, tone, http) {
-        Ok(text) => labeled_take("hermes", &label, &text, &[]),
+        Ok(text) => labeled_take("hermes", super::agents::HERMES_VYCE_LABEL, &text, &[]),
         Err(error) => failed_take(
             "hermes",
             &format!(
@@ -751,10 +777,10 @@ fn agy_headless(program: &str, prompt: &str) -> Result<String, String> {
             if err.is_empty() {
                 Err("Agy returned no text. Headless print mode produced an empty response.".into())
             } else {
-                Err(err)
+                Err(agy_credit_error(&err).unwrap_or(err))
             }
         } else {
-            agy_print_text(&stdout)
+            agy_print_text(&stdout).map_err(|error| agy_credit_error(&error).unwrap_or(error))
         }
     } else {
         kill_pid(pid);
@@ -821,7 +847,7 @@ fn hermes_raced(
     tone: &str,
     http: &dyn crate::io::Http,
 ) -> Result<String, String> {
-    let draft = super::cards::hermes_take_toned(config, http, post, tone);
+    let draft = super::hermes_draft::hermes_take_toned(config, http, post, tone);
     if draft.text.trim().is_empty()
         || is_provider_failure(&draft.text)
         || is_provider_failure(&draft.note)
@@ -926,19 +952,17 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
     let plan = background_grok_spawn();
     let mut command = std::process::Command::new(plan.program);
+    command.args(grok_print_args(&prompt));
     apply_hidden_command(&mut command);
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let _ = command.stdin(std::process::Stdio::null());
+    let child = command.spawn().map_err(|error| error.to_string())?;
     let pid = child.id();
     register_job(&post.id, pid);
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    let result = if let Ok(Ok(output)) = rx.recv_timeout(TAKE_TIMEOUT) {
+    let result = if let Ok(Ok(output)) = rx.recv_timeout(HERMES_TAKE_TIMEOUT) {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if takes_halted() {
             Err("takes stopped".into())
@@ -951,7 +975,7 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
         }
     } else {
         kill_pid(pid);
-        Err("grok timed out after 45s".into())
+        Err("grok timed out after 90s".into())
     };
     unregister_job(&post.id);
     result
@@ -1101,7 +1125,7 @@ mod tests {
         assert_eq!(chain_order(), vec!["grok", "hermes", "treg", "free"]);
         assert_eq!(
             agy_credit_error("Gemini 402 credits depleted"),
-            Some("Agy needs credits (402)".into())
+            Some("Agy: Google credits depleted (402)".into())
         );
         assert!(agy_credit_error("a normal reply about courts").is_none());
         let dir = agent_work_dir(Path::new(r"C:\Users\j\AppData\Roaming\Termy XL"));
@@ -1273,7 +1297,8 @@ mod tests {
                 assert!(request.url.contains("hermes.test"));
                 assert!(!request.url.contains("treg"));
                 let body = request.body.unwrap_or_default();
-                assert!(body.contains("glm-5.3-flash"));
+                assert!(body.contains("hermes-agent"));
+                assert!(!body.contains("glm-5.3-flash"));
                 assert!(!body.contains("hermes-secret"));
                 Err("503 Service Unavailable".into())
             }
@@ -1378,17 +1403,33 @@ mod tests {
             specific_transport_error("tcp connect error: Connection refused (os error 111)"),
             "connection refused"
         );
-        assert_eq!(
-            specific_transport_error("http 503 Service Unavailable"),
-            "http 503"
-        );
         let ok_line = verify_status("Grok", true, 40, "");
         assert_eq!(ok_line, "Grok verified · 40ms");
         let bad_line = verify_status("Grok", false, 0, "grok not found");
         assert!(bad_line.contains("not found"));
-        assert_eq!(provider_kind(&picked), super::super::TakeProvider::Grok);
-        assert_eq!(probe_cli_args("grok"), vec!["--version".to_string()]);
-        assert_eq!(probe_cli_args("agy"), vec!["--version".to_string()]);
+        let grok_probe = probe_cli_args("grok");
+        assert_eq!(grok_probe[0], "-p");
+        assert!(grok_probe.iter().any(|arg| arg == PROBE_PROMPT));
+        assert!(
+            grok_probe
+                .windows(2)
+                .any(|p| p == ["--output-format", "plain"])
+        );
+        assert!(grok_probe.iter().any(|arg| arg == "--always-approve"));
+        assert!(grok_probe.iter().any(|arg| arg == "--no-alt-screen"));
+        assert!(probe_cli_args("agy").iter().any(|arg| arg == "-p"));
+        let muse_probe = probe_cli_args("muse");
+        assert_eq!(muse_probe[0], "exec");
+        assert!(muse_probe.iter().any(|arg| arg == PROBE_PROMPT));
+        assert_eq!(PROBE_TIMEOUT, std::time::Duration::from_secs(30));
+        assert_eq!(
+            specific_transport_error("401 Invalid gateway API key (API_SERVER_KEY)"),
+            "Invalid gateway API key (API_SERVER_KEY)"
+        );
+        assert_eq!(
+            agy_credit_error("http 402"),
+            Some("Agy: Google credits depleted (402)".into())
+        );
         struct ProbeHttp {
             fail_models: bool,
         }

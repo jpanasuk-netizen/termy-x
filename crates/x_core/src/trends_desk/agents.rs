@@ -343,6 +343,65 @@ pub fn api_server_key_from_env_file(text: &str) -> Option<String> {
     None
 }
 
+pub fn hermes_key_resolved(saved: &str) -> String {
+    resolve_hermes_key(saved, &read_hermes_dotenv(), &read_hermes_config_yaml())
+}
+
+/// Saved XL key, then `API_SERVER_KEY` in the Hermes `.env`, then the yaml.
+pub fn resolve_hermes_key(saved: &str, env_text: &str, yaml_text: &str) -> String {
+    if let Some(key) = choose_hermes_key(saved, env_text) {
+        return key;
+    }
+    api_server_key_from_yaml(yaml_text).unwrap_or_default()
+}
+
+fn read_hermes_dotenv() -> String {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return String::new();
+    };
+    std::fs::read_to_string(std::path::PathBuf::from(root).join("hermes").join(".env"))
+        .unwrap_or_default()
+}
+
+fn read_hermes_config_yaml() -> String {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        paths.push(std::path::PathBuf::from(r"D:\hermes\config.yaml"));
+    }
+    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+        paths.push(
+            std::path::PathBuf::from(root)
+                .join("hermes")
+                .join("config.yaml"),
+        );
+    }
+    for path in paths {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+    }
+    String::new()
+}
+
+pub fn api_server_key_from_yaml(text: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        let Some((_, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = line.split(':').next().unwrap_or("").trim();
+        if key != "API_SERVER_KEY" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() || value.starts_with('$') || value.contains("key_env") {
+            continue;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
 pub fn choose_hermes_key(saved: &str, env_text: &str) -> Option<String> {
     let saved = saved.trim();
     if !saved.is_empty() {
@@ -1147,6 +1206,18 @@ mod tests {
         );
         assert_eq!(choose_hermes_key("  ", env).as_deref(), Some("from-env"));
         assert!(choose_hermes_key("", "API_SERVER_KEY=\n").is_none());
+        assert_eq!(
+            resolve_hermes_key("", env, "API_SERVER_KEY: from-yaml\n"),
+            "from-env"
+        );
+        assert_eq!(
+            resolve_hermes_key("", "", "API_SERVER_KEY: \"from-yaml\"\n"),
+            "from-yaml"
+        );
+        assert!(api_server_key_from_yaml("key_env: API_SERVER_KEY\n").is_none());
+        let logged = take_log_line("hermes", "ok");
+        assert!(!logged.contains("from-env"));
+        assert!(!logged.contains("from-yaml"));
         let auth = hermes_auth("", "", "leak-me", env);
         assert_eq!(auth.base, HERMES_BASE);
         assert_eq!(auth.model, HERMES_MODEL);

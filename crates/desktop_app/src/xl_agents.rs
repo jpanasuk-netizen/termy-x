@@ -207,8 +207,9 @@ impl TrendsDesk {
         let mut config = self.config.clone();
         let provider = termy_x::trends_desk::provider_kind(&saved);
         if provider == TakeProvider::Hermes {
-            config.hermes_model = termy_x::trends_desk::provider_model(&saved)
-                .unwrap_or_else(|| termy_x::trends_desk::VYCE_MODEL.to_string());
+            config.hermes_model = termy_x::trends_desk::HERMES_MODEL.to_string();
+            config.hermes_api_key =
+                termy_x::trends_desk::hermes_key_resolved(&config.hermes_api_key);
         }
         if provider == TakeProvider::Vyce
             && let Some(model) = termy_x::trends_desk::provider_model(&saved)
@@ -264,11 +265,7 @@ impl TrendsDesk {
                         termy_x::trends_desk::ReplyPhase::Editing { text: next },
                     );
                 }
-                desk.action_note = if draft.text.trim().is_empty() {
-                    draft.note.clone()
-                } else {
-                    draft.note.clone()
-                };
+                desk.action_note = draft.note.clone();
                 desk.model_notice = desk.action_note.clone();
                 termy_x::trends_desk::append_desk_log(
                     &desk.data_root,
