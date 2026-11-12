@@ -1,8 +1,7 @@
-//! Reply popout for Termy XL.
+//! Inline reply panel inside a Termy XL gold card.
 //!
-//! It follows the Termy X reply box: context line, caret field, character
-//! count, and Post/Cancel. Only the Send button posts. Esc and Cancel close
-//! it and leave the draft on the card.
+//! Draft take, Reply, and Edit open this panel in the card. Only Send posts.
+//! Esc and Close collapse it and leave the draft on the card.
 
 use gpui_kit::{
     Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
@@ -10,13 +9,20 @@ use gpui_kit::{
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{TakeProvider, TakeTone, char_count, wrap_token};
+use termy_x::trends_desk::{
+    TakeTone, apply_variant, char_count, panel_tone_name, panel_tones, wrap_token,
+};
 
 impl TrendsDesk {
-    pub(crate) fn reply_popout(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
-        let Some(pop) = self.popout.clone() else {
-            return div().into_any_element();
-        };
+    pub(crate) fn inline_editor(
+        &self,
+        card_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui_kit::AnyElement> {
+        let pop = self.popout.clone()?;
+        if !pop.open || pop.card_id != card_id {
+            return None;
+        }
         let post = self
             .columns
             .iter()
@@ -29,15 +35,20 @@ impl TrendsDesk {
         let caret = self.pop_caret.caret.min(pop.draft.len());
         let (head, tail) = pop.draft.split_at(caret);
         let over = count > 280;
+        let drafting = pop.draft == termy_x::trends_desk::DRAFTING_PLACEHOLDER;
+        let field = if drafting {
+            termy_x::trends_desk::DRAFTING_PLACEHOLDER.to_string()
+        } else {
+            format!("{head}|{tail}")
+        };
+        let dial = format!("Tone · {}", panel_tone_name(TakeTone::parse(&pop.tone)));
         let mut box_el = div()
-            .id("desk-reply-popout")
+            .id("desk-inline-editor")
             .w_full()
-            .max_h(px(520.0))
-            .overflow_y_scroll()
-            .p(px(12.0))
-            .rounded(px(12.0))
+            .p(px(8.0))
+            .rounded(px(10.0))
             .bg(rgb(0x2a0f1a))
-            .border_2()
+            .border_1()
             .border_color(rgb(termy_x::trends_desk::SELECT_PINK))
             .flex()
             .flex_col()
@@ -65,69 +76,31 @@ impl TrendsDesk {
                     .bg(rgb(0x0c1422))
                     .whitespace_normal()
                     .text_size(px(14.0))
-                    .child(format!("{head}|{tail}")),
+                    .child(field),
             )
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .text_color(if over { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
-                    .child({
-                        let read = termy_x::trends_desk::read_composer(&pop.draft);
-                        format!(
-                            "{count} / 280{} · {} mentions · {} links · Send button posts",
-                            if read.over { " over limit" } else { "" },
-                            read.mentions,
-                            read.links
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .flex_wrap()
-                    .children(TakeTone::all().map(|tone| {
-                        tone_button(
-                            &format!("desk-tone-{}", tone.label()),
-                            tone.label(),
-                            &pop.tone,
-                            tone,
-                            cx,
-                        )
-                    })),
-            )
-            .child(
-                div()
-                    .id("desk-provider-label")
-                    .flex_shrink_0()
-                    .text_size(px(12.0))
-                    .child(pop.provider.caption()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap(px(8.0))
-                    .child(pop_button("desk-pop-grok", "Grok", cx, |this, cx| {
-                        this.set_take_provider("grok", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
-                        this.set_take_provider("free", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
-                        this.set_take_provider("treg", cx);
-                        this.regenerate_open_variants(cx);
-                    }))
-                    .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
-                        this.set_take_provider("hermes", cx);
-                        this.regenerate_open_variants(cx);
-                    })),
-            )
-            .child(self.agent_controls(cx));
+            .child({
+                let mut tones = div().flex().gap(px(8.0)).flex_wrap();
+                for tone in panel_tones() {
+                    tones = tones.child(tone_button(
+                        &format!("desk-tone-{}", panel_tone_name(tone)),
+                        panel_tone_name(tone),
+                        &pop.tone,
+                        tone,
+                        cx,
+                    ));
+                }
+                tones.child(pop_button("desk-tone-dial", &dial, cx, |this, cx| {
+                    let current = this
+                        .popout
+                        .as_ref()
+                        .map(|pop| pop.tone.clone())
+                        .unwrap_or_default();
+                    let next = termy_x::trends_desk::next_tone(&current);
+                    this.set_pop_tone(panel_tone_name(next));
+                    this.regenerate_open_variants(cx);
+                }))
+            });
         for (index, variant) in pop.variants.iter().enumerate() {
-            let text = variant.clone();
             box_el = box_el.child(
                 div()
                     .id(SharedString::from(format!("desk-variant-{index}")))
@@ -143,9 +116,17 @@ impl TrendsDesk {
                         MouseButton::Left,
                         cx.listener(move |this, _, _, cx| {
                             if let Some(pop) = this.popout.as_mut() {
-                                pop.draft = text.clone();
+                                let variants = pop.variants.clone();
+                                if !apply_variant(&mut pop.draft, &variants, index) {
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                let text = pop.draft.clone();
+                                let id = pop.card_id.clone();
                                 this.pop_caret =
                                     termy_x::draft_edit::DraftCaret::at_end(text.len());
+                                this.card_replies
+                                    .insert(id, termy_x::trends_desk::ReplyPhase::Editing { text });
                             }
                             cx.stop_propagation();
                             cx.notify();
@@ -153,35 +134,113 @@ impl TrendsDesk {
                     ),
             );
         }
-        box_el
-            .child(pop_button(
-                "desk-variant-next",
-                "Next variant",
-                cx,
-                |this, cx| {
-                    if let Some(pop) = this.popout.as_mut() {
-                        let index = pop
-                            .variants
-                            .iter()
-                            .position(|item| item == &pop.draft)
-                            .unwrap_or(0);
-                        let next = termy_x::trends_desk::flip_variant(index, 1, pop.variants.len());
-                        if let Some(text) = pop.variants.get(next).cloned() {
-                            pop.draft = text.clone();
-                            this.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
-                        }
-                    }
-                    cx.notify();
-                },
-            ))
-            .child(pop_button("desk-pop-send", "Send", cx, |this, cx| {
-                this.send_from_popout(cx);
-            }))
-            .child(pop_button("desk-pop-cancel", "Cancel", cx, |this, cx| {
-                this.close_popout();
-                cx.notify();
-            }))
-            .into_any_element()
+        Some(
+            box_el
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(if over { rgb(0xff5d8f) } else { rgb(0x9ad7ff) })
+                        .child({
+                            let read = termy_x::trends_desk::read_composer(&pop.draft);
+                            format!(
+                                "{count} / 280{} · {} mentions · {} links · Send button posts",
+                                if read.over { " over limit" } else { "" },
+                                read.mentions,
+                                read.links
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .id("desk-provider-label")
+                        .flex_shrink_0()
+                        .text_size(px(12.0))
+                        .child(pop.provider.caption()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(8.0))
+                        .child(pop_button("desk-pop-grok", "Grok", cx, |this, cx| {
+                            this.set_take_provider("grok", cx);
+                            this.regenerate_open_variants(cx);
+                        }))
+                        .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
+                            this.set_take_provider("free", cx);
+                            this.regenerate_open_variants(cx);
+                        }))
+                        .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
+                            this.set_take_provider("treg", cx);
+                            this.regenerate_open_variants(cx);
+                        }))
+                        .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
+                            this.set_take_provider("hermes", cx);
+                            this.regenerate_open_variants(cx);
+                        }))
+                        .child(pop_button("desk-open-grok", "Open Grok", cx, |this, cx| {
+                            this.open_agent(termy_x::agents::Agent::Grok, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(pop_button("desk-inline-close", "Close", cx, |this, cx| {
+                            this.close_popout();
+                            cx.notify();
+                        }))
+                        .child(pop_button("desk-pop-send", "Send", cx, |this, cx| {
+                            this.send_from_popout(cx);
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    pub(crate) fn show_inline_editor(&mut self, id: &str, text: &str) {
+        let provider = termy_x::trends_desk::TakeProvider::parse(&self.settings.take_provider);
+        let tone = panel_tone_name(TakeTone::parse(&self.pack.tone)).to_string();
+        let stored = self
+            .takes
+            .get(id)
+            .map(|take| take.variants.clone())
+            .unwrap_or_default();
+        let mut editor = termy_x::trends_desk::open_editor(id, text, provider);
+        editor.tone = tone;
+        if !stored.is_empty() {
+            editor.variants = termy_x::trends_desk::distinct_variants(text, &stored);
+        }
+        self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(text.len());
+        self.selected = Some(termy_x::trends_desk::select_take(id));
+        self.card_replies.insert(
+            id.to_string(),
+            termy_x::trends_desk::ReplyPhase::Editing {
+                text: text.to_string(),
+            },
+        );
+        self.popout = Some(editor);
+    }
+
+    pub(crate) fn open_inline_for(&mut self, id: String, cx: &mut Context<Self>) {
+        let existing = self
+            .card_replies
+            .get(&id)
+            .map(|phase| phase.text().to_string())
+            .filter(|text| !termy_x::trends_desk::reply_needs_a_take(text))
+            .or_else(|| {
+                self.takes
+                    .get(&id)
+                    .map(|take| take.text.clone())
+                    .filter(|text| !termy_x::trends_desk::reply_needs_a_take(text))
+            })
+            .unwrap_or_default();
+        if termy_x::trends_desk::reply_needs_a_take(&existing) {
+            self.draft_take_for(id, cx);
+        } else {
+            self.show_inline_editor(&id, &existing);
+            cx.notify();
+        }
     }
 }
 
@@ -192,8 +251,8 @@ fn tone_button(
     tone: TakeTone,
     cx: &mut Context<TrendsDesk>,
 ) -> gpui_kit::AnyElement {
-    let active = current.eq_ignore_ascii_case(tone.label());
-    let name = tone.label().to_string();
+    let active = TakeTone::parse(current) == tone;
+    let name = panel_tone_name(tone).to_string();
     pop_button(id, label, cx, move |this, cx| {
         if active {
             return;

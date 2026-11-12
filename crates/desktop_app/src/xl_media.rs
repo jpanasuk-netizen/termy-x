@@ -481,7 +481,7 @@ fn window_hwnd(window: &Window) -> isize {
         if let Ok(handle) = HasWindowHandle::window_handle(window)
             && let RawWindowHandle::Win32(win32) = handle.as_raw()
         {
-            return win32.hwnd.get() as isize;
+            return win32.hwnd.get();
         }
     }
     #[cfg(not(target_os = "windows"))]

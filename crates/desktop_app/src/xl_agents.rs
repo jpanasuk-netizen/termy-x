@@ -208,6 +208,12 @@ impl TrendsDesk {
         let previous = pop.variants.clone();
         let provider = pop.provider;
         let id = pop.card_id.clone();
+        if let Some(open) = self.popout.as_mut() {
+            open.draft = termy_x::trends_desk::DRAFTING_PLACEHOLDER.into();
+        }
+        self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(
+            termy_x::trends_desk::DRAFTING_PLACEHOLDER.len(),
+        );
         self.model_notice = format!("Drafting with {}…", provider.as_str());
         let draft_tone = tone.clone();
         cx.spawn(async move |this, cx| {
@@ -228,13 +234,15 @@ impl TrendsDesk {
                 termy_x::trends_desk::settle_variants(&previous, &[draft.variants], &tone);
             let _ = this.update(cx, |desk, cx| {
                 if let Some(open) = desk.popout.as_mut().filter(|item| item.card_id == id) {
-                    open.variants = variants;
-                    if error.is_empty()
-                        && open.draft.trim().is_empty()
-                        && let Some(text) = open.variants.first().cloned()
-                    {
-                        open.draft = text;
-                    }
+                    open.variants = variants.clone();
+                    let generated = variants.first().cloned().unwrap_or_default();
+                    let next = termy_x::trends_desk::fill_reply_if_waiting(&open.draft, &generated);
+                    open.draft = next.clone();
+                    desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
+                    desk.card_replies.insert(
+                        id.clone(),
+                        termy_x::trends_desk::ReplyPhase::Editing { text: next },
+                    );
                 }
                 desk.model_notice = if error.is_empty() {
                     format!("{} ready. Not posted.", provider.as_str())

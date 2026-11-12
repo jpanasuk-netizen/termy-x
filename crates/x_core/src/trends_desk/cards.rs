@@ -387,7 +387,7 @@ pub fn scroll_of(offsets: &std::collections::HashMap<String, f32>, id: &str) -> 
     offsets.get(id).copied().unwrap_or(0.0)
 }
 
-/// Floating reply editor. Closing it never posts.
+/// Reply editor drawn inside the gold card. Closing it never posts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EditPopout {
     pub card_id: String,
@@ -442,6 +442,38 @@ pub fn close_editor(pop: &EditPopout) -> EditPopout {
     }
 }
 
+/// Shown in the reply box until the one take for this card is ready.
+pub const DRAFTING_PLACEHOLDER: &str = "Drafting…";
+
+/// Replace the placeholder when the take arrives. Typed text stays.
+pub fn fill_reply_if_waiting(current: &str, generated: &str) -> String {
+    let generated = generated.trim();
+    if current == DRAFTING_PLACEHOLDER || current.trim().is_empty() {
+        if generated.is_empty() {
+            current.to_string()
+        } else {
+            generated.to_string()
+        }
+    } else {
+        current.to_string()
+    }
+}
+
+/// Reply and Edit open the panel. They draft only when the box has no take yet.
+pub fn reply_needs_a_take(existing: &str) -> bool {
+    let trimmed = existing.trim();
+    trimmed.is_empty() || trimmed == DRAFTING_PLACEHOLDER
+}
+
+/// Clicking a variant copies that line into the reply box.
+pub fn apply_variant(draft: &mut String, variants: &[String], index: usize) -> bool {
+    let Some(text) = variants.get(index) else {
+        return false;
+    };
+    *draft = text.clone();
+    true
+}
+
 /// Send is allowed only from an open editor and an explicit click.
 /// This does not post. The caller posts only after `Ok`.
 pub fn editor_send(pop: &EditPopout, explicit: bool) -> Result<String, String> {
@@ -452,7 +484,7 @@ pub fn editor_send(pop: &EditPopout, explicit: bool) -> Result<String, String> {
         return Err("The editor is closed. Nothing was posted.".into());
     }
     let text = pop.draft.trim();
-    if text.is_empty() {
+    if text.is_empty() || text == DRAFTING_PLACEHOLDER {
         return Err("Write a reply first.".into());
     }
     Ok(text.to_string())
@@ -1153,6 +1185,38 @@ mod tests {
         assert_eq!(after.text(), "hello take");
         assert_eq!(editor_send(&open, true).unwrap(), "hello take");
         assert_eq!(*poster.calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn draft_take_fills_the_reply_inside_the_card() {
+        assert_eq!(DRAFTING_PLACEHOLDER, "Drafting…");
+        assert_eq!(
+            fill_reply_if_waiting(DRAFTING_PLACEHOLDER, "a real joke"),
+            "a real joke"
+        );
+        assert_eq!(fill_reply_if_waiting("my edit", "a real joke"), "my edit");
+        assert_eq!(
+            fill_reply_if_waiting(DRAFTING_PLACEHOLDER, "  "),
+            DRAFTING_PLACEHOLDER
+        );
+        assert!(reply_needs_a_take(""));
+        assert!(reply_needs_a_take(DRAFTING_PLACEHOLDER));
+        assert!(!reply_needs_a_take("a real joke"));
+        let waiting = open_editor("9", DRAFTING_PLACEHOLDER, TakeProvider::Grok);
+        assert!(editor_send(&waiting, true).is_err());
+        let mut ready = open_editor("9", "a real joke", TakeProvider::Grok);
+        ready.variants = vec![
+            "a real joke".into(),
+            "the concrete bit".into(),
+            "the spicy one".into(),
+        ];
+        assert!(apply_variant(&mut ready.draft, &ready.variants, 2));
+        assert_eq!(ready.draft, "the spicy one");
+        assert_eq!(editor_send(&ready, true).unwrap(), "the spicy one");
+        let closed = close_editor(&ready);
+        assert!(!closed.open);
+        assert_eq!(closed.draft, "the spicy one");
+        assert!(editor_send(&closed, true).is_err());
     }
 
     #[test]

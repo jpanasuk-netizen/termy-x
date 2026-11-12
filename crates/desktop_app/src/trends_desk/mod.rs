@@ -695,8 +695,9 @@ impl TrendsDesk {
             return;
         };
         let parsed = termy_x::trends_desk::TakeTone::parse(tone);
-        pop.tone = parsed.label().to_string();
-        self.pack.tone = parsed.label().to_ascii_lowercase();
+        let name = termy_x::trends_desk::panel_tone_name(parsed);
+        pop.tone = name.to_string();
+        self.pack.tone = name.to_ascii_lowercase();
         self.save_pack_file();
     }
 
@@ -746,6 +747,9 @@ impl TrendsDesk {
     }
 
     fn spawn_one_take(&mut self, id: String, open_compose: bool, cx: &mut Context<Self>) {
+        if self.media_blocks_card_click() {
+            return;
+        }
         self.takes_halted = false;
         termy_x::trends_desk::resume_takes();
         let Some(post) = self
@@ -768,18 +772,20 @@ impl TrendsDesk {
         );
         let provider = TakeProvider::parse(&self.settings.take_provider);
         let config = self.config.clone();
-        let current = self
-            .card_replies
-            .get(&id)
-            .cloned()
-            .unwrap_or(ReplyPhase::Idle);
+        let tone = termy_x::trends_desk::panel_tone_name(termy_x::trends_desk::TakeTone::parse(
+            &self.pack.tone,
+        ))
+        .to_string();
+        if open_compose {
+            self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
+        }
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let http = termy_x::io::UreqHttp::default();
                     let drafted = termy_x::trends_desk::run_take_chain(
-                        provider, &config, &post, &http, "Reply",
+                        provider, &config, &post, &http, &tone,
                     );
                     if open_compose && !drafted.text.trim().is_empty() {
                         let _ = termy_x::trends_desk::queue_reply(
@@ -794,16 +800,37 @@ impl TrendsDesk {
             let _ = this.update(cx, |desk, cx| {
                 desk.takes.insert(id.clone(), result.clone());
                 if open_compose {
-                    desk.card_replies
-                        .insert(id.clone(), edit_reply(&current, result.text.clone()));
-                    desk.draft_note = result.note.clone();
-                    desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(result.text.len());
-                    let mut editor = open_editor(&id, &result.text, provider);
-                    if !result.variants.is_empty() {
-                        editor.variants =
-                            termy_x::trends_desk::distinct_variants(&result.text, &result.variants);
+                    let current = if desk
+                        .popout
+                        .as_ref()
+                        .is_some_and(|pop| pop.open && pop.card_id == id)
+                    {
+                        desk.popout
+                            .as_ref()
+                            .map(|pop| pop.draft.clone())
+                            .unwrap_or_default()
+                    } else {
+                        desk.card_replies
+                            .get(&id)
+                            .map(|phase| phase.text().to_string())
+                            .unwrap_or_default()
+                    };
+                    let next = termy_x::trends_desk::fill_reply_if_waiting(&current, &result.text);
+                    if let Some(pop) = desk
+                        .popout
+                        .as_mut()
+                        .filter(|pop| pop.open && pop.card_id == id)
+                    {
+                        pop.draft = next.clone();
+                        if !result.variants.is_empty() {
+                            pop.variants =
+                                termy_x::trends_desk::distinct_variants(&next, &result.variants);
+                        }
+                        desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
                     }
-                    desk.popout = Some(editor);
+                    desk.card_replies
+                        .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next));
+                    desk.draft_note = result.note.clone();
                     desk.selected = Some(format!("take:{id}"));
                 }
                 cx.notify();
@@ -1275,9 +1302,6 @@ impl Render for TrendsDesk {
                         Surface::Draft => self.draft_view(cx),
                         Surface::Settings => self.settings_view(cx),
                     });
-                    if self.popout.as_ref().is_some_and(|pop| pop.open) {
-                        body = body.child(self.reply_popout(cx));
-                    }
                     body
                 })
                 .child(self.footer());
