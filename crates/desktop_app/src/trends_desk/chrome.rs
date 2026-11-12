@@ -376,7 +376,10 @@ impl TrendsDesk {
                 let (base, model) = self.config.ai_endpoint();
                 div()
                     .text_size(px(12.0))
-                    .child(format!("Free model: {model} @ {base}"))
+                    .whitespace_normal()
+                    .child(format!(
+                        "Takes start at Vyce · glm-5.3-flash. A saved model URL overrides it. Now: {model} @ {base}"
+                    ))
             })
             .child(self.field_chip(
                 "desk-ai-base",

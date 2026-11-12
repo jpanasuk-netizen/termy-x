@@ -851,6 +851,9 @@ impl TrendsDesk {
                     desk.card_replies
                         .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next));
                     desk.draft_note = result.note.clone();
+                    if !result.note.is_empty() {
+                        desk.action_note = result.note.clone();
+                    }
                     desk.selected = Some(format!("take:{id}"));
                 }
                 cx.notify();

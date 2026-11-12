@@ -235,73 +235,72 @@ pub fn is_termy_x_image(path: &str) -> bool {
         || lower.contains("\\termy x\\")
 }
 
-/// Run Grok and Hermes together. The first real reply wins, so a slow Hermes
-/// failover does not hold up a Grok answer. Hermes uses [`HERMES_TAKE_TIMEOUT`].
-pub fn race_labeled<G, H>(grok: G, hermes: H) -> Result<(&'static str, String), String>
-where
-    G: FnOnce() -> Result<String, String> + Send + 'static,
-    H: FnOnce() -> Result<String, String> + Send + 'static,
-{
-    let (tx, rx) = std::sync::mpsc::channel();
-    let grok_tx = tx.clone();
-    std::thread::spawn(move || {
-        let _ = grok_tx.send(("grok", grok()));
-    });
-    std::thread::spawn(move || {
-        let _ = tx.send(("hermes", hermes()));
-    });
-    let mut failures = Vec::new();
-    let mut left = 2;
-    while left > 0 {
-        match rx.recv() {
-            Ok(("grok", Ok(text))) if good_reply(&text) => return Ok(("grok", text)),
-            Ok(("hermes", Ok(text))) if good_reply(&text) => return Ok(("hermes", text)),
-            Ok((name, Ok(text))) => {
-                failures.push(format!("{name}: {text}"));
-                left -= 1;
-            }
-            Ok((name, Err(error))) => {
-                failures.push(format!("{name}: {error}"));
-                left -= 1;
-            }
-            Err(_) => break,
-        }
-    }
-    Err(failures.join("; "))
-}
-
-fn good_reply(text: &str) -> bool {
-    !super::agents::keep_distinct(&split_rough(text)).is_empty()
+pub fn take_chain_order() -> [&'static str; 4] {
+    ["vyce", "hermes", "grok", "treg"]
 }
 
 pub fn run_take_chain(
-    _preferred: super::TakeProvider,
+    preferred: super::TakeProvider,
     config: &crate::config::XConfig,
     post: &super::SourcePost,
     http: &dyn crate::io::Http,
     tone: &str,
 ) -> super::TakeDraft {
+    let _ = preferred;
+    run_take_chain_with(
+        config,
+        post,
+        http,
+        tone,
+        &read_hermes_env(),
+        &read_hermes_yaml(),
+    )
+}
+
+pub fn run_take_chain_with(
+    config: &crate::config::XConfig,
+    post: &super::SourcePost,
+    http: &dyn crate::io::Http,
+    tone: &str,
+    env_text: &str,
+    yaml_text: &str,
+) -> super::TakeDraft {
     let mut reasons = Vec::new();
-    let config_h = config.clone();
-    let post_g = post.clone();
-    let post_h = post.clone();
-    let tone_g = tone.to_string();
-    let tone_h = tone.to_string();
-    match race_labeled(
-        move || grok_cli(&post_g, &tone_g),
-        move || hermes_raced(&config_h, &post_h, &tone_h),
-    ) {
-        Ok((name, text)) => return draft_from_provider(name, &text),
-        Err(error) => reasons.push(error),
+    let auth = super::agents::vyce_auth(
+        &config.ai_base_url,
+        &config.ai_model,
+        &config.ai_api_key,
+        env_text,
+        yaml_text,
+    );
+    let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
+    match super::agents::vyce_complete(&auth, http, &prompt) {
+        Ok(text) => return labeled_take("vyce", super::agents::VYCE_LABEL, &text, &reasons),
+        Err(error) => reasons.push(format!("Vyce · {error}")),
     }
-    for provider in [super::TakeProvider::Treg, super::TakeProvider::Free] {
+    match hermes_raced(config, post, tone, http) {
+        Ok(text) => {
+            let model = if config.hermes_model.trim().is_empty() {
+                super::agents::HERMES_MODEL
+            } else {
+                config.hermes_model.trim()
+            };
+            return labeled_take("hermes", &format!("Hermes · {model}"), &text, &reasons);
+        }
+        Err(error) => reasons.push(format!("Hermes · {error}")),
+    }
+    match grok_cli(post, tone) {
+        Ok(text) => return labeled_take("grok", "Grok", &text, &reasons),
+        Err(error) => reasons.push(format!("Grok · {error}")),
+    }
+    for provider in [super::TakeProvider::Treg] {
         match super::cards::draft_take(provider, config, post, http) {
             Ok(draft)
                 if !draft.text.trim().is_empty()
                     && !is_provider_failure(&draft.text)
                     && !is_provider_failure(&draft.note) =>
             {
-                return draft;
+                return labeled_take("treg", "Treg", &draft.text, &reasons);
             }
             Ok(draft) => {
                 let why = if draft.note.is_empty() {
@@ -326,9 +325,9 @@ fn hermes_raced(
     config: &crate::config::XConfig,
     post: &super::SourcePost,
     tone: &str,
+    http: &dyn crate::io::Http,
 ) -> Result<String, String> {
-    let http = crate::io::UreqHttp::with_timeout(HERMES_TAKE_TIMEOUT);
-    let draft = super::cards::hermes_take_toned(config, &http, post, tone);
+    let draft = super::cards::hermes_take_toned(config, http, post, tone);
     if draft.text.trim().is_empty()
         || is_provider_failure(&draft.text)
         || is_provider_failure(&draft.note)
@@ -343,14 +342,52 @@ fn hermes_raced(
     }
 }
 
-fn draft_from_provider(name: &str, text: &str) -> super::TakeDraft {
+fn labeled_take(
+    source: &'static str,
+    label: &str,
+    text: &str,
+    earlier: &[String],
+) -> super::TakeDraft {
     let lines = super::agents::keep_distinct(&split_rough(text));
+    let note = if earlier.is_empty() {
+        label.to_string()
+    } else {
+        format!("{}. {label}", earlier.join(". "))
+    };
     super::TakeDraft {
         text: lines.first().cloned().unwrap_or_default(),
-        source: if name == "grok" { "grok" } else { "hermes" },
-        note: format!("{name} draft. Not posted."),
+        source,
+        note,
         variants: lines,
     }
+}
+
+fn read_hermes_env() -> String {
+    let Some(root) = std::env::var_os("LOCALAPPDATA") else {
+        return String::new();
+    };
+    std::fs::read_to_string(std::path::PathBuf::from(root).join("hermes").join(".env"))
+        .unwrap_or_default()
+}
+
+fn read_hermes_yaml() -> String {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        paths.push(std::path::PathBuf::from(r"D:\hermes\config.yaml"));
+    }
+    if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+        paths.push(
+            std::path::PathBuf::from(root)
+                .join("hermes")
+                .join("config.yaml"),
+        );
+    }
+    for path in paths {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            return text;
+        }
+    }
+    String::new()
 }
 
 thread_local! {
@@ -640,25 +677,9 @@ mod tests {
     }
 
     #[test]
-    fn grok_wins_when_it_answers_before_a_slow_hermes() {
+    fn the_take_chain_tries_vyce_before_hermes_grok_and_treg() {
+        assert_eq!(take_chain_order(), ["vyce", "hermes", "grok", "treg"]);
         assert!(HERMES_TAKE_TIMEOUT >= std::time::Duration::from_secs(60));
-        assert_eq!(HERMES_TAKE_TIMEOUT, std::time::Duration::from_secs(90));
-        let started = std::time::Instant::now();
-        let (winner, text) = race_labeled(
-            || Ok("Grok one\n---\nGrok two\n---\nGrok three".into()),
-            || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                Ok("Hermes late reply".into())
-            },
-        )
-        .unwrap();
-        assert_eq!(winner, "grok");
-        assert!(text.contains("Grok one"));
-        assert!(
-            started.elapsed() < std::time::Duration::from_millis(300),
-            "Hermes blocked the chain for {:?}",
-            started.elapsed()
-        );
     }
 
     #[test]
@@ -683,6 +704,55 @@ mod tests {
         assert_eq!(fallback.len(), 1);
         assert!(!fallback[0].is_empty());
         assert!(error.contains("Spicy"));
+    }
+
+    #[test]
+    fn vyce_503_falls_through_to_hermes_and_the_key_stays_out() {
+        assert_eq!(take_chain_order(), ["vyce", "hermes", "grok", "treg"]);
+        let post = super::super::domain::SourcePost::from_value(&serde_json::json!({
+            "id": "9",
+            "author": "ada",
+            "text": "the court posted a model draft",
+            "url": "https://x.com/ada/status/9"
+        }))
+        .unwrap();
+        let config = crate::config::XConfig {
+            ai_base_url: "https://vyce.test/v1".into(),
+            ai_model: "glm-5.3-flash".into(),
+            ai_api_key: "vyce-secret-key".into(),
+            ai_explicit: true,
+            hermes_base_url: "http://hermes.test/v1".into(),
+            hermes_model: "hermes-agent".into(),
+            hermes_api_key: "hermes-secret".into(),
+            ..crate::config::XConfig::default()
+        };
+        struct RouteHttp;
+        impl crate::io::Http for RouteHttp {
+            fn request(&self, request: crate::io::HttpRequest) -> Result<String, String> {
+                if request.url.contains("vyce.test") {
+                    assert_eq!(request.bearer.as_deref(), Some("vyce-secret-key"));
+                    let body = request.body.unwrap_or_default();
+                    assert!(body.contains("glm-5.3-flash"));
+                    assert!(!body.contains("vyce-secret-key"));
+                    return Err("503 Service Unavailable".into());
+                }
+                if request.url.contains("hermes.test") {
+                    return Ok(
+                        r#"{"choices":[{"message":{"content":"Hermes one\n---\nHermes two\n---\nHermes three"}}]}"#
+                            .into(),
+                    );
+                }
+                Err(format!("unexpected {}", request.url))
+            }
+        }
+        let http = RouteHttp;
+        let draft = run_take_chain_with(&config, &post, &http, "Funny", "", "");
+        assert_eq!(draft.source, "hermes");
+        assert!(draft.text.contains("Hermes"));
+        assert!(draft.note.contains("503"));
+        assert!(draft.note.contains("Hermes · hermes-agent"));
+        assert!(!draft.note.contains("vyce-secret-key"));
+        assert!(!draft.note.contains("hermes-secret"));
     }
 }
 

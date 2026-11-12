@@ -11,7 +11,8 @@ use crate::io::{Http, HttpRequest};
 pub const HERMES_BASE: &str = "http://127.0.0.1:8642/v1";
 pub const HERMES_MODEL: &str = "hermes-agent";
 pub const HERMES_HEALTH_PATH: &str = "/health";
-const VYCE_MODEL: &str = "glm-5.3-flash";
+pub const VYCE_MODEL: &str = "glm-5.3-flash";
+pub const VYCE_LABEL: &str = "Vyce · glm-5.3-flash";
 
 /// Command line used when Termy XL's x.toml does not set one.
 /// Hermes is the Windows-native CLI, not `wsl.exe`.
@@ -515,6 +516,162 @@ pub fn hermes_body(model: &str, prompt: &str) -> String {
         body["model"] = serde_json::json!(model);
     }
     body.to_string()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VyceAuth {
+    pub base: String,
+    pub model: String,
+    pub key: String,
+}
+
+fn env_value(text: &str, name: &str) -> Option<String> {
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != name {
+            continue;
+        }
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn yaml_value_in_vyce(text: &str, names: &[&str]) -> Option<String> {
+    let mut in_block = false;
+    let mut block_indent = 0usize;
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let indent = raw.chars().take_while(|ch| *ch == ' ').count();
+        if !in_block {
+            if trimmed == "vyce:"
+                || trimmed.starts_with("vyce:")
+                || trimmed == "name: vyce"
+                || trimmed == "provider: vyce"
+            {
+                in_block = true;
+                block_indent = indent;
+            }
+            continue;
+        }
+        if indent <= block_indent {
+            in_block = false;
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        if value.is_empty() || !names.contains(&key) {
+            continue;
+        }
+        return Some(value.to_string());
+    }
+    None
+}
+
+fn first_filled(values: &[Option<&str>]) -> String {
+    values
+        .iter()
+        .copied()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// XL settings win, then the Hermes `.env`, then `config.yaml` provider entries.
+pub fn vyce_auth(
+    override_base: &str,
+    override_model: &str,
+    override_key: &str,
+    env_text: &str,
+    yaml_text: &str,
+) -> VyceAuth {
+    let env_base =
+        env_value(env_text, "VYCE_BASE_URL").or_else(|| env_value(env_text, "VYCE_API_BASE"));
+    let env_key = env_value(env_text, "VYCE_API_KEY").or_else(|| env_value(env_text, "VYCE_KEY"));
+    let env_model = env_value(env_text, "VYCE_MODEL");
+    let yaml_base = yaml_value_in_vyce(yaml_text, &["base_url", "api_base", "base", "url"]);
+    let yaml_key = yaml_value_in_vyce(yaml_text, &["api_key", "key", "token"]);
+    let yaml_model = yaml_value_in_vyce(yaml_text, &["model"]);
+    let model = first_filled(&[
+        Some(override_model),
+        env_model.as_deref(),
+        yaml_model.as_deref(),
+    ]);
+    VyceAuth {
+        base: first_filled(&[
+            Some(override_base),
+            env_base.as_deref(),
+            yaml_base.as_deref(),
+        ])
+        .trim_end_matches('/')
+        .to_string(),
+        model: if model.is_empty() {
+            VYCE_MODEL.to_string()
+        } else {
+            model
+        },
+        key: first_filled(&[Some(override_key), env_key.as_deref(), yaml_key.as_deref()]),
+    }
+}
+
+/// Direct OpenAI-compatible chat call. The key is a header, never part of the body.
+pub fn vyce_request(auth: &VyceAuth, prompt: &str) -> Result<HttpRequest, String> {
+    if auth.base.trim().is_empty() {
+        return Err("Vyce base URL is missing".into());
+    }
+    if auth.key.trim().is_empty() {
+        return Err("Vyce key is missing".into());
+    }
+    let body = serde_json::json!({
+        "model": auth.model,
+        "temperature": 1.0,
+        "messages": [
+            {"role": "system", "content": "You draft X replies. You never post."},
+            {"role": "user", "content": prompt}
+        ]
+    })
+    .to_string();
+    Ok(HttpRequest {
+        method: "POST",
+        url: format!("{}/chat/completions", auth.base.trim_end_matches('/')),
+        body: Some(body),
+        bearer: Some(auth.key.clone()),
+        content_type: Some("application/json".into()),
+        headers: Vec::new(),
+    })
+}
+
+pub fn vyce_complete(auth: &VyceAuth, http: &dyn Http, prompt: &str) -> Result<String, String> {
+    let request = vyce_request(auth, prompt)?;
+    let secret = auth.key.clone();
+    match http.request(request) {
+        Ok(body) => {
+            let lower = body.to_lowercase();
+            if !lower.contains("\"choices\"")
+                && (lower.contains("503") || lower.contains("\"error\""))
+            {
+                return Err(redact_secret(&one_line(&body), &secret));
+            }
+            parse_chat_text(&body).map_err(|error| redact_secret(&error, &secret))
+        }
+        Err(error) => Err(redact_secret(&error, &secret)),
+    }
 }
 
 pub fn plan_hermes_draft(auth: &HermesAuth, prompt: &str) -> Result<HttpRequest, String> {
@@ -1093,5 +1250,40 @@ mod tests {
         let empty = plan_hermes_draft(&hermes_auth("", "", "", ""), "hi").unwrap_err();
         assert!(empty.contains("Hermes key is missing"));
         assert!(!empty.contains("env-key"));
+    }
+
+    #[test]
+    fn vyce_request_is_a_direct_chat_call_and_settings_override_the_hermes_files() {
+        let env = "VYCE_BASE_URL=https://env.example/v1\nVYCE_API_KEY=env-secret\n";
+        let yaml = "providers:\n  vyce:\n    base_url: https://yaml.example/v1\n    api_key: yaml-secret\n    model: other-model\n";
+        let from_files = vyce_auth("", "", "", env, yaml);
+        assert_eq!(from_files.base, "https://env.example/v1");
+        assert_eq!(from_files.key, "env-secret");
+        assert_eq!(from_files.model, "other-model");
+        let from_yaml = vyce_auth("", "", "", "", yaml);
+        assert_eq!(from_yaml.base, "https://yaml.example/v1");
+        assert_eq!(from_yaml.key, "yaml-secret");
+        assert_eq!(from_yaml.model, "other-model");
+        let overridden = vyce_auth(
+            "https://settings.example/v1",
+            "glm-5.3-flash",
+            "settings-secret",
+            env,
+            yaml,
+        );
+        assert_eq!(overridden.base, "https://settings.example/v1");
+        assert_eq!(overridden.key, "settings-secret");
+        let request = vyce_request(&overridden, "say something funny").unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, "https://settings.example/v1/chat/completions");
+        assert_eq!(request.bearer.as_deref(), Some("settings-secret"));
+        let body = request.body.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], VYCE_MODEL);
+        assert!(parsed.get("provider").is_none());
+        assert_eq!(parsed["messages"][1]["content"], "say something funny");
+        assert!(!body.contains("settings-secret"));
+        let leaked = redact_secret("503 settings-secret", "settings-secret");
+        assert!(!leaked.contains("settings-secret"));
     }
 }
