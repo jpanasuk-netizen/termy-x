@@ -797,29 +797,32 @@ pub fn parse_reg_sz(output: &str) -> Option<String> {
 }
 
 pub fn take_log_line(provider: &str, status: &str) -> String {
-    let status = status
-        .split_whitespace()
-        .take(8)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let status = super::retry::flatten_error(status);
     format!("INFO take: {provider} {status}")
 }
 
 pub fn vyce_complete(auth: &VyceAuth, http: &dyn Http, prompt: &str) -> Result<String, String> {
-    let request = vyce_request(auth, prompt)?;
     let secret = auth.key.clone();
-    match http.request(request) {
-        Ok(body) => {
-            let lower = body.to_lowercase();
-            if !lower.contains("\"choices\"")
-                && (lower.contains("503") || lower.contains("\"error\""))
-            {
-                return Err(redact_secret(&one_line(&body), &secret));
-            }
-            parse_chat_text(&body).map_err(|error| redact_secret(&error, &secret))
-        }
-        Err(error) => Err(redact_secret(&error, &secret)),
+    super::retry::retry_result(|| match vyce_request(auth, prompt) {
+        Err(error) => Err(error),
+        Ok(request) => match http.request(request) {
+            Ok(body) => chat_or_provider_error(&body, &secret),
+            Err(error) => Err(redact_secret(&error, &secret)),
+        },
+    })
+}
+
+fn chat_or_provider_error(body: &str, secret: &str) -> Result<String, String> {
+    let lower = body.to_lowercase();
+    if !lower.contains("\"choices\"")
+        && (lower.contains("503")
+            || lower.contains("429")
+            || lower.contains("service_unavailable")
+            || lower.contains("\"error\""))
+    {
+        return Err(redact_secret(&one_line(body), secret));
     }
+    parse_chat_text(body).map_err(|error| redact_secret(&error, secret))
 }
 
 pub fn plan_hermes_draft(auth: &HermesAuth, prompt: &str) -> Result<HttpRequest, String> {
@@ -896,18 +899,20 @@ pub fn draft_hermes_variants(
 ) -> (Vec<String>, String) {
     let n = n.clamp(1, 3);
     let prompt = reply_prompt(author, tweet, tone);
-    let result = match plan_hermes_draft(auth, &prompt) {
-        Ok(request) => {
-            let secret = auth.key.clone();
-            match http.request(request) {
-                Ok(body) => parse_chat_text(&body).map_err(|error| redact_secret(&error, &secret)),
-                Err(error) => Err(redact_secret(&error, &secret)),
-            }
-        }
+    let secret = auth.key.clone();
+    let result = super::retry::retry_result(|| match plan_hermes_draft(auth, &prompt) {
+        Ok(request) => match http.request(request) {
+            Ok(body) => chat_or_provider_error(&body, &secret),
+            Err(error) => Err(redact_secret(&error, &secret)),
+        },
         Err(error) => Err(error),
-    };
+    });
     let (mut lines, mut note) = variants_from_draft(tweet, result);
-    if lines.len() < n && !note.contains("401") && !note.contains("402") {
+    if lines.len() < n
+        && !note.contains("401")
+        && !note.contains("402")
+        && !super::retry::is_retryable(&note)
+    {
         let second = match plan_hermes_draft(auth, &prompt) {
             Ok(request) => match http.request(request) {
                 Ok(body) => {

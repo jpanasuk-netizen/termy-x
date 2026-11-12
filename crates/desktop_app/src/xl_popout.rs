@@ -175,6 +175,14 @@ impl TrendsDesk {
                 |this, cx| this.choose_provider("vyce", cx),
             ));
         }
+        if status.contains("pick another provider") {
+            box_el = box_el.child(box_button("desk-switch-grok", "Grok", cx, |this, cx| {
+                this.choose_provider("grok", cx);
+            }));
+            box_el = box_el.child(box_button("desk-switch-muse", "Muse", cx, |this, cx| {
+                this.choose_provider("muse", cx);
+            }));
+        }
         let copy_label = if self.action_note == termy_x::trends_desk::copied_mark() {
             termy_x::trends_desk::copied_mark()
         } else {
@@ -753,19 +761,45 @@ impl TrendsDesk {
             self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
         }
         cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let limit =
-                        if provider == TakeProvider::Hermes || provider == TakeProvider::Grok {
-                            termy_x::trends_desk::HERMES_TAKE_TIMEOUT
-                        } else {
-                            termy_x::trends_desk::TAKE_TIMEOUT
+            let (note_tx, note_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _guard = termy_x::trends_desk::bind_retry_notice(Some(note_tx));
+                let limit = if provider == TakeProvider::Hermes || provider == TakeProvider::Grok {
+                    termy_x::trends_desk::HERMES_TAKE_TIMEOUT
+                } else {
+                    termy_x::trends_desk::TAKE_TIMEOUT
+                };
+                let http = termy_x::io::UreqHttp::with_timeout(limit);
+                let result =
+                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone);
+                let _ = done_tx.send(result);
+                drop(_guard);
+            });
+            let result = loop {
+                match done_rx.try_recv() {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break TakeDraft {
+                            text: String::new(),
+                            source: "offline",
+                            note: "take stopped".into(),
+                            variants: Vec::new(),
                         };
-                    let http = termy_x::io::UreqHttp::with_timeout(limit);
-                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
-                })
-                .await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        while let Ok(msg) = note_rx.try_recv() {
+                            let _ = this.update(cx, |desk, cx| {
+                                desk.action_note = msg;
+                                cx.notify();
+                            });
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                }
+            };
             let _ = this.update(cx, |desk, cx| {
                 desk.takes.insert(id.clone(), result.clone());
                 let status = if result.text.trim().is_empty() {
@@ -1052,7 +1086,7 @@ fn probe_cli(program: &str) -> Result<String, String> {
     command.args(termy_x::trends_desk::probe_cli_args(program));
     termy_x::trends_desk::apply_hidden_command(&mut command);
     let _ = command.stdin(std::process::Stdio::null());
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return Err(format!("{program} not found ({error})")),
     };

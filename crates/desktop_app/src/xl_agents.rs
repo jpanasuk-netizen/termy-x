@@ -230,20 +230,50 @@ impl TrendsDesk {
         self.model_notice = format!("Drafting with {}…", provider.as_str());
         let draft_tone = tone.clone();
         cx.spawn(async move |this, cx| {
-            let draft = cx
-                .background_executor()
-                .spawn(async move {
-                    let http =
-                        termy_x::io::UreqHttp::with_timeout(termy_x::trends_desk::TAKE_TIMEOUT);
-                    termy_x::trends_desk::run_take_chain(
-                        provider,
-                        &config,
-                        &post,
-                        &http,
-                        &draft_tone,
-                    )
-                })
-                .await;
+            let (note_tx, note_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _guard = termy_x::trends_desk::bind_retry_notice(Some(note_tx));
+                let limit = if provider == TakeProvider::Hermes || provider == TakeProvider::Grok {
+                    termy_x::trends_desk::HERMES_TAKE_TIMEOUT
+                } else {
+                    termy_x::trends_desk::TAKE_TIMEOUT
+                };
+                let http = termy_x::io::UreqHttp::with_timeout(limit);
+                let draft = termy_x::trends_desk::run_take_chain(
+                    provider,
+                    &config,
+                    &post,
+                    &http,
+                    &draft_tone,
+                );
+                let _ = done_tx.send(draft);
+                drop(_guard);
+            });
+            let draft = loop {
+                match done_rx.try_recv() {
+                    Ok(draft) => break draft,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break termy_x::trends_desk::TakeDraft {
+                            text: String::new(),
+                            source: "offline",
+                            note: "take stopped".into(),
+                            variants: Vec::new(),
+                        };
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        while let Ok(msg) = note_rx.try_recv() {
+                            let _ = this.update(cx, |desk, cx| {
+                                desk.action_note = msg;
+                                cx.notify();
+                            });
+                        }
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(150))
+                            .await;
+                    }
+                }
+            };
             let _ = previous;
             let _ = this.update(cx, |desk, cx| {
                 let next = if !draft.text.trim().is_empty() {

@@ -1,13 +1,7 @@
-//! Real takes. A canned template is never shown as a model reply.
-//!
-//! The card chain is Grok, then Hermes, then Treg, then Free. A provider that
-//! errors, returns 402, or returns Hermes's "no reply" fallback is skipped.
-
 use std::path::{Path, PathBuf};
 
 pub const TAKE_CHAIN: [&str; 4] = ["grok", "hermes", "treg", "free"];
 pub const HONEST_PREFIX: &str = "No model available";
-/// Hermes fails over and sends a large system prompt. 90s covers that.
 pub const HERMES_TAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
 
 pub fn is_template_angle(text: &str) -> bool {
@@ -279,6 +273,9 @@ pub fn specific_transport_error(error: &str) -> String {
     if lower.contains("403") || lower.contains("forbidden") {
         return "http 403 forbidden".into();
     }
+    if super::retry::is_retryable(error) {
+        return super::retry::flatten_error(error);
+    }
     if let Some(code) = lower.split("http ").nth(1).and_then(|rest| {
         let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
         if digits.len() == 3 {
@@ -292,15 +289,11 @@ pub fn specific_transport_error(error: &str) -> String {
     if lower.trim() == "network error" || lower.contains("network error") {
         return "connection failed".into();
     }
-    let short = error
-        .split_whitespace()
-        .take(14)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if short.is_empty() {
+    let full = super::retry::flatten_error(error);
+    if full.is_empty() {
         "connection failed".into()
     } else {
-        short
+        full
     }
 }
 
@@ -326,16 +319,21 @@ pub fn probe_cli_args(program: &str) -> Vec<String> {
             "30s".into(),
             "--dangerously-skip-permissions".into(),
         ],
-        "muse" => vec![
-            "exec".into(),
-            "--disable-approval".into(),
-            "--max-model-steps".into(),
-            "1".into(),
-            "--".into(),
-            PROBE_PROMPT.into(),
-        ],
+        "muse" => muse_print_args(PROBE_PROMPT),
         _ => grok_print_args(PROBE_PROMPT),
     }
+}
+
+/// Muse Code 1.4 headless mode. `muse` with no subcommand is the TUI.
+pub fn muse_print_args(prompt: &str) -> Vec<String> {
+    vec![
+        "exec".into(),
+        "--disable-approval".into(),
+        "--max-model-steps".into(),
+        "1".into(),
+        "--".into(),
+        prompt.to_string(),
+    ]
 }
 
 pub fn grok_print_args(prompt: &str) -> Vec<String> {
@@ -658,13 +656,7 @@ fn hermes_vyce_take(
     }
     match hermes_raced(&config, post, tone, http) {
         Ok(text) => labeled_take("hermes", super::agents::HERMES_VYCE_LABEL, &text, &[]),
-        Err(error) => failed_take(
-            "hermes",
-            &format!(
-                "Hermes · {}. Vyce direct is one click away.",
-                specific_transport_error(&error)
-            ),
-        ),
+        Err(error) => failed_take("hermes", &super::retry::hermes_failure_note(&error)),
     }
 }
 
@@ -690,7 +682,7 @@ fn vyce_direct_take(
         Ok(text) => labeled_take("vyce", &label, &text, &[]),
         Err(error) => failed_take(
             "vyce",
-            &format!("Vyce · {}", specific_transport_error(&error)),
+            &super::retry::provider_failure_note("Vyce", &auth.model, &error),
         ),
     }
 }
@@ -729,7 +721,10 @@ fn custom_take(
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
     match super::agents::vyce_complete(&auth, http, &prompt) {
         Ok(text) => labeled_take("custom", &format!("Custom · {model}"), &text, &[]),
-        Err(error) => failed_take("custom", &format!("Custom · {error}")),
+        Err(error) => failed_take(
+            "custom",
+            &super::retry::provider_failure_note("Custom", &model, &error),
+        ),
     }
 }
 
@@ -802,20 +797,18 @@ pub fn hidden_agent_draft(
         return agy_headless(program, &prompt);
     }
     let mut command = std::process::Command::new(program);
+    command.args(muse_print_args(&prompt));
     apply_hidden_command(&mut command);
-    let Ok(mut child) = command.spawn() else {
+    let _ = command.stdin(std::process::Stdio::null());
+    let Ok(child) = command.spawn() else {
         return Err(format!("{label} CLI was not found. Nothing was drafted."));
     };
     let pid = child.id();
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(prompt.as_bytes());
-    }
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(child.wait_with_output());
     });
-    if let Ok(Ok(output)) = rx.recv_timeout(TAKE_TIMEOUT) {
+    if let Ok(Ok(output)) = rx.recv_timeout(HERMES_TAKE_TIMEOUT) {
         let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if text.is_empty() {
             let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -836,7 +829,7 @@ pub fn hidden_agent_draft(
     } else {
         kill_pid(pid);
         Err(format!(
-            "{label} did not return text within 45s. Its CLI stays interactive, so this draft was not written."
+            "{label} did not return text within 90s. Nothing was drafted."
         ))
     }
 }
@@ -1300,7 +1293,10 @@ mod tests {
                 assert!(body.contains("hermes-agent"));
                 assert!(!body.contains("glm-5.3-flash"));
                 assert!(!body.contains("hermes-secret"));
-                Err("503 Service Unavailable".into())
+                Err(
+                    r#"http 503: {"error":{"message":"This model is currently unavailable. Please try again later.","code":"service_unavailable"}}"#
+                        .into(),
+                )
             }
         }
         let down = run_take_chain_with(
@@ -1317,9 +1313,15 @@ mod tests {
             },
         );
         assert!(down.text.is_empty());
-        assert!(down.note.contains("503"));
-        assert!(down.note.contains("Vyce direct"));
-        assert!(!down.note.to_lowercase().contains("treg"));
+        assert!(
+            down.note
+                .contains("Vyce glm-5.3-flash busy (503), try again or pick another provider")
+        );
+        assert!(
+            down.note
+                .contains("This model is currently unavailable. Please try again later.")
+        );
+        assert!(!down.note.contains("Vyce direct"));
         assert!(!down.note.contains("hermes-secret"));
         let yaml =
             "providers:\n  vyce:\n    api: https://vyceai.com/v1\n    key_env: VYCE_API_KEY\n";
@@ -1418,9 +1420,7 @@ mod tests {
         assert!(grok_probe.iter().any(|arg| arg == "--always-approve"));
         assert!(grok_probe.iter().any(|arg| arg == "--no-alt-screen"));
         assert!(probe_cli_args("agy").iter().any(|arg| arg == "-p"));
-        let muse_probe = probe_cli_args("muse");
-        assert_eq!(muse_probe[0], "exec");
-        assert!(muse_probe.iter().any(|arg| arg == PROBE_PROMPT));
+        assert_eq!(probe_cli_args("muse"), muse_print_args(PROBE_PROMPT));
         assert_eq!(PROBE_TIMEOUT, std::time::Duration::from_secs(30));
         assert_eq!(
             specific_transport_error("401 Invalid gateway API key (API_SERVER_KEY)"),

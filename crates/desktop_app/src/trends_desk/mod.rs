@@ -6,23 +6,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui_kit::{
-    App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowKind,
-    WindowOptions, div, point, px, rgb, size,
+    App, AppContext, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 use termy_x::XConfig;
 use termy_x::io::SystemRunner;
 use termy_x::trends_desk::{
-    COMPANION_HEIGHT, COMPANION_WIDTH, ChangeTag, ColumnView, DOCK_WIDTH, DeskFrame, DeskSettings,
-    DeskStore, EditPopout, GPU_NOTE, IMAGE_QUOTE_NOTE, InspectedPost, Nav, OpenCliDesk,
-    OutcomeKind, Phase, ReplyPhase, RunOutcome, SessionState, SessionStatus, Surface, TakeDraft,
-    TakeProvider, Topic, VISIBLE_NAME, WINDOW_PAD, apply_send_result, card_columns, card_from_post,
-    close_editor, column_count_for_width, column_from_cache, column_from_outcome,
-    column_loading_keep, daily_due, draft_take, drafts_file, edit_reply, editor_send, filter_posts,
-    fixture_column, frame_from_parts, isolated_opencli_config, layout_takes, move_selection,
-    offline_take, open_editor, page_label, post_reply_opencli, prepare_draft_file, request_send,
-    scroll_by, surface_after_nav, synthetic_fixture_posts, termy_xl_data_root, turn_page,
-    within_termy_x_config, wrap_token,
+    ChangeTag, ColumnView, DOCK_WIDTH, DeskFrame, DeskSettings, DeskStore, EditPopout, GPU_NOTE,
+    InspectedPost, Nav, OpenCliDesk, OutcomeKind, Phase, ReplyPhase, RunOutcome, SessionState,
+    SessionStatus, Surface, TakeProvider, Topic, VISIBLE_NAME, close_editor,
+    column_count_for_width, column_from_cache, column_from_outcome, column_loading_keep, daily_due,
+    drafts_file, edit_reply, editor_send, filter_posts, fixture_column, frame_from_parts,
+    isolated_opencli_config, open_editor, prepare_draft_file, surface_after_nav,
+    synthetic_fixture_posts, termy_xl_data_root, within_termy_x_config,
 };
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -61,7 +57,7 @@ pub struct TrendsDesk {
     pub(crate) search_focus: FocusHandle,
     pub(crate) options: DeskOptions,
     pub(crate) data_root: PathBuf,
-    config: XConfig,
+    pub(crate) config: XConfig,
     pub(crate) store: DeskStore,
     pub(crate) writable: bool,
     pub(crate) settings: DeskSettings,
@@ -89,7 +85,7 @@ pub struct TrendsDesk {
     pub(crate) free_halted: bool,
     pub(crate) draft_text: String,
     draft_reply_to: Option<String>,
-    draft_note: String,
+    pub(crate) draft_note: String,
     replies: Vec<InspectedPost>,
     reply_note: String,
     history: Vec<termy_x::trends_desk::StoredReport>,
@@ -655,7 +651,6 @@ impl TrendsDesk {
     }
 
     fn popout_key(&mut self, key: &str, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        use termy_x::draft_edit::Motion;
         if self.agent_input {
             if key == "escape" {
                 self.agent_input = false;

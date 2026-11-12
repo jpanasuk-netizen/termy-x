@@ -15,6 +15,7 @@ mod log;
 mod media;
 mod pack;
 mod parse;
+mod retry;
 mod snap;
 mod store;
 mod takes;
@@ -90,6 +91,10 @@ pub use pack::{
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
+};
+pub use retry::{
+    RETRY_BACKOFF, VYCE_RETRYING, bind_retry_notice, flatten_error, is_retryable, retry_result,
+    vyce_busy_line,
 };
 pub use snap::{
     SeenWindow, Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, attach_plan,
