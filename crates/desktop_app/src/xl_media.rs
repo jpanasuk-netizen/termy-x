@@ -121,7 +121,7 @@ impl TrendsDesk {
                 tile_el = tile_el.child(
                     div()
                         .w(px(tile.w))
-                        .h(px(tile.h.max(48.0).min(72.0)))
+                        .h(px(tile.h.clamp(48.0, 72.0)))
                         .flex()
                         .items_center()
                         .justify_center()
