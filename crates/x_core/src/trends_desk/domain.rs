@@ -17,7 +17,7 @@ pub const QUERY_LIMIT: usize = 180;
 pub const VISIBLE_NAME: &str = "Termy XL";
 
 pub const GPU_NOTE: &str = "The Termy XL window is drawn with Termy's GPU renderer. An OpenCLI search still waits on the network and the browser bridge; the GPU does not make that search faster.";
-pub const IMAGE_QUOTE_NOTE: &str = "Image-only quote posts are not shown. Open the status link; photos and video stay in the X panel.";
+pub const IMAGE_QUOTE_NOTE: &str = "Photos, GIFs, and video on a card, including a quoted tweet, open in Termy. A broken image stays a small placeholder.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourcePost {
@@ -36,6 +36,10 @@ pub struct SourcePost {
     pub author_name: String,
     #[serde(default)]
     pub media: Vec<String>,
+    #[serde(default)]
+    pub media_items: Vec<crate::model::MediaItem>,
+    #[serde(default)]
+    pub quoted: Option<super::media::QuotedTweet>,
     #[serde(default)]
     pub verified: bool,
     #[serde(default)]
@@ -91,6 +95,8 @@ impl SourcePost {
             replies: metric(value, &["replies", "reply_count"]),
             author_name: display_name_of(value),
             media: media_urls_of(value),
+            media_items: super::media::items_from_post(value),
+            quoted: super::media::quoted_from_post(value),
             verified: value
                 .get("verified")
                 .and_then(Value::as_bool)

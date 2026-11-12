@@ -11,6 +11,7 @@ mod domain;
 mod fetch;
 mod lifecycle;
 mod log;
+mod media;
 mod pack;
 mod parse;
 mod snap;
@@ -59,6 +60,10 @@ pub use lifecycle::{
 };
 pub use log::{
     append_desk_log, install_panic_log, panic_log_line, redact_log, should_log_model_failure,
+};
+pub use media::{
+    QuotedTweet, TileBox, cache_name, cached_file, grid_inside, items_from_post, media_cache_dir,
+    play_badge, preview_url, quoted_from_post, read_cached, tile_grid, write_cached,
 };
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, SearchEdit, TakeTone,

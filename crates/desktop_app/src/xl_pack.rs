@@ -622,7 +622,7 @@ impl TrendsDesk {
                                 div()
                                     .w(px(frame.width))
                                     .min_w(px(0.0))
-                                    .child(self.tweet_card(post, column, cx)),
+                                    .child(self.tweet_card(post, column, frame.width, cx)),
                             );
                         }
                         list

@@ -117,6 +117,7 @@ pub struct TrendsDesk {
     pub(crate) close_hooked: bool,
     fitted: bool,
     pub(crate) card_window: usize,
+    pub(crate) media: xl_media::MediaDesk,
 }
 
 impl TrendsDesk {
@@ -254,6 +255,7 @@ impl TrendsDesk {
             close_hooked: false,
             fitted: false,
             card_window: 12,
+            media: xl_media::MediaDesk::default(),
         }
     }
 
@@ -1177,6 +1179,11 @@ impl TrendsDesk {
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
+        if key == "escape" && self.close_media() {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if key == "x" && mods.shift && (mods.control || mods.platform) {
             self.toggle_frame(window, cx);
             cx.stop_propagation();
@@ -1398,20 +1405,6 @@ fn snapped_frame(cx: &App) -> DeskFrame {
     }
 }
 
-fn saved_frame() -> DeskFrame {
-    let root = termy_xl_data_root();
-    let settings = DeskStore::open_isolated(&root)
-        .map(|store| store.load_settings())
-        .unwrap_or_default();
-    frame_from_parts(
-        settings.docked,
-        settings.frame_x as f32,
-        settings.frame_y as f32,
-        settings.expanded_width as f32,
-        settings.frame_height as f32,
-    )
-}
-
 fn desk_window_options(frame: &DeskFrame) -> WindowOptions {
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -1489,6 +1482,9 @@ impl Render for TrendsDesk {
         if self.palette {
             root = root.child(self.palette_view(cx));
         }
+        if let Some(overlay) = self.media_overlay(cx) {
+            root = root.child(overlay);
+        }
         root
     }
 }
@@ -1496,4 +1492,6 @@ impl Render for TrendsDesk {
 mod chrome;
 #[path = "../xl_agents.rs"]
 mod xl_agents;
+#[path = "../xl_media.rs"]
+mod xl_media;
 pub(crate) use chrome::{HintView, button, open_status};

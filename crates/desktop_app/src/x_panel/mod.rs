@@ -5,9 +5,9 @@ pub mod art;
 mod desk;
 mod editor_surface;
 mod list_sort;
-mod media_fit;
-mod player;
-mod preview;
+pub(crate) mod media_fit;
+pub(crate) mod player;
+pub(crate) mod preview;
 mod scroll_math;
 mod thread_view;
 

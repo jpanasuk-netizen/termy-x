@@ -13,6 +13,7 @@ impl TrendsDesk {
         &self,
         post: &termy_x::trends_desk::SourcePost,
         column: &ColumnUi,
+        width: f32,
         cx: &mut Context<Self>,
     ) -> gpui_kit::AnyElement {
         let card = card_from_post(post);
@@ -48,11 +49,6 @@ impl TrendsDesk {
                 )
             })
             .unwrap_or_else(|| "time not provided".into());
-        let media = if card.media.is_empty() {
-            "no media".to_string()
-        } else {
-            card.media.join(" ")
-        };
         let reply_text = wrap_token(phase.text());
         let shown = self.takes.get(&card.id);
         let full_note = shown
@@ -195,13 +191,37 @@ impl TrendsDesk {
                         card.likes, card.reposts, card.replies, card.views
                     )),
             )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .whitespace_normal()
-                    .text_color(rgb(0x8e8e93))
-                    .child(wrap_token(&media)),
+            .children(
+                (!card.media_items.is_empty())
+                    .then(|| self.media_block(&card.media_items, (width - 20.0).max(80.0), cx)),
             )
+            .children(card.quoted.clone().map(|quoted| {
+                let mut quote = div()
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .border_1()
+                    .border_color(rgb(0x3a3a3c))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xc7c7cc))
+                            .child(format!("Quote · @{}", wrap_token(&quoted.author))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .whitespace_normal()
+                            .child(wrap_token(&quoted.text)),
+                    );
+                if !quoted.media.is_empty() {
+                    quote =
+                        quote.child(self.media_block(&quoted.media, (width - 36.0).max(80.0), cx));
+                }
+                quote
+            }))
             .child(
                 div()
                     .text_size(px(12.0))
