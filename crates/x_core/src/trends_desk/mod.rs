@@ -6,6 +6,7 @@
 
 mod agents;
 mod cards;
+mod carousel;
 mod desk_cmd;
 mod domain;
 mod fetch;
@@ -45,6 +46,10 @@ pub use cards::{
     short_take_note, subject_pages, take_column_count, takes_for_posts, text_after_take,
     text_to_post, toggle_dock, tone_variants, turn_page, wrap_token,
 };
+pub use carousel::{
+    Slide, cli_take_prompt, draft_post_label, failure_banner, handle_from_status, indicator,
+    next_providers, run_take_fallback, slide,
+};
 pub use desk_cmd::{
     find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
     topic_by_subject,
@@ -62,6 +67,7 @@ pub use fetch::{
     SessionStatus, engage_opencli, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft,
     prepare_draft_file, refuse_unsafe_cli_name, run_topics, search_args,
 };
+pub use grok_take::bind_grok_stream;
 pub use hermes_draft::{hermes_take, hermes_take_toned};
 pub use lifecycle::{
     DeskSession, EscapeEffect, OffUiRequest, PruneLog, RefreshPress, child_is_gone,
@@ -80,15 +86,16 @@ pub use media::{
 };
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, POSTED_BORDER_PX,
-    PackFile, PostFace, ReplyMark, SearchEdit, TakeTone, apply_filters, card_is_posted,
-    copied_mark, copy_all, copy_entry, delete_draft, desk_key, distinct_variants, flip_variant,
-    format_clock, format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack,
-    local_offset_secs, new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key,
-    panel_tone_name, panel_tones, post_button_text, post_log_line, post_reply_label,
-    posts_on_ctrl_enter, provider_drafts, quote_seed, read_composer, refresh_due,
-    refresh_is_search_only, remember_take, replied_badge, reply_link, reply_receipt, rewrite_draft,
-    save_pack, saved_drafts_label, search_edit, search_label, search_page_name, sends_on_key,
-    should_auto_refresh, sort_by_heat,
+    PackFile, PostFace, ReplyMark, SavedTake, SearchEdit, TakeTone, append_take_draft,
+    apply_filters, card_is_posted, copied_mark, copy_all, copy_entry, delete_draft, desk_key,
+    distinct_variants, flip_variant, format_clock, format_post_time, heat_badge, heat_line,
+    heat_score, hud_line, load_pack, local_offset_secs, new_ids, next_click_reaches,
+    next_refresh_text, next_tone, page_after_key, panel_tone_name, panel_tones, post_button_text,
+    post_log_line, post_reply_label, posts_on_ctrl_enter, provider_drafts, quote_seed,
+    read_composer, refresh_due, refresh_is_search_only, remember_saved_take, remember_take,
+    replied_badge, reply_link, reply_receipt, rewrite_draft, save_pack, saved_drafts_label,
+    search_edit, search_label, search_page_name, sends_on_key, should_auto_refresh, sort_by_heat,
+    status_id,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
@@ -106,8 +113,8 @@ pub use store::{
     within_termy_x_config,
 };
 pub use takes::{
-    CLICK_TO_DRAFT, DeskEvent, HERMES_TAKE_TIMEOUT, HONEST_PREFIX, PROBE_PROMPT, PROBE_TIMEOUT,
-    TAKE_CHAIN, TAKE_TIMEOUT, TakeSources, accept_lines, admit_grok, agent_work_dir,
+    CLICK_TO_DRAFT, DeskEvent, GROK_TAKE_TIMEOUT, HERMES_TAKE_TIMEOUT, HONEST_PREFIX, PROBE_PROMPT,
+    PROBE_TIMEOUT, TAKE_CHAIN, TAKE_TIMEOUT, TakeSources, accept_lines, admit_grok, agent_work_dir,
     agy_credit_error, agy_print_args, agy_print_text, apply_hidden_command, background_grok_spawn,
     base_provider_menu, canonical_provider, chain_order, choose_chain, halt_takes,
     hidden_agent_draft, honest_failure, interactive_command, is_provider_failure,

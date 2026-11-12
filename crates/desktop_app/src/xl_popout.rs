@@ -101,6 +101,9 @@ impl TrendsDesk {
                     }),
             )
             .child(self.provider_dropdown(cx))
+            .child(self.take_carousel(cx))
+            .children((!self.take_banner.is_empty()).then(|| self.failure_banner(cx)))
+            .children((drafting || self.take_generating).then(|| self.cancel_row(cx)))
             .child(
                 div()
                     .id("desk-reply-editor")
@@ -127,7 +130,7 @@ impl TrendsDesk {
                         .size_full(),
                     )
                     .child(if drafting {
-                        drafting_mark()
+                        drafting_mark(self.elapsed_secs())
                     } else {
                         reply_surface(&shown, &caret)
                     })
@@ -349,6 +352,7 @@ impl TrendsDesk {
     }
 
     fn place_reply_cursor(&mut self, x: f32, y: f32, extend: bool) {
+        self.carousel_keys = false;
         let Some(mut editor) = self.reply_edit.clone() else {
             return;
         };
@@ -757,23 +761,43 @@ impl TrendsDesk {
             &self.pack.tone,
         ))
         .to_string();
-        if open_compose {
+        let fallback = self.settings.auto_fallback && provider != TakeProvider::Grok;
+        self.take_epoch = self.take_epoch.wrapping_add(1);
+        let epoch = self.take_epoch;
+        if self.take_started.is_none() {
+            self.take_started = Some(std::time::Instant::now());
+        }
+        if open_compose && !self.more_take {
+            self.load_take_history(&id);
             self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
         }
+        self.more_take = false;
+        let posted = post.clone();
         cx.spawn(async move |this, cx| {
             let (note_tx, note_rx) = std::sync::mpsc::channel();
+            let (part_tx, part_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let tone_done = tone.clone();
             std::thread::spawn(move || {
                 let _guard = termy_x::trends_desk::bind_retry_notice(Some(note_tx));
-                let limit = if provider == TakeProvider::Hermes || provider == TakeProvider::Grok {
+                let _stream = termy_x::trends_desk::bind_grok_stream(Some(part_tx));
+                let limit = if provider == TakeProvider::Grok {
+                    termy_x::trends_desk::GROK_TAKE_TIMEOUT
+                } else if provider == TakeProvider::Hermes {
                     termy_x::trends_desk::HERMES_TAKE_TIMEOUT
                 } else {
                     termy_x::trends_desk::TAKE_TIMEOUT
                 };
                 let http = termy_x::io::UreqHttp::with_timeout(limit);
-                let result =
-                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone);
+                let result = if fallback {
+                    termy_x::trends_desk::run_take_fallback(
+                        provider, &config, &post, &http, &tone, true,
+                    )
+                } else {
+                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                };
                 let _ = done_tx.send(result);
+                drop(_stream);
                 drop(_guard);
             });
             let result = loop {
@@ -794,89 +818,289 @@ impl TrendsDesk {
                                 cx.notify();
                             });
                         }
+                        while let Ok(chunk) = part_rx.try_recv() {
+                            let _ = this.update(cx, |desk, cx| {
+                                desk.stream_take = chunk;
+                                cx.notify();
+                            });
+                        }
+                        let _ = this.update(cx, |_, cx| cx.notify());
                         cx.background_executor()
-                            .timer(std::time::Duration::from_millis(150))
+                            .timer(std::time::Duration::from_millis(200))
                             .await;
                     }
                 }
             };
             let _ = this.update(cx, |desk, cx| {
-                desk.takes.insert(id.clone(), result.clone());
-                let status = if result.text.trim().is_empty() {
-                    result.note.clone()
-                } else {
-                    "ok".into()
-                };
-                termy_x::trends_desk::append_desk_log(
-                    &desk.data_root,
-                    &termy_x::trends_desk::take_log_line(result.source, &status),
-                );
-                if open_compose {
-                    let current = if desk
-                        .popout
-                        .as_ref()
-                        .is_some_and(|pop| pop.open && pop.card_id == id)
-                    {
-                        desk.popout
-                            .as_ref()
-                            .map(|pop| pop.draft.clone())
-                            .unwrap_or_default()
-                    } else {
-                        desk.card_replies
-                            .get(&id)
-                            .map(|phase| phase.text().to_string())
-                            .unwrap_or_default()
-                    };
-                    let next =
-                        termy_x::trends_desk::text_after_take(&current, &result.text, &result.note);
-                    if let Some(pop) = desk
-                        .popout
-                        .as_mut()
-                        .filter(|pop| pop.open && pop.card_id == id)
-                    {
-                        pop.draft = next.clone();
-                        if !result.variants.is_empty() {
-                            pop.variants =
-                                termy_x::trends_desk::distinct_variants(&next, &result.variants);
-                        }
-                        desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
-                        desk.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&next));
-                    }
-                    desk.card_replies
-                        .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next.clone()));
-                    desk.draft_note = result.note.clone();
-                    if !result.note.is_empty() {
-                        desk.action_note = result.note.clone();
-                    }
-                    if !next.trim().is_empty() && next != termy_x::trends_desk::DRAFTING_PLACEHOLDER
-                    {
-                        if let Some(post) = desk
-                            .columns
-                            .iter()
-                            .flat_map(|column| column.view.posts.iter())
-                            .find(|post| post.id == id)
-                        {
-                            let path = termy_x::trends_desk::drafts_file(&desk.data_root);
-                            if let Ok(count) = termy_x::trends_desk::remember_take(
-                                &path, &id, &post.text, &post.url, &next,
-                            ) {
-                                desk.saved_urls.insert(post.url.clone());
-                                desk.draft_count = count;
-                                let saved = termy_x::trends_desk::saved_drafts_label(count);
-                                desk.action_note = if desk.action_note.is_empty() {
-                                    saved
-                                } else {
-                                    format!("{}. {saved}", desk.action_note)
-                                };
-                            }
-                        }
-                    }
-                    desk.selected = Some(format!("take:{id}"));
+                if desk.take_epoch != epoch {
+                    cx.notify();
+                    return;
                 }
+                desk.land_take(&id, &posted, &tone_done, result);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn land_take(
+        &mut self,
+        id: &str,
+        post: &termy_x::trends_desk::SourcePost,
+        tone: &str,
+        result: TakeDraft,
+    ) {
+        self.takes.insert(id.to_string(), result.clone());
+        self.take_generating = false;
+        self.take_started = None;
+        self.stream_take.clear();
+        let status = if result.text.trim().is_empty() {
+            result.note.clone()
+        } else {
+            "ok".into()
+        };
+        termy_x::trends_desk::append_desk_log(
+            &self.data_root,
+            &termy_x::trends_desk::take_log_line(result.source, &status),
+        );
+        let next = termy_x::trends_desk::text_after_take(
+            termy_x::trends_desk::DRAFTING_PLACEHOLDER,
+            &result.text,
+            &result.note,
+        );
+        if next.trim().is_empty() {
+            let banner = termy_x::trends_desk::failure_banner(result.source, &result.note);
+            self.take_banner = banner.clone();
+            self.action_note = banner;
+            if let Some(pop) = self.popout.as_mut().filter(|pop| pop.card_id == id) {
+                if pop.draft == termy_x::trends_desk::DRAFTING_PLACEHOLDER {
+                    pop.draft.clear();
+                }
+            }
+            self.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(""));
+            return;
+        }
+        self.take_banner.clear();
+        let label = if result.note.trim().is_empty() {
+            result.source.to_string()
+        } else {
+            result.note.clone()
+        };
+        termy_x::trends_desk::remember_saved_take(&mut self.pack, id, &next, &label, tone);
+        self.save_pack_file();
+        self.take_cards = self.pack.takes.get(id).cloned().unwrap_or_default();
+        self.take_index = self.take_cards.len().saturating_sub(1);
+        if let Some(pop) = self.popout.as_mut().filter(|pop| pop.card_id == id) {
+            pop.draft = next.clone();
+            pop.variants = termy_x::trends_desk::distinct_variants(&next, &result.variants);
+        }
+        self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
+        self.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&next));
+        self.card_replies
+            .insert(id.to_string(), edit_reply(&ReplyPhase::Idle, next.clone()));
+        self.draft_note = result.note.clone();
+        self.action_note = label;
+        let path = termy_x::trends_desk::drafts_file(&self.data_root);
+        if let Ok(count) =
+            termy_x::trends_desk::append_take_draft(&path, id, &post.text, &post.url, &next)
+        {
+            self.saved_urls.insert(post.url.clone());
+            self.draft_count = count;
+        }
+        self.selected = Some(format!("take:{id}"));
+    }
+
+    fn load_take_history(&mut self, id: &str) {
+        self.take_cards = self.pack.takes.get(id).cloned().unwrap_or_default();
+        self.take_index = self.take_cards.len().saturating_sub(1);
+        self.carousel_keys = true;
+    }
+
+    pub(crate) fn nudge_carousel(&mut self, delta: i32, cx: &mut Context<Self>) {
+        match termy_x::trends_desk::slide(
+            self.take_cards.len(),
+            self.take_index,
+            self.take_generating,
+            delta,
+        ) {
+            termy_x::trends_desk::Slide::Stay => {}
+            termy_x::trends_desk::Slide::Move(index) => {
+                self.take_index = index;
+                self.use_current_take();
+                cx.notify();
+            }
+            termy_x::trends_desk::Slide::More => self.request_another_take(cx),
+        }
+    }
+
+    fn use_current_take(&mut self) {
+        let Some(card) = self.take_cards.get(self.take_index).cloned() else {
+            return;
+        };
+        let Some(pop) = self.popout.as_mut() else {
+            return;
+        };
+        pop.draft = card.text.clone();
+        self.pop_caret = termy_x::draft_edit::DraftCaret::at_end(card.text.len());
+        self.reply_edit = Some(termy_x::draft_edit::ReplyEditor::new(&card.text));
+        self.card_replies.insert(
+            pop.card_id.clone(),
+            edit_reply(&ReplyPhase::Idle, card.text),
+        );
+        self.take_banner.clear();
+    }
+
+    pub(crate) fn request_another_take(&mut self, cx: &mut Context<Self>) {
+        if self.take_generating {
+            return;
+        }
+        let Some(id) = self.popout.as_ref().map(|pop| pop.card_id.clone()) else {
+            return;
+        };
+        self.more_take = true;
+        self.take_generating = true;
+        self.take_started = Some(std::time::Instant::now());
+        self.take_banner.clear();
+        self.stream_take.clear();
+        self.spawn_one_take(id, false, cx);
+    }
+
+    pub(crate) fn cancel_take(&mut self, cx: &mut Context<Self>) {
+        self.take_epoch = self.take_epoch.wrapping_add(1);
+        termy_x::trends_desk::halt_takes();
+        self.take_generating = false;
+        self.take_started = None;
+        self.stream_take.clear();
+        self.take_banner = "Cancelled".into();
+        self.action_note = "Cancelled".into();
+        cx.notify();
+    }
+
+    fn try_provider(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(id) = self.popout.as_ref().map(|pop| pop.card_id.clone()) else {
+            return;
+        };
+        self.choose_provider(name, cx);
+        self.take_banner.clear();
+        self.more_take = true;
+        self.take_generating = true;
+        self.take_started = Some(std::time::Instant::now());
+        self.spawn_one_take(id, false, cx);
+    }
+
+    fn elapsed_secs(&self) -> u64 {
+        self.take_started
+            .map(|start| start.elapsed().as_secs())
+            .unwrap_or(0)
+    }
+
+    fn take_carousel(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let index = self.take_index;
+        let generating = self.take_generating;
+        let count = termy_x::trends_desk::indicator(self.take_cards.len(), index, generating);
+        let shown = if generating && !self.stream_take.is_empty() {
+            self.stream_take.clone()
+        } else if generating {
+            format!("… {}s", self.elapsed_secs())
+        } else if let Some(card) = self.take_cards.get(index) {
+            format!("{}\n{}", card.provider, card.text)
+        } else {
+            "Press → for a take.".into()
+        };
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(box_button("desk-take-left", "←", cx, |this, cx| {
+                this.carousel_keys = true;
+                this.nudge_carousel(-1, cx);
+            }))
+            .child(
+                div()
+                    .id("desk-take-card")
+                    .w(px(240.0))
+                    .min_h(px(72.0))
+                    .p(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(rgb(0x2a1020))
+                    .text_size(px(14.0))
+                    .text_color(rgb(0xffe56a))
+                    .whitespace_normal()
+                    .cursor_pointer()
+                    .child(shown)
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x7af6ff))
+                            .child(count),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.carousel_keys = true;
+                            this.use_current_take();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .with_animation(
+                        SharedString::from(format!("desk-slide-{index}-{generating}")),
+                        Animation::new(std::time::Duration::from_millis(280)),
+                        |card, t| card.ml(px((1.0 - t) * 32.0)),
+                    ),
+            )
+            .child(box_button("desk-take-right", "→", cx, |this, cx| {
+                this.carousel_keys = true;
+                this.nudge_carousel(1, cx);
+            }))
+            .child(box_button("desk-take-use", "Use this", cx, |this, cx| {
+                this.use_current_take();
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn failure_banner(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let text = self.take_banner.clone();
+        div()
+            .p(px(10.0))
+            .rounded(px(8.0))
+            .bg(rgb(0x7a1020))
+            .text_size(px(16.0))
+            .text_color(rgb(0xffe56a))
+            .whitespace_normal()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(text)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(8.0))
+                    .child(post_button("desk-take-retry", "Retry", cx, |this, cx| {
+                        this.request_another_take(cx);
+                    }))
+                    .child(post_button(
+                        "desk-try-hermes",
+                        "Try Hermes",
+                        cx,
+                        |this, cx| {
+                            this.try_provider("hermes", cx);
+                        },
+                    ))
+                    .child(post_button("desk-try-muse", "Try Muse", cx, |this, cx| {
+                        this.try_provider("muse", cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    fn cancel_row(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        post_button("desk-cancel-take", "Cancel", cx, |this, cx| {
+            this.cancel_take(cx);
+        })
     }
 
     pub(crate) fn send_reply(&mut self, id: String, cx: &mut Context<Self>) {
@@ -986,7 +1210,7 @@ fn variant_chip(
         let _ = index;
         this.action_note = format!("Drafting {label}…");
         this.set_pop_tone(label);
-        this.regenerate_open_variants(cx);
+        this.request_another_take(cx);
         cx.notify();
     })
 }
@@ -1185,11 +1409,11 @@ fn breath_animation() -> Animation {
         .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
 }
 
-fn drafting_mark() -> gpui_kit::AnyElement {
+fn drafting_mark(secs: u64) -> gpui_kit::AnyElement {
     div()
         .text_size(px(28.0))
         .text_color(rgb(0xffe56a))
-        .child("…")
+        .child(format!("… {secs}s"))
         .with_animation("desk-drafting-breath", breath_animation(), |el, value| {
             el.opacity(0.2 + 0.8 * value)
         })

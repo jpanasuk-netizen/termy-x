@@ -6,15 +6,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::takes::{
-    HERMES_TAKE_TIMEOUT, apply_hidden_command, background_grok_spawn, is_provider_failure,
-    kill_pid, register_job, takes_halted, unregister_job,
+    GROK_TAKE_TIMEOUT, apply_hidden_command, background_grok_spawn, is_provider_failure, kill_pid,
+    register_job, takes_halted, unregister_job,
 };
-
-/// One line. Newlines and quotes in a tweet stay out of argv.
-pub fn flatten_grok_prompt(prompt: &str) -> String {
-    let flat = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("{flat} Answer with the reply text only. Do not use tools, search, or browse.")
-}
 
 /// Headless take flags for grok 1.0.77. No `--always-approve`, so a draft
 /// cannot wander into web search. `--prompt-file` is the single-turn trigger.
@@ -33,15 +27,21 @@ pub fn grok_take_args(prompt_file: &Path) -> Vec<String> {
         "1".into(),
         "--permission-mode".into(),
         "dontAsk".into(),
+        "--model".into(),
+        GROK_FAST_MODEL.into(),
     ]
 }
+
+pub const GROK_FAST_MODEL: &str = "grok-4-fast-non-reasoning";
+
+pub use super::carousel::cli_take_prompt;
 
 pub fn grok_take_log_line(prompt_len: usize, exit: &str, stdout_bytes: usize) -> String {
     format!("INFO grok: prompt_len={prompt_len} exit={exit} stdout_bytes={stdout_bytes}")
 }
 
 pub(crate) fn run(post: &super::SourcePost, tone: &str) -> Result<String, String> {
-    let prompt = flatten_grok_prompt(&super::agents::reply_prompt(&post.author, &post.text, tone));
+    let prompt = cli_take_prompt(&post.author, &post.text, tone);
     let prompt_len = prompt.len();
     let path = match write_prompt_file(&prompt) {
         Ok(path) => path,
@@ -87,8 +87,9 @@ fn run_file(path: &Path, post_id: &str, prompt_len: usize) -> Result<String, Str
     register_job(post_id, pid);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_rx = drain_pipe(stdout);
-    let stderr_rx = drain_pipe(stderr);
+    let partial = PARTIAL.with(|slot| slot.borrow().clone());
+    let stdout_rx = drain_pipe(stdout, partial);
+    let stderr_rx = drain_pipe(stderr, None);
     let started = Instant::now();
     let status = loop {
         if takes_halted() {
@@ -101,7 +102,7 @@ fn run_file(path: &Path, post_id: &str, prompt_len: usize) -> Result<String, Str
         }
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() > HERMES_TAKE_TIMEOUT => {
+            Ok(None) if started.elapsed() > GROK_TAKE_TIMEOUT => {
                 kill_pid(pid);
                 let _ = child.kill();
                 let _ = child.wait();
@@ -110,7 +111,7 @@ fn run_file(path: &Path, post_id: &str, prompt_len: usize) -> Result<String, Str
                     .unwrap_or_default();
                 unregister_job(post_id);
                 log_grok(prompt_len, "timeout", bytes.len());
-                return Err("grok timed out after 90s".into());
+                return Err("grok timed out after 5 minutes".into());
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
             Err(error) => {
@@ -144,7 +145,10 @@ fn run_file(path: &Path, post_id: &str, prompt_len: usize) -> Result<String, Str
     }
 }
 
-fn drain_pipe(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+fn drain_pipe(
+    pipe: Option<impl Read + Send + 'static>,
+    partial: Option<std::sync::mpsc::Sender<String>>,
+) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut all = Vec::new();
@@ -153,13 +157,39 @@ fn drain_pipe(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Rece
             loop {
                 match pipe.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(n) => all.extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        all.extend_from_slice(&chunk[..n]);
+                        if let Some(partial) = &partial {
+                            let text = String::from_utf8_lossy(&all).trim().to_string();
+                            if !text.is_empty() {
+                                let _ = partial.send(text);
+                            }
+                        }
+                    }
                 }
             }
         }
         let _ = tx.send(all);
     });
     rx
+}
+
+thread_local! {
+    static PARTIAL: std::cell::RefCell<Option<std::sync::mpsc::Sender<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub struct PartialBinding;
+
+impl Drop for PartialBinding {
+    fn drop(&mut self) {
+        PARTIAL.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+pub fn bind_grok_stream(tx: Option<std::sync::mpsc::Sender<String>>) -> PartialBinding {
+    PARTIAL.with(|slot| *slot.borrow_mut() = tx);
+    PartialBinding
 }
 
 fn log_grok(prompt_len: usize, exit: &str, stdout_bytes: usize) {
@@ -173,13 +203,11 @@ mod tests {
 
     #[test]
     fn take_prompt_is_one_line_in_a_file_and_the_log_omits_the_tweet() {
-        let tweet = "Courts\nare \"testing\" models\nhttps://x.com/ada/status/9";
-        let flat = flatten_grok_prompt(&format!("Post:\n{tweet}"));
+        let flat = cli_take_prompt("ada", "Courts are \"testing\" models", "Funny");
         assert!(!flat.contains('\n'));
-        assert!(!flat.contains('\r'));
-        assert!(flat.contains("Answer with the reply text only"));
-        assert!(flat.contains("Do not use tools"));
-        assert!(flat.contains("Courts are \"testing\" models"));
+        assert!(flat.contains("Reply text only"));
+        assert!(flat.contains("No tools"));
+        assert!(flat.contains("Courts"));
         let path = write_prompt_file(&flat).unwrap();
         let stored = std::fs::read_to_string(&path).unwrap();
         assert_eq!(stored, flat);
@@ -193,6 +221,17 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--disable-web-search"));
         assert!(args.iter().any(|arg| arg == "--no-plan"));
         assert!(args.iter().any(|arg| arg == "--verbatim"));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair[0] == "--model" && pair[1] == GROK_FAST_MODEL })
+        );
+        let short = cli_take_prompt("ada", &"courts ".repeat(300), "Funny");
+        assert!(short.chars().count() <= 400);
+        assert!(short.contains("Reply text only"));
+        assert_eq!(
+            super::super::takes::GROK_TAKE_TIMEOUT,
+            std::time::Duration::from_secs(300)
+        );
         assert!(!args.iter().any(|arg| arg == "--always-approve"));
         assert!(!args.iter().any(|arg| arg.contains("Courts")));
         assert!(!args.iter().any(|arg| arg.contains('\n')));

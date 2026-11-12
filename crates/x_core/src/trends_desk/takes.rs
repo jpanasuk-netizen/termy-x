@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 pub const TAKE_CHAIN: [&str; 4] = ["grok", "hermes", "treg", "free"];
 pub const HONEST_PREFIX: &str = "No model available";
 pub const HERMES_TAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+pub const GROK_TAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub fn is_template_angle(text: &str) -> bool {
     let lower = text.to_lowercase();
@@ -792,7 +793,7 @@ pub fn hidden_agent_draft(
     if program == "grok" {
         return grok_cli(post, tone);
     }
-    let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
+    let prompt = super::grok_take::cli_take_prompt(&post.author, &post.text, tone);
     if label == "Agy" {
         return agy_headless(program, &prompt);
     }

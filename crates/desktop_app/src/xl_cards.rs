@@ -285,9 +285,12 @@ impl TrendsDesk {
             )
             .children(posted.then(|| {
                 div()
-                    .text_size(px(13.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
                     .text_color(rgb(0xffe14a))
-                    .child("Posted ✓")
+                    .child(div().text_size(px(22.0)).child("✓"))
+                    .child(div().text_size(px(13.0)).child("Posted ✓"))
             }))
             .children(self.saved_urls.contains(&card.url).then(|| {
                 div()

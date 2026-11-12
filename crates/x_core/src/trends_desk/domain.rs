@@ -694,6 +694,9 @@ pub struct DeskSettings {
     /// Hermes, Vyce direct, Grok, Muse, Agy, or Custom. Draft takes never post.
     #[serde(default = "default_take_provider")]
     pub take_provider: String,
+    /// Opt-in. Grok never switches by itself. Hermes and Muse stay buttons.
+    #[serde(default)]
+    pub auto_fallback: bool,
     #[serde(default)]
     pub custom_base: String,
     #[serde(default)]
@@ -763,6 +766,7 @@ impl Default for DeskSettings {
             daily_at: default_daily_at(),
             daily_done: None,
             take_provider: default_take_provider(),
+            auto_fallback: false,
             custom_base: String::new(),
             custom_model: String::new(),
             custom_key_env: default_custom_key_env(),

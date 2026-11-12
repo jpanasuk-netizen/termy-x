@@ -478,7 +478,7 @@ pub fn text_after_take(waiting: &str, generated: &str, _error: &str) -> String {
         return waiting.to_string();
     }
     let generated = generated.trim();
-    if generated.is_empty() || reply_is_status(generated) {
+    if generated.is_empty() {
         String::new()
     } else {
         generated.to_string()

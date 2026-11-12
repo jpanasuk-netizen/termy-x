@@ -434,6 +434,16 @@ pub struct PackFile {
     pub last_refresh: Option<i64>,
     #[serde(default)]
     pub seen: HashMap<String, Vec<String>>,
+    /// Generated takes for one tweet, oldest first. The carousel reads this.
+    #[serde(default)]
+    pub takes: HashMap<String, Vec<SavedTake>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTake {
+    pub text: String,
+    pub provider: String,
+    pub tone: String,
 }
 
 fn default_tone() -> String {
@@ -458,6 +468,7 @@ impl Default for PackFile {
             refresh_minutes: 10,
             last_refresh: None,
             seen: HashMap::new(),
+            takes: HashMap::new(),
         }
     }
 }
@@ -832,6 +843,53 @@ pub fn copy_all(parts: &[String]) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+pub fn remember_saved_take(
+    pack: &mut PackFile,
+    card_id: &str,
+    text: &str,
+    provider: &str,
+    tone: &str,
+) {
+    let text = super::cards::text_to_post(text);
+    if text.is_empty() {
+        return;
+    }
+    let list = pack.takes.entry(card_id.to_string()).or_default();
+    if list.last().is_some_and(|item| item.text == text) {
+        return;
+    }
+    list.push(SavedTake {
+        text,
+        provider: provider.to_string(),
+        tone: tone.to_string(),
+    });
+}
+
+pub fn append_take_draft(
+    path: &std::path::Path,
+    card_id: &str,
+    tweet: &str,
+    url: &str,
+    text: &str,
+) -> Result<usize, String> {
+    let text = super::cards::text_to_post(text);
+    let id = format!("take-{card_id}-{}", text_hash(&text));
+    let mut rows = crate::drafts::load_drafts(path);
+    if rows.iter().any(|row| row.id == id) {
+        return Ok(rows.len());
+    }
+    rows.push(crate::model::Draft {
+        id,
+        text,
+        tone: Some(tweet.trim().to_string()),
+        source: "termy-xl".into(),
+        created_at: "saved".into(),
+        reply_to: Some(url.trim().to_string()),
+    });
+    crate::drafts::save_drafts(path, &rows)?;
+    Ok(rows.len())
 }
 
 pub fn remember_take(

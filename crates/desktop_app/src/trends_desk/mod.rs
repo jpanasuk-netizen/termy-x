@@ -1,5 +1,5 @@
 //! GPU-rendered Trends Desk window. OpenCLI searches on a background thread.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -131,6 +131,16 @@ pub struct TrendsDesk {
     pub(crate) saved_urls: std::collections::HashSet<String>,
     pub(crate) list_pick: Option<String>,
     pub(crate) reader: Option<InlineRead>,
+    pub(crate) take_cards: Vec<termy_x::trends_desk::SavedTake>,
+    pub(crate) take_index: usize,
+    pub(crate) take_generating: bool,
+    pub(crate) take_started: Option<Instant>,
+    pub(crate) take_banner: String,
+    pub(crate) carousel_keys: bool,
+    pub(crate) stream_take: String,
+    pub(crate) more_take: bool,
+    pub(crate) draft_busy: HashSet<String>,
+    pub(crate) draft_errors: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -301,6 +311,16 @@ impl TrendsDesk {
             saved_urls,
             list_pick: None,
             reader: None,
+            take_cards: Vec::new(),
+            take_index: 0,
+            take_generating: false,
+            take_started: None,
+            take_banner: String::new(),
+            carousel_keys: true,
+            stream_take: String::new(),
+            more_take: false,
+            draft_busy: HashSet::new(),
+            draft_errors: HashMap::new(),
         }
     }
 
@@ -695,6 +715,13 @@ impl TrendsDesk {
             self.send_from_popout(cx);
             return;
         }
+        if self.carousel_keys
+            && !event.keystroke.modifiers.shift
+            && (key == "left" || key == "right")
+        {
+            self.nudge_carousel(if key == "left" { -1 } else { 1 }, cx);
+            return;
+        }
         self.edit_reply_key(key, event, cx);
     }
 
@@ -786,6 +813,10 @@ impl TrendsDesk {
     pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
         self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
         cx.notify();
+        self.more_take = false;
+        self.take_generating = true;
+        self.take_started = Some(Instant::now());
+        self.take_banner.clear();
         self.spawn_one_take(id, true, cx);
     }
 
@@ -1022,55 +1053,6 @@ impl TrendsDesk {
         let seed = termy_x::trends_desk::quote_seed(&post.text);
         self.show_inline_editor(id, &seed);
         self.action_note = format!("Quote mode for @{}.", post.author);
-        cx.notify();
-    }
-
-    pub(crate) fn post_saved(&mut self, id: String, cx: &mut Context<Self>) {
-        let rows =
-            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
-        let Some(row) = rows.into_iter().find(|row| row.id == id) else {
-            self.action_note = "That draft is not in the list.".into();
-            cx.notify();
-            return;
-        };
-        let url = row.reply_to.unwrap_or_default();
-        let text = if self.list_pick.as_deref() == Some(&format!("draft:{}", row.id))
-            && !self.draft_text.trim().is_empty()
-        {
-            self.draft_text.clone()
-        } else {
-            row.text.clone()
-        };
-        if !url.contains("/status/") {
-            self.action_note = "That draft has no status URL. Nothing was posted.".into();
-            cx.notify();
-            return;
-        }
-        self.action_note = "Posting…".into();
-        let bin = self.config.opencli_bin.clone();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    termy_x::trends_desk::post_reply_opencli(
-                        &bin,
-                        &termy_x::io::SystemRunner,
-                        &url,
-                        &text,
-                    )
-                })
-                .await;
-            let _ = this.update(cx, |desk, cx| {
-                desk.action_note = match &result {
-                    Ok(receipt) => termy_x::trends_desk::reply_link(receipt)
-                        .map(|link| format!("Posted ✓ {link}"))
-                        .unwrap_or_else(|| "Posted ✓".into()),
-                    Err(error) => error.clone(),
-                };
-                cx.notify();
-            });
-        })
-        .detach();
         cx.notify();
     }
 

@@ -11,6 +11,92 @@ use termy_x::trends_desk::{
 };
 
 impl TrendsDesk {
+    pub(crate) fn post_saved(&mut self, id: String, cx: &mut Context<Self>) {
+        let rows =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
+        let Some(row) = rows.into_iter().find(|row| row.id == id) else {
+            self.action_note = "That draft is not in the list.".into();
+            cx.notify();
+            return;
+        };
+        let url = row.reply_to.unwrap_or_default();
+        let text = termy_x::trends_desk::text_to_post(
+            if self.list_pick.as_deref() == Some(&format!("draft:{}", row.id))
+                && !self.draft_text.trim().is_empty()
+            {
+                &self.draft_text
+            } else {
+                &row.text
+            },
+        );
+        if !url.contains("/status/") {
+            self.draft_errors.insert(
+                id,
+                "That draft has no status URL. Nothing was posted.".into(),
+            );
+            self.action_note = "That draft has no status URL. Nothing was posted.".into();
+            cx.notify();
+            return;
+        }
+        if self.draft_busy.contains(&id) {
+            self.action_note = "Posting…".into();
+            cx.notify();
+            return;
+        }
+        self.draft_busy.insert(id.clone());
+        self.draft_errors.remove(&id);
+        self.action_note = "Posting…".into();
+        let bin = self.config.opencli_bin.clone();
+        let posted_url = url.clone();
+        let posted_text = text.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    termy_x::trends_desk::post_reply_opencli(
+                        &bin,
+                        &termy_x::io::SystemRunner,
+                        &posted_url,
+                        &posted_text,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.draft_busy.remove(&id);
+                match result {
+                    Ok(receipt) => {
+                        let parent = termy_x::trends_desk::status_id(&url).unwrap_or_default();
+                        let mut mark = termy_x::trends_desk::reply_receipt(&parent, &url, &receipt);
+                        mark.at_unix = TrendsDesk::now_unix();
+                        mark.status = "confirmed".into();
+                        mark.text = text.clone();
+                        desk.pack.receipts.push(mark);
+                        desk.save_pack_file();
+                        if !parent.is_empty() {
+                            desk.card_replies.insert(
+                                parent,
+                                termy_x::trends_desk::ReplyPhase::Confirmed {
+                                    text: text.clone(),
+                                    receipt: receipt.clone(),
+                                },
+                            );
+                        }
+                        desk.action_note = termy_x::trends_desk::reply_link(&receipt)
+                            .map(|link| format!("Posted ✓ {link}"))
+                            .unwrap_or_else(|| "Posted ✓".into());
+                    }
+                    Err(error) => {
+                        desk.draft_errors.insert(id, error.clone());
+                        desk.action_note = error;
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     pub(crate) fn header(&self, _per_row: usize, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .flex()
@@ -402,7 +488,6 @@ impl TrendsDesk {
                 text.clone()
             };
             let copy_id = id.clone();
-            let post_id = id.clone();
             let delete_id = id.clone();
             let select_id = id.clone();
             let select_text = text.clone();
@@ -455,24 +540,20 @@ impl TrendsDesk {
                                 SharedString::from(format!("desk-draft-copy-{copy_id}")),
                                 "Copy",
                                 false,
-                                cx.listener(move |this, _, _, cx| {
-                                    let payload = termy_x::trends_desk::copy_entry(&text, &url);
-                                    this.copy_text(&payload, cx);
-                                    this.action_note = termy_x::trends_desk::copied_mark().into();
-                                    cx.stop_propagation();
-                                    cx.notify();
+                                cx.listener({
+                                    let text = text.clone();
+                                    let url = url.clone();
+                                    move |this, _, _, cx| {
+                                        let payload = termy_x::trends_desk::copy_entry(&text, &url);
+                                        this.copy_text(&payload, cx);
+                                        this.action_note =
+                                            termy_x::trends_desk::copied_mark().into();
+                                        cx.stop_propagation();
+                                        cx.notify();
+                                    }
                                 }),
                             ))
-                            .child(button(
-                                SharedString::from(format!("desk-draft-post-{post_id}")),
-                                "Post reply",
-                                false,
-                                cx.listener(move |this, _, _, cx| {
-                                    this.post_saved(post_id.clone(), cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                }),
-                            ))
+                            .child(draft_post_control(&id, &url, self, cx))
                             .child(button(
                                 SharedString::from(format!("desk-draft-delete-{delete_id}")),
                                 "Delete",
@@ -614,6 +695,27 @@ impl TrendsDesk {
                 "Save Hermes",
                 false,
                 cx.listener(|this, _, _, cx| this.save_hermes(cx)),
+            ))
+            .child(button(
+                "desk-auto-fallback",
+                if self.settings.auto_fallback {
+                    "Auto-fallback: On"
+                } else {
+                    "Auto-fallback: Off"
+                },
+                self.settings.auto_fallback,
+                cx.listener(|this, _, _, cx| {
+                    this.settings.auto_fallback = !this.settings.auto_fallback;
+                    if this.writable {
+                        let _ = this.store.save_settings(&this.settings);
+                    }
+                    this.action_note = if this.settings.auto_fallback {
+                        "Auto-fallback is on. Grok still does not switch by itself.".into()
+                    } else {
+                        "Auto-fallback is off.".into()
+                    };
+                    cx.notify();
+                }),
             ))
             .child(
                 div()
@@ -880,6 +982,94 @@ pub(crate) fn button(
         .tooltip(move |_, cx| cx.new(|_| HintView { text: tip.clone() }).into())
         .child(label)
         .on_mouse_down(MouseButton::Left, handler)
+        .into_any_element()
+}
+
+fn draft_post_control(
+    id: &str,
+    url: &str,
+    desk: &TrendsDesk,
+    cx: &mut Context<TrendsDesk>,
+) -> gpui_kit::AnyElement {
+    if let Some(mark) = desk.pack.receipts.iter().rev().find(|mark| {
+        mark.status == "confirmed" && (mark.parent_url == url || mark.reply_url == url)
+    }) {
+        let when = termy_x::trends_desk::format_clock(
+            mark.at_unix,
+            termy_x::trends_desk::local_offset_secs(mark.at_unix),
+        );
+        let link = if mark.reply_url.is_empty() {
+            mark.parent_url.clone()
+        } else {
+            mark.reply_url.clone()
+        };
+        return div()
+            .flex()
+            .flex_col()
+            .gap(px(4.0))
+            .child(
+                div()
+                    .text_size(px(28.0))
+                    .text_color(rgb(0xffe14a))
+                    .child("✓"),
+            )
+            .child(format!("Posted ✓ {when}"))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x7af6ff))
+                    .whitespace_normal()
+                    .child(link),
+            )
+            .into_any_element();
+    }
+    let busy = desk.draft_busy.contains(id);
+    let error = desk.draft_errors.get(id).cloned();
+    let label = if busy {
+        "Posting…".to_string()
+    } else if error.is_some() {
+        "Retry".to_string()
+    } else {
+        termy_x::trends_desk::draft_post_label(url)
+    };
+    let post_id = id.to_string();
+    let mut column = div().flex().flex_col().gap(px(6.0));
+    if let Some(error) = error {
+        column = column.child(
+            div()
+                .text_color(rgb(0xff6b6b))
+                .whitespace_normal()
+                .child(error),
+        );
+    }
+    column
+        .child(
+            div()
+                .id(SharedString::from(format!("desk-draft-post-{post_id}")))
+                .w_full()
+                .min_h(px(56.0))
+                .px(px(16.0))
+                .py(px(12.0))
+                .rounded(px(10.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgb(0x7af6ff))
+                .text_size(px(16.0))
+                .text_color(rgb(0x070b14))
+                .cursor_pointer()
+                .child(label)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if !busy {
+                            this.post_saved(post_id.clone(), cx);
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+        )
         .into_any_element()
 }
 
