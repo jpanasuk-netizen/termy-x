@@ -95,17 +95,17 @@ pub fn takes_for_tweet(
     };
     let provider = TakeProvider::parse(provider);
     let mut config = isolated_opencli_config(data_root);
-    if config.take_provider.trim().is_empty() {
-        if let Ok(store) = DeskStore::open_isolated(data_root) {
-            config.take_provider = store.load_settings().take_provider;
-        }
+    if config.take_provider.trim().is_empty()
+        && let Ok(store) = DeskStore::open_isolated(data_root)
+    {
+        config.take_provider = store.load_settings().take_provider;
     }
     let draft = match draft_take(provider, &config, &post, http) {
         Ok(draft) => draft,
         Err(error) => return fail(&error),
     };
     let mut variants = if draft.variants.is_empty() {
-        super::distinct_variants(&post.text, &[draft.text.clone()])
+        super::distinct_variants(&post.text, std::slice::from_ref(&draft.text))
     } else {
         draft.variants.clone()
     };
@@ -155,7 +155,7 @@ pub fn queue_reply(data_root: &Path, tweet: &str, text: &str) -> Value {
         tone: Some("reply".into()),
         source: "termy-xl-queue".into(),
         created_at: drafts::timestamp(),
-        reply_to: reply_to.clone(),
+        reply_to,
     };
     let path = super::drafts_file(data_root);
     match replace_draft_for_target(&path, draft) {

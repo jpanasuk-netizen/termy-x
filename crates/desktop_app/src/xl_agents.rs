@@ -29,8 +29,7 @@ pub(crate) struct AgentProc {
 
 impl Drop for AgentProc {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        termy_x::trends_desk::reap_child(&mut self.child);
     }
 }
 

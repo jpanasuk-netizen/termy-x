@@ -278,7 +278,7 @@ pub fn prepare_draft_file(
         created_at: timestamp(),
         reply_to: reply_to.clone(),
     };
-    match drafts::replace_draft_for_target(path, draft.clone()) {
+    match drafts::replace_draft_for_target(path, draft) {
         Ok(kept) => DraftPrep {
             text,
             reply_to,

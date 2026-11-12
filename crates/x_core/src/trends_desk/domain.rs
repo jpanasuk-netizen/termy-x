@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::{post_url, strip_handle};
-use crate::time::{parse_created_at, ymd};
+#[cfg(test)]
+use crate::time::parse_created_at;
+use crate::time::ymd;
 
 pub const QUERY_LIMIT: usize = 180;
 /// Window title and shortcut label for the standalone desk.
@@ -1068,6 +1070,7 @@ pub fn redact_secrets(text: &str) -> String {
 }
 
 /// Created-at text is kept even when it also parses as a timestamp.
+#[cfg(test)]
 pub fn preserved_timestamp(post: &SourcePost) -> Option<&str> {
     let raw = post.created_at.as_deref()?;
     let _ = parse_created_at(raw);

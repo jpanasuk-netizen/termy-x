@@ -648,7 +648,17 @@ fn refresh_button(topic_id: String, cx: &mut Context<TrendsDesk>) -> gpui_kit::A
         "Refresh",
         false,
         cx.listener(move |this, _, _, cx| {
-            this.start_run(std::slice::from_ref(&topic_id), cx);
+            let pressed = termy_x::trends_desk::press_refresh(
+                crate::trends_desk::TrendsDesk::now_unix(),
+                this.busy,
+                Some(topic_id.as_str()),
+                this.pack.last_refresh,
+            );
+            if pressed.started {
+                this.pack.last_refresh = pressed.last_refresh;
+                this.save_pack_file();
+                this.start_run(std::slice::from_ref(&topic_id), cx);
+            }
             cx.stop_propagation();
         }),
     )

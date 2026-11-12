@@ -9,6 +9,7 @@ mod cards;
 mod desk_cmd;
 mod domain;
 mod fetch;
+mod lifecycle;
 mod log;
 mod pack;
 mod parse;
@@ -50,6 +51,10 @@ pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
     SessionStatus, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft, prepare_draft_file,
     refuse_unsafe_cli_name, run_topics, search_args,
+};
+pub use lifecycle::{
+    DeskSession, OffUiRequest, PruneLog, RefreshPress, child_is_gone, click_after_scroll,
+    press_refresh, prune_backups, quit_dialog_for_agents, reap_child, start_off_ui,
 };
 pub use log::{append_desk_log, redact_log, should_log_model_failure};
 pub use pack::{

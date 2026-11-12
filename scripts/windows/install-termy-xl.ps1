@@ -82,6 +82,32 @@ if (Test-Path $sourceCli) {
     Backup-ThenCopy $sourceCli (Join-Path $InstallDir $cliName)
 }
 
+function Prune-OldBackups([string]$Dir) {
+    $baks = @(Get-ChildItem -LiteralPath $Dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "*.bak" } |
+        Sort-Object LastWriteTime, Name)
+    if ($baks.Count -gt 1) {
+        $keep = $baks[-1]
+        foreach ($old in $baks[0..($baks.Count - 2)]) {
+            Remove-Item -LiteralPath $old.FullName -Force
+            Write-Output "removed $($old.FullName)"
+        }
+        Write-Output "kept $($keep.FullName)"
+    }
+    $folders = @(Get-ChildItem -LiteralPath $Dir -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "backup-*" } |
+        Sort-Object LastWriteTime, Name)
+    if ($folders.Count -gt 1) {
+        $keep = $folders[-1]
+        foreach ($old in $folders[0..($folders.Count - 2)]) {
+            Remove-Item -LiteralPath $old.FullName -Recurse -Force
+            Write-Output "removed $($old.FullName)"
+        }
+        Write-Output "kept $($keep.FullName)"
+    }
+}
+Prune-OldBackups $InstallDir
+
 $target = Join-Path $InstallDir $binaryName
 $shell = New-Object -ComObject WScript.Shell
 $shortcutPaths = @(

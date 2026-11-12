@@ -55,6 +55,9 @@ jobs:
           -A clippy::trivially_copy_pass_by_ref
           -A clippy::type_complexity
 
+      - name: Desk clippy without the allow-list
+        run: bash scripts/check-desk-clippy.sh
+
   # Windows-only code (updater, ConPTY, registry) is invisible to the macOS
   # run above.
   clippy-windows:
@@ -103,6 +106,9 @@ jobs:
           -A clippy::manual_slice_fill
           -A clippy::trivially_copy_pass_by_ref
           -A clippy::type_complexity
+
+      - name: Desk clippy without the allow-list
+        run: bash scripts/check-desk-clippy.sh
 
   # Compiles termy.iss for both architectures against placeholder binaries,
   # so installer script errors surface in PRs instead of at release time.

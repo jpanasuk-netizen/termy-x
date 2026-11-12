@@ -3,7 +3,9 @@
 //! Sending is a separate explicit step. Drafting a take never posts.
 //! A failed provider stays an error and does not invent a successful draft.
 
-use crate::io::{Http, HttpRequest};
+use crate::io::Http;
+#[cfg(test)]
+use crate::io::HttpRequest;
 use crate::reply_guy::{self, Secret};
 
 use super::domain::SourcePost;
@@ -786,13 +788,11 @@ pub fn parse_treg_draft(body: &str) -> Result<String, String> {
         .or_else(|| value.get("detail").and_then(|item| item.as_str()))
         .or_else(|| value.get("error").and_then(|item| item.as_str()))
         .or_else(|| value.get("message").and_then(|item| item.as_str()))
+        && value.pointer("/choices/0/message/content").is_none()
+        && value.pointer("/output/data/text").is_none()
+        && value.pointer("/output/text").is_none()
     {
-        if value.pointer("/choices/0/message/content").is_none()
-            && value.pointer("/output/data/text").is_none()
-            && value.pointer("/output/text").is_none()
-        {
-            return Err(format!("treg: {text}"));
-        }
+        return Err(format!("treg: {text}"));
     }
     let text = value
         .pointer("/choices/0/message/content")
@@ -833,10 +833,11 @@ fn redact_token(error: &str, token: &str) -> String {
     error.replace(token, "[redacted]")
 }
 
-/// Unused request shape kept so a future catalog draft tool can be swapped in
+/// Request shape kept so a future catalog draft tool can be swapped in
 /// without changing the state machine. Tests assert it carries the token header
 /// and never targets a post/reply publish URL.
-pub fn treg_draft_probe(token: &str) -> HttpRequest {
+#[cfg(test)]
+fn treg_draft_probe(token: &str) -> HttpRequest {
     reply_guy::treg_request("GET", reply_guy::TREG_ME_URL, token, None)
 }
 

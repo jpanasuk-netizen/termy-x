@@ -9,7 +9,6 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use super::domain::SourcePost;
-use super::fetch::search_args;
 use super::{TakeProvider, char_count};
 use crate::time::parse_created_at;
 
@@ -447,7 +446,7 @@ pub fn local_offset_secs(now: i64) -> i32 {
             1 => info.standard_bias,
             _ => 0,
         };
-        return -(info.bias + extra) * 60;
+        -(info.bias + extra) * 60
     }
     #[cfg(not(windows))]
     {
@@ -567,9 +566,8 @@ pub fn hud_line(
     last_refresh: Option<i64>,
     offset_secs: i32,
 ) -> String {
-    let refresh = last_refresh
-        .map(|at| format_clock(at, offset_secs))
-        .unwrap_or_else(|| "never".into());
+    let refresh =
+        last_refresh.map_or_else(|| "never".to_string(), |at| format_clock(at, offset_secs));
     format!("{sent_today} sent today · {drafts} drafts · {provider} · refresh {refresh}")
 }
 
@@ -808,7 +806,7 @@ mod tests {
             "auto-refresh off"
         );
         assert!(next_refresh_text(Some(0), 10, true, 15, -6 * 3600).contains("next refresh"));
-        let args = search_args("ai", 20);
+        let args = super::super::fetch::search_args("ai", 20);
         assert!(refresh_is_search_only(&args));
         assert!(refresh_due(None, 100, true, 10));
         assert!(!refresh_due(Some(100), 200, true, 10));

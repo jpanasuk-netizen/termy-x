@@ -354,12 +354,12 @@ pub fn hermes_models_line(base: &str, result: Result<&str, &str>) -> String {
         Err(error) => {
             let lower = error.to_lowercase();
             if lower.contains("401") || lower.contains("unauthorized") {
-                format!("Hermes · needs a key (401)")
+                "Hermes · needs a key (401)".to_string()
             } else if lower.contains("402")
                 || lower.contains("payment required")
                 || lower.contains("insufficient")
             {
-                format!("Hermes · needs credits (402)")
+                "Hermes · needs credits (402)".to_string()
             } else {
                 let short = one_line(error);
                 let short: String = short.chars().take(80).collect();
