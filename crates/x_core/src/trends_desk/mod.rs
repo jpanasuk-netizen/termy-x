@@ -68,7 +68,7 @@ pub use fetch::{
     prepare_draft_file, refuse_unsafe_cli_name, run_topics, search_args,
 };
 pub use grok_take::{
-    bind_grok_model, bind_grok_stream, parse_grok_models, refresh_grok_models,
+    GrokModel, bind_grok_model, bind_grok_stream, parse_grok_models, refresh_grok_models,
     take_cleared_grok_model,
 };
 pub use hermes_draft::{hermes_take, hermes_take_toned};

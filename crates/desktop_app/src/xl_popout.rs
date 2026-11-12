@@ -297,8 +297,12 @@ impl TrendsDesk {
                 .filter(|(id, _)| id.contains(':'))
                 .collect();
             for model in grok_models {
-                let id = format!("grok:{model}");
-                let label = format!("Grok · {model}");
+                let id = format!("grok:{}", model.id);
+                let label = if model.is_default {
+                    format!("Grok · {} (default)", model.id)
+                } else {
+                    format!("Grok · {}", model.id)
+                };
                 if !extras.iter().any(|(have, _)| have == &id) {
                     extras.push((id, label));
                 }

@@ -219,67 +219,168 @@ pub fn unknown_model(text: &str) -> bool {
         || lower.contains("could not set model")
 }
 
-pub fn parse_grok_models(text: &str) -> Vec<String> {
-    let mut models = Vec::new();
-    let push = |models: &mut Vec<String>, id: &str| {
-        let id = id
-            .trim()
-            .trim_matches(|ch: char| ch == '*' || ch == '|' || ch == '"' || ch == ',');
-        if id.len() < 3 {
-            return;
-        }
-        if !id
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-        {
-            return;
-        }
-        let lower = id.to_ascii_lowercase();
-        if matches!(
-            lower.as_str(),
-            "id" | "model" | "models" | "name" | "default" | "available" | "current"
-        ) {
-            return;
-        }
-        if models.iter().any(|have: &String| have == id) {
-            return;
-        }
-        models.push(id.to_string());
-    };
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-        let rows = value
-            .as_array()
-            .cloned()
-            .or_else(|| {
-                value
-                    .get("models")
-                    .and_then(|item| item.as_array())
-                    .cloned()
-            })
-            .unwrap_or_default();
-        for row in rows {
-            if let Some(id) = row.as_str() {
-                push(&mut models, id);
-            } else if let Some(id) = row.get("id").and_then(|item| item.as_str()) {
-                push(&mut models, id);
-            }
-        }
-        if !models.is_empty() {
-            return models;
-        }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GrokModel {
+    pub id: String,
+    pub is_default: bool,
+}
+
+pub fn parse_grok_models(text: &str) -> Vec<GrokModel> {
+    let trimmed = text.trim();
+    if (trimmed.starts_with('[') || trimmed.starts_with('{'))
+        && let Some(models) = parse_grok_models_json(trimmed)
+        && !models.is_empty()
+    {
+        return models;
     }
+    let mut models = Vec::new();
+    let mut named_default = None;
     for line in text.lines() {
-        let line = line.trim().trim_start_matches(['*', '-', '#']).trim();
-        if line.is_empty() || line.ends_with(':') {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
         }
-        let token = line.split_whitespace().next().unwrap_or("");
-        push(&mut models, token);
+        let lower = line.to_ascii_lowercase();
+        if let Some((_, rest)) = line.split_once(':')
+            && lower.starts_with("default model:")
+        {
+            if let Some(id) = model_id_token(rest) {
+                named_default = Some(id);
+            }
+            continue;
+        }
+        if is_status_line(&lower) {
+            continue;
+        }
+        let Some(body) = bullet_body(line).or_else(|| bare_model_line(line)) else {
+            continue;
+        };
+        let Some(id) = model_id_token(body) else {
+            continue;
+        };
+        if models.iter().any(|have: &GrokModel| have.id == id) {
+            continue;
+        }
+        models.push(GrokModel {
+            id,
+            is_default: body.to_ascii_lowercase().contains("(default)"),
+        });
+    }
+    if let Some(id) = named_default {
+        if let Some(model) = models.iter_mut().find(|model| model.id == id) {
+            model.is_default = true;
+        } else if model_id_token(&id).is_some() {
+            models.insert(
+                0,
+                GrokModel {
+                    id,
+                    is_default: true,
+                },
+            );
+        }
     }
     models
 }
 
-pub fn load_cached_grok_models(root: &Path) -> Vec<String> {
+fn parse_grok_models_json(text: &str) -> Option<Vec<GrokModel>> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    let rows = value.as_array().cloned().or_else(|| {
+        value
+            .get("models")
+            .and_then(|item| item.as_array())
+            .cloned()
+    })?;
+    let mut models = Vec::new();
+    for row in rows {
+        let (id, is_default) = if let Some(id) = row.as_str() {
+            (id.to_string(), false)
+        } else {
+            let id = row.get("id")?.as_str()?.to_string();
+            let is_default = row
+                .get("default")
+                .and_then(|item| item.as_bool())
+                .unwrap_or(false);
+            (id, is_default)
+        };
+        let Some(id) = model_id_token(&id) else {
+            continue;
+        };
+        if models.iter().any(|have: &GrokModel| have.id == id) {
+            continue;
+        }
+        models.push(GrokModel { id, is_default });
+    }
+    Some(models)
+}
+
+fn is_status_line(lower: &str) -> bool {
+    lower.contains("logged in")
+        || lower.contains("not authenticated")
+        || lower.contains("not signed in")
+        || lower.starts_with("you are")
+        || lower.starts_with("available models")
+}
+
+fn bullet_body(line: &str) -> Option<&str> {
+    line.strip_prefix("* ")
+        .or_else(|| line.strip_prefix("- "))
+        .map(str::trim)
+}
+
+fn bare_model_line(line: &str) -> Option<&str> {
+    if line.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    model_id_token(line).map(|_| line)
+}
+
+fn model_id_token(text: &str) -> Option<String> {
+    let token = text
+        .split(|ch: char| ch == '(' || ch.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '*' | '|' | '"' | ',' | ':' | '.'));
+    if !is_model_id(token) {
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn is_model_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() || id.len() < 3 {
+        return false;
+    }
+    if !id
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    let lower = id.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "you"
+            | "default"
+            | "available"
+            | "models"
+            | "model"
+            | "logged"
+            | "login"
+            | "current"
+            | "name"
+            | "id"
+    ) {
+        return false;
+    }
+    id.contains('-') || id.chars().any(|ch| ch.is_ascii_digit())
+}
+
+pub fn load_cached_grok_models(root: &Path) -> Vec<GrokModel> {
     let path = root.join("grok-models.txt");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
@@ -295,23 +396,29 @@ pub fn load_cached_grok_models(root: &Path) -> Vec<String> {
     parse_grok_models(&text)
 }
 
-pub fn refresh_grok_models(root: &Path) -> Vec<String> {
+pub fn refresh_grok_models(root: &Path) -> Vec<GrokModel> {
     if let Some(cached) = fresh_cache(root) {
         return cached;
     }
-    let listed = run_grok_models();
+    let raw = run_grok_models();
+    let listed = parse_grok_models(&raw);
     if listed.is_empty() {
         return std::fs::read_to_string(root.join("grok-models.txt"))
             .map(|text| parse_grok_models(&text))
             .unwrap_or_default();
     }
-    let body = listed.join("\n");
     let _ = std::fs::create_dir_all(root);
-    let _ = std::fs::write(root.join("grok-models.txt"), body);
+    let _ = std::fs::write(root.join("grok-models.txt"), raw);
     listed
 }
 
-fn fresh_cache(root: &Path) -> Option<Vec<String>> {
+fn fresh_cache(root: &Path) -> Option<Vec<GrokModel>> {
+    let path = root.join("grok-models.txt");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let lower = text.to_ascii_lowercase();
+    if !lower.contains("default model:") && !lower.contains("(default)") {
+        return None;
+    }
     let models = load_cached_grok_models(root);
     if models.is_empty() {
         None
@@ -320,14 +427,14 @@ fn fresh_cache(root: &Path) -> Option<Vec<String>> {
     }
 }
 
-fn run_grok_models() -> Vec<String> {
+fn run_grok_models() -> String {
     let plan = background_grok_spawn();
     let mut command = std::process::Command::new(plan.program);
     command.arg("models");
     apply_hidden_command(&mut command);
     let _ = command.stdin(std::process::Stdio::null());
     let Ok(mut child) = command.spawn() else {
-        return Vec::new();
+        return String::new();
     };
     let started = Instant::now();
     let limit = std::time::Duration::from_secs(20);
@@ -338,16 +445,16 @@ fn run_grok_models() -> Vec<String> {
                 if let Some(mut pipe) = child.stdout.take() {
                     let _ = pipe.read_to_string(&mut stdout);
                 }
-                return parse_grok_models(&stdout);
+                return stdout;
             }
-            Ok(Some(_)) => return Vec::new(),
+            Ok(Some(_)) => return String::new(),
             Ok(None) if started.elapsed() > limit => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Vec::new();
+                return String::new();
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(40)),
-            Err(_) => return Vec::new(),
+            Err(_) => return String::new(),
         }
     }
 }
@@ -424,10 +531,23 @@ mod tests {
         assert!(unknown_model(
             "Couldn't set model 'old': Invalid params: \"unknown model id\""
         ));
-        assert_eq!(
-            parse_grok_models("Available models:\n* grok-3 (default)\ngrok-4\n"),
-            vec!["grok-3".to_string(), "grok-4".to_string()]
+        let listed = parse_grok_models(
+            "You are logged in with grok.com.\n\nDefault model: grok-4.7\n\nAvailable models:\n  - grok-3\n  * grok-4.7 (default)\n  - grok-build\n",
         );
+        assert!(listed.iter().all(|model| model.id != "You"));
+        assert_eq!(
+            listed
+                .iter()
+                .find(|model| model.is_default)
+                .map(|model| model.id.as_str()),
+            Some("grok-4.7")
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|model| model.id == "grok-3" && !model.is_default)
+        );
+        assert!(listed.iter().any(|model| model.id == "grok-build"));
         let short = cli_take_prompt("ada", &"courts ".repeat(300), "Funny");
         assert!(short.chars().count() <= 400);
         assert!(short.contains("Reply text only"));
