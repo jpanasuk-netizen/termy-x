@@ -272,6 +272,7 @@ impl TrendsDesk {
                             this.focus_root_after_click(window, cx);
                             this.draft_take_for(take_id.clone(), cx);
                             cx.stop_propagation();
+                            cx.notify();
                         }),
                     ))
                     .child({

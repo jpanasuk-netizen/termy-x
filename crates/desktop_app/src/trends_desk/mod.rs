@@ -739,17 +739,19 @@ impl TrendsDesk {
     }
 
     pub(crate) fn draft_card_take(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.media_blocks_card_click() {
+            return;
+        }
         self.spawn_one_take(id, false, cx);
     }
 
     pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
+        self.show_inline_editor(&id, termy_x::trends_desk::DRAFTING_PLACEHOLDER);
+        cx.notify();
         self.spawn_one_take(id, true, cx);
     }
 
     fn spawn_one_take(&mut self, id: String, open_compose: bool, cx: &mut Context<Self>) {
-        if self.media_blocks_card_click() {
-            return;
-        }
         self.takes_halted = false;
         termy_x::trends_desk::resume_takes();
         let Some(post) = self
@@ -759,6 +761,15 @@ impl TrendsDesk {
             .find(|post| post.id == id)
             .cloned()
         else {
+            if open_compose {
+                let message = termy_x::trends_desk::text_after_take(
+                    termy_x::trends_desk::DRAFTING_PLACEHOLDER,
+                    "",
+                    "this card has no post",
+                );
+                self.show_inline_editor(&id, &message);
+                cx.notify();
+            }
             return;
         };
         self.takes.insert(
@@ -815,7 +826,8 @@ impl TrendsDesk {
                             .map(|phase| phase.text().to_string())
                             .unwrap_or_default()
                     };
-                    let next = termy_x::trends_desk::fill_reply_if_waiting(&current, &result.text);
+                    let next =
+                        termy_x::trends_desk::text_after_take(&current, &result.text, &result.note);
                     if let Some(pop) = desk
                         .popout
                         .as_mut()

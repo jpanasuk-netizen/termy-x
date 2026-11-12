@@ -206,7 +206,11 @@ impl TrendsDesk {
             .get(id)
             .map(|take| take.variants.clone())
             .unwrap_or_default();
-        let mut editor = termy_x::trends_desk::open_editor(id, text, provider);
+        let mut editor = if text == termy_x::trends_desk::DRAFTING_PLACEHOLDER {
+            termy_x::trends_desk::editor_on_draft_click(id, provider)
+        } else {
+            termy_x::trends_desk::open_editor(id, text, provider)
+        };
         editor.tone = tone;
         if !stored.is_empty() {
             editor.variants = termy_x::trends_desk::distinct_variants(text, &stored);

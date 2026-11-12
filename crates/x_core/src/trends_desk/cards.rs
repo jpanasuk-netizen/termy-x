@@ -445,6 +445,30 @@ pub fn close_editor(pop: &EditPopout) -> EditPopout {
 /// Shown in the reply box until the one take for this card is ready.
 pub const DRAFTING_PLACEHOLDER: &str = "Drafting…";
 
+/// Draft take opens the in-card editor on the click, before any provider runs.
+pub fn editor_on_draft_click(card_id: &str, provider: TakeProvider) -> EditPopout {
+    open_editor(card_id, DRAFTING_PLACEHOLDER, provider)
+}
+
+/// A finished take replaces Drafting…. An empty result shows the error in the box.
+pub fn text_after_take(waiting: &str, generated: &str, error: &str) -> String {
+    if waiting != DRAFTING_PLACEHOLDER && !waiting.trim().is_empty() {
+        return waiting.to_string();
+    }
+    let generated = generated.trim();
+    if !generated.is_empty() {
+        return generated.to_string();
+    }
+    let error = error.trim();
+    if error.is_empty() {
+        format!("{}: no provider answered", super::takes::HONEST_PREFIX)
+    } else if error.starts_with(super::takes::HONEST_PREFIX) {
+        error.to_string()
+    } else {
+        format!("{}: {error}", super::takes::HONEST_PREFIX)
+    }
+}
+
 /// Replace the placeholder when the take arrives. Typed text stays.
 pub fn fill_reply_if_waiting(current: &str, generated: &str) -> String {
     let generated = generated.trim();
@@ -484,7 +508,10 @@ pub fn editor_send(pop: &EditPopout, explicit: bool) -> Result<String, String> {
         return Err("The editor is closed. Nothing was posted.".into());
     }
     let text = pop.draft.trim();
-    if text.is_empty() || text == DRAFTING_PLACEHOLDER {
+    if text.is_empty()
+        || text == DRAFTING_PLACEHOLDER
+        || text.starts_with(super::takes::HONEST_PREFIX)
+    {
         return Err("Write a reply first.".into());
     }
     Ok(text.to_string())
@@ -1190,6 +1217,27 @@ mod tests {
     #[test]
     fn draft_take_fills_the_reply_inside_the_card() {
         assert_eq!(DRAFTING_PLACEHOLDER, "Drafting…");
+        let opened = editor_on_draft_click("42", TakeProvider::Grok);
+        assert!(opened.open);
+        assert_eq!(opened.card_id, "42");
+        assert_eq!(opened.draft, DRAFTING_PLACEHOLDER);
+        let missing = text_after_take(DRAFTING_PLACEHOLDER, "", "grok: not installed");
+        assert!(missing.contains("grok: not installed"));
+        assert!(missing.starts_with(crate::trends_desk::HONEST_PREFIX));
+        assert!(
+            editor_send(
+                &EditPopout {
+                    draft: missing,
+                    ..opened
+                },
+                true
+            )
+            .is_err()
+        );
+        assert_eq!(
+            text_after_take(DRAFTING_PLACEHOLDER, "a real joke", "unused"),
+            "a real joke"
+        );
         assert_eq!(
             fill_reply_if_waiting(DRAFTING_PLACEHOLDER, "a real joke"),
             "a real joke"
