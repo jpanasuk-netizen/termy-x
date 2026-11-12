@@ -295,7 +295,7 @@ termy-xcli trends-desk status
 termy-xcli trends-desk run --topic law --focus AI
 ```
 
-Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts stay in the Termy XL data folder. Copying a draft into Termy X is explicit, and Run does not post. The window is drawn on the GPU. That does not make the search faster. Windows install uses a separate folder and a `Termy XL.lnk` shortcut; it does not edit a shortcut that launches `termy-7154b8a5.exe`. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
+Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts stay in the Termy XL data folder. Copying a draft into Termy X is explicit, and Run does not post. The window is drawn on the GPU. That does not make the search faster. When Termy X is open, the slim XL tab sits on its right edge. Hermes is a third takes provider, configured only in `%APPDATA%\Termy XL\x.toml`. Agents can call `termy-xcli desk search`, `desk takes`, `desk drafts`, and `desk queue-reply`. Those commands print JSON and do not post. The checklist is [docs/termy-xl-todo.md](docs/termy-xl-todo.md). The agent skill is [docs/termy-xl-agents.md](docs/termy-xl-agents.md). Windows install uses a separate folder and a `Termy XL.lnk` shortcut; it does not edit a shortcut that launches `termy-7154b8a5.exe`. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
 
 ## Sync across PCs
 
