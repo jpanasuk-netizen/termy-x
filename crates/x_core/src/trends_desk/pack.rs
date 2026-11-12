@@ -37,7 +37,7 @@ impl TakeTone {
     pub fn parse(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
             "funny" => Self::Funny,
-            "data" => Self::Data,
+            "data" | "smart" => Self::Data,
             "contrarian" => Self::Contrarian,
             "supportive" => Self::Supportive,
             "hype" => Self::Hype,
@@ -55,6 +55,25 @@ impl TakeTone {
             Self::Hype => "Hype",
         }
     }
+}
+
+/// The three chips in the card's reply panel. Data is shown as Smart.
+pub fn panel_tones() -> [TakeTone; 3] {
+    [TakeTone::Funny, TakeTone::Data, TakeTone::Spicy]
+}
+
+pub fn panel_tone_name(tone: TakeTone) -> &'static str {
+    match tone {
+        TakeTone::Data => "Smart",
+        other => other.label(),
+    }
+}
+
+pub fn next_tone(current: &str) -> TakeTone {
+    let tones = TakeTone::all();
+    let parsed = TakeTone::parse(current);
+    let index = tones.iter().position(|tone| *tone == parsed).unwrap_or(0);
+    tones[(index + 1) % tones.len()]
 }
 
 /// Engagement per hour from counts already on the post. Missing time is not a rate.
@@ -754,6 +773,12 @@ mod tests {
         assert!(!err.contains("Funny"));
         assert_eq!(flip_variant(2, 1, 3), 0);
         assert_eq!(flip_variant(0, -1, 3), 2);
+        let names: Vec<_> = panel_tones().into_iter().map(panel_tone_name).collect();
+        assert_eq!(names, vec!["Funny", "Smart", "Spicy"]);
+        assert_eq!(TakeTone::parse("smart"), TakeTone::Data);
+        assert_eq!(panel_tone_name(TakeTone::parse("Smart")), "Smart");
+        assert_eq!(next_tone("Spicy"), TakeTone::Funny);
+        assert_eq!(panel_tone_name(next_tone("Smart")), "Contrarian");
     }
 
     #[test]

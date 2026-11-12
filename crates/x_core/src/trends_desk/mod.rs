@@ -27,15 +27,16 @@ pub use agents::{
     seed_agent_block, variants_from_draft, write_hermes_settings,
 };
 pub use cards::{
-    COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, EditPopout, LOCKED_OPEN_WIDTH,
-    ReplyPhase, SELECT_CYAN, SELECT_PINK, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame,
-    TakeProvider, TweetCard, WINDOW_PAD, apply_send_result, card_columns, card_from_post,
-    char_count, close_editor, collapse_dock, commit_send, draft_take, edit_reply, editor_send,
-    expand_locked, expand_right, expand_to_full, frame_from_parts, layout_takes, move_selection,
-    offline_take, open_editor, open_width, page_index, page_label, remember_width, request_send,
-    scroll_by, scroll_of, select_take, selection_after_card, selection_after_empty,
-    selection_colors, send_is_busy, short_take_note, subject_pages, take_column_count,
-    takes_for_posts, toggle_dock, tone_variants, turn_page, wrap_token,
+    COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DRAFTING_PLACEHOLDER, DeskFrame, EditPopout,
+    LOCKED_OPEN_WIDTH, ReplyPhase, SELECT_CYAN, SELECT_PINK, SubjectPage, TAKE_CARD_WIDTH,
+    TakeDraft, TakeFrame, TakeProvider, TweetCard, WINDOW_PAD, apply_send_result, apply_variant,
+    card_columns, card_from_post, char_count, close_editor, collapse_dock, commit_send, draft_take,
+    edit_reply, editor_send, expand_locked, expand_right, expand_to_full, fill_reply_if_waiting,
+    frame_from_parts, layout_takes, move_selection, offline_take, open_editor, open_width,
+    page_index, page_label, remember_width, reply_needs_a_take, request_send, scroll_by, scroll_of,
+    select_take, selection_after_card, selection_after_empty, selection_colors, send_is_busy,
+    short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock, tone_variants,
+    turn_page, wrap_token,
 };
 pub use desk_cmd::{
     find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
@@ -73,9 +74,10 @@ pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, ReplyMark,
     SearchEdit, TakeTone, apply_filters, desk_key, distinct_variants, flip_variant, format_clock,
     format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs,
-    new_ids, next_click_reaches, next_refresh_text, page_after_key, provider_drafts, read_composer,
-    refresh_due, refresh_is_search_only, replied_badge, save_pack, search_edit, search_label,
-    search_page_name, sends_on_key, should_auto_refresh, sort_by_heat,
+    new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key, panel_tone_name,
+    panel_tones, provider_drafts, read_composer, refresh_due, refresh_is_search_only,
+    replied_badge, save_pack, search_edit, search_label, search_page_name, sends_on_key,
+    should_auto_refresh, sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

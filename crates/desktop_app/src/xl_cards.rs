@@ -83,7 +83,7 @@ impl TrendsDesk {
                 ReplyPhase::Editing { .. } | ReplyPhase::Idle => String::new(),
             }
         };
-        div()
+        let mut shell = div()
             .id(SharedString::from(format!("desk-card-{id}")))
             .w_full()
             .min_w(px(0.0))
@@ -292,7 +292,7 @@ impl TrendsDesk {
                         "Reply",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.draft_take_for(edit_id.clone(), cx);
+                            this.open_inline_for(edit_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -339,12 +339,16 @@ impl TrendsDesk {
                         "Edit",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.draft_take_for(send_id.clone(), cx);
+                            this.open_inline_for(send_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
                     )),
             )
-            .into_any_element()
+            .children(self.inline_editor(&id, cx));
+        if editing {
+            shell = shell.max_h(px(640.0)).overflow_y_scroll();
+        }
+        shell.into_any_element()
     }
 }
