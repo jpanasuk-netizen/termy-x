@@ -214,6 +214,13 @@ impl TerminalView {
             CommandAction::OpenXResearch => {
                 self.open_x_section(termy::x_panel::XSection::Research, cx);
             }
+            CommandAction::OpenTrendsDesk => {
+                if let Err(error) =
+                    termy::trends_desk::open_in(cx, termy::trends_desk::DeskOptions::default())
+                {
+                    log::error!("Termy XL did not open: {error}");
+                }
+            }
             _ if shortcuts_suspended => {}
             CommandAction::OpenConfig
             | CommandAction::PrettifyConfig
@@ -489,6 +496,15 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         self.execute_command_action(CommandAction::OpenXResearch, true, window, cx);
+    }
+
+    pub(in super::super) fn handle_open_trends_desk_action(
+        &mut self,
+        _: &commands::OpenTrendsDesk,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.execute_command_action(CommandAction::OpenTrendsDesk, true, window, cx);
     }
 
     pub(in super::super) fn handle_new_tab_action(

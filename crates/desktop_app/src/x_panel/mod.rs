@@ -5,9 +5,9 @@ pub mod art;
 mod desk;
 mod editor_surface;
 mod list_sort;
-mod media_fit;
-mod player;
-mod preview;
+pub(crate) mod media_fit;
+pub(crate) mod player;
+pub(crate) mod preview;
 mod scroll_math;
 mod thread_view;
 
@@ -645,6 +645,8 @@ pub struct XPanel {
     /// Char limit resolved once at startup. Loading x.toml from disk on
     /// every render (and again per reply box) was pure waste on the hot path.
     char_limit: usize,
+    /// Where this panel reads and writes x.toml, drafts, and action state.
+    config_dir: PathBuf,
     media_cache: HashMap<String, MediaState>,
     viewer: Option<Viewer>,
     video_player: Option<player::VideoPlayer>,
@@ -1053,10 +1055,18 @@ fn log_switch(section: XSection, started: Instant, kind: &str) {
 
 impl XPanel {
     pub fn new(cx: &mut Context<Self>, fill_window: bool) -> Self {
+        Self::new_in(cx, fill_window, termy_x::config::default_config_dir())
+    }
+
+    /// `config_dir` is the only directory this panel may write. Termy XL passes
+    /// its own data root. Termy X keeps the default config directory.
+    pub fn new_in(cx: &mut Context<Self>, fill_window: bool, config_dir: PathBuf) -> Self {
         let config = if fill_window {
-            XConfig::default()
+            let mut config = XConfig::default();
+            config.config_dir = config_dir.clone();
+            config
         } else {
-            termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+            termy_x::config::XConfig::load(&config_dir)
         };
         let saved_handle = if fill_window {
             None
@@ -1081,6 +1091,7 @@ impl XPanel {
         let mut panel = Self {
             focus: cx.focus_handle(),
             char_limit,
+            config_dir,
             media_cache: HashMap::new(),
             viewer: None,
             video_player: None,
@@ -2110,6 +2121,7 @@ impl XPanel {
             None
         };
 
+        let config_dir = self.config_dir.clone();
         cx.spawn(async move |this, cx| {
             let payload = cx
                 .background_executor()
@@ -2125,6 +2137,7 @@ impl XPanel {
                         append,
                         limit,
                         fetch_cursor,
+                        &config_dir,
                     )
                 })
                 .await;
@@ -2321,6 +2334,8 @@ impl XPanel {
     /// id never refetches on every render. Six fetches per pass, then
     /// the completion re-scans and drains the rest.
     fn resolve_bare_reposts(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.repost_resolving {
             return;
         }
@@ -2360,7 +2375,7 @@ impl XPanel {
             let resolved = cx
                 .background_executor()
                 .spawn(async move {
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&config_dir);
                     wanted
                         .iter()
                         .map(|(id, fetch_id)| {
@@ -2406,8 +2421,8 @@ impl XPanel {
         .detach();
     }
 
-    fn service_free() -> termy_x::providers::Service {
-        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+    fn service_free(dir: &std::path::Path) -> termy_x::providers::Service {
+        let config = termy_x::config::XConfig::load(dir);
         termy_x::providers::Service::free(
             &config,
             Arc::new(termy_x::io::SystemRunner),
@@ -2416,6 +2431,8 @@ impl XPanel {
     }
 
     fn start_connection_check(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.checking_conn {
             return;
         }
@@ -2426,8 +2443,7 @@ impl XPanel {
             let conn = cx
                 .background_executor()
                 .spawn(async move {
-                    let config =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let config = termy_x::config::XConfig::load(&config_dir);
                     termy_x::connect::detect_connection(
                         &config,
                         &termy_x::io::SystemRunner,
@@ -2484,7 +2500,9 @@ impl XPanel {
     }
 
     fn disconnect_x(&mut self, cx: &mut Context<Self>) {
-        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let config_dir = self.config_dir.clone();
+
+        let config = termy_x::config::XConfig::load(&config_dir);
         let _ = termy_x::connect::disconnect(&config);
         self.posts.clear();
         self.search_posts.clear();
@@ -2517,7 +2535,9 @@ impl XPanel {
     }
 
     fn save_bearer(&mut self, cx: &mut Context<Self>) {
-        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let config_dir = self.config_dir.clone();
+
+        let config = termy_x::config::XConfig::load(&config_dir);
         match termy_x::connect::store_bearer_token(&config, &self.bearer_input) {
             Ok(()) => {
                 self.bearer_mode = false;
@@ -2708,6 +2728,8 @@ impl XPanel {
 
     /// Instant local templates, then optional AI in the background. Never blocks UI.
     fn suggest_async(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         self.suggest_templates();
         self.suggesting = true;
         self.notice = Some("Drafting variantsâ€¦ UI stays live.".into());
@@ -2716,8 +2738,7 @@ impl XPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let config =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let config = termy_x::config::XConfig::load(&config_dir);
                     let http = termy_x::io::UreqHttp::default();
                     termy_x::ai::draft_variants(&config, &http, &idea, Tone::Punchy, 3)
                 })
@@ -2742,8 +2763,9 @@ impl XPanel {
     }
 
     fn arm_confirm(&mut self) {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-            .char_limit_or_fallback();
+        let config_dir = self.config_dir.clone();
+
+        let char_limit = termy_x::config::XConfig::load(&config_dir).char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             vec![self.compose.trim().to_string()]
@@ -2834,7 +2856,9 @@ impl XPanel {
     }
 
     fn live_config(&self) -> XConfig {
-        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+        let config_dir = self.config_dir.clone();
+
+        termy_x::config::XConfig::load(&config_dir)
     }
 
     fn arm_confirm_reply(&mut self, text: &str, reply_to: &str, queue_id: Option<String>) {
@@ -2882,6 +2906,8 @@ impl XPanel {
     }
 
     fn load_inbox(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let Some(me) = self.me_handle() else {
             self.desk.inbox_error = Some("Connect my X first.".into());
             cx.notify();
@@ -2902,7 +2928,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().inbox_posts(&me, LIST_PAGE)
+                        XPanel::service_free(&config_dir).inbox_posts(&me, LIST_PAGE)
                     } else {
                         MockProvider
                             .search(&termy_x::inbox::to_me_query(&me), true, 8)
@@ -2939,6 +2965,8 @@ impl XPanel {
     }
 
     fn load_mentions(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let Some(me) = self.me_handle() else {
             self.desk.mentions_error = Some("Connect my X first.".into());
             cx.notify();
@@ -2959,7 +2987,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().mentions_posts(&me, LIST_PAGE)
+                        XPanel::service_free(&config_dir).mentions_posts(&me, LIST_PAGE)
                     } else {
                         MockProvider.search(&format!("@{me}"), true, 8)
                     }
@@ -3009,6 +3037,8 @@ impl XPanel {
     }
 
     fn inbox_ai_draft(&mut self, post: &Post, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.desk.loading {
             self.notice = Some("Already drafting \u{2014} wait for it.".into());
             cx.notify();
@@ -3024,8 +3054,7 @@ impl XPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let config =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let config = termy_x::config::XConfig::load(&config_dir);
                     let http = termy_x::io::UreqHttp::default();
                     termy_x::ai::draft_variants(
                         &config,
@@ -3100,6 +3129,8 @@ impl XPanel {
     }
 
     fn run_selected_feed(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let Some(feed) = self.desk.selected_feed().cloned() else {
             self.notice = Some("Add or select a feed first.".into());
             cx.notify();
@@ -3121,7 +3152,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().search(&query, true, LIST_PAGE)
+                        XPanel::service_free(&config_dir).search(&query, true, LIST_PAGE)
                     } else {
                         MockProvider.search(&query, true, 8)
                     }
@@ -3158,6 +3189,8 @@ impl XPanel {
     }
 
     fn load_stats(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let Some(me) = self.me_handle() else {
             self.desk.stats_error = Some("Connect my X first.".into());
             cx.notify();
@@ -3177,7 +3210,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        XPanel::service_free().tweets(&me, 80)
+                        XPanel::service_free(&config_dir).tweets(&me, 80)
                     } else {
                         MockProvider.tweets(&me, 8)
                     }
@@ -3214,6 +3247,8 @@ impl XPanel {
     }
 
     fn snapshot_followers(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let Some(me) = self.me_handle() else {
             self.desk.follower_error = Some("Connect my X first.".into());
             cx.notify();
@@ -3231,11 +3266,14 @@ impl XPanel {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    if live {
-                        XPanel::service_free().followers(&me_fetch, 200)
-                    } else {
-                        MockProvider.followers(&me_fetch, 8)
+                .spawn({
+                    let config_dir = config_dir.clone();
+                    async move {
+                        if live {
+                            XPanel::service_free(&config_dir).followers(&me_fetch, 200)
+                        } else {
+                            MockProvider.followers(&me_fetch, 8)
+                        }
                     }
                 })
                 .await;
@@ -3248,8 +3286,7 @@ impl XPanel {
                             &mut panel.desk.follower_log,
                             termy_x::followers::make_snapshot(&me, served.value, None),
                         );
-                        let config =
-                            termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                        let config = termy_x::config::XConfig::load(&config_dir);
                         if let Err(error) = panel.desk.persist_followers(&config) {
                             panel.desk.follower_error = Some(error);
                         } else {
@@ -3320,6 +3357,8 @@ impl XPanel {
     }
 
     fn run_analyze(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let handle = termy_x::model::strip_handle(&self.desk.analyze_handle).to_string();
         if handle.is_empty() {
             self.notice = Some("Type a handle first.".into());
@@ -3340,7 +3379,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        let service = XPanel::service_free();
+                        let service = XPanel::service_free(&config_dir);
                         let profile = service.lookup(&handle_fetch).ok().map(|s| s.value);
                         let posts = match service.tweets(&handle_fetch, LIST_PAGE) {
                             Ok(served) if !served.value.is_empty() => served.value,
@@ -4208,6 +4247,8 @@ impl XPanel {
     /// or slow check caches nothing and shows nothing, and nothing here
     /// can block typing or posting.
     fn maybe_spawn_mention_check(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if !self.live || self.mention_inflight.is_some() {
             return;
         }
@@ -4251,7 +4292,7 @@ impl XPanel {
         let executor = cx.background_executor().clone();
         cx.spawn(async move |this, cx| {
             let result = executor
-                .spawn(async move { Self::service_free().lookup(&lookup_handle) })
+                .spawn(async move { Self::service_free(&config_dir).lookup(&lookup_handle) })
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 panel.mention_inflight = None;
@@ -4625,15 +4666,19 @@ impl XPanel {
     }
 
     fn persist_actions(&self) {
+        let config_dir = self.config_dir.clone();
+
         if !self.action_persist || !self.live {
             return;
         }
-        let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+        let config = termy_x::config::XConfig::load(&config_dir);
         let _ = self.action_db.save(&config.action_state_path());
         termy_x::supabase_sync::push_saved_in_background();
     }
 
     fn schedule_supabase_pull(&self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if !self.live {
             return;
         }
@@ -4641,8 +4686,7 @@ impl XPanel {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    let config =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                    let config = termy_x::config::XConfig::load(&config_dir);
                     let http = termy_x::io::UreqHttp::default();
                     let db =
                         termy_x::action_state::ActionDb::load(&config.action_state_path()).ok();
@@ -4891,6 +4935,8 @@ impl XPanel {
     /// payload's real flag or a session-verified override — never a
     /// guess; on failure nothing flips and the error is humanized.
     fn toggle_follow(&mut self, handle: &str, target: bool, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if !termy_x::action_state::follow_write_allowed(self.follow_pending.is_some()) {
             return;
         }
@@ -4921,7 +4967,7 @@ impl XPanel {
                 .background_executor()
                 .spawn(async move {
                     if live {
-                        let service = XPanel::service_free();
+                        let service = XPanel::service_free(&config_dir);
                         let publishers = service.publishers;
                         let Some(publisher) =
                             termy_x::publish::first_that_follows(publishers.as_slice())
@@ -5008,6 +5054,8 @@ impl XPanel {
         author: &str,
         cx: &mut Context<Self>,
     ) {
+        let config_dir = self.config_dir.clone();
+
         use termy_x::publish::EngageAction;
         let id = id.to_string();
         if self.engage_pending.iter().any(|p| p == &id) {
@@ -5058,7 +5106,7 @@ impl XPanel {
                 .spawn(async move {
                     let probe_started = Instant::now();
                     if live {
-                        let service = XPanel::service_free();
+                        let service = XPanel::service_free(&config_dir);
                         let publishers = service.publishers;
                         let Some(publisher) =
                             termy_x::publish::first_available(publishers.as_slice())
@@ -5339,6 +5387,8 @@ impl XPanel {
     /// Post the quote via OpenCLI `twitter quote <url> <text>`.
     /// A normal post is not a fallback. Failure leaves the draft.
     fn submit_quote(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.quote_posting {
             self.notice = Some("Already sending that quote \u{2014} wait for it.".into());
             cx.notify();
@@ -5397,11 +5447,12 @@ impl XPanel {
         self.submit_seq += 1;
         self.spawn_still_posting_ticker(cx, SubmitKind::Quote, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
+            let service_dir = config_dir.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let probe_started = Instant::now();
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&service_dir);
                     let publishers = service.publishers;
                     let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
@@ -5502,6 +5553,8 @@ impl XPanel {
     /// `--window background`). Never opens Chrome. A real click on Reply
     /// is the confirmation — the draft and target are shown in place.
     fn submit_reply(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.reply_posting {
             self.notice = Some("Already sending that reply — wait for it.".into());
             cx.notify();
@@ -5545,11 +5598,12 @@ impl XPanel {
         self.submit_seq += 1;
         self.spawn_still_posting_ticker(cx, SubmitKind::Reply, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
+            let service_dir = config_dir.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let probe_started = Instant::now();
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&service_dir);
                     let publishers = service.publishers;
                     let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
@@ -5563,8 +5617,7 @@ impl XPanel {
                         probe_started.elapsed().as_millis()
                     ));
                     let char_limit =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-                            .char_limit_or_fallback();
+                        termy_x::config::XConfig::load(&config_dir).char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
                         Some(&target_id),
@@ -5739,9 +5792,10 @@ fn fetch_section(
     append: bool,
     limit: usize,
     cursor: Option<String>,
+    config_dir: &std::path::Path,
 ) -> FetchPayload {
     if live {
-        let service = XPanel::service_free();
+        let service = XPanel::service_free(config_dir);
         match section {
             XSection::Timeline => {
                 // Cursor-paginated path first: refresh walks from the
@@ -5938,7 +5992,7 @@ fn fetch_section(
                 }
             },
             XSection::Research => {
-                let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+                let config = termy_x::config::XConfig::load(&config_dir);
                 let runner = termy_x::io::SystemRunner;
                 let hits = if query.trim().is_empty() {
                     Vec::new()
@@ -7110,6 +7164,27 @@ impl XPanel {
                 .text_size(px(12.0))
                 .text_color(rgb(0x7af6ff))
                 .child("Trends \u{b7} worldwide \u{b7} click any trend to search it on X")
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .gap(px(8.0))
+                .items_center()
+                .child(x_button!(
+                    "x-open-trends-desk",
+                    "Open Termy XL",
+                    cx.listener(|_, _, _, cx| {
+                        if let Err(error) = crate::trends_desk::open_in(
+                            cx,
+                            crate::trends_desk::DeskOptions::default(),
+                        ) {
+                            log::error!("Termy XL did not open: {error}");
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                    })
+                ))
                 .into_any_element(),
         );
         rows.push(self.single_line_field(TextField::Trends, cx));
@@ -10390,6 +10465,8 @@ impl XPanel {
     }
 
     fn submit_new_tweet(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.new_tweet_posting {
             self.notice = Some("Already posting that tweet. Nothing else was sent.".into());
             cx.notify();
@@ -10425,7 +10502,7 @@ impl XPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&config_dir);
                     let publishers = service.publishers;
                     let Some(publisher) = termy_x::publish::first_available(publishers.as_slice())
                     else {
@@ -10435,8 +10512,7 @@ impl XPanel {
                         );
                     };
                     let char_limit =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-                            .char_limit_or_fallback();
+                        termy_x::config::XConfig::load(&config_dir).char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
                         termy_x::publish::standalone_reply_to(),
@@ -11479,8 +11555,9 @@ impl XPanel {
     }
 
     fn copy_current_part(&mut self, cx: &mut Context<Self>) {
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-            .char_limit_or_fallback();
+        let config_dir = self.config_dir.clone();
+
+        let char_limit = termy_x::config::XConfig::load(&config_dir).char_limit_or_fallback();
         let source = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
             self.reply_text.as_str()
         } else {
@@ -11501,6 +11578,8 @@ impl XPanel {
     /// official API, etc.). Never opens Chrome/x.com. The web-intent publisher is
     /// deliberately NOT in this chain — browser posting is the explicit button only.
     fn post_now_async(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         if self.posting {
             self.notice = Some("Already posting — wait for it to finish.".into());
             cx.notify();
@@ -11543,11 +11622,12 @@ impl XPanel {
         self.submit_seq += 1;
         self.spawn_still_posting_ticker(cx, SubmitKind::Post, self.submit_seq, submit_started);
         cx.spawn(async move |this, cx| {
+            let service_dir = config_dir.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
                     let probe_started = Instant::now();
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&service_dir);
                     let publishers = service.publishers;
                     let Some(publisher) =
                         termy_x::publish::first_available(publishers.as_slice())
@@ -11564,7 +11644,7 @@ impl XPanel {
                     // A publisher that cannot upload must say so, not fake it:
                     // OpenCLI supports --images; twitter-cli/official reject media.
                     let char_limit =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                        termy_x::config::XConfig::load(&service_dir)
                             .char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
@@ -11640,9 +11720,7 @@ impl XPanel {
                         }
                         if let Some(id) = &queue_id {
                             termy_x::queue::remove_item(&mut panel.desk.queue, id);
-                            let config = termy_x::config::XConfig::load(
-                                &termy_x::config::default_config_dir(),
-                            );
+                            let config = termy_x::config::XConfig::load(&config_dir);
                             let _ = panel.desk.persist_queue(&config);
                         }
                         panel.confirm_queue_id = None;
@@ -11668,6 +11746,8 @@ impl XPanel {
     }
 
     fn dry_run_async(&mut self, cx: &mut Context<Self>) {
+        let config_dir = self.config_dir.clone();
+
         let text = if self.confirm_reply_to.is_some() && !self.reply_text.trim().is_empty() {
             self.reply_text.trim().to_string()
         } else {
@@ -11686,7 +11766,7 @@ impl XPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let service = XPanel::service_free();
+                    let service = XPanel::service_free(&config_dir);
                     let publishers = service.publishers;
                     let Some(publisher) =
                         termy_x::publish::first_available(publishers.as_slice())
@@ -11694,7 +11774,7 @@ impl XPanel {
                         return Err("No publish path to plan against.".to_string());
                     };
                     let char_limit =
-                        termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
+                        termy_x::config::XConfig::load(&config_dir)
                             .char_limit_or_fallback();
                     match termy_x::publish::confirm_and_publish_with_media(
                         &text,
@@ -11739,6 +11819,8 @@ impl XPanel {
     /// Preview and mock never open a browser. Debounced so repeated
     /// clicks/Enter cannot reopen Chrome in a burst.
     fn open_current_intent(&mut self) {
+        let config_dir = self.config_dir.clone();
+
         if let Some(at) = self.last_browser_open
             && at.elapsed() < Duration::from_secs(5)
         {
@@ -11746,8 +11828,7 @@ impl XPanel {
             return;
         }
         self.last_browser_open = Some(Instant::now());
-        let char_limit = termy_x::config::XConfig::load(&termy_x::config::default_config_dir())
-            .char_limit_or_fallback();
+        let char_limit = termy_x::config::XConfig::load(&config_dir).char_limit_or_fallback();
         let parts = split_thread_limited(&self.compose, char_limit);
         let parts = if parts.is_empty() {
             let trimmed = self.compose.trim().to_string();
@@ -12176,6 +12257,7 @@ mod edit_keys_tests {
             false,
             TIMELINE_PAGE,
             None,
+            std::path::Path::new("."),
         );
         let FetchPayload::Timeline {
             posts,
@@ -12202,6 +12284,7 @@ mod edit_keys_tests {
             true,
             TIMELINE_PAGE,
             Some(cursor),
+            std::path::Path::new("."),
         );
         let FetchPayload::Timeline {
             posts: more,
@@ -12249,6 +12332,7 @@ mod edit_keys_tests {
             false,
             TIMELINE_PAGE,
             None,
+            std::path::Path::new("."),
         );
         let FetchPayload::Timeline { posts, status, .. } = payload else {
             panic!("timeline");

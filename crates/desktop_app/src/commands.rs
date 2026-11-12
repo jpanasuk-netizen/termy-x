@@ -1238,6 +1238,22 @@ define_commands!(
         )),
         None
     ),
+    (
+        OpenTrendsDesk,
+        TERMINAL_CONTEXT,
+        Some(palette(
+            "Termy XL",
+            "x trends desk termy xl law finance ai columns reports opencli",
+            CommandPaletteVisibility::Always
+        )),
+        Some(menu(
+            MenuRoot::View,
+            0,
+            "Termy XL",
+            MenuVisibility::Always,
+            MenuActionRole::Normal
+        ))
+    ),
 );
 
 termy_core::termy_command_catalog!(impl_command_action_id_mapping);

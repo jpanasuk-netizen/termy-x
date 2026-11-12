@@ -25,6 +25,217 @@ pub fn draft_variants(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatModelChoice {
+    pub model: String,
+    /// Models still unused, local names before `:cloud` names.
+    pub later: Vec<String>,
+    pub substituted: bool,
+}
+
+/// Pick a chat model on the configured endpoint.
+///
+/// An explicit `ai.model` is used as written. The implicit default (`llama3.2`)
+/// is kept only when the server lists it. Otherwise the first listed model is
+/// used. A dead server is `free model unreachable at <host>`. An empty catalog
+/// is `model <name> not installed`.
+pub fn choose_chat_model(config: &XConfig, http: &dyn Http) -> Result<ChatModelChoice, String> {
+    let (base, preferred) = config.ai_endpoint();
+    let host = endpoint_host(&base);
+    if !config.ai_model.trim().is_empty() {
+        return Ok(ChatModelChoice {
+            model: preferred,
+            later: Vec::new(),
+            substituted: false,
+        });
+    }
+    let Ok(models) = list_model_ids(http, &base) else {
+        return Err(format!("free model unreachable at {host}"));
+    };
+    let ordered = prefer_local_models(models, &preferred);
+    let Some(model) = ordered.first().cloned() else {
+        return Err(format!("model {preferred} not installed"));
+    };
+    Ok(ChatModelChoice {
+        substituted: !model_matches(&model, &preferred),
+        later: ordered.into_iter().skip(1).collect(),
+        model,
+    })
+}
+
+/// Local names first. A `:cloud` model is used only when nothing local is listed.
+pub fn prefer_local_models(models: Vec<String>, preferred: &str) -> Vec<String> {
+    let mut local = Vec::new();
+    let mut cloud = Vec::new();
+    for name in models {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if is_cloud_model(&name) {
+            cloud.push(name);
+        } else {
+            local.push(name);
+        }
+    }
+    let mut ordered = Vec::new();
+    if let Some(index) = local.iter().position(|name| model_matches(name, preferred)) {
+        ordered.push(local.remove(index));
+    }
+    ordered.append(&mut local);
+    if ordered.is_empty()
+        && let Some(index) = cloud.iter().position(|name| model_matches(name, preferred))
+    {
+        ordered.push(cloud.remove(index));
+    }
+    ordered.append(&mut cloud);
+    ordered
+}
+
+pub fn is_cloud_model(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name.contains(":cloud") || name.ends_with("-cloud")
+}
+
+/// A paid or unauthorized model. The caller may try one other model, then stop.
+pub fn blocks_free_model(note: &str) -> bool {
+    let note = note.to_lowercase();
+    note.contains("402")
+        || note.contains("401")
+        || note.contains("payment required")
+        || note.contains("insufficient")
+        || note.contains("unauthorized")
+}
+
+fn endpoint_host(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let without_scheme = trimmed.split("://").nth(1).unwrap_or(trimmed);
+    without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
+}
+
+fn model_matches(installed: &str, wanted: &str) -> bool {
+    let installed = installed.trim();
+    let wanted = wanted.trim();
+    installed.eq_ignore_ascii_case(wanted)
+        || installed
+            .split(':')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+}
+
+fn list_model_ids(http: &dyn Http, base: &str) -> Result<Vec<String>, String> {
+    let mut saw_answer = false;
+    let openai = format!("{}/models", base.trim().trim_end_matches('/'));
+    if let Ok(body) = http.request(get_json(&openai)) {
+        saw_answer = true;
+        let ids = parse_openai_models(&body);
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
+    let host = endpoint_host(base);
+    if host.contains("11434") {
+        let tags = format!("http://{host}/api/tags");
+        if let Ok(body) = http.request(get_json(&tags)) {
+            saw_answer = true;
+            let ids = parse_ollama_tags(&body);
+            if !ids.is_empty() {
+                return Ok(ids);
+            }
+        }
+    }
+    if saw_answer {
+        Ok(Vec::new())
+    } else {
+        Err(format!("free model unreachable at {host}"))
+    }
+}
+
+fn get_json(url: &str) -> HttpRequest {
+    HttpRequest {
+        method: "GET",
+        url: url.to_string(),
+        body: None,
+        bearer: None,
+        content_type: None,
+        headers: Vec::new(),
+    }
+}
+
+fn parse_openai_models(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/data")
+        .and_then(|item| item.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("id").and_then(|id| id.as_str()))
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_ollama_tags(body: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/models")
+        .and_then(|item| item.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get("name").and_then(|name| name.as_str()))
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One completion from the configured free endpoint. No template fallback.
+pub fn chat_completion(
+    config: &XConfig,
+    http: &dyn Http,
+    system: &str,
+    user: &str,
+) -> Result<String, String> {
+    let (base, model) = config.ai_endpoint();
+    let body = serde_json::json!({
+        "model": model,
+        "temperature": 0.4,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user}
+        ]
+    })
+    .to_string();
+    let mut url = base.trim_end_matches('/').to_string();
+    url.push_str("/chat/completions");
+    let response = http.request(HttpRequest {
+        method: "POST",
+        url,
+        body: Some(body),
+        bearer: config.api_key(),
+        content_type: Some("application/json".into()),
+        headers: Vec::new(),
+    })?;
+    let text = completion_text(&response)?;
+    if let Some(key) = config.api_key() {
+        return Ok(text.replace(&key, "[redacted]"));
+    }
+    Ok(text)
+}
+
 fn model_variants(
     config: &XConfig,
     http: &dyn Http,
@@ -218,6 +429,86 @@ mod tests {
     }
 
     #[test]
+    fn default_ollama_uses_the_first_installed_model_when_llama_is_missing() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(r#"{"data":[{"id":"qwen2.5:latest"}]}"#.into()),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert!(choice.substituted);
+        assert_eq!(choice.model, "qwen2.5:latest");
+    }
+
+    #[test]
+    fn a_local_model_is_chosen_ahead_of_cloud_models() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(
+                r#"{"data":[{"id":"minimax-m3:cloud"},{"id":"llama3.2"},{"id":"glm-5.2:cloud"}]}"#
+                    .into(),
+            ),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert_eq!(choice.model, "llama3.2");
+        assert!(choice.later.iter().all(|name| is_cloud_model(name)));
+    }
+
+    #[test]
+    fn only_cloud_models_leave_one_backup() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(r#"{"data":[{"id":"minimax-m3:cloud"},{"id":"glm-5.2:cloud"}]}"#.into()),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert_eq!(choice.model, "minimax-m3:cloud");
+        assert_eq!(choice.later, vec!["glm-5.2:cloud".to_string()]);
+        assert!(blocks_free_model("http 402: payment required"));
+        assert!(!blocks_free_model("connection refused"));
+    }
+
+    #[test]
+    fn a_dead_local_endpoint_names_the_host() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        let error = choose_chat_model(&config, &http).unwrap_err();
+        assert_eq!(error, "free model unreachable at 127.0.0.1:11434");
+    }
+
+    #[test]
+    fn an_empty_catalog_says_the_default_model_is_not_installed() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/v1/models".into(),
+            Ok(r#"{"data":[]}"#.into()),
+        );
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/api/tags".into(),
+            Ok(r#"{"models":[]}"#.into()),
+        );
+        let error = choose_chat_model(&config, &http).unwrap_err();
+        assert_eq!(error, "model llama3.2 not installed");
+    }
+
+    #[test]
+    fn llama_with_a_tag_still_counts_as_installed() {
+        let config = XConfig::default();
+        let http = MapHttp::default();
+        http.routes.lock().unwrap().insert(
+            "http://127.0.0.1:11434/api/tags".into(),
+            Ok(r#"{"models":[{"name":"llama3.2:latest"}]}"#.into()),
+        );
+        let choice = choose_chat_model(&config, &http).unwrap();
+        assert!(!choice.substituted);
+        assert_eq!(choice.model, "llama3.2:latest");
+    }
+
     fn prompt_file_has_the_four_tones() {
         for tone in ["punchy", "informative", "thread", "reply"] {
             assert!(PROMPTS.contains(&format!("[{tone}]")), "{tone}");

@@ -312,10 +312,11 @@ impl XPanel {
             self.account_sync.status = "syncing".into();
         }
         cx.notify();
+        let config_dir = self.config_dir.clone();
         cx.spawn(async move |this, cx| {
             let done = cx
                 .background_executor()
-                .spawn(async move { run_job(job, launch, email, password) })
+                .spawn(async move { run_job(job, launch, email, password, config_dir) })
                 .await;
             let _ = this.update(cx, |panel, cx| {
                 panel.account_sync.busy = false;
@@ -345,8 +346,14 @@ struct Done {
     synced: Option<termy_x::supabase_sync::SyncOutcome>,
 }
 
-fn run_job(job: Job, launch: bool, email: String, password: String) -> Done {
-    let config = termy_x::config::XConfig::load(&termy_x::config::default_config_dir());
+fn run_job(
+    job: Job,
+    launch: bool,
+    email: String,
+    password: String,
+    config_dir: std::path::PathBuf,
+) -> Done {
+    let config = termy_x::config::XConfig::load(&config_dir);
     let http = termy_x::io::UreqHttp::default();
     if launch {
         let db =

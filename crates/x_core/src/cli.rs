@@ -95,6 +95,16 @@ enum Cmd {
         #[arg(long, default_value_t = 10)]
         limit: usize,
     },
+    /// Law, Finance, and AI desk. Live OpenCLI only. Never posts.
+    /// `desk` is the short name agents should call.
+    #[command(alias = "desk")]
+    TrendsDesk {
+        /// Termy XL data directory. Defaults to the Termy XL app folder, not Termy X AppData.
+        #[arg(long, global = true)]
+        data_dir: Option<PathBuf>,
+        #[command(subcommand)]
+        action: TrendsDeskAction,
+    },
     /// Top posts for a topic, ranked by engagement
     Popular {
         topic: String,
@@ -586,6 +596,252 @@ pub fn execute(args: &[String], io: &mut CliIo, interactive: bool) -> i32 {
     }
 }
 
+#[derive(Subcommand, Debug)]
+enum TrendsDeskAction {
+    /// Show OpenCLI readiness, focus, and columns. Does not search.
+    Status,
+    /// Run one column or `all`. Saves a report only when OpenCLI returns source links.
+    Run {
+        /// Column id, or `all`.
+        #[arg(long, default_value = "all")]
+        topic: String,
+        /// Focus kept in the search when it is not already in the column text.
+        #[arg(long)]
+        focus: Option<String>,
+    },
+    /// Add a custom column. Does not search.
+    Add { name: String, desc: String },
+    /// Copy one saved Termy XL draft into the Termy X draft file. Does not post.
+    Handoff {
+        /// Draft id saved in the Termy XL data directory.
+        id: String,
+    },
+    /// Search one column. JSON lists posts. Nothing is posted.
+    Search {
+        /// Column name or id, such as Law.
+        #[arg(long)]
+        subject: String,
+    },
+    /// Draft reply variants for a cached tweet. Nothing is posted.
+    Takes {
+        /// Status id or https://x.com/.../status/ id.
+        #[arg(long)]
+        tweet: String,
+        /// free, treg, or hermes.
+        #[arg(long, default_value = "free")]
+        provider: String,
+        /// How many distinct replies to return. Clamped to 1..=3.
+        #[arg(long, default_value_t = 3)]
+        n: usize,
+    },
+    /// List or save Termy XL drafts. Saving does not post.
+    Drafts {
+        #[command(subcommand)]
+        action: DeskDrafts,
+    },
+    /// Queue a reply draft in Termy XL. Does not post.
+    QueueReply {
+        /// Status id or URL the draft replies to.
+        #[arg(long)]
+        tweet: String,
+        /// Reply text stored in the Termy XL draft file.
+        #[arg(long)]
+        text: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeskDrafts {
+    /// List drafts saved in the Termy XL data folder.
+    List,
+    /// Save a draft. A second save for the same tweet replaces it.
+    Save {
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        tweet: Option<String>,
+    },
+}
+
+fn trends_desk_cmd(
+    data_dir: Option<PathBuf>,
+    action: TrendsDeskAction,
+    json: bool,
+    io: &CliIo,
+) -> i32 {
+    let data_root = data_dir.unwrap_or_else(crate::trends_desk::termy_xl_data_root);
+    let store = match crate::trends_desk::DeskStore::open_isolated(&data_root) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    match action {
+        TrendsDeskAction::Status => {
+            let settings = store.load_settings();
+            let topics = store.load_topics();
+            let desk = crate::trends_desk::OpenCliDesk::new(
+                &crate::trends_desk::isolated_opencli_config(&data_root),
+                io.runner.clone(),
+            );
+            let session = desk.probe(&std::sync::atomic::AtomicBool::new(false));
+            if json {
+                let body = serde_json::json!({
+                    "ok": true,
+                    "session": session.label,
+                    "detail": session.detail,
+                    "focus": settings.focus,
+                    "topics": topics.iter().map(|topic| {
+                        serde_json::json!({"id": topic.id, "name": topic.name, "desc": topic.desc})
+                    }).collect::<Vec<_>>(),
+                    "data": data_root.display().to_string(),
+                    "gpu": crate::trends_desk::GPU_NOTE,
+                    "posts": false,
+                });
+                println!("{body}");
+            } else {
+                println!("data: {}", data_root.display());
+                println!("{}", session.label);
+                println!("{}", session.detail);
+                println!("focus: {}", settings.focus);
+                for topic in &topics {
+                    println!("column {} — {}", topic.id, topic.name);
+                }
+                println!("{}", crate::trends_desk::GPU_NOTE);
+                println!("Nothing is posted from this command.");
+            }
+            0
+        }
+        TrendsDeskAction::Add { name, desc } => {
+            let Some(id) = crate::trends_desk::slug_id(&name) else {
+                eprintln!("column name needs a letter or number");
+                return 2;
+            };
+            let mut topics = store.load_topics();
+            if topics.iter().any(|topic| topic.id == id) {
+                eprintln!("column `{id}` already exists");
+                return 2;
+            }
+            topics.push(crate::trends_desk::Topic {
+                id: id.clone(),
+                name,
+                desc,
+            });
+            if let Err(error) = store.save_topics(&topics) {
+                eprintln!("{error}");
+                return 1;
+            }
+            println!("added column {id}");
+            0
+        }
+        TrendsDeskAction::Handoff { id } => {
+            let drafts = crate::drafts::load_drafts(&crate::trends_desk::drafts_file(&data_root));
+            let Some(draft) = crate::drafts::find_draft(&drafts, &id) else {
+                eprintln!("no Termy XL draft `{id}`");
+                return 2;
+            };
+            match crate::trends_desk::handoff_draft_to_termy_x(
+                &draft.text,
+                draft.reply_to.as_deref(),
+            ) {
+                Ok(new_id) => {
+                    println!(
+                        "copied draft {new_id} into the Termy X draft file. Nothing was posted."
+                    );
+                    0
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
+        TrendsDeskAction::Search { subject } => {
+            let body = crate::trends_desk::search_subject(&data_root, &subject, io.runner.clone());
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::Takes { tweet, provider, n } => {
+            let body = crate::trends_desk::takes_for_tweet(
+                &data_root,
+                &tweet,
+                &provider,
+                n,
+                io.http.as_ref(),
+            );
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::Drafts { action } => {
+            let body = match action {
+                DeskDrafts::List => crate::trends_desk::list_drafts(&data_root),
+                DeskDrafts::Save { text, tweet } => {
+                    crate::trends_desk::save_draft(&data_root, &text, tweet.as_deref())
+                }
+            };
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::QueueReply { tweet, text } => {
+            let body = crate::trends_desk::queue_reply(&data_root, &tweet, &text);
+            println!("{body}");
+            if body.get("ok").and_then(|item| item.as_bool()) == Some(true) {
+                0
+            } else {
+                1
+            }
+        }
+        TrendsDeskAction::Run { topic, focus } => {
+            match crate::trends_desk::run_saved_topic(
+                io.runner.clone(),
+                &topic,
+                focus.as_deref(),
+                &data_root,
+            ) {
+                Ok(outcomes) => {
+                    let failed = outcomes
+                        .iter()
+                        .any(|item| item.kind != crate::trends_desk::OutcomeKind::Fresh);
+                    if json {
+                        let body = serde_json::json!({
+                            "ok": !failed,
+                            "runs": outcomes.iter().map(|item| serde_json::json!({
+                                "topic": item.topic_id,
+                                "kind": item.kind.as_str(),
+                                "wrote_report": item.kind.writes_report(),
+                                "query": item.query,
+                                "message": item.message,
+                                "urls": item.posts.iter().map(|post| post.url.clone()).collect::<Vec<_>>(),
+                            })).collect::<Vec<_>>(),
+                        });
+                        println!("{body}");
+                    } else {
+                        print!("{}", crate::trends_desk::format_outcomes(&outcomes));
+                    }
+                    if failed { 1 } else { 0 }
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            }
+        }
+    }
+}
+
 fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 {
     let service = Service::free(&io.config, io.runner.clone(), io.http.clone());
     match command {
@@ -645,6 +901,7 @@ fn dispatch(command: Cmd, json: bool, io: &mut CliIo, interactive: bool) -> i32 
                     .map(|served| (served.status.render(), json_value(served))),
             )
         }
+        Cmd::TrendsDesk { data_dir, action } => trends_desk_cmd(data_dir, action, json, io),
         Cmd::Trends { place, limit } => emit(
             json,
             service

@@ -46,7 +46,10 @@ This crate owns X read/search/publish planning for the `x` CLI and the desktop p
 
 ```sh
 cargo test -p termy_x
+cargo test -p termy_x --lib trends_desk
 ```
+
+Trends Desk lives in `src/trends_desk`. It reads through OpenCLI only, keeps reports under the Termy config directory, and does not publish. `termy-xcli trends-desk` is the headless entry. The GPU window is `trends_desk` in the desktop crate.
 
 ## Forbidden Dependencies
 

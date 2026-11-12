@@ -33,6 +33,8 @@ pub struct XConfig {
     pub ai_key_env: String,
     pub ai_base_url: String,
     pub ai_model: String,
+    /// Optional key from x.toml. Env vars still win. Never logged.
+    pub ai_api_key: String,
     /// Set when a config file or env var chose the endpoint. The free local
     /// default stays implicit so a dead Ollama falls back to templates.
     pub ai_explicit: bool,
@@ -53,6 +55,13 @@ pub struct XConfig {
     pub agent_hermes: Option<String>,
     pub agent_grok: Option<String>,
     pub agent_muse: Option<String>,
+    /// Hermes gateway. Empty means the Windows default
+    /// `http://127.0.0.1:8642/v1`. The key is written only when the user saves it.
+    pub hermes_base_url: String,
+    pub hermes_model: String,
+    pub hermes_api_key: String,
+    /// `free`, `treg`, or `hermes`. Empty means the desk settings file decides.
+    pub take_provider: String,
     /// WSL distro/user tried when an agent is not on the Windows PATH.
     pub wsl_distro: String,
     pub wsl_user: String,
@@ -83,6 +92,7 @@ impl Default for XConfig {
             ai_key_env: "TERMY_X_AI_API_KEY".to_string(),
             ai_base_url: String::new(),
             ai_model: String::new(),
+            ai_api_key: String::new(),
             ai_explicit: false,
             min_interval_ms: 1500,
             bulk_cap: crate::bulk::DEFAULT_BULK_CAP,
@@ -98,6 +108,10 @@ impl Default for XConfig {
             agent_hermes: None,
             agent_grok: None,
             agent_muse: None,
+            hermes_base_url: String::new(),
+            hermes_model: String::new(),
+            hermes_api_key: String::new(),
+            take_provider: String::new(),
             wsl_distro: "Ubuntu".to_string(),
             wsl_user: String::new(),
             config_dir: default_config_dir(),
@@ -197,6 +211,7 @@ impl XConfig {
                 self.ai_explicit = true;
             }
             "ai.model" => self.ai_model = value.to_string(),
+            "ai.api_key" => self.ai_api_key = value.to_string(),
             // `ai.preset = "xai"` (or "grok"): Grok via xAI's OpenAI-compatible API.
             "ai.preset" if matches!(value.trim(), "xai" | "grok") => {
                 self.ai_base_url = crate::reply_guy::XAI_BASE_URL.to_string();
@@ -228,6 +243,10 @@ impl XConfig {
             "agents.hermes" | "agent_hermes" => self.agent_hermes = nonempty_owned(value),
             "agents.grok" | "agent_grok" => self.agent_grok = nonempty_owned(value),
             "agents.muse" | "agent_muse" => self.agent_muse = nonempty_owned(value),
+            "agents.hermes_base_url" => self.hermes_base_url = value.to_string(),
+            "agents.hermes_model" => self.hermes_model = value.to_string(),
+            "agents.hermes_api_key" => self.hermes_api_key = value.to_string(),
+            "desk.provider" | "takes.provider" => self.take_provider = value.to_string(),
             "agents.wsl_distro" => self.wsl_distro = value.to_string(),
             "agents.wsl_user" => self.wsl_user = value.to_string(),
             "supabase_url" | "supabase.url" => self.supabase_url = value.to_string(),
@@ -308,13 +327,15 @@ impl XConfig {
     }
 
     pub fn api_key(&self) -> Option<String> {
-        nonempty_var(&self.ai_key_env).or_else(|| {
-            if self.ai_base_url.contains("api.x.ai") {
-                crate::reply_guy::load_secret(self, crate::reply_guy::Secret::Grok)
-            } else {
-                nonempty_var("OPENAI_API_KEY")
-            }
-        })
+        nonempty_var(&self.ai_key_env)
+            .or_else(|| nonempty_owned(&self.ai_api_key))
+            .or_else(|| {
+                if self.ai_base_url.contains("api.x.ai") {
+                    crate::reply_guy::load_secret(self, crate::reply_guy::Secret::Grok)
+                } else {
+                    nonempty_var("OPENAI_API_KEY")
+                }
+            })
     }
 
     /// The user's own X developer bearer token, from their shell env only.
@@ -356,6 +377,33 @@ impl XConfig {
         self.upsert_config_assignment("supabase_email", &format!("supabase_email = \"{email}\""))
     }
 
+    /// Writes the free-model endpoint into this config directory only.
+    pub fn save_ai(&self, base: &str, model: &str, key: &str) -> Result<(), String> {
+        let base = toml_string(base);
+        let model = toml_string(model);
+        let key = toml_string(key);
+        self.upsert_config_assignment("ai.base_url", &format!("ai.base_url = {base}"))?;
+        self.upsert_config_assignment("ai.model", &format!("ai.model = {model}"))?;
+        if !key.trim_matches('"').is_empty() {
+            self.upsert_config_assignment("ai.api_key", &format!("ai.api_key = {key}"))?;
+        }
+        Ok(())
+    }
+
+    /// Writes the takes provider into this config directory only.
+    pub fn save_take_provider(&self, provider: &str) -> Result<(), String> {
+        let provider = provider.trim();
+        fs::create_dir_all(&self.config_dir).map_err(|error| error.to_string())?;
+        let path = self.config_dir.join("x.toml");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let text = upsert_root_assignment(
+            &text,
+            "desk.provider",
+            &format!("desk.provider = \"{provider}\""),
+        );
+        fs::write(path, text).map_err(|error| error.to_string())
+    }
+
     pub fn save_list_sort(&self) -> Result<(), String> {
         self.upsert_config_assignment(
             "list_sort",
@@ -373,6 +421,20 @@ impl XConfig {
         };
         upsert_assignment(&mut text, key, line);
         fs::write(path, text).map_err(|error| error.to_string())
+    }
+
+    /// Files this config is allowed to create or rewrite.
+    pub fn writable_paths(&self) -> Vec<PathBuf> {
+        vec![
+            self.config_dir.join("x.toml"),
+            self.drafts_path(),
+            self.inbox_path(),
+            self.feeds_path(),
+            self.followers_path(),
+            self.queue_path(),
+            self.token_path(),
+            self.action_state_path(),
+        ]
     }
 
     pub fn drafts_path(&self) -> PathBuf {
@@ -458,9 +520,46 @@ fn parse_bool(value: &str) -> bool {
     )
 }
 
+fn toml_string(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value.trim().replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
 fn nonempty_owned(value: &str) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+/// Keep a root key out of a later `[section]`.
+fn upsert_root_assignment(text: &str, key: &str, line: &str) -> String {
+    let mut out = String::new();
+    let mut found = false;
+    let mut in_section = false;
+    for raw in text.lines() {
+        let code = raw.split('#').next().unwrap_or("").trim();
+        if code.starts_with('[') && code.ends_with(']') {
+            in_section = true;
+        }
+        let matches = !in_section
+            && code
+                .split_once('=')
+                .is_some_and(|(left, _)| left.trim() == key);
+        if matches {
+            out.push_str(line);
+            found = true;
+        } else {
+            out.push_str(raw);
+        }
+        out.push('\n');
+    }
+    if found {
+        return out;
+    }
+    let mut prefixed = format!("{line}\n");
+    prefixed.push_str(&out);
+    prefixed
 }
 
 fn upsert_assignment(text: &mut String, key: &str, line: &str) {
@@ -654,5 +753,42 @@ mod tests {
         config.save_list_sort().expect("rewrite list_sort");
         let loaded = XConfig::load(dir.path());
         assert_eq!(loaded.list_sort, ResultSort::Popular);
+    }
+
+    #[test]
+    fn writes_stay_inside_the_given_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = XConfig::load(dir.path());
+        let termy = default_config_dir();
+        assert_ne!(dir.path(), termy.as_path());
+        for path in config.writable_paths() {
+            assert!(
+                path.starts_with(dir.path()),
+                "{} is outside the XL root",
+                path.display()
+            );
+            assert!(
+                !path.starts_with(&termy),
+                "{} would write the Termy X config",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn save_ai_writes_the_xl_file_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = XConfig::load(dir.path());
+        config
+            .save_ai("http://127.0.0.1:11434/v1", "qwen2.5", "secret-key")
+            .unwrap();
+        let loaded = XConfig::load(dir.path());
+        assert_eq!(loaded.ai_base_url, "http://127.0.0.1:11434/v1");
+        assert_eq!(loaded.ai_model, "qwen2.5");
+        assert_eq!(loaded.ai_api_key, "secret-key");
+        assert!(loaded.ai_explicit);
+        let text = std::fs::read_to_string(dir.path().join("x.toml")).unwrap();
+        assert!(text.contains("ai.base_url"));
+        assert!(!text.contains("TERMY"));
     }
 }

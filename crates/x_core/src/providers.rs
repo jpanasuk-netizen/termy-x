@@ -4879,6 +4879,10 @@ fn tombstone_url(item: &Value) -> Option<String> {
 /// (photo JPGs on pbs.twimg.com, mp4s on video.twimg.com) with parallel
 /// `media_posters` thumbnails. Also accepts official-API style
 /// `includes.media` / `attachments` and simple `media`/`images` arrays.
+pub fn media_items_of(item: &Value) -> Vec<crate::model::MediaItem> {
+    media_from_value(item)
+}
+
 fn media_from_value(item: &Value) -> Vec<crate::model::MediaItem> {
     use crate::model::{MediaItem, MediaKind};
     let kind_of = crate::parse_borrowed::media_kind;

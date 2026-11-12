@@ -334,6 +334,7 @@ Related UI option:
 - `open_x_lookup`
 - `open_x_compose`
 - `open_x_research`
+- `open_trends_desk`
 
 ## Customization Examples
 

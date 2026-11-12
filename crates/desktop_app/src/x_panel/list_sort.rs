@@ -110,7 +110,7 @@ impl XPanel {
         if self.fill_window {
             return;
         }
-        let mut config = XConfig::load(&termy_x::config::default_config_dir());
+        let mut config = XConfig::load(&self.config_dir);
         config.list_sort = self.list_sort;
         let _ = config.save_list_sort();
     }

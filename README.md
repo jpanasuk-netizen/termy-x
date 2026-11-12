@@ -284,6 +284,19 @@ cargo run -p termy --bin x_panel_preview -- --mock --width 1600 --height 1000
 cargo run -p termy --bin x_panel_preview -- --splash
 ```
 
+### Termy XL
+
+Termy XL is the standalone Trends Desk window. Termy X, its installer, and its shortcut stay named Termy. Inside Termy, open Termy XL from the command palette (`Termy XL`), the View menu, or the Trends tab's **Open Termy XL** button. It can also start on its own:
+
+```bash
+cargo run -p termy --bin trends_desk
+cargo run -p termy --bin trends_desk -- --fixture
+termy-xcli trends-desk status
+termy-xcli trends-desk run --topic law --focus AI
+```
+
+Live columns call OpenCLI and nothing else. A failed or empty search does not save a fixture report. Drafts stay in the Termy XL data folder. Copying a draft into Termy X is explicit, and Run does not post. The window is drawn on the GPU. That does not make the search faster. When Termy X is open, the slim XL tab sits on its right edge. Hermes is a third takes provider, configured only in `%APPDATA%\Termy XL\x.toml`. Agents can call `termy-xcli desk search`, `desk takes`, `desk drafts`, and `desk queue-reply`. Those commands print JSON and do not post. The checklist is [docs/termy-xl-todo.md](docs/termy-xl-todo.md). The agent skill is [docs/termy-xl-agents.md](docs/termy-xl-agents.md). Windows install uses a separate folder and a `Termy XL.lnk` shortcut; it does not edit a shortcut that launches `termy-7154b8a5.exe`. Setup is in [docs/trends-desk/README.md](docs/trends-desk/README.md). The browser desk on port 3489 is a separate local app and is not required.
+
 ## Sync across PCs
 
 In the X panel Help tab, **Account sync (optional)** takes an email and password. Sign in or Create account copies likes, follows, reposts, and receipts to your other signed-in PCs. The password is not saved. Sync stays off until you sign in, and this PC keeps working from its local database either way. Details are in [crates/x_core/README.md](crates/x_core/README.md#sync-across-pcs).
