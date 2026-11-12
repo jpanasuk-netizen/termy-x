@@ -1006,24 +1006,17 @@ fn command_exists_in_dir(dir: &std::path::Path, command: &str) -> bool {
     candidate_is_executable(&candidate)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn candidate_is_executable(candidate: &std::path::Path) -> bool {
     let Ok(metadata) = std::fs::metadata(candidate) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
+    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+}
 
-    #[cfg(unix)]
-    {
-        metadata.permissions().mode() & 0o111 != 0
-    }
-
-    #[cfg(not(unix))]
-    {
-        true
-    }
+#[cfg(all(test, not(unix)))]
+fn candidate_is_executable(candidate: &std::path::Path) -> bool {
+    std::fs::metadata(candidate).is_ok_and(|metadata| metadata.is_file())
 }
 
 #[cfg(test)]
