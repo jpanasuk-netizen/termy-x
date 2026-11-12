@@ -209,12 +209,15 @@ impl TrendsDesk {
         let provider = pop.provider;
         let id = pop.card_id.clone();
         self.model_notice = format!("Drafting with {}…", provider.as_str());
+        let draft_tone = tone.clone();
         cx.spawn(async move |this, cx| {
             let draft = cx
                 .background_executor()
                 .spawn(async move {
                     let http = termy_x::io::UreqHttp::default();
-                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                    termy_x::trends_desk::run_take_chain(
+                        provider, &config, &post, &http, &draft_tone,
+                    )
                 })
                 .await;
             let (variants, error) =
