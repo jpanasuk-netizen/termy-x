@@ -5,7 +5,7 @@ use gpui_kit::{
     SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
-use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status};
+use crate::trends_desk::{ColumnUi, TrendsDesk, button};
 use termy_x::trends_desk::{ChangeTag, ReplyPhase, card_from_post, scroll_by, wrap_token};
 
 impl TrendsDesk {
@@ -32,7 +32,11 @@ impl TrendsDesk {
                 ChangeTag::Fading => "FADING",
             });
         let url = card.url.clone();
+        let like_url = url.clone();
+        let repost_url = url.clone();
         let id = card.id.clone();
+        let open_id = id.clone();
+        let quote_id = id.clone();
         let take_id = id.clone();
         let edit_id = id.clone();
         let send_id = id.clone();
@@ -49,7 +53,6 @@ impl TrendsDesk {
                 )
             })
             .unwrap_or_else(|| "time not provided".into());
-        let reply_text = wrap_token(phase.text());
         let shown = self.takes.get(&card.id);
         let full_note = shown
             .filter(|take| take.source == "offline" && !take.note.is_empty())
@@ -171,27 +174,55 @@ impl TrendsDesk {
                         .into()
                     })
             }))
-            .child(div().text_size(px(14.0)).whitespace_normal().child(format!(
-                "{}{} · @{}",
-                tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
-                wrap_token(&card.author_name),
-                wrap_token(&card.handle)
-            )))
+            .child({
+                let profile_id = id.clone();
+                let handle = card.handle.clone();
+                div()
+                    .id(SharedString::from(format!("desk-handle-{profile_id}")))
+                    .text_size(px(14.0))
+                    .whitespace_normal()
+                    .cursor_pointer()
+                    .child(format!(
+                        "{}{} · @{}",
+                        tag.map(|tag| format!("{tag} · ")).unwrap_or_default(),
+                        wrap_token(&card.author_name),
+                        wrap_token(&card.handle)
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.show_profile(&handle);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            })
             .child(
                 div()
                     .text_size(px(13.0))
                     .whitespace_normal()
                     .child(wrap_token(&card.text)),
             )
-            .child(
+            .child({
+                let time_id = id.clone();
                 div()
+                    .id(SharedString::from(format!("desk-time-{time_id}")))
                     .text_size(px(12.0))
                     .text_color(rgb(0xc7c7cc))
+                    .cursor_pointer()
                     .child(format!(
                         "{created} · {} likes · {} reposts · {} replies · {} views",
                         card.likes, card.reposts, card.replies, card.views
-                    )),
-            )
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.show_thread(&time_id);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+            })
             .children(
                 (!card.media_items.is_empty())
                     .then(|| self.media_block(&card.media_items, (width - 20.0).max(80.0), cx)),
@@ -243,11 +274,11 @@ impl TrendsDesk {
                     .text_color(rgb(0x30d158))
                     .child(self.badge_for(&card.id).unwrap_or_default()),
             )
-            .children((!reply_text.trim().is_empty() && editing).then(|| {
+            .children(self.saved_urls.contains(&card.url).then(|| {
                 div()
                     .text_size(px(12.0))
-                    .whitespace_normal()
-                    .child(reply_text)
+                    .text_color(rgb(0x30d158))
+                    .child(termy_x::trends_desk::saved_drafts_label(self.draft_count))
             }))
             .child(
                 div()
@@ -256,10 +287,10 @@ impl TrendsDesk {
                     .gap(px(8.0))
                     .child(button(
                         SharedString::from(format!("desk-open-{id}")),
-                        "Open source",
+                        "Open",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.action_note = open_status(&url).into();
+                            this.show_thread(&open_id);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -327,7 +358,7 @@ impl TrendsDesk {
                             let link = card.url.clone();
                             move |this, _, _, cx| {
                                 this.copy_text(&link, cx);
-                                this.action_note = "Copied the link.".into();
+                                this.action_note = termy_x::trends_desk::copied_mark().into();
                                 cx.stop_propagation();
                                 cx.notify();
                             }
@@ -341,10 +372,40 @@ impl TrendsDesk {
                             let body = card.text.clone();
                             move |this, _, _, cx| {
                                 this.copy_text(&body, cx);
-                                this.action_note = "Copied the post.".into();
+                                this.action_note = termy_x::trends_desk::copied_mark().into();
                                 cx.stop_propagation();
                                 cx.notify();
                             }
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-like-{id}")),
+                        "Like",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.engage("like", like_url.clone(), cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-repost-{id}")),
+                        "Repost",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.engage("retweet", repost_url.clone(), cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-quote-{id}")),
+                        "Quote",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_quote(&quote_id, cx);
+                            cx.stop_propagation();
+                            cx.notify();
                         }),
                     ))
                     .child(button(

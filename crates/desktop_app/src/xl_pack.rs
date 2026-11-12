@@ -9,7 +9,7 @@ use gpui_kit::{
     ParentElement, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
-use crate::trends_desk::{ColumnUi, TrendsDesk, button, open_status, page_button};
+use crate::trends_desk::{ColumnUi, TrendsDesk, button, page_button};
 use termy_x::trends_desk::{
     DeskKey, PackFile, Phase, SessionState, SourcePost, TakeTone, WINDOW_PAD, apply_filters,
     desk_key, hud_line, layout_takes, load_pack, move_selection, new_ids, page_label,
@@ -149,8 +149,8 @@ impl TrendsDesk {
                 }
             }
             DeskKey::Open => {
-                if let Some(url) = self.selected_url() {
-                    self.action_note = open_status(&url).into();
+                if let Some(id) = self.selected_take() {
+                    self.show_thread(&id);
                 } else {
                     self.action_note = "No card selected.".into();
                 }
@@ -177,15 +177,6 @@ impl TrendsDesk {
             .as_deref()
             .and_then(|id| id.strip_prefix("take:"))
             .map(str::to_string)
-    }
-
-    fn selected_url(&self) -> Option<String> {
-        let id = self.selected_take()?;
-        self.columns
-            .iter()
-            .flat_map(|column| column.view.posts.iter())
-            .find(|post| post.id == id)
-            .map(|post| post.url.clone())
     }
 
     pub(crate) fn note_key(&mut self, keystroke: &Keystroke) {

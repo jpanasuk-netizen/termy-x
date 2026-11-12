@@ -700,6 +700,78 @@ pub fn post_button_text(face: PostFace, handle: &str) -> String {
     }
 }
 
+pub fn copied_mark() -> &'static str {
+    "Copied ✓"
+}
+
+pub fn saved_drafts_label(count: usize) -> String {
+    format!("Saved to Drafts ✓ ({count})")
+}
+
+pub fn quote_seed(text: &str) -> String {
+    format!("Quote: {text}")
+}
+
+pub fn copy_entry(text: &str, url: &str) -> String {
+    let text = text.trim();
+    let url = url.trim();
+    if url.is_empty() {
+        text.to_string()
+    } else if text.is_empty() {
+        url.to_string()
+    } else {
+        format!("{text}\n{url}")
+    }
+}
+
+pub fn copy_all(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+pub fn remember_take(
+    path: &std::path::Path,
+    card_id: &str,
+    tweet: &str,
+    url: &str,
+    text: &str,
+) -> Result<usize, String> {
+    let draft = crate::model::Draft {
+        id: format!("take-{card_id}"),
+        text: text.trim().to_string(),
+        tone: Some(tweet.trim().to_string()),
+        source: "termy-xl".into(),
+        created_at: "saved".into(),
+        reply_to: Some(url.trim().to_string()),
+    };
+    crate::drafts::replace_draft_for_target(path, draft)?;
+    Ok(crate::drafts::load_drafts(path).len())
+}
+
+pub fn rewrite_draft(path: &std::path::Path, id: &str, text: &str) -> Result<(), String> {
+    let mut rows = crate::drafts::load_drafts(path);
+    let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
+        return Err("That draft is not in the list.".into());
+    };
+    row.text = text.trim().to_string();
+    crate::drafts::save_drafts(path, &rows)
+}
+
+pub fn delete_draft(path: &std::path::Path, id: &str) -> Result<usize, String> {
+    let mut rows = crate::drafts::load_drafts(path);
+    let before = rows.len();
+    rows.retain(|row| row.id != id);
+    if rows.len() == before {
+        return Err("That draft is not in the list.".into());
+    }
+    crate::drafts::save_drafts(path, &rows)?;
+    Ok(rows.len())
+}
+
 /// A status URL inside a send receipt, when OpenCLI returned one.
 pub fn reply_link(receipt: &str) -> Option<String> {
     receipt.split_whitespace().find_map(|word| {
@@ -1036,5 +1108,56 @@ mod tests {
         assert!(!older.contains("+0000"));
         assert!(line.contains("2 sent"));
         assert!(line.contains("free"));
+    }
+
+    #[test]
+    fn copy_post_and_draft_labels_change_visible_state() {
+        assert_eq!(copied_mark(), "Copied ✓");
+        assert_eq!(saved_drafts_label(2), "Saved to Drafts ✓ (2)");
+        assert_eq!(
+            post_button_text(PostFace::Ready, "ada"),
+            "Post reply → @ada"
+        );
+        assert_eq!(post_button_text(PostFace::Posting, "ada"), "Posting…");
+        assert_eq!(post_button_text(PostFace::Posted, "ada"), "Posted ✓");
+        assert_eq!(post_button_text(PostFace::Retry, "ada"), "Retry");
+        assert!(posts_on_ctrl_enter("enter", true));
+        assert!(!posts_on_ctrl_enter("enter", false));
+        let copied = copy_entry("the reply", "https://x.com/ada/status/9");
+        assert!(copied.contains("the reply"));
+        assert!(copied.contains("https://x.com/ada/status/9"));
+        assert_eq!(
+            copy_all(&[copied.clone(), "second\nhttps://x.com/a/status/2".into()])
+                .matches("https://")
+                .count(),
+            2
+        );
+        assert!(quote_seed("the filing").starts_with("Quote:"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drafts.json");
+        let first = remember_take(
+            &path,
+            "9",
+            "original tweet",
+            "https://x.com/ada/status/9",
+            "first take",
+        )
+        .unwrap();
+        assert_eq!(first, 1);
+        let again = remember_take(
+            &path,
+            "9",
+            "original tweet",
+            "https://x.com/ada/status/9",
+            "second take",
+        )
+        .unwrap();
+        assert_eq!(again, 1);
+        let rows = crate::drafts::load_drafts(&path);
+        assert_eq!(rows[0].text, "second take");
+        assert_eq!(rows[0].tone.as_deref(), Some("original tweet"));
+        rewrite_draft(&path, &rows[0].id, "edited").unwrap();
+        assert_eq!(crate::drafts::load_drafts(&path)[0].text, "edited");
+        assert_eq!(delete_draft(&path, &rows[0].id).unwrap(), 0);
     }
 }

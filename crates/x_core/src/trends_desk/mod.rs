@@ -54,8 +54,8 @@ pub use domain::{
 };
 pub use fetch::{
     DraftPrep, InspectedPost, InspectedReply, OpenCliDesk, SEARCH_TIMEOUT, SessionState,
-    SessionStatus, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft, prepare_draft_file,
-    refuse_unsafe_cli_name, run_topics, search_args,
+    SessionStatus, engage_opencli, handoff_draft_to_termy_x, post_reply_opencli, prepare_draft,
+    prepare_draft_file, refuse_unsafe_cli_name, run_topics, search_args,
 };
 pub use lifecycle::{
     DeskSession, EscapeEffect, OffUiRequest, PruneLog, RefreshPress, child_is_gone,
@@ -74,13 +74,14 @@ pub use media::{
 };
 pub use pack::{
     CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, PostFace,
-    ReplyMark, SearchEdit, TakeTone, apply_filters, desk_key, distinct_variants, flip_variant,
-    format_clock, format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack,
-    local_offset_secs, new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key,
-    panel_tone_name, panel_tones, post_button_text, post_reply_label, posts_on_ctrl_enter,
-    provider_drafts, read_composer, refresh_due, refresh_is_search_only, replied_badge, reply_link,
-    save_pack, search_edit, search_label, search_page_name, sends_on_key, should_auto_refresh,
-    sort_by_heat,
+    ReplyMark, SearchEdit, TakeTone, apply_filters, copied_mark, copy_all, copy_entry,
+    delete_draft, desk_key, distinct_variants, flip_variant, format_clock, format_post_time,
+    heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
+    next_click_reaches, next_refresh_text, next_tone, page_after_key, panel_tone_name, panel_tones,
+    post_button_text, post_reply_label, posts_on_ctrl_enter, provider_drafts, quote_seed,
+    read_composer, refresh_due, refresh_is_search_only, remember_take, replied_badge, reply_link,
+    rewrite_draft, save_pack, saved_drafts_label, search_edit, search_label, search_page_name,
+    sends_on_key, should_auto_refresh, sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

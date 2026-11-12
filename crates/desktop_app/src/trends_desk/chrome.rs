@@ -221,7 +221,7 @@ impl TrendsDesk {
             ))
             .child(nav_button(
                 "desk-nav-draft",
-                "Draft",
+                format!("Drafts ({})", self.draft_count),
                 current == Surface::Draft,
                 cx,
                 Nav::Draft,
@@ -263,25 +263,73 @@ impl TrendsDesk {
         }
     }
 
-    pub(crate) fn history_view(&self) -> gpui_kit::AnyElement {
-        let mut list = div().flex().flex_col().gap(px(8.0));
+    pub(crate) fn history_view(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let all = termy_x::trends_desk::copy_all(
+            &self
+                .history
+                .iter()
+                .map(|report| report.markdown.clone())
+                .collect::<Vec<_>>(),
+        );
+        let mut list = div().flex().flex_col().gap(px(8.0)).child(button(
+            "desk-history-copy-all",
+            "Copy all",
+            false,
+            cx.listener(move |this, _, _, cx| {
+                this.copy_text(&all, cx);
+                this.action_note = termy_x::trends_desk::copied_mark().into();
+                cx.notify();
+            }),
+        ));
         if self.history.is_empty() {
             list = list.child("No saved reports yet. A failed run does not write one.");
         }
-        for report in &self.history {
+        for (index, report) in self.history.iter().enumerate() {
+            let picked = self.list_pick.as_deref() == Some(&format!("history:{index}"));
+            let markdown = report.markdown.clone();
+            let copy_text = markdown.clone();
             list = list.child(
                 div()
+                    .id(SharedString::from(format!("desk-history-{index}")))
                     .p(px(10.0))
                     .rounded(px(10.0))
-                    .bg(rgb(0x16161e))
+                    .bg(rgb(if picked { 0x2a1020 } else { 0x16161e }))
+                    .border_1()
+                    .border_color(rgb(if picked { 0xff4fa3 } else { 0x3a3a3c }))
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.list_pick = Some(format!("history:{index}"));
+                            this.action_note = "Selected a history entry. Ctrl+C copies it.".into();
+                            cx.notify();
+                        }),
+                    )
                     .child(format!(
                         "{} · {} · cached file {}",
                         report.topic_id, report.query, report.file
                     ))
-                    .child(report.markdown.clone()),
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .text_size(px(13.0))
+                            .child(markdown),
+                    )
+                    .child(button(
+                        SharedString::from(format!("desk-history-copy-{index}")),
+                        "Copy",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_text(&copy_text, cx);
+                            this.list_pick = Some(format!("history:{index}"));
+                            this.action_note = termy_x::trends_desk::copied_mark().into();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )),
             );
         }
         list.into_any_element()
@@ -319,51 +367,210 @@ impl TrendsDesk {
         list.into_any_element()
     }
 
-    fn queued_drafts(&self) -> gpui_kit::AnyElement {
+    pub(crate) fn draft_view(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         let rows =
             termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
-        let mut list = div().flex().flex_col().gap(px(6.0)).child(format!(
-            "{} queued draft(s) from this app or termy-xcli",
-            rows.len()
-        ));
-        for draft in rows.iter().rev().take(12) {
-            let target = draft.reply_to.clone().unwrap_or_else(|| "no tweet".into());
+        let all = termy_x::trends_desk::copy_all(
+            &rows
+                .iter()
+                .map(|row| {
+                    termy_x::trends_desk::copy_entry(
+                        &row.text,
+                        row.reply_to.as_deref().unwrap_or(""),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(self.draft_note.clone())
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .child(termy_x::trends_desk::saved_drafts_label(self.draft_count)),
+            )
+            .child(button(
+                "desk-drafts-copy-all",
+                "Copy all",
+                false,
+                cx.listener(move |this, _, _, cx| {
+                    this.copy_text(&all, cx);
+                    this.action_note = termy_x::trends_desk::copied_mark().into();
+                    cx.notify();
+                }),
+            ))
+            .child(self.field_chip(
+                "desk-draft-text",
+                "Edit selected draft",
+                &self.draft_text,
+                Field::Draft,
+                cx,
+            ))
+            .child(button(
+                "desk-draft-save-edit",
+                "Save edit",
+                false,
+                cx.listener(|this, _, _, cx| {
+                    this.save_picked_draft();
+                    cx.notify();
+                }),
+            ));
+        if rows.is_empty() {
+            list = list.child("No drafts yet. Draft take saves one here.");
+        }
+        for row in rows.iter().rev() {
+            let id = row.id.clone();
+            let tweet = row.tone.clone().unwrap_or_else(|| "Original tweet".into());
+            let url = row.reply_to.clone().unwrap_or_default();
+            let text = row.text.clone();
+            let picked = self.list_pick.as_deref() == Some(&format!("draft:{id}"));
+            let shown = if picked && !self.draft_text.is_empty() {
+                self.draft_text.clone()
+            } else {
+                text.clone()
+            };
+            let copy_id = id.clone();
+            let post_id = id.clone();
+            let delete_id = id.clone();
+            let select_id = id.clone();
+            let select_text = text.clone();
+            let select_url = url.clone();
             list = list.child(
                 div()
-                    .text_size(px(12.0))
-                    .whitespace_normal()
-                    .child(format!("{} · reply to {target} · {}", draft.id, draft.text)),
+                    .id(SharedString::from(format!("desk-draft-row-{id}")))
+                    .p(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(rgb(if picked { 0x2a1020 } else { 0x16161e }))
+                    .border_1()
+                    .border_color(rgb(if picked { 0xff4fa3 } else { 0x3a3a3c }))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.list_pick = Some(format!("draft:{select_id}"));
+                            this.draft_text = select_text.clone();
+                            this.draft_reply_to = Some(select_url.clone());
+                            this.action_note = "Selected a draft. Ctrl+C copies it.".into();
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0xc7c7cc))
+                            .whitespace_normal()
+                            .child(format!("Original · {tweet}")),
+                    )
+                    .child(div().text_size(px(14.0)).whitespace_normal().child(shown))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .whitespace_normal()
+                            .text_color(rgb(0x7af6ff))
+                            .child(url.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(8.0))
+                            .child(button(
+                                SharedString::from(format!("desk-draft-copy-{copy_id}")),
+                                "Copy",
+                                false,
+                                cx.listener(move |this, _, _, cx| {
+                                    let payload = termy_x::trends_desk::copy_entry(&text, &url);
+                                    this.copy_text(&payload, cx);
+                                    this.action_note = termy_x::trends_desk::copied_mark().into();
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button(
+                                SharedString::from(format!("desk-draft-post-{post_id}")),
+                                "Post reply",
+                                false,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.post_saved(post_id.clone(), cx);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(button(
+                                SharedString::from(format!("desk-draft-delete-{delete_id}")),
+                                "Delete",
+                                false,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.delete_saved(&delete_id);
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             );
         }
         list.into_any_element()
     }
 
-    pub(crate) fn draft_view(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+    pub(crate) fn reader_bar(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let Some(reader) = self.reader.clone() else {
+            return div().into_any_element();
+        };
+        let body = reader.body.clone();
+        let url = reader.url.clone();
         div()
+            .id("desk-reader")
+            .mb(px(8.0))
+            .p(px(10.0))
+            .rounded(px(10.0))
+            .bg(rgb(0x16161e))
+            .border_1()
+            .border_color(rgb(0x7af6ff))
             .flex()
             .flex_col()
-            .gap(px(8.0))
-            .child(self.draft_note.clone())
-            .child(self.field_chip(
-                "desk-draft-text",
-                "Draft",
-                &self.draft_text,
-                Field::Draft,
-                cx,
-            ))
+            .gap(px(6.0))
+            .child(reader.title.clone())
+            .child(div().whitespace_normal().text_size(px(14.0)).child(body))
             .child(
-                div().text_size(px(12.0)).text_color(rgb(0x8e8e93)).child(
-                    self.draft_reply_to
-                        .clone()
-                        .unwrap_or_else(|| "No reply target yet.".into()),
-                ),
+                div()
+                    .whitespace_normal()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0x7af6ff))
+                    .child(url.clone()),
             )
             .child(
                 div()
-                    .text_size(px(12.0))
-                    .child("Sending stays on the card Send button. This page does not post."),
+                    .flex()
+                    .gap(px(8.0))
+                    .child(button(
+                        "desk-reader-copy",
+                        "Copy",
+                        false,
+                        cx.listener(move |this, _, _, cx| {
+                            this.copy_text(
+                                &termy_x::trends_desk::copy_entry(&reader.body, &reader.url),
+                                cx,
+                            );
+                            this.action_note = termy_x::trends_desk::copied_mark().into();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(button(
+                        "desk-reader-close",
+                        "Close",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.reader = None;
+                            this.action_note = "Closed the inline view.".into();
+                            cx.notify();
+                        }),
+                    )),
             )
-            .child(self.queued_drafts())
             .into_any_element()
     }
 
@@ -624,7 +831,7 @@ fn hermes_key_label(key: &str, editing: bool) -> String {
 
 fn nav_button(
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString> + 'static,
     active: bool,
     cx: &mut Context<TrendsDesk>,
     nav: Nav,
@@ -643,6 +850,8 @@ pub(crate) fn button(
     active: bool,
     handler: impl Fn(&gpui_kit::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui_kit::AnyElement {
+    let label = label.into();
+    let tip = label.clone();
     div()
         .id(id.into())
         .flex_shrink_0()
@@ -668,7 +877,8 @@ pub(crate) fn button(
                 .border_color(rgb(0xff4fa3))
                 .text_color(rgb(0x070b14))
         })
-        .child(label.into())
+        .tooltip(move |_, cx| cx.new(|_| HintView { text: tip.clone() }).into())
+        .child(label)
         .on_mouse_down(MouseButton::Left, handler)
         .into_any_element()
 }
@@ -679,6 +889,8 @@ pub(crate) fn page_button(
     label: impl Into<SharedString>,
     handler: impl Fn(&gpui_kit::MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui_kit::AnyElement {
+    let label = label.into();
+    let tip = label.clone();
     let hit = termy_x::trends_desk::PAGE_BAR_HIT;
     div()
         .id(id.into())
@@ -703,18 +915,10 @@ pub(crate) fn page_button(
                 .text_color(rgb(0xffe56a))
         })
         .active(|style| style.bg(rgb(0xff4fa3)).text_color(rgb(0x070b14)))
-        .child(label.into())
+        .tooltip(move |_, cx| cx.new(|_| HintView { text: tip.clone() }).into())
+        .child(label)
         .on_mouse_down(MouseButton::Left, handler)
         .into_any_element()
-}
-
-pub(crate) fn open_status(url: &str) -> &'static str {
-    if url.starts_with("https://x.com/") && url.contains("/status/") {
-        let _ = webbrowser::open(url);
-        "Opened the post in the browser."
-    } else {
-        "That link is not an X post."
-    }
 }
 
 pub(crate) struct HintView {

@@ -4,12 +4,12 @@
 //! Copy copies it. Send is the only control that posts. Esc and Close keep the text.
 
 use gpui_kit::{
-    Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
+    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, div, px, rgb,
 };
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{TakeTone, panel_tone_name, panel_tones, pink_box_controls};
+use termy_x::trends_desk::{TakeTone, panel_tone_name, panel_tones};
 
 impl TrendsDesk {
     pub(crate) fn inline_editor(
@@ -22,7 +22,6 @@ impl TrendsDesk {
         if !pop.open || pop.card_id != card_id {
             return None;
         }
-        let controls = pink_box_controls();
         let drafting = pop.draft == termy_x::trends_desk::DRAFTING_PLACEHOLDER;
         let caret = self.pop_caret.caret.min(pop.draft.len());
         let (head, tail) = pop.draft.split_at(caret);
@@ -109,28 +108,43 @@ impl TrendsDesk {
                     .child(self.action_note.clone()),
             );
         }
-        box_el = box_el.child(box_button(
-            "desk-reply-copy",
-            controls[3],
-            cx,
-            |this, cx| {
-                if let Some(pop) = this.popout.clone() {
-                    this.copy_text(&pop.draft, cx);
-                    this.action_note = "Copied the reply.".into();
-                }
-                cx.notify();
-            },
-        ));
+        let copy_label = if self.action_note == termy_x::trends_desk::copied_mark() {
+            termy_x::trends_desk::copied_mark()
+        } else {
+            "Copy"
+        };
+        box_el = box_el.child(box_button("desk-reply-copy", copy_label, cx, |this, cx| {
+            if let Some(pop) = this.popout.clone() {
+                this.copy_text(&pop.draft, cx);
+                this.action_note = termy_x::trends_desk::copied_mark().into();
+            }
+            cx.notify();
+        }));
         if let Some(url) = posted_url.clone() {
-            box_el = box_el.child(box_button(
-                "desk-posted-link",
-                "Open the reply",
-                cx,
-                move |this, cx| {
-                    this.action_note = crate::trends_desk::open_status(&url).into();
-                    cx.notify();
-                },
-            ));
+            let shown = url.clone();
+            box_el = box_el.child(
+                div()
+                    .id("desk-posted-link")
+                    .text_size(px(13.0))
+                    .whitespace_normal()
+                    .text_color(rgb(0x070b14))
+                    .cursor_pointer()
+                    .child(format!("Posted ✓ {shown}"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            this.reader = Some(crate::trends_desk::InlineRead {
+                                title: "Reply".into(),
+                                body: "Posted from this window.".into(),
+                                url: url.clone(),
+                            });
+                            this.list_pick = Some("reader".into());
+                            this.action_note = format!("Posted ✓ {shown}");
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    ),
+            );
         }
         Some(
             box_el
@@ -248,6 +262,13 @@ fn post_button(
         .hover(|style| style.bg(rgb(0xffe56a)))
         .active(|style| style.bg(rgb(0xff4fa3)).text_color(rgb(0x070b14)))
         .child(label.to_string())
+        .tooltip({
+            let tip: SharedString = label.to_string().into();
+            move |_, cx| {
+                cx.new(|_| crate::trends_desk::HintView { text: tip.clone() })
+                    .into()
+            }
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -290,6 +311,13 @@ fn box_button(
                 .border_color(rgb(0x7af6ff))
         })
         .child(label.to_string())
+        .tooltip({
+            let tip: SharedString = label.to_string().into();
+            move |_, cx| {
+                cx.new(|_| crate::trends_desk::HintView { text: tip.clone() })
+                    .into()
+            }
+        })
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {

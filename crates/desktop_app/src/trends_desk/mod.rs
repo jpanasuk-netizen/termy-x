@@ -121,6 +121,17 @@ pub struct TrendsDesk {
     pub(crate) media: xl_media::MediaDesk,
     pub(crate) take_epoch: u64,
     pub(crate) takes_halted: bool,
+    pub(crate) draft_count: usize,
+    pub(crate) saved_urls: std::collections::HashSet<String>,
+    pub(crate) list_pick: Option<String>,
+    pub(crate) reader: Option<InlineRead>,
+}
+
+#[derive(Clone)]
+pub(crate) struct InlineRead {
+    pub title: String,
+    pub body: String,
+    pub url: String,
 }
 
 impl TrendsDesk {
@@ -158,6 +169,13 @@ impl TrendsDesk {
             settings.frame_height as f32,
         );
         let history = store.all_reports();
+        let saved_rows =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&data_root));
+        let draft_count = saved_rows.len();
+        let saved_urls = saved_rows
+            .into_iter()
+            .filter_map(|row| row.reply_to)
+            .collect::<std::collections::HashSet<_>>();
         let columns = store
             .load_topics()
             .into_iter()
@@ -262,6 +280,10 @@ impl TrendsDesk {
             media: xl_media::MediaDesk::default(),
             take_epoch: 0,
             takes_halted: false,
+            draft_count,
+            saved_urls,
+            list_pick: None,
+            reader: None,
         }
     }
 
@@ -660,7 +682,7 @@ impl TrendsDesk {
         if key == "c" && (event.keystroke.modifiers.control || event.keystroke.modifiers.platform) {
             if let Some(pop) = self.popout.clone() {
                 self.copy_text(&pop.draft, cx);
-                self.action_note = "Copied the reply.".into();
+                self.action_note = termy_x::trends_desk::copied_mark().into();
             }
             cx.notify();
             return;
@@ -849,10 +871,33 @@ impl TrendsDesk {
                         desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(next.len());
                     }
                     desk.card_replies
-                        .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next));
+                        .insert(id.clone(), edit_reply(&ReplyPhase::Idle, next.clone()));
                     desk.draft_note = result.note.clone();
                     if !result.note.is_empty() {
                         desk.action_note = result.note.clone();
+                    }
+                    if !next.trim().is_empty() && next != termy_x::trends_desk::DRAFTING_PLACEHOLDER
+                    {
+                        if let Some(post) = desk
+                            .columns
+                            .iter()
+                            .flat_map(|column| column.view.posts.iter())
+                            .find(|post| post.id == id)
+                        {
+                            let path = termy_x::trends_desk::drafts_file(&desk.data_root);
+                            if let Ok(count) = termy_x::trends_desk::remember_take(
+                                &path, &id, &post.text, &post.url, &next,
+                            ) {
+                                desk.saved_urls.insert(post.url.clone());
+                                desk.draft_count = count;
+                                let saved = termy_x::trends_desk::saved_drafts_label(count);
+                                desk.action_note = if desk.action_note.is_empty() {
+                                    saved
+                                } else {
+                                    format!("{}. {saved}", desk.action_note)
+                                };
+                            }
+                        }
                     }
                     desk.selected = Some(format!("take:{id}"));
                 }
@@ -917,7 +962,13 @@ impl TrendsDesk {
                         });
                         desk.save_pack_file();
                         desk.action_note = match &result {
-                            Ok(_) => "Sent.".into(),
+                            Ok(receipt) => {
+                                if let Some(url) = termy_x::trends_desk::reply_link(receipt) {
+                                    format!("Posted ✓ {url}")
+                                } else {
+                                    "Posted ✓".into()
+                                }
+                            }
                             Err(error) => error.clone(),
                         };
                         desk.card_replies
@@ -1047,7 +1098,233 @@ impl TrendsDesk {
         }
     }
 
+    fn selected_copy(&self) -> Option<String> {
+        let pick = self.list_pick.as_deref()?;
+        if pick == "reader" {
+            let reader = self.reader.as_ref()?;
+            return Some(termy_x::trends_desk::copy_entry(&reader.body, &reader.url));
+        }
+        if let Some(index) = pick.strip_prefix("history:") {
+            let index: usize = index.parse().ok()?;
+            return self
+                .history
+                .get(index)
+                .map(|report| report.markdown.clone());
+        }
+        if let Some(id) = pick.strip_prefix("draft:") {
+            let rows =
+                termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
+            let row = rows.iter().find(|row| row.id == id)?;
+            return Some(termy_x::trends_desk::copy_entry(
+                &row.text,
+                row.reply_to.as_deref().unwrap_or(""),
+            ));
+        }
+        None
+    }
+
+    pub(crate) fn show_thread(&mut self, id: &str) {
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
+            self.action_note = "That post is not in this window.".into();
+            return;
+        };
+        let when = post.created_at.clone().unwrap_or_default();
+        self.reader = Some(InlineRead {
+            title: format!("Thread · @{}", post.author),
+            body: format!("{}\n{when}\n{}", post.author_name, post.text),
+            url: post.url.clone(),
+        });
+        self.list_pick = Some("reader".into());
+        self.action_note = format!("Showing the thread for @{} in this window.", post.author);
+    }
+
+    pub(crate) fn show_profile(&mut self, handle: &str) {
+        let handle = handle.trim().trim_start_matches('@');
+        let posts: Vec<String> = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .filter(|post| post.author == handle)
+            .map(|post| post.text.clone())
+            .collect();
+        let body = if posts.is_empty() {
+            format!("@{handle}")
+        } else {
+            posts.join("\n\n")
+        };
+        self.reader = Some(InlineRead {
+            title: format!("Profile · @{handle}"),
+            body,
+            url: format!("https://x.com/{handle}"),
+        });
+        self.list_pick = Some("reader".into());
+        self.action_note = format!("Showing @{handle} in this window.");
+    }
+
+    pub(crate) fn engage(&mut self, verb: &str, url: String, cx: &mut Context<Self>) {
+        self.action_note = if verb == "like" {
+            "Liking…".into()
+        } else {
+            "Reposting…".into()
+        };
+        let bin = self.config.opencli_bin.clone();
+        let verb = verb.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    termy_x::trends_desk::engage_opencli(
+                        &bin,
+                        &termy_x::io::SystemRunner,
+                        &verb,
+                        &url,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.action_note = match result {
+                    Ok(text) => text,
+                    Err(error) => error,
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn open_quote(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == id)
+            .cloned()
+        else {
+            self.action_note = "That post is not in this window.".into();
+            cx.notify();
+            return;
+        };
+        let seed = termy_x::trends_desk::quote_seed(&post.text);
+        self.show_inline_editor(id, &seed);
+        self.action_note = format!("Quote mode for @{}.", post.author);
+        cx.notify();
+    }
+
+    pub(crate) fn post_saved(&mut self, id: String, cx: &mut Context<Self>) {
+        let rows =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
+        let Some(row) = rows.into_iter().find(|row| row.id == id) else {
+            self.action_note = "That draft is not in the list.".into();
+            cx.notify();
+            return;
+        };
+        let url = row.reply_to.unwrap_or_default();
+        let text = if self.list_pick.as_deref() == Some(&format!("draft:{}", row.id))
+            && !self.draft_text.trim().is_empty()
+        {
+            self.draft_text.clone()
+        } else {
+            row.text.clone()
+        };
+        if !url.contains("/status/") {
+            self.action_note = "That draft has no status URL. Nothing was posted.".into();
+            cx.notify();
+            return;
+        }
+        self.action_note = "Posting…".into();
+        let bin = self.config.opencli_bin.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    termy_x::trends_desk::post_reply_opencli(
+                        &bin,
+                        &termy_x::io::SystemRunner,
+                        &url,
+                        &text,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                desk.action_note = match &result {
+                    Ok(receipt) => termy_x::trends_desk::reply_link(receipt)
+                        .map(|link| format!("Posted ✓ {link}"))
+                        .unwrap_or_else(|| "Posted ✓".into()),
+                    Err(error) => error.clone(),
+                };
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub(crate) fn delete_saved(&mut self, id: &str) {
+        let path = termy_x::trends_desk::drafts_file(&self.data_root);
+        match termy_x::trends_desk::delete_draft(&path, id) {
+            Ok(count) => {
+                self.draft_count = count;
+                self.reload_saved_urls();
+                self.action_note = format!("Deleted. {count} draft(s) left.");
+                if self.list_pick.as_deref() == Some(&format!("draft:{id}")) {
+                    self.list_pick = None;
+                }
+            }
+            Err(error) => self.action_note = error,
+        }
+    }
+
+    pub(crate) fn save_picked_draft(&mut self) {
+        let Some(id) = self
+            .list_pick
+            .as_deref()
+            .and_then(|pick| pick.strip_prefix("draft:"))
+            .map(str::to_string)
+        else {
+            self.action_note = "Select a draft first.".into();
+            return;
+        };
+        let path = termy_x::trends_desk::drafts_file(&self.data_root);
+        match termy_x::trends_desk::rewrite_draft(&path, &id, &self.draft_text) {
+            Ok(()) => self.action_note = "Saved the edit.".into(),
+            Err(error) => self.action_note = error,
+        }
+    }
+
+    fn reload_saved_urls(&mut self) {
+        let rows =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
+        self.draft_count = rows.len();
+        self.saved_urls = rows.into_iter().filter_map(|row| row.reply_to).collect();
+    }
+
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let mods = &event.keystroke.modifiers;
+        if key == "c"
+            && (mods.control || mods.platform)
+            && self.field.is_none()
+            && !self.popout.as_ref().is_some_and(|pop| pop.open)
+        {
+            if let Some(text) = self.selected_copy() {
+                self.copy_text(&text, cx);
+                self.action_note = termy_x::trends_desk::copied_mark().into();
+                cx.stop_propagation();
+                cx.notify();
+                return;
+            }
+        }
+        self.on_key_rest(event, window, cx);
+    }
+
+    fn on_key_rest(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         if key == "escape" && self.close_media() {
@@ -1323,13 +1600,16 @@ impl Render for TrendsDesk {
                     if surface != Surface::Columns {
                         body = body.overflow_y_scroll();
                     }
-                    body = body.relative().child(match surface {
-                        Surface::Columns => self.columns_view(width, per_row, cx),
-                        Surface::History => self.history_view(),
-                        Surface::Replies => self.replies_view(cx),
-                        Surface::Draft => self.draft_view(cx),
-                        Surface::Settings => self.settings_view(cx),
-                    });
+                    body = body
+                        .relative()
+                        .child(self.reader_bar(cx))
+                        .child(match surface {
+                            Surface::Columns => self.columns_view(width, per_row, cx),
+                            Surface::History => self.history_view(cx),
+                            Surface::Replies => self.replies_view(cx),
+                            Surface::Draft => self.draft_view(cx),
+                            Surface::Settings => self.settings_view(cx),
+                        });
                     body
                 })
                 .child(self.footer());
@@ -1355,4 +1635,4 @@ mod chrome;
 mod xl_agents;
 #[path = "../xl_media.rs"]
 mod xl_media;
-pub(crate) use chrome::{HintView, button, open_status, page_button};
+pub(crate) use chrome::{HintView, button, page_button};

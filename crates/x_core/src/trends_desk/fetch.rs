@@ -357,7 +357,42 @@ pub fn post_reply_opencli(
     {
         return Err(shorten(&redact_secrets(&error.to_string())));
     }
+    if let Some(url) = super::pack::reply_link(output.stdout.trim()) {
+        return Ok(format!("reply receipt · {url}"));
+    }
     Ok(format!("reply receipt · {target_url}"))
+}
+
+/// Like or repost through the same OpenCLI path. The caller shows the result in the window.
+pub fn engage_opencli(
+    bin: &str,
+    runner: &dyn CommandRunner,
+    verb: &str,
+    url: &str,
+) -> Result<String, String> {
+    refuse_unsafe_cli_name(bin)?;
+    if !matches!(verb, "like" | "retweet") {
+        return Err("That action is not available in this window.".into());
+    }
+    if !url.contains("/status/") {
+        return Err("That post has no status URL.".into());
+    }
+    let args = vec![
+        "twitter".into(),
+        verb.into(),
+        url.to_string(),
+        "--window".into(),
+        "background".into(),
+        "-f".into(),
+        "json".into(),
+    ];
+    let output = runner.run_timeout(bin, &args, Duration::from_secs(60))?;
+    if output.status != 0 {
+        let combined = format!("{}\n{}", output.stdout, output.stderr);
+        return Err(shorten(&redact_secrets(&humanize_error(&combined))));
+    }
+    let name = if verb == "like" { "Liked" } else { "Reposted" };
+    Ok(format!("{name} ✓"))
 }
 
 pub fn search_args(query: &str, limit: usize) -> Vec<String> {
@@ -785,5 +820,58 @@ mod tests {
         );
         assert_eq!(again.saved_id.as_deref(), Some(id.as_str()));
         assert_eq!(crate::drafts::load_drafts(&config.drafts_path()).len(), 1);
+    }
+
+    #[test]
+    fn like_and_repost_use_opencli_and_a_mock_confirms_them() {
+        let runner = ScriptedRunner::new();
+        runner.script(
+            "opencli",
+            &["twitter", "like"],
+            r#"{"ok":true,"data":{"id":"1"}}"#,
+        );
+        let liked =
+            engage_opencli("opencli", &runner, "like", "https://x.com/ada/status/9").unwrap();
+        assert_eq!(liked, "Liked ✓");
+        runner.script(
+            "opencli",
+            &["twitter", "retweet"],
+            r#"{"ok":true,"data":{"id":"1"}}"#,
+        );
+        let reposted =
+            engage_opencli("opencli", &runner, "retweet", "https://x.com/ada/status/9").unwrap();
+        assert_eq!(reposted, "Reposted ✓");
+        let missing = engage_opencli("opencli", &runner, "like", "not-a-status").unwrap_err();
+        assert!(missing.contains("status"));
+        let calls = runner.calls.lock().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "like"))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "retweet"))
+        );
+    }
+
+    #[test]
+    fn a_mocked_reply_returns_the_posted_status_link() {
+        let runner = ScriptedRunner::new();
+        runner.script(
+            "opencli",
+            &["twitter", "reply"],
+            "https://x.com/me/status/44\n",
+        );
+        let receipt = post_reply_opencli(
+            "opencli",
+            &runner,
+            "https://x.com/ada/status/9",
+            "the reply",
+        )
+        .unwrap();
+        assert!(receipt.contains("https://x.com/me/status/44"));
+        assert!(!receipt.contains("secret"));
     }
 }
