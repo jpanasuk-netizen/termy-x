@@ -128,6 +128,9 @@ pub struct TrendsDesk {
     pub(crate) reply_drag: bool,
     pub(crate) provider_menu: bool,
     pub(crate) extra_models: Vec<(String, String)>,
+    pub(crate) verify_line: String,
+    pub(crate) verify_ok: Option<bool>,
+    pub(crate) verify_gen: u64,
     pub(crate) draft_count: usize,
     pub(crate) saved_urls: std::collections::HashSet<String>,
     pub(crate) list_pick: Option<String>,
@@ -160,9 +163,9 @@ impl TrendsDesk {
         if !config.take_provider.trim().is_empty() {
             settings.take_provider = config.take_provider.clone();
         }
-        let migrated = termy_x::trends_desk::migrate_saved_provider(&settings.take_provider);
+        let migrated = termy_x::trends_desk::canonical_provider(&settings.take_provider);
         if settings.take_provider != migrated {
-            settings.take_provider = migrated.to_string();
+            settings.take_provider = migrated;
             if writable {
                 let _ = store.save_settings(&settings);
             }
@@ -295,6 +298,9 @@ impl TrendsDesk {
             reply_drag: false,
             provider_menu: false,
             extra_models: Vec::new(),
+            verify_line: String::new(),
+            verify_ok: None,
+            verify_gen: 0,
             draft_count,
             saved_urls,
             list_pick: None,

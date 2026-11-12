@@ -254,6 +254,133 @@ pub fn migrate_saved_provider(saved: &str) -> &'static str {
     }
 }
 
+/// Turn a transport failure into a specific line. Never the words "network error".
+pub fn specific_transport_error(error: &str) -> String {
+    let lower = error.to_lowercase();
+    if lower.contains("connection refused")
+        || lower.contains("os error 111")
+        || lower.contains("os error 10061")
+        || lower.contains("actively refused")
+    {
+        return "connection refused".into();
+    }
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return "timed out".into();
+    }
+    if lower.contains("404") || lower.contains("not found") {
+        return "http 404 not found".into();
+    }
+    if lower.contains("401") || lower.contains("unauthorized") {
+        return "http 401 unauthorized".into();
+    }
+    if lower.contains("403") || lower.contains("forbidden") {
+        return "http 403 forbidden".into();
+    }
+    if let Some(code) = lower.split("http ").nth(1).and_then(|rest| {
+        let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+        if digits.len() == 3 {
+            Some(digits)
+        } else {
+            None
+        }
+    }) {
+        return format!("http {code}");
+    }
+    if lower.trim() == "network error" || lower.contains("network error") {
+        return "connection failed".into();
+    }
+    let short = error
+        .split_whitespace()
+        .take(14)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if short.is_empty() {
+        "connection failed".into()
+    } else {
+        short
+    }
+}
+
+pub fn verify_status(label: &str, ok: bool, millis: u128, error: &str) -> String {
+    if ok {
+        format!("{label} verified · {millis}ms")
+    } else {
+        format!("{label} · {}", specific_transport_error(error))
+    }
+}
+
+pub fn probe_cli_args(program: &str) -> Vec<String> {
+    match program {
+        "agy" => vec!["--version".into()],
+        "muse" => vec!["--version".into()],
+        _ => vec!["--version".into()],
+    }
+}
+
+/// `/v1/models` then a 1-token chat. The key stays in the header only.
+pub fn probe_openai(
+    http: &dyn crate::io::Http,
+    base: &str,
+    model: &str,
+    key: &str,
+) -> Result<(), String> {
+    let base = base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("base URL is missing".into());
+    }
+    let bearer = {
+        let key = key.trim();
+        if key.is_empty() {
+            None
+        } else {
+            Some(key.to_string())
+        }
+    };
+    let models = crate::io::HttpRequest {
+        method: "GET",
+        url: format!("{base}/models"),
+        body: None,
+        bearer: bearer.clone(),
+        content_type: None,
+        headers: Vec::new(),
+    };
+    http.request(models)
+        .map_err(|error| specific_transport_error(&redact_key(&error, key)))?;
+    let body = serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}]
+    })
+    .to_string();
+    let chat = crate::io::HttpRequest {
+        method: "POST",
+        url: format!("{base}/chat/completions"),
+        body: Some(body),
+        bearer,
+        content_type: Some("application/json".into()),
+        headers: Vec::new(),
+    };
+    let text = http
+        .request(chat)
+        .map_err(|error| specific_transport_error(&redact_key(&error, key)))?;
+    if text.to_lowercase().contains("\"error\"") && !text.contains("choices") {
+        return Err(specific_transport_error(&redact_key(&text, key)));
+    }
+    if text.contains(key) && !key.is_empty() {
+        return Err("probe echoed the key".into());
+    }
+    Ok(())
+}
+
+fn redact_key(text: &str, key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(key, "[redacted]")
+    }
+}
+
 pub fn canonical_provider(saved: &str) -> String {
     let saved = saved.trim();
     if let Some((kind, model)) = saved.split_once(':') {
@@ -507,7 +634,10 @@ fn hermes_vyce_take(
         Ok(text) => labeled_take("hermes", &label, &text, &[]),
         Err(error) => failed_take(
             "hermes",
-            &format!("Hermes · {error}. Vyce direct is one click away."),
+            &format!(
+                "Hermes · {}. Vyce direct is one click away.",
+                specific_transport_error(&error)
+            ),
         ),
     }
 }
@@ -532,7 +662,10 @@ fn vyce_direct_take(
     let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
     match super::agents::vyce_complete(&auth, http, &prompt) {
         Ok(text) => labeled_take("vyce", &label, &text, &[]),
-        Err(error) => failed_take("vyce", &format!("Vyce · {error}")),
+        Err(error) => failed_take(
+            "vyce",
+            &format!("Vyce · {}", specific_transport_error(&error)),
+        ),
     }
 }
 
@@ -1233,6 +1366,67 @@ mod tests {
             "hermes:hermes-agent"
         );
         assert_eq!(provider_kind("free"), super::super::TakeProvider::Hermes);
+        assert_eq!(canonical_provider("grok"), "grok");
+        assert_eq!(provider_kind("Grok"), super::super::TakeProvider::Grok);
+        let picked = canonical_provider("grok");
+        assert_eq!(picked, "grok");
+        assert_eq!(provider_kind(&picked), super::super::TakeProvider::Grok);
+        let refused = specific_transport_error("Network Error");
+        assert_eq!(refused, "connection failed");
+        assert!(!refused.to_lowercase().contains("network error"));
+        assert_eq!(
+            specific_transport_error("tcp connect error: Connection refused (os error 111)"),
+            "connection refused"
+        );
+        assert_eq!(
+            specific_transport_error("http 503 Service Unavailable"),
+            "http 503"
+        );
+        let ok_line = verify_status("Grok", true, 40, "");
+        assert_eq!(ok_line, "Grok verified · 40ms");
+        let bad_line = verify_status("Grok", false, 0, "grok not found");
+        assert!(bad_line.contains("not found"));
+        assert_eq!(provider_kind(&picked), super::super::TakeProvider::Grok);
+        assert_eq!(probe_cli_args("grok"), vec!["--version".to_string()]);
+        assert_eq!(probe_cli_args("agy"), vec!["--version".to_string()]);
+        struct ProbeHttp {
+            fail_models: bool,
+        }
+        impl crate::io::Http for ProbeHttp {
+            fn request(&self, request: crate::io::HttpRequest) -> Result<String, String> {
+                assert!(
+                    request.bearer.as_deref().unwrap_or("").is_empty()
+                        || request.url.contains("models")
+                        || request.url.contains("chat")
+                );
+                let body = request.body.clone().unwrap_or_default();
+                assert!(!body.contains("secret-key"));
+                if self.fail_models {
+                    return Err("connection refused".into());
+                }
+                if request.url.ends_with("/models") {
+                    return Ok(r#"{"data":[{"id":"glm-5.3-flash"}]}"#.into());
+                }
+                assert!(body.contains("\"max_tokens\":1"));
+                Ok(r#"{"choices":[{"message":{"content":"ok"}}]}"#.into())
+            }
+        }
+        probe_openai(
+            &ProbeHttp { fail_models: false },
+            "http://127.0.0.1:8642/v1",
+            "glm-5.3-flash",
+            "secret-key",
+        )
+        .unwrap();
+        let failed = probe_openai(
+            &ProbeHttp { fail_models: true },
+            "http://127.0.0.1:8642/v1",
+            "glm-5.3-flash",
+            "secret-key",
+        )
+        .unwrap_err();
+        assert_eq!(failed, "connection refused");
+        assert!(!failed.contains("secret-key"));
         assert_eq!(
             models_from_openai(r#"{"data":[{"id":"glm-5.3-flash"},{"id":"other"}]}"#),
             vec!["glm-5.3-flash".to_string(), "other".to_string()]

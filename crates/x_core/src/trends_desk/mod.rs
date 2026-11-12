@@ -103,9 +103,10 @@ pub use takes::{
     canonical_provider, chain_order, choose_chain, halt_takes, hidden_agent_draft, honest_failure,
     interactive_command, is_provider_failure, is_template_angle, is_termy_x_image,
     menu_with_models, merge_attempts, migrate_saved_provider, models_from_openai, muse_needs_trust,
-    muse_trust_line, provider_kind, provider_label, provider_model, resume_takes, retain_grok_jobs,
-    run_take_chain, run_take_chain_with, settle_variants, take_chain_order, take_spawns,
-    takes_halted, with_grok_stub,
+    muse_trust_line, probe_cli_args, probe_openai, provider_kind, provider_label, provider_model,
+    resume_takes, retain_grok_jobs, run_take_chain, run_take_chain_with, settle_variants,
+    specific_transport_error, take_chain_order, take_spawns, takes_halted, verify_status,
+    with_grok_stub,
 };
 
 const SYNTHETIC_OPENCLI: &str = include_str!("synthetic_opencli.json");

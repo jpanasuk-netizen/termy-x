@@ -292,6 +292,8 @@ impl TrendsDesk {
             }
         }
         let open = self.provider_menu;
+        let verify_ok = self.verify_ok;
+        let verify_line = self.verify_line.clone();
         let mut column = div().flex().flex_col().gap(px(4.0)).child(box_button(
             "desk-provider-combo",
             &format!("{current} ▾"),
@@ -317,6 +319,20 @@ impl TrendsDesk {
                     },
                 ));
             }
+        }
+        if !verify_line.is_empty() {
+            let color = if verify_ok == Some(true) {
+                rgb(0x30d158)
+            } else {
+                rgb(0xff453a)
+            };
+            column = column.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(color)
+                    .whitespace_normal()
+                    .child(verify_line),
+            );
         }
         column.into_any_element()
     }
@@ -555,21 +571,80 @@ impl TrendsDesk {
     }
 
     pub(crate) fn choose_provider(&mut self, name: &str, cx: &mut Context<Self>) {
-        let empty = self
-            .reply_edit
-            .as_ref()
-            .map(|editor| editor.text.trim().is_empty())
-            .unwrap_or(true);
-        let failed = empty && !self.action_note.trim().is_empty();
-        self.remember_provider(name);
-        self.action_note = format!("Next take uses {name}.");
-        if failed {
-            if let Some(id) = self.popout.as_ref().map(|pop| pop.card_id.clone()) {
-                self.draft_take_for(id, cx);
-                return;
-            }
-        }
+        let name = termy_x::trends_desk::canonical_provider(name);
+        self.remember_provider(&name);
+        let label = termy_x::trends_desk::provider_label(&self.settings.take_provider);
+        self.action_note = format!("Next take uses {label}.");
+        self.verify_line = format!("Checking {label}…");
+        self.verify_ok = None;
+        self.verify_gen = self.verify_gen.saturating_add(1);
+        let generation = self.verify_gen;
+        self.spawn_verify(generation, cx);
         cx.notify();
+    }
+
+    fn spawn_verify(&mut self, generation: u64, cx: &mut Context<Self>) {
+        let saved = self.settings.take_provider.clone();
+        let kind = termy_x::trends_desk::provider_kind(&saved);
+        let label = termy_x::trends_desk::provider_label(&saved);
+        let (hermes, hermes_key, custom) = self.provider_probe();
+        let model = termy_x::trends_desk::provider_model(&saved)
+            .unwrap_or_else(|| termy_x::trends_desk::VYCE_MODEL.to_string());
+        cx.spawn(async move |this, cx| {
+            let started = std::time::Instant::now();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let http =
+                        termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(8));
+                    match kind {
+                        termy_x::trends_desk::TakeProvider::Hermes => {
+                            termy_x::trends_desk::probe_openai(&http, &hermes, &model, &hermes_key)
+                        }
+                        termy_x::trends_desk::TakeProvider::Vyce => {
+                            let key = std::env::var("VYCE_API_KEY").unwrap_or_default();
+                            termy_x::trends_desk::probe_openai(
+                                &http,
+                                termy_x::trends_desk::VYCE_DIRECT_BASE,
+                                &model,
+                                &key,
+                            )
+                        }
+                        termy_x::trends_desk::TakeProvider::Custom => {
+                            termy_x::trends_desk::probe_openai(&http, &custom, &model, "")
+                        }
+                        termy_x::trends_desk::TakeProvider::Grok => probe_cli("grok"),
+                        termy_x::trends_desk::TakeProvider::Muse => probe_cli("muse"),
+                        termy_x::trends_desk::TakeProvider::Agy => probe_cli("agy"),
+                        _ => Err("that provider is not available".into()),
+                    }
+                })
+                .await;
+            let millis = started.elapsed().as_millis();
+            let _ = this.update(cx, |desk, cx| {
+                if desk.verify_gen != generation {
+                    return;
+                }
+                if desk.settings.take_provider != saved {
+                    return;
+                }
+                let (ok, line) = match result {
+                    Ok(()) => (
+                        true,
+                        termy_x::trends_desk::verify_status(&label, true, millis, ""),
+                    ),
+                    Err(error) => (
+                        false,
+                        termy_x::trends_desk::verify_status(&label, false, millis, &error),
+                    ),
+                };
+                desk.verify_ok = Some(ok);
+                desk.verify_line = line.clone();
+                desk.action_note = line;
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     pub(crate) fn open_inline_for(&mut self, id: String, cx: &mut Context<Self>) {
@@ -697,6 +772,26 @@ fn box_button(
             }),
         )
         .into_any_element()
+}
+
+fn probe_cli(program: &str) -> Result<(), String> {
+    let mut command = std::process::Command::new(program);
+    command.args(termy_x::trends_desk::probe_cli_args(program));
+    termy_x::trends_desk::apply_hidden_command(&mut command);
+    match command.output() {
+        Err(error) => Err(format!("{program} not found ({error})")),
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !err.is_empty() { err } else { out };
+            if detail.is_empty() {
+                Err(format!("{program} --version failed"))
+            } else {
+                Err(detail)
+            }
+        }
+    }
 }
 
 fn model_ids(http: &termy_x::io::UreqHttp, base: &str, key: &str) -> Vec<String> {
