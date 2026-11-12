@@ -210,7 +210,7 @@ impl TrendsDesk {
         }
     }
 
-    pub(crate) fn turn_subject(&mut self, delta: i32, cx: &mut Context<Self>) {
+    pub(crate) fn turn_subject(&mut self, delta: i32) {
         let count = self.columns.len();
         let index = self
             .columns
@@ -220,7 +220,6 @@ impl TrendsDesk {
         let next = turn_page(index, count, delta);
         if let Some(column) = self.columns.get(next) {
             self.settings.subject_id = column.topic.id.clone();
-            self.schedule_takes(cx);
             if self.writable {
                 let _ = self.store.save_settings(&self.settings);
             }

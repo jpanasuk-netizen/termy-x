@@ -60,10 +60,7 @@ impl TrendsDesk {
                 (take.note.clone(), Some("Retry".to_string()))
             }
             Some(take) => (take.text.clone(), None),
-            None => (
-                "Take not drafted yet".to_string(),
-                Some("Retry".to_string()),
-            ),
+            None => (termy_x::trends_desk::CLICK_TO_DRAFT.to_string(), None),
         };
         let editing = self
             .popout
@@ -111,9 +108,11 @@ impl TrendsDesk {
                 MouseButton::Left,
                 cx.listener({
                     let take_key = take_key.clone();
+                    let click_id = id.clone();
                     move |this, _, window, cx| {
                         this.selected = Some(take_key.clone());
                         this.focus_root_after_click(window, cx);
+                        this.draft_card_take(click_id.clone(), cx);
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -256,7 +255,10 @@ impl TrendsDesk {
                         SharedString::from(format!("desk-open-{id}")),
                         "Open source",
                         false,
-                        cx.listener(move |_, _, _, _| open_status(&url)),
+                        cx.listener(move |_, _, _, cx| {
+                            open_status(&url);
+                            cx.stop_propagation();
+                        }),
                     ))
                     .child(button(
                         SharedString::from(format!("desk-take-{id}")),
@@ -268,22 +270,25 @@ impl TrendsDesk {
                             cx.stop_propagation();
                         }),
                     ))
-                    .child(button(
-                        SharedString::from(format!("desk-retry-{id}")),
-                        "Retry",
-                        false,
-                        cx.listener(move |this, _, window, cx| {
-                            this.focus_root_after_click(window, cx);
-                            this.retry_takes(cx);
-                            cx.stop_propagation();
-                        }),
-                    ))
+                    .child({
+                        let retry_id = id.clone();
+                        button(
+                            SharedString::from(format!("desk-retry-{id}")),
+                            "Retry",
+                            false,
+                            cx.listener(move |this, _, window, cx| {
+                                this.focus_root_after_click(window, cx);
+                                this.draft_card_take(retry_id.clone(), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                    })
                     .child(button(
                         SharedString::from(format!("desk-reply-{id}")),
                         "Reply",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.open_popout(&edit_id);
+                            this.draft_take_for(edit_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),
@@ -330,7 +335,7 @@ impl TrendsDesk {
                         "Edit",
                         false,
                         cx.listener(move |this, _, _, cx| {
-                            this.open_popout(&send_id);
+                            this.draft_take_for(send_id.clone(), cx);
                             cx.stop_propagation();
                             cx.notify();
                         }),

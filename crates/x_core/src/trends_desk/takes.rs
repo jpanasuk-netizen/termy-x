@@ -135,8 +135,40 @@ pub fn muse_needs_trust(output: &str) -> bool {
 
 /// Windows flag that keeps a console subsystem child from opening a window.
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-pub const GROK_TAKE_CAP: usize = 2;
-pub const TAKE_DEBOUNCE_MS: u64 = 1500;
+pub const GROK_TAKE_CAP: usize = 1;
+pub const CLICK_TO_DRAFT: &str = "Click to draft take";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeskEvent {
+    Load,
+    Search,
+    Flip,
+    Scroll,
+    Refresh,
+    CardClick,
+    DraftTake,
+    Reply,
+    Edit,
+    ProviderPill,
+    TonePill,
+}
+
+/// Search, flip, scroll, and refresh never call a provider. A card action calls once.
+pub fn take_spawns(event: DeskEvent) -> usize {
+    match event {
+        DeskEvent::Load
+        | DeskEvent::Search
+        | DeskEvent::Flip
+        | DeskEvent::Scroll
+        | DeskEvent::Refresh => 0,
+        DeskEvent::CardClick
+        | DeskEvent::DraftTake
+        | DeskEvent::Reply
+        | DeskEvent::Edit
+        | DeskEvent::ProviderPill
+        | DeskEvent::TonePill => 1,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BackgroundSpawn {
@@ -562,8 +594,27 @@ mod tests {
         assert!(plan.piped_stdio);
         assert!(!plan.console_wrapper);
         assert!(!admit_grok(GROK_TAKE_CAP));
-        assert!(admit_grok(1));
-        assert_eq!(TAKE_DEBOUNCE_MS, 1500);
+        assert!(admit_grok(0));
+        assert_eq!(GROK_TAKE_CAP, 1);
+        for event in [
+            DeskEvent::Load,
+            DeskEvent::Search,
+            DeskEvent::Flip,
+            DeskEvent::Scroll,
+            DeskEvent::Refresh,
+        ] {
+            assert_eq!(take_spawns(event), 0, "{event:?}");
+        }
+        for event in [
+            DeskEvent::CardClick,
+            DeskEvent::DraftTake,
+            DeskEvent::Reply,
+            DeskEvent::Edit,
+            DeskEvent::ProviderPill,
+            DeskEvent::TonePill,
+        ] {
+            assert_eq!(take_spawns(event), 1, "{event:?}");
+        }
         let visible = interactive_command("grok");
         if cfg!(windows) {
             assert_eq!(visible[0], "cmd.exe");

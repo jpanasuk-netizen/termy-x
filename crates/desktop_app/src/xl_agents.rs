@@ -189,6 +189,8 @@ impl TrendsDesk {
     }
 
     pub(crate) fn regenerate_open_variants(&mut self, cx: &mut Context<Self>) {
+        self.takes_halted = false;
+        termy_x::trends_desk::resume_takes();
         let Some(pop) = self.popout.clone() else {
             return;
         };
@@ -208,26 +210,15 @@ impl TrendsDesk {
         let id = pop.card_id.clone();
         self.model_notice = format!("Drafting with {}…", provider.as_str());
         cx.spawn(async move |this, cx| {
-            let mut attempts = Vec::new();
-            for _ in 0..3 {
-                let config = config.clone();
-                let post = post.clone();
-                let tone = tone.clone();
-                let draft = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let http = termy_x::io::UreqHttp::default();
-                        termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
-                    })
-                    .await;
-                let empty = draft.variants.is_empty();
-                attempts.push(draft.variants);
-                if !empty {
-                    break;
-                }
-            }
+            let draft = cx
+                .background_executor()
+                .spawn(async move {
+                    let http = termy_x::io::UreqHttp::default();
+                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                })
+                .await;
             let (variants, error) =
-                termy_x::trends_desk::settle_variants(&previous, &attempts, &tone);
+                termy_x::trends_desk::settle_variants(&previous, &[draft.variants], &tone);
             let _ = this.update(cx, |desk, cx| {
                 if let Some(open) = desk.popout.as_mut().filter(|item| item.card_id == id) {
                     open.variants = variants;
@@ -247,15 +238,6 @@ impl TrendsDesk {
             });
         })
         .detach();
-    }
-
-    pub(crate) fn retry_takes(&mut self, cx: &mut Context<Self>) {
-        self.takes.clear();
-        self.free_halted = false;
-        self.takes_halted = false;
-        termy_x::trends_desk::resume_takes();
-        self.model_notice.clear();
-        self.schedule_takes(cx);
     }
 
     pub(crate) fn focus_root_after_click(
@@ -325,7 +307,6 @@ impl TrendsDesk {
         if TakeProvider::parse(name) == TakeProvider::Hermes {
             self.probe_hermes_models(cx);
         }
-        self.schedule_takes(cx);
         cx.notify();
     }
 

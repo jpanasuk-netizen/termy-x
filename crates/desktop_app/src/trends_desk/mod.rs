@@ -272,7 +272,6 @@ impl TrendsDesk {
             return;
         }
         self.started = true;
-        self.schedule_takes(cx);
         self.fetch_empty_subjects(cx);
         self.spawn_probe(cx);
         self.spawn_daily(cx);
@@ -280,213 +279,6 @@ impl TrendsDesk {
         self.spawn_follow(cx);
         self.probe_hermes_models(cx);
         self.seed_agent_file();
-    }
-
-    pub(crate) fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
-        if self.takes_halted {
-            return;
-        }
-        self.take_wave = self.take_wave.saturating_add(1);
-        let wave = self.take_wave;
-        let posts = self.posts_for_takes();
-        termy_x::trends_desk::retain_grok_jobs(
-            &posts.iter().map(|post| post.id.clone()).collect::<Vec<_>>(),
-        );
-        if self.options.fixture {
-            return;
-        }
-        if self.free_halted
-            && matches!(
-                TakeProvider::parse(&self.settings.take_provider),
-                TakeProvider::Free | TakeProvider::Hermes
-            )
-        {
-            let detail = self.model_detail.clone();
-            for post in &posts {
-                let mut draft = offline_take(post);
-                if !detail.is_empty() {
-                    draft.note = detail.clone();
-                }
-                self.takes.insert(post.id.clone(), draft);
-            }
-            return;
-        }
-        for post in &posts {
-            self.takes.insert(
-                post.id.clone(),
-                TakeDraft {
-                    text: String::new(),
-                    source: "pending",
-                    note: String::new(),
-                    variants: Vec::new(),
-                },
-            );
-        }
-        if posts.is_empty() {
-            return;
-        }
-        let provider = TakeProvider::parse(&self.settings.take_provider);
-        let mut config = self.config.clone();
-        let data_root = self.data_root.clone();
-        cx.spawn(async move |this, cx| {
-            let mut model_down = false;
-            let mut shared_offline: Option<String> = None;
-            let mut later = Vec::new();
-            let mut tried_next = false;
-            if provider == TakeProvider::Free {
-                let listed = config.clone();
-                let picked = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let http =
-                            termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(30));
-                        termy_x::ai::choose_chat_model(&listed, &http)
-                    })
-                    .await;
-                let (base, preferred) = config.ai_endpoint();
-                match picked {
-                    Ok(choice) => {
-                        let line = if choice.substituted {
-                            format!(
-                                "free takes: model {preferred} not installed, using {} @ {base}",
-                                choice.model
-                            )
-                        } else {
-                            format!("free takes: {} @ {base}", choice.model)
-                        };
-                        termy_x::trends_desk::append_desk_log(&data_root, &line);
-                        config.ai_model = choice.model;
-                        later = choice.later;
-                    }
-                    Err(reason) => {
-                        termy_x::trends_desk::append_desk_log(&data_root, &reason);
-                        model_down = true;
-                        shared_offline = Some(reason);
-                    }
-                }
-            }
-            let mut shared_error: Option<String> = None;
-            let mut logged_offline = false;
-            for post in posts {
-                let post_id = post.id.clone();
-                let mut draft = if let Some(error) = shared_error.clone() {
-                    TakeDraft {
-                        text: error.clone(),
-                        source: "error",
-                        note: error,
-                        variants: Vec::new(),
-                    }
-                } else if model_down
-                    && matches!(provider, TakeProvider::Free | TakeProvider::Hermes)
-                {
-                    let mut draft = offline_take(&post);
-                    if let Some(reason) = &shared_offline {
-                        draft.note = reason.clone();
-                    }
-                    draft
-                } else {
-                    let post = post.clone();
-                    let config = config.clone();
-                    let provider = provider;
-                    cx.background_executor()
-                        .spawn(async move {
-                            let http = termy_x::io::UreqHttp::with_timeout(
-                                std::time::Duration::from_secs(30),
-                            );
-                            termy_x::trends_desk::run_take_chain(
-                                provider, &config, &post, &http, "Reply",
-                            )
-                        })
-                        .await
-                };
-                if matches!(provider, TakeProvider::Free | TakeProvider::Hermes)
-                    && termy_x::ai::blocks_free_model(&draft.note)
-                {
-                    if !tried_next {
-                        tried_next = true;
-                        if let Some(next) = later.first().cloned() {
-                            termy_x::trends_desk::append_desk_log(
-                                &data_root,
-                                &format!("model returned 401 or 402; trying {next} once"),
-                            );
-                            let mut retry_config = config.clone();
-                            retry_config.ai_model = next.clone();
-                            let retry_post = post.clone();
-                            let retry = cx
-                                .background_executor()
-                                .spawn(async move {
-                                    let http = termy_x::io::UreqHttp::with_timeout(
-                                        std::time::Duration::from_secs(30),
-                                    );
-                                    match draft_take(
-                                        TakeProvider::Free,
-                                        &retry_config,
-                                        &retry_post,
-                                        &http,
-                                    ) {
-                                        Ok(draft) => draft,
-                                        Err(error) => TakeDraft {
-                                            text: error.clone(),
-                                            source: "error",
-                                            note: error,
-                                            variants: Vec::new(),
-                                        },
-                                    }
-                                })
-                                .await;
-                            if retry.source == "model"
-                                && !termy_x::ai::blocks_free_model(&retry.note)
-                            {
-                                config.ai_model = next;
-                                draft = retry;
-                            } else {
-                                draft = retry;
-                                model_down = true;
-                                shared_offline = Some(draft.note.clone());
-                            }
-                        } else {
-                            model_down = true;
-                            shared_offline = Some(draft.note.clone());
-                        }
-                    } else {
-                        model_down = true;
-                        shared_offline = Some(draft.note.clone());
-                    }
-                } else if draft.source == "offline" {
-                    if shared_offline.is_none() {
-                        shared_offline = Some(draft.note.clone());
-                    }
-                    model_down = true;
-                }
-                if draft.source == "error"
-                    && (draft.note.contains("key") || draft.note.contains("No Treg"))
-                {
-                    shared_error = Some(draft.note.clone());
-                }
-                let record_failure = (draft.source == "offline" || draft.source == "error")
-                    && termy_x::trends_desk::should_log_model_failure(logged_offline, &draft.note);
-                if record_failure {
-                    logged_offline = true;
-                    termy_x::trends_desk::append_desk_log(&data_root, &draft.note);
-                }
-                let failure_note = record_failure.then(|| draft.note.clone());
-                let _ = this.update(cx, |desk, cx| {
-                    if desk.take_wave != wave {
-                        return;
-                    }
-                    if let Some(note) = failure_note {
-                        desk.model_detail = note.clone();
-                        desk.model_notice = termy_x::trends_desk::short_take_note(&note);
-                        if termy_x::ai::blocks_free_model(&note) {
-                            desk.free_halted = true;
-                        }
-                    }
-                    desk.takes.insert(post_id, draft);
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
     }
 
     fn fetch_empty_subjects(&mut self, cx: &mut Context<Self>) {
@@ -669,7 +461,6 @@ impl TrendsDesk {
                 }
                 desk.busy = false;
                 desk.apply_outcomes(outcomes.0, outcomes.1);
-                desk.schedule_takes(cx);
                 cx.notify();
             });
         })
@@ -946,7 +737,17 @@ impl TrendsDesk {
         );
     }
 
+    pub(crate) fn draft_card_take(&mut self, id: String, cx: &mut Context<Self>) {
+        self.spawn_one_take(id, false, cx);
+    }
+
     pub(crate) fn draft_take_for(&mut self, id: String, cx: &mut Context<Self>) {
+        self.spawn_one_take(id, true, cx);
+    }
+
+    fn spawn_one_take(&mut self, id: String, open_compose: bool, cx: &mut Context<Self>) {
+        self.takes_halted = false;
+        termy_x::trends_desk::resume_takes();
         let Some(post) = self
             .columns
             .iter()
@@ -956,6 +757,15 @@ impl TrendsDesk {
         else {
             return;
         };
+        self.takes.insert(
+            id.clone(),
+            TakeDraft {
+                text: String::new(),
+                source: "pending",
+                note: String::new(),
+                variants: Vec::new(),
+            },
+        );
         let provider = TakeProvider::parse(&self.settings.take_provider);
         let config = self.config.clone();
         let current = self
@@ -971,38 +781,30 @@ impl TrendsDesk {
                     let drafted = termy_x::trends_desk::run_take_chain(
                         provider, &config, &post, &http, "Reply",
                     );
-                    if !drafted.text.trim().is_empty() {
+                    if open_compose && !drafted.text.trim().is_empty() {
                         let _ = termy_x::trends_desk::queue_reply(
                             &config.config_dir,
                             &post.id,
                             &drafted.text,
                         );
                     }
-                    Ok(drafted)
+                    drafted
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
-                match result {
-                    Ok(draft) => {
-                        desk.card_replies
-                            .insert(id.clone(), edit_reply(&current, draft.text.clone()));
-                        desk.draft_note = draft.note;
-                        desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(draft.text.len());
-                        let mut editor = open_editor(&id, &draft.text, provider);
-                        if !draft.variants.is_empty() {
-                            editor.variants = termy_x::trends_desk::distinct_variants(
-                                &draft.text,
-                                &draft.variants,
-                            );
-                        }
-                        desk.popout = Some(editor);
-                        desk.selected = Some(format!("take:{id}"));
+                desk.takes.insert(id.clone(), result.clone());
+                if open_compose {
+                    desk.card_replies
+                        .insert(id.clone(), edit_reply(&current, result.text.clone()));
+                    desk.draft_note = result.note.clone();
+                    desk.pop_caret = termy_x::draft_edit::DraftCaret::at_end(result.text.len());
+                    let mut editor = open_editor(&id, &result.text, provider);
+                    if !result.variants.is_empty() {
+                        editor.variants =
+                            termy_x::trends_desk::distinct_variants(&result.text, &result.variants);
                     }
-                    Err(error) => {
-                        let text = current.text().to_string();
-                        desk.card_replies
-                            .insert(id, ReplyPhase::Failed { text, error });
-                    }
+                    desk.popout = Some(editor);
+                    desk.selected = Some(format!("take:{id}"));
                 }
                 cx.notify();
             });
@@ -1093,7 +895,6 @@ impl TrendsDesk {
             }
             Err(error) => self.draft_note = error,
         }
-        self.schedule_takes(cx);
         cx.notify();
     }
 
