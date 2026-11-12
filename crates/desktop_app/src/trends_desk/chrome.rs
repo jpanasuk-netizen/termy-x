@@ -615,6 +615,33 @@ pub(crate) fn button(
         .into_any_element()
 }
 
+/// Prev and Next. Tall enough to hit, and they do not shrink when the title is long.
+pub(crate) fn page_button(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    handler: impl Fn(&gpui_kit::MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui_kit::AnyElement {
+    let hit = termy_x::trends_desk::PAGE_BAR_HIT;
+    div()
+        .id(id.into())
+        .flex_shrink_0()
+        .min_w(px(72.0))
+        .h(px(hit))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgb(0x3a3a3c))
+        .bg(rgb(0x2c2c2e))
+        .text_size(px(14.0))
+        .cursor_pointer()
+        .child(label.into())
+        .on_mouse_down(MouseButton::Left, handler)
+        .into_any_element()
+}
+
 pub(crate) fn open_status(url: &str) {
     if url.starts_with("https://x.com/") && url.contains("/status/") {
         let _ = webbrowser::open(url);

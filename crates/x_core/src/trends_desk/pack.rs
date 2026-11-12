@@ -635,6 +635,16 @@ pub fn search_page_name(term: &str) -> String {
     format!("Search: {term}")
 }
 
+/// The subject bar stays above a freshly loaded result list.
+pub const PAGE_BAR_H: f32 = 52.0;
+pub const PAGE_BAR_HIT: f32 = 44.0;
+
+/// Next is missed after a search when the result list paints over a short bar.
+/// The bar is painted last and is at least a 44px hit target.
+pub fn next_click_reaches(bar_painted_last: bool, bar_h: f32) -> bool {
+    bar_painted_last && bar_h >= PAGE_BAR_HIT
+}
+
 /// Page keys move the subject. Escape is not one of them.
 pub fn page_after_key(index: usize, count: usize, key: &str) -> Option<usize> {
     match desk_key(key, false, false) {
@@ -851,6 +861,12 @@ mod tests {
         assert_eq!(page_after_key(2, 4, "pageup"), Some(1));
         assert_eq!(page_after_key(1, 4, "up"), Some(0));
         assert!(page_after_key(1, 4, "escape").is_none());
+        assert!(next_click_reaches(true, PAGE_BAR_H));
+        assert!(!next_click_reaches(false, PAGE_BAR_H));
+        assert!(!next_click_reaches(true, PAGE_BAR_HIT - 1.0));
+        let search = search_page_name("a long query that used to cover next");
+        assert!(search.starts_with("Search:"));
+        assert!(next_click_reaches(true, PAGE_BAR_H));
         assert_eq!(search_label(true, ""), "|");
         assert!(!search_label(true, "rates").contains("click to edit"));
         match search_edit("rat", "e", Some("e")) {

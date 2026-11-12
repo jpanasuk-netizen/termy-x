@@ -1045,12 +1045,28 @@ impl TrendsDesk {
             return;
         }
         if key == "escape" {
-            if self.field.is_some() {
-                self.field = None;
-            } else if self.selected.is_some() {
-                self.selected = None;
-            } else if self.frame.expanded {
-                self.toggle_frame(window, cx);
+            let effect = termy_x::trends_desk::escape_effect(
+                false,
+                false,
+                false,
+                self.field.is_some(),
+                self.selected.is_some(),
+                self.frame.expanded,
+            );
+            if termy_x::trends_desk::escape_requests_quit(effect) {
+                termy_x::trends_desk::note_exit_reason("escape requested quit");
+            }
+            match effect {
+                termy_x::trends_desk::EscapeEffect::ClearField => self.field = None,
+                termy_x::trends_desk::EscapeEffect::ClearSelection => self.selected = None,
+                termy_x::trends_desk::EscapeEffect::CollapseDock => {
+                    termy_x::trends_desk::append_desk_log(
+                        &self.data_root,
+                        "INFO exit: escape collapsed the dock; the window stayed open",
+                    );
+                    self.toggle_frame(window, cx);
+                }
+                _ => {}
             }
             cx.notify();
             return;
@@ -1187,6 +1203,13 @@ pub fn run_standalone(fixture: bool) {
             eprintln!("  termy-xcli trends-desk run --topic all");
         }
     });
+    let reason = termy_x::trends_desk::exit_reason();
+    let detail = if reason.is_empty() {
+        "process ending; no quit() call and no window-close callback".to_string()
+    } else {
+        format!("process ending after {reason}")
+    };
+    termy_x::trends_desk::append_desk_log(&root, &termy_x::trends_desk::exit_log_line(&detail));
 }
 
 /// Taskbar identity for the standalone window only.
@@ -1208,6 +1231,7 @@ impl Render for TrendsDesk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_started(cx);
         self.ensure_close_hook(window, cx);
+        self.focus_open_media(window, cx);
         self.ensure_scrolls();
         self.maybe_refresh(cx);
         self.follow_host(window, cx);
@@ -1264,6 +1288,9 @@ impl Render for TrendsDesk {
         if let Some(overlay) = self.media_overlay(cx) {
             root = root.child(overlay);
         }
+        if let Some(shield) = self.media_shield(cx) {
+            root = root.child(shield);
+        }
         if let Some(close) = self.media_close(cx) {
             root = root.child(close);
         }
@@ -1276,4 +1303,4 @@ mod chrome;
 mod xl_agents;
 #[path = "../xl_media.rs"]
 mod xl_media;
-pub(crate) use chrome::{HintView, button, open_status};
+pub(crate) use chrome::{HintView, button, open_status, page_button};

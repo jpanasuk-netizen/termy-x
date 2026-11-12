@@ -55,23 +55,27 @@ pub use fetch::{
     refuse_unsafe_cli_name, run_topics, search_args,
 };
 pub use lifecycle::{
-    DeskSession, OffUiRequest, PruneLog, RefreshPress, child_is_gone, click_after_scroll,
+    DeskSession, EscapeEffect, OffUiRequest, PruneLog, RefreshPress, child_is_gone,
+    click_after_scroll, escape_effect, escape_requests_quit, focus_loss_closes_the_window,
     press_refresh, prune_backups, quit_dialog_for_agents, reap_child, start_off_ui,
 };
 pub use log::{
-    append_desk_log, install_panic_log, panic_log_line, redact_log, should_log_model_failure,
+    append_desk_log, exit_log_line, exit_reason, install_panic_log, note_exit_reason,
+    panic_log_line, redact_log, remember_exit, should_log_model_failure,
 };
 pub use media::{
-    QuotedTweet, TileBox, cache_name, cached_file, grid_inside, items_from_post, media_cache_dir,
-    play_badge, preview_url, quoted_from_post, read_cached, tile_grid, write_cached,
+    CLOSE_HIT, CLOSE_ICON, MediaClick, QuotedTweet, TileBox, cache_name, cached_file,
+    card_click_drafts, click_drafts_a_card, close_hit_box, grid_inside, items_from_post,
+    media_cache_dir, media_click, play_badge, player_origin, preview_url, quoted_from_post,
+    read_cached, tile_grid, write_cached,
 };
 pub use pack::{
-    CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, SearchEdit, TakeTone,
-    apply_filters, desk_key, distinct_variants, flip_variant, format_clock, format_post_time,
-    heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
-    next_refresh_text, page_after_key, provider_drafts, read_composer, refresh_due,
-    refresh_is_search_only, replied_badge, save_pack, search_edit, search_label, search_page_name,
-    sends_on_key, should_auto_refresh, sort_by_heat,
+    CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, ReplyMark,
+    SearchEdit, TakeTone, apply_filters, desk_key, distinct_variants, flip_variant, format_clock,
+    format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs,
+    new_ids, next_click_reaches, next_refresh_text, page_after_key, provider_drafts, read_composer,
+    refresh_due, refresh_is_search_only, replied_badge, save_pack, search_edit, search_label,
+    search_page_name, sends_on_key, should_auto_refresh, sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,

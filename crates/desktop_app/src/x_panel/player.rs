@@ -500,6 +500,23 @@ pub fn reap_video_hosts() {
     vlc_embed::reap_hosts();
 }
 
+/// A new host opens only after the previous player is gone and its window
+/// has been released. Starting during `libvlc_release` leaves the new host hidden.
+pub fn replay_allowed(busy: bool, released: bool) -> bool {
+    !busy && released
+}
+
+pub fn engine_ready_for_replay() -> bool {
+    #[cfg(windows)]
+    {
+        vlc_embed::engine_ready_for_replay()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnginePlan {
     Embed,
@@ -1156,6 +1173,7 @@ mod vlc_embed {
     const SW_SHOWNA: i32 = 8;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_SHOWWINDOW: u32 = 0x0040;
     const WM_SYSCOMMAND: u32 = 0x0112;
     const SC_MAXIMIZE: usize = 0xF030;
     const WS_EX_NOPARENTNOTIFY: u32 = 0x0000_0004;
@@ -1811,7 +1829,19 @@ mod vlc_embed {
                 unsafe { DestroyWindow(host) };
                 return Err(err);
             }
-            unsafe { ShowWindow(host, SW_SHOWNA) };
+            unsafe {
+                ShowWindow(host, SW_SHOWNA);
+                // HWND_TOP. A host that was only hidden must not stay above this one.
+                SetWindowPos(
+                    host,
+                    std::ptr::null_mut(),
+                    x,
+                    y,
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
             Ok(Self {
                 host,
                 parent: parent as Hwnd,
@@ -1950,6 +1980,22 @@ mod vlc_embed {
                 slot: Arc::clone(&self.slot),
             });
         }
+    }
+
+    pub(super) fn engine_ready_for_replay() -> bool {
+        let busy = current()
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(true);
+        let released = reaps()
+            .lock()
+            .map(|guard| {
+                guard
+                    .iter()
+                    .all(|reap| reap.slot.released.load(Ordering::Acquire))
+            })
+            .unwrap_or(false);
+        super::replay_allowed(busy, released)
     }
 
     pub fn reap_hosts() {
@@ -3363,7 +3409,7 @@ mod tests {
         event_name, format_obs_line, host_child_style, host_create_style, host_style_starts_hidden,
         keep_main_window, launches_external_vlc, libvlc_argc, libvlc_instance_args,
         live_size_differs_half, locate_vlc_root, marker_name, pe_machine, playback_args,
-        pos_is_noop, rect_changed, rects_overlap, sanitize_token, select_vlc,
+        pos_is_noop, rect_changed, rects_overlap, replay_allowed, sanitize_token, select_vlc,
         start_would_abort_in_ucrt, surface_style_for_libvlc, swp_names, vlc_candidates,
         vlc_playback_args, volume_commands, volume_percent,
     };
@@ -3390,6 +3436,21 @@ mod tests {
         let filled = embed_rect(1600.0, 900.0, true).unwrap();
         assert_eq!(filled.2, 1600.0);
         assert!(filled.3 <= 900.0);
+    }
+
+    #[test]
+    fn a_second_play_starts_only_after_the_first_host_is_released() {
+        assert!(!replay_allowed(true, false));
+        assert!(!replay_allowed(false, false));
+        assert!(replay_allowed(false, true));
+        let stopping = engine_step(EnginePhase::Playing, EngineStep::Stop).unwrap();
+        let released = engine_step(stopping, EngineStep::Release).unwrap();
+        assert_eq!(released, EnginePhase::Released);
+        let again = engine_step(EnginePhase::Idle, EngineStep::PlaceHost).unwrap();
+        assert_eq!(
+            engine_step(again, EngineStep::Play).unwrap(),
+            EnginePhase::Playing
+        );
     }
 
     #[test]
