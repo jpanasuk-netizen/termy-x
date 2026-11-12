@@ -67,6 +67,13 @@ impl TrendsDesk {
         if self.writable {
             let _ = self.store.save_settings(&self.settings);
         }
+        termy_x::trends_desk::append_desk_log(
+            &self.data_root,
+            &format!(
+                "INFO settings: wrote settings.json docked={} expanded={}",
+                self.settings.docked, self.frame.expanded
+            ),
+        );
     }
 
     pub(crate) fn ensure_close_hook(&mut self, window: &mut Window, cx: &mut Context<Self>) {

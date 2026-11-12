@@ -1,8 +1,8 @@
 //! Header, navigation, and settings for the Termy XL window.
 
 use gpui_kit::{
-    App, AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    App, AppContext, Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
 };
 
 use super::{Field, Surface, TrendsDesk};
@@ -196,13 +196,7 @@ impl TrendsDesk {
                 cx,
                 Nav::Settings,
             ))
-            .child(self.field_chip(
-                "desk-filter",
-                "Search",
-                &self.filter_text,
-                Field::Filter,
-                cx,
-            ))
+            .child(self.search_box(cx))
             .into_any_element()
     }
 
@@ -475,6 +469,65 @@ impl TrendsDesk {
             )
             .child(self.session.detail.clone())
             .into_any_element()
+    }
+
+    fn search_box(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let editing = self.field == Some(Field::Filter);
+        div()
+            .id("desk-filter")
+            .track_focus(&self.search_focus)
+            .px(px(10.0))
+            .py(px(6.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(if editing {
+                rgb(0x0a84ff)
+            } else {
+                rgb(0x3a3a3c)
+            })
+            .bg(if editing {
+                rgb(0x1a2a44)
+            } else {
+                rgb(0x2c2c2e)
+            })
+            .text_size(px(12.0))
+            .min_w(px(180.0))
+            .cursor_text()
+            .child(termy_x::trends_desk::search_label(
+                editing,
+                &self.filter_text,
+            ))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.field = Some(Field::Filter);
+                    this.search_focus.focus(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                }),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.on_search_key(event, cx);
+            }))
+            .into_any_element()
+    }
+
+    pub(crate) fn on_search_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        self.field = Some(Field::Filter);
+        let key = event.keystroke.key.as_str();
+        let ch = event.keystroke.key_char.as_deref();
+        match termy_x::trends_desk::search_edit(&self.filter_text, key, ch) {
+            termy_x::trends_desk::SearchEdit::Submit(term) => {
+                self.filter_text = term;
+                self.run_live_search(cx);
+                self.field = None;
+            }
+            termy_x::trends_desk::SearchEdit::Close => self.field = None,
+            termy_x::trends_desk::SearchEdit::Text(text) => self.filter_text = text,
+            termy_x::trends_desk::SearchEdit::Ignore => return,
+        }
+        cx.stop_propagation();
+        cx.notify();
     }
 
     fn field_chip(

@@ -580,6 +580,15 @@ impl TakeProvider {
         }
     }
 
+    pub fn caption(self) -> &'static str {
+        match self {
+            Self::Treg => "Provider · Treg",
+            Self::Free => "Provider · Free",
+            Self::Hermes => "Provider · Hermes",
+            Self::Grok => "Provider · Grok",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Treg => "treg",
@@ -1106,6 +1115,8 @@ mod tests {
         assert!(selection_after_empty().is_none());
         assert_eq!(selection_colors(true), (SELECT_PINK, SELECT_CYAN));
         let open = open_editor("55", "Courts are testing models", TakeProvider::Hermes);
+        assert_eq!(open.provider.caption(), "Provider · Hermes");
+        assert_eq!(TakeProvider::parse("grok").caption(), "Provider · Grok");
         assert!(open.open);
         assert_eq!(open.card_id, "55");
         assert!(open.variants.is_empty());

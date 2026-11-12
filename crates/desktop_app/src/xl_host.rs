@@ -145,14 +145,72 @@ pub(crate) fn find_termy_x() -> Option<WindowRect> {
 }
 
 pub(crate) fn termy_host() -> Option<TermyHost> {
+    seen_host().map(|host| TermyHost {
+        rect: host.rect,
+        minimized: host.minimized,
+    })
+}
+
+pub(crate) fn seen_host() -> Option<termy_x::trends_desk::SeenWindow> {
+    termy_x::trends_desk::pick_termy_host(&scan_windows())
+}
+
+fn scan_windows() -> Vec<termy_x::trends_desk::SeenWindow> {
     #[cfg(target_os = "windows")]
     {
-        find_termy_x_windows()
+        scan_windows_win32()
     }
     #[cfg(not(target_os = "windows"))]
     {
-        None
+        Vec::new()
     }
+}
+
+pub(crate) fn ensure_location_hook(root: &std::path::Path) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let registered = register_location_hook();
+    termy_x::trends_desk::append_desk_log(
+        root,
+        if registered {
+            "INFO dock: location hook registered"
+        } else {
+            "INFO dock: location hook failed"
+        },
+    );
+}
+
+fn register_location_hook() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        register_location_hook_win32()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
+pub(crate) fn log_attach(
+    root: &std::path::Path,
+    monitor: termy_x::trends_desk::WindowRect,
+    expanded: bool,
+    docked_setting: bool,
+) {
+    use std::sync::Mutex;
+    static LAST: Mutex<String> = Mutex::new(String::new());
+    let host = seen_host();
+    let (_snap, line) =
+        termy_x::trends_desk::attach_plan(host.as_ref(), monitor, expanded, docked_setting);
+    let mut last = LAST.lock().unwrap_or_else(|err| err.into_inner());
+    if *last == line {
+        return;
+    }
+    *last = line.clone();
+    termy_x::trends_desk::append_desk_log(root, &line);
 }
 
 pub(crate) fn fit_window(window: &mut Window) -> bool {
@@ -192,6 +250,13 @@ impl TrendsDesk {
             return;
         }
         self.last_follow = Some(std::time::Instant::now());
+        ensure_location_hook(&self.data_root);
+        log_attach(
+            &self.data_root,
+            monitor_rect(window, cx),
+            self.frame.expanded,
+            self.settings.docked,
+        );
         let host = termy_host();
         if host.as_ref().map(|item| (item.rect, item.minimized)) == self.last_host_key {
             return;
@@ -228,31 +293,152 @@ impl TrendsDesk {
 }
 
 #[cfg(target_os = "windows")]
-fn find_termy_x_windows() -> Option<TermyHost> {
-    use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, GetWindowRect, IsIconic, IsWindowVisible,
-    };
-    use windows::core::PCWSTR;
+fn scan_windows_win32() -> Vec<termy_x::trends_desk::SeenWindow> {
+    #[repr(C)]
+    struct RectWin {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+    struct Bag {
+        windows: Vec<termy_x::trends_desk::SeenWindow>,
+    }
+    unsafe extern "system" {
+        fn EnumWindows(
+            proc: Option<unsafe extern "system" fn(isize, isize) -> i32>,
+            param: isize,
+        ) -> i32;
+        fn IsWindowVisible(hwnd: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn GetWindowTextW(hwnd: isize, buf: *mut u16, max: i32) -> i32;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetWindowRect(hwnd: isize, rect: *mut RectWin) -> i32;
+    }
 
-    // Exact title. "Termy XL" does not match.
-    let title: Vec<u16> = "Termy".encode_utf16().chain(std::iter::once(0)).collect();
-    let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }.ok()?;
-    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool() && !minimized {
+    unsafe extern "system" fn each(hwnd: isize, param: isize) -> i32 {
+        let bag = unsafe { &mut *(param as *mut Bag) };
+        let minimized = unsafe { IsIconic(hwnd) } != 0;
+        if unsafe { IsWindowVisible(hwnd) } == 0 && !minimized {
+            return 1;
+        }
+        let mut title_buf = [0u16; 512];
+        let title_len =
+            unsafe { GetWindowTextW(hwnd, title_buf.as_mut_ptr(), title_buf.len() as i32) };
+        let title = String::from_utf16_lossy(&title_buf[..title_len.max(0) as usize]);
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        let image = process_image(pid).unwrap_or_default();
+        if title.is_empty() && image.is_empty() {
+            return 1;
+        }
+        let mut rect = RectWin {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
+            return 1;
+        }
+        bag.windows.push(termy_x::trends_desk::SeenWindow {
+            title,
+            image,
+            minimized,
+            rect: WindowRect {
+                x: rect.left as f32,
+                y: rect.top as f32,
+                width: (rect.right - rect.left) as f32,
+                height: (rect.bottom - rect.top) as f32,
+            },
+        });
+        1
+    }
+
+    let mut bag = Bag {
+        windows: Vec::new(),
+    };
+    unsafe { EnumWindows(Some(each), &mut bag as *mut Bag as isize) };
+    bag.windows
+}
+
+#[cfg(target_os = "windows")]
+fn process_image(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    };
+    use windows::core::PWSTR;
+    if pid == 0 {
         return None;
     }
-    let mut rect = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
-    Some(TermyHost {
-        minimized,
-        rect: WindowRect {
-            x: rect.left as f32,
-            y: rect.top as f32,
-            width: (rect.right - rect.left) as f32,
-            height: (rect.bottom - rect.top) as f32,
-        },
-    })
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let mut buffer = [0u16; 1024];
+    let mut len = buffer.len() as u32;
+    let result = unsafe {
+        QueryFullProcessImageNameW(
+            handle,
+            Default::default(),
+            PWSTR(buffer.as_mut_ptr()),
+            &mut len,
+        )
+    };
+    let _ = unsafe { CloseHandle(handle) };
+    result.ok()?;
+    Some(String::from_utf16_lossy(&buffer[..len as usize]))
+}
+
+#[cfg(target_os = "windows")]
+fn register_location_hook_win32() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static MOVED: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" {
+        fn SetWinEventHook(
+            min: u32,
+            max: u32,
+            module: *mut core::ffi::c_void,
+            proc: Option<
+                unsafe extern "system" fn(*mut core::ffi::c_void, u32, isize, i32, i32, u32, u32),
+            >,
+            pid: u32,
+            tid: u32,
+            flags: u32,
+        ) -> *mut core::ffi::c_void;
+    }
+
+    unsafe extern "system" fn on_location(
+        _hook: *mut core::ffi::c_void,
+        event: u32,
+        _hwnd: isize,
+        _object: i32,
+        _child: i32,
+        _thread: u32,
+        _time: u32,
+    ) {
+        if event == 0x800B {
+            MOVED.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let hook = unsafe {
+        SetWinEventHook(
+            0x800B,
+            0x800B,
+            core::ptr::null_mut(),
+            Some(on_location),
+            0,
+            0,
+            0,
+        )
+    };
+    if hook.is_null() {
+        return false;
+    }
+    // The hook has to stay alive for the process. Dropping it unhooks.
+    std::mem::forget(hook);
+    let _ = MOVED.load(Ordering::Relaxed);
+    true
 }
 
 #[cfg(target_os = "windows")]

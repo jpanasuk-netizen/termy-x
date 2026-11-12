@@ -291,15 +291,33 @@ fn words(text: &str) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn too_similar(lines: &[String]) -> bool {
-    for i in 0..lines.len() {
-        for j in (i + 1)..lines.len() {
-            if similarity(&lines[i], &lines[j]) > 0.55 {
-                return true;
-            }
+    keep_distinct(lines).len() < lines.iter().filter(|line| !line.trim().is_empty()).count()
+        && lines.len() > 1
+}
+
+/// Drop lookalikes. A real line is never thrown away just because a sibling
+/// repeats it, so a spicy set cannot come back empty.
+pub fn keep_distinct(lines: &[String]) -> Vec<String> {
+    let mut kept = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || super::takes::is_provider_failure(line) {
+            continue;
+        }
+        if kept
+            .iter()
+            .any(|have: &String| have == line || similarity(have, line) > 0.55)
+        {
+            continue;
+        }
+        kept.push(line.to_string());
+        if kept.len() == 3 {
+            break;
         }
     }
-    false
+    kept
 }
 
 pub fn api_server_key_from_env_file(text: &str) -> Option<String> {
@@ -683,11 +701,10 @@ pub fn split_agent_output(text: &str) -> Vec<String> {
 pub fn variants_from_draft(tweet: &str, result: Result<String, String>) -> (Vec<String>, String) {
     let _ = tweet;
     match result {
-        Ok(text) if super::takes::is_provider_failure(&text) => (Vec::new(), one_line(&text)),
         Ok(text) => {
-            let lines = super::distinct_variants("", &split_agent_output(&text));
-            if too_similar(&lines) {
-                (Vec::new(), "variants were too similar; regenerate".into())
+            let lines = keep_distinct(&split_agent_output(&text));
+            if lines.is_empty() {
+                (Vec::new(), one_line(&text))
             } else {
                 (lines, String::new())
             }
@@ -1017,12 +1034,12 @@ mod tests {
             assert!(!lower.starts_with("question:"));
             assert!(!lower.starts_with("contrarian:"));
         }
-        let (rejected, why) = variants_from_draft(
+        let (kept_one, why) = variants_from_draft(
             tweet,
             Ok("The court asked the model.\n---\nThe court asked the model today.\n---\nThe court asked the model again.".into()),
         );
-        assert!(rejected.is_empty());
-        assert!(why.contains("similar"));
+        assert_eq!(kept_one.len(), 1);
+        assert!(why.is_empty());
         let pane = AgentPane::open(Agent::Grok, "grok");
         assert!(pane.scrollback.is_empty());
         assert!(!pane.scrollback.contains("$ grok"));

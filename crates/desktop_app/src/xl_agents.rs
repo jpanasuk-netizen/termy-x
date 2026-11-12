@@ -220,38 +220,46 @@ impl TrendsDesk {
         };
         let config = self.config.clone();
         let tone = pop.tone.clone();
+        let previous = pop.variants.clone();
         let provider = pop.provider;
         let id = pop.card_id.clone();
         self.model_notice = format!("Drafting with {}…", provider.as_str());
         cx.spawn(async move |this, cx| {
-            let draft = cx
-                .background_executor()
-                .spawn(async move {
-                    let http = termy_x::io::UreqHttp::default();
-                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
-                })
-                .await;
+            let mut attempts = Vec::new();
+            for _ in 0..3 {
+                let config = config.clone();
+                let post = post.clone();
+                let tone = tone.clone();
+                let draft = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let http = termy_x::io::UreqHttp::default();
+                        termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                    })
+                    .await;
+                let empty = draft.variants.is_empty();
+                attempts.push(draft.variants);
+                if !empty {
+                    break;
+                }
+            }
+            let (variants, error) =
+                termy_x::trends_desk::settle_variants(&previous, &attempts, &tone);
             let _ = this.update(cx, |desk, cx| {
                 if let Some(open) = desk.popout.as_mut().filter(|item| item.card_id == id) {
-                    open.variants = draft.variants.clone();
-                    if open.draft.trim().is_empty() && !draft.text.trim().is_empty() {
-                        open.draft = draft.text.clone();
+                    open.variants = variants;
+                    if error.is_empty()
+                        && open.draft.trim().is_empty()
+                        && let Some(text) = open.variants.first().cloned()
+                    {
+                        open.draft = text;
                     }
                 }
-                desk.model_notice = if draft.variants.is_empty() {
-                    draft.note.clone()
-                } else {
+                desk.model_notice = if error.is_empty() {
                     format!("{} ready. Not posted.", provider.as_str())
+                } else {
+                    error
                 };
-                if draft.note.to_lowercase().contains("402")
-                    || termy_x::trends_desk::agy_credit_error(&draft.note).is_some()
-                {
-                    desk.model_notice = draft.note.clone();
-                    if let Some(open) = desk.popout.as_mut() {
-                        open.draft.clear();
-                        open.variants.clear();
-                    }
-                }
                 cx.notify();
             });
         })

@@ -55,6 +55,7 @@ pub(crate) struct ColumnUi {
 
 pub struct TrendsDesk {
     focus_handle: FocusHandle,
+    pub(crate) search_focus: FocusHandle,
     pub(crate) options: DeskOptions,
     pub(crate) data_root: PathBuf,
     config: XConfig,
@@ -187,6 +188,7 @@ impl TrendsDesk {
         let hermes_key_text = config.hermes_api_key.clone();
         Self {
             focus_handle: cx.focus_handle(),
+            search_focus: cx.focus_handle(),
             options,
             data_root,
             config,
@@ -886,7 +888,6 @@ impl TrendsDesk {
         };
         let parsed = termy_x::trends_desk::TakeTone::parse(tone);
         pop.tone = parsed.label().to_string();
-        pop.variants.clear();
         self.pack.tone = parsed.label().to_ascii_lowercase();
         self.save_pack_file();
     }
@@ -1336,7 +1337,13 @@ pub fn open_in(cx: &mut App, options: DeskOptions) -> Result<(), String> {
 pub fn run_standalone(fixture: bool) {
     set_standalone_app_id();
     let root = termy_xl_data_root();
+    termy_x::trends_desk::install_panic_log(&root);
+    termy_x::trends_desk::append_desk_log(&root, "INFO startup: opening Termy XL");
     let Some(_instance) = crate::xl_instance::claim(&root) else {
+        termy_x::trends_desk::append_desk_log(
+            &root,
+            "INFO startup: already open, focusing the existing window",
+        );
         crate::xl_host::focus_existing();
         eprintln!("{VISIBLE_NAME} is already open.");
         return;
@@ -1344,6 +1351,10 @@ pub fn run_standalone(fixture: bool) {
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         if let Err(error) = open_in(cx, DeskOptions { fixture }) {
+            termy_x::trends_desk::append_desk_log(
+                &termy_xl_data_root(),
+                &format!("INFO startup: window did not open: {error}"),
+            );
             eprintln!("{VISIBLE_NAME} did not open: {error}");
             eprintln!("The same desk can run without this window:");
             eprintln!("  termy-xcli trends-desk status");
@@ -1369,12 +1380,14 @@ fn set_standalone_app_id() {}
 
 fn snapped_frame(cx: &App) -> DeskFrame {
     let monitor = crate::xl_host::monitor_rect_app(cx);
-    let snap = termy_x::trends_desk::snap_beside(
-        crate::xl_host::find_termy_x(),
-        monitor,
-        true,
-        termy_x::trends_desk::LOCKED_OPEN_WIDTH,
-    );
+    let root = termy_xl_data_root();
+    let docked = DeskStore::open_isolated(&root)
+        .map(|store| store.load_settings().docked)
+        .unwrap_or(true);
+    crate::xl_host::ensure_location_hook(&root);
+    let host = crate::xl_host::seen_host();
+    let (snap, line) = termy_x::trends_desk::attach_plan(host.as_ref(), monitor, true, docked);
+    termy_x::trends_desk::append_desk_log(&root, &line);
     DeskFrame {
         x: snap.x,
         y: snap.y,
@@ -1459,18 +1472,19 @@ impl Render for TrendsDesk {
                     if surface != Surface::Columns {
                         body = body.overflow_y_scroll();
                     }
-                    body.child(match surface {
+                    body = body.relative().child(match surface {
                         Surface::Columns => self.columns_view(width, per_row, cx),
                         Surface::History => self.history_view(),
                         Surface::Replies => self.replies_view(cx),
                         Surface::Draft => self.draft_view(cx),
                         Surface::Settings => self.settings_view(cx),
-                    })
+                    });
+                    if self.popout.as_ref().is_some_and(|pop| pop.open) {
+                        body = body.child(self.reply_popout(cx));
+                    }
+                    body
                 })
                 .child(self.footer());
-        }
-        if self.popout.as_ref().is_some_and(|pop| pop.open) {
-            root = root.child(self.reply_popout(cx));
         }
         if self.palette {
             root = root.child(self.palette_view(cx));

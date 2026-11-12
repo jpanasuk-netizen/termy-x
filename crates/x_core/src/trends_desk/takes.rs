@@ -19,11 +19,14 @@ pub fn is_template_angle(text: &str) -> bool {
 
 pub fn is_provider_failure(text: &str) -> bool {
     let lower = text.to_lowercase();
+    // "credit" by itself is ordinary spicy copy ("no credit for that").
+    // Only the payment phrases are a provider failure.
     lower.contains("402")
         || lower.contains("401")
         || lower.contains("payment required")
-        || lower.contains("credit")
-        || lower.contains("no reply")
+        || lower.contains("credits depleted")
+        || lower.contains("insufficient credit")
+        || lower.contains("no reply:")
         || lower.contains("every provider in the fallback chain")
         || text.contains('⚠')
         || is_template_angle(text)
@@ -188,16 +191,8 @@ where
     Err(failures.join("; "))
 }
 
-fn reply_ok(text: &str) -> bool {
-    !text.trim().is_empty() && !is_provider_failure(text)
-}
-
 fn good_reply(text: &str) -> bool {
-    if !reply_ok(text) {
-        return false;
-    }
-    let lines = accept_lines(&split_rough(text));
-    !lines.is_empty() && !super::agents::too_similar(&lines)
+    !super::agents::keep_distinct(&split_rough(text)).is_empty()
 }
 
 pub fn run_take_chain(
@@ -270,15 +265,7 @@ fn hermes_raced(
 }
 
 fn draft_from_provider(name: &str, text: &str) -> super::TakeDraft {
-    let lines = accept_lines(&split_rough(text));
-    if super::agents::too_similar(&lines) {
-        return super::TakeDraft {
-            text: String::new(),
-            source: "offline",
-            note: "variants were too similar; regenerate".into(),
-            variants: Vec::new(),
-        };
-    }
+    let lines = super::agents::keep_distinct(&split_rough(text));
     super::TakeDraft {
         text: lines.first().cloned().unwrap_or_default(),
         source: if name == "grok" { "grok" } else { "hermes" },
@@ -442,5 +429,52 @@ mod tests {
             "Hermes blocked the chain for {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn spicy_credit_lines_stay_and_a_failed_tone_keeps_the_previous_list() {
+        let spicy = "The court gets no credit for outsourcing the opinion.\n---\nThe panel still signed a model draft and called it judgment.\n---\nOutsourcing the signature does not make the opinion cheaper.";
+        assert!(
+            !is_provider_failure(spicy),
+            "a spicy reply that says credit is not a billing error"
+        );
+        let lines = super::super::agents::keep_distinct(&split_rough(spicy));
+        assert_eq!(lines.len(), 3);
+        let previous = vec!["Funny line that was already on the card.".to_string()];
+        let (kept, note) =
+            settle_variants(&previous, &[Vec::new(), Vec::new(), Vec::new()], "Spicy");
+        assert_eq!(kept, previous);
+        assert!(note.contains("Spicy"));
+        assert!(note.contains("3"));
+        let (fresh, quiet) = settle_variants(&previous, &[Vec::new(), lines.clone()], "Spicy");
+        assert_eq!(fresh, lines);
+        assert!(quiet.is_empty());
+        let (fallback, error) = settle_variants(&[], &[Vec::new(), Vec::new()], "Spicy");
+        assert_eq!(fallback.len(), 1);
+        assert!(!fallback[0].is_empty());
+        assert!(error.contains("Spicy"));
+    }
+}
+
+/// First try plus at most two retries. An empty result keeps the previous
+/// variants. If there were none, the list is the one-line error.
+pub fn settle_variants(
+    previous: &[String],
+    attempts: &[Vec<String>],
+    tone: &str,
+) -> (Vec<String>, String) {
+    let mut tries = 0;
+    for batch in attempts.iter().take(3) {
+        tries += 1;
+        let kept = super::agents::keep_distinct(batch);
+        if !kept.is_empty() {
+            return (kept, String::new());
+        }
+    }
+    let error = format!("{tone} draft failed after {tries} tries");
+    if previous.is_empty() {
+        (vec![error.clone()], error)
+    } else {
+        (previous.to_vec(), error)
     }
 }

@@ -35,6 +35,28 @@ pub fn should_log_model_failure(already_logged: bool, note: &str) -> bool {
     !already_logged && !note.trim().is_empty()
 }
 
+pub fn panic_log_line(message: &str, location: &str) -> String {
+    format!("INFO panic: {message} at {location}")
+}
+
+pub fn install_panic_log(root: &Path) {
+    let root = root.to_path_buf();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic".into());
+        let location = info.location().map_or_else(String::new, |loc| {
+            format!("{}:{}:{}", loc.file(), loc.line(), loc.column())
+        });
+        append_desk_log(&root, &panic_log_line(&message, &location));
+        previous(info);
+    }));
+}
+
 pub fn append_desk_log(root: &Path, line: &str) {
     append_desk_log_limited(root, line, MAX_BYTES);
 }
@@ -88,7 +110,11 @@ mod tests {
         assert!(dir.join("logs").join("termy-xl.log").is_file());
         assert!(dir.join("logs").join("termy-xl.log.1").is_file());
         assert!(dir.join("logs").join("termy-xl.log.2").is_file());
+        let panic_line = panic_log_line("settings write then boom", "trends_desk/mod.rs:1");
+        assert!(panic_line.starts_with("INFO panic:"));
+        append_desk_log(&dir, &panic_line);
         let kept = std::fs::read_to_string(dir.join("logs").join("termy-xl.log")).unwrap();
+        assert!(kept.contains("INFO panic:"));
         assert!(!kept.contains("super"));
         let _ = std::fs::remove_dir_all(&dir);
     }

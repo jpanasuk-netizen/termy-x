@@ -1034,6 +1034,13 @@ pub enum Nav {
     Settings,
 }
 
+/// A click in the nav reaches the tab when the compose popout starts at or
+/// below the nav. The old overlay started at y=88 and covered the tabs.
+#[cfg(test)]
+pub fn nav_click_reaches(click_y: f32, nav_top: f32, nav_bottom: f32, popout_top: f32) -> bool {
+    click_y >= nav_top && click_y < nav_bottom && click_y < popout_top
+}
+
 pub fn surface_after_nav(_current: Surface, nav: Nav) -> Surface {
     match nav {
         Nav::Columns => Surface::Columns,
@@ -1276,6 +1283,8 @@ mod tests {
             surface_after_nav(Surface::Settings, Nav::Columns),
             Surface::Columns
         );
+        assert!(nav_click_reaches(100.0, 80.0, 120.0, 120.0));
+        assert!(!nav_click_reaches(100.0, 80.0, 120.0, 88.0));
     }
 
     #[test]

@@ -57,20 +57,23 @@ pub use lifecycle::{
     DeskSession, OffUiRequest, PruneLog, RefreshPress, child_is_gone, click_after_scroll,
     press_refresh, prune_backups, quit_dialog_for_agents, reap_child, start_off_ui,
 };
-pub use log::{append_desk_log, redact_log, should_log_model_failure};
+pub use log::{
+    append_desk_log, install_panic_log, panic_log_line, redact_log, should_log_model_failure,
+};
 pub use pack::{
-    CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, TakeTone, apply_filters,
-    desk_key, distinct_variants, flip_variant, format_clock, format_post_time, heat_badge,
-    heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids, next_refresh_text,
-    provider_drafts, read_composer, refresh_due, refresh_is_search_only, replied_badge, save_pack,
+    CardFilter, ComposerRead, DeskKey, HitItem, PackFile, ReplyMark, SearchEdit, TakeTone,
+    apply_filters, desk_key, distinct_variants, flip_variant, format_clock, format_post_time,
+    heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
+    next_refresh_text, page_after_key, provider_drafts, read_composer, refresh_due,
+    refresh_is_search_only, replied_badge, save_pack, search_edit, search_label, search_page_name,
     sends_on_key, should_auto_refresh, sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
 };
 pub use snap::{
-    Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, clamp_outer, is_termy_x_title,
-    snap_beside, snap_tracked, termy_areas,
+    SeenWindow, Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, attach_plan,
+    clamp_outer, is_termy_x_title, pick_termy_host, snap_beside, snap_tracked, termy_areas,
 };
 pub use store::{
     DATA_DIR_ENV, DATA_FOLDER, DIR_NAME, DeskStore, drafts_file, termy_xl_data_root,
@@ -80,7 +83,7 @@ pub use takes::{
     HONEST_PREFIX, TAKE_CHAIN, accept_lines, agent_work_dir, agy_credit_error, chain_order,
     choose_chain, honest_failure, interactive_command, is_provider_failure, is_template_angle,
     is_termy_x_image, merge_attempts, muse_needs_trust, muse_trust_line, run_take_chain,
-    with_grok_stub,
+    settle_variants, with_grok_stub,
 };
 
 const SYNTHETIC_OPENCLI: &str = include_str!("synthetic_opencli.json");

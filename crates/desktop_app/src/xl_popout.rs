@@ -32,9 +32,11 @@ impl TrendsDesk {
         let mut box_el = div()
             .id("desk-reply-popout")
             .absolute()
-            .top(px(88.0))
-            .left(px(48.0))
-            .right(px(48.0))
+            .top(px(8.0))
+            .left(px(8.0))
+            .right(px(8.0))
+            .max_h(px(520.0))
+            .overflow_y_scroll()
             .p(px(12.0))
             .rounded(px(12.0))
             .bg(rgb(0x2a0f1a))
@@ -126,15 +128,12 @@ impl TrendsDesk {
             );
         }
         box_el
-            .child(div().text_size(px(12.0)).child(format!(
-                "Provider · {}",
-                match pop.provider {
-                    TakeProvider::Treg => "Treg",
-                    TakeProvider::Hermes => "Hermes",
-                    TakeProvider::Grok => "Grok",
-                    TakeProvider::Free => "Free",
-                }
-            )))
+            .child(
+                div()
+                    .id("desk-provider-label")
+                    .text_size(px(12.0))
+                    .child(pop.provider.caption()),
+            )
             .child(
                 div()
                     .flex()

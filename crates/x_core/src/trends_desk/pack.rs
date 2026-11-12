@@ -578,13 +578,68 @@ pub fn desk_key(key: &str, ctrl: bool, shift: bool) -> DeskKey {
     match key {
         "j" => DeskKey::Select(1),
         "k" => DeskKey::Select(-1),
-        "h" | "left" | "pageup" | "page_up" => DeskKey::Page(-1),
-        "l" | "right" | "pagedown" | "page_down" => DeskKey::Page(1),
+        "h" | "left" | "up" | "pageup" | "page_up" => DeskKey::Page(-1),
+        "l" | "right" | "down" | "pagedown" | "page_down" => DeskKey::Page(1),
         "d" => DeskKey::Draft,
         "r" => DeskKey::Reply,
         "o" => DeskKey::Open,
         "s" => DeskKey::Star,
         _ => DeskKey::Unbound,
+    }
+}
+
+pub fn search_label(editing: bool, text: &str) -> String {
+    if editing {
+        format!("{text}|")
+    } else if text.is_empty() {
+        "Search: click to edit".into()
+    } else {
+        format!("Search: {text}")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SearchEdit {
+    Text(String),
+    Submit(String),
+    Close,
+    Ignore,
+}
+
+pub fn search_edit(text: &str, key: &str, ch: Option<&str>) -> SearchEdit {
+    match key {
+        "enter" => SearchEdit::Submit(text.trim().to_string()),
+        "escape" => SearchEdit::Close,
+        "backspace" => {
+            let mut next: String = text.chars().collect();
+            next.pop();
+            SearchEdit::Text(next)
+        }
+        _ => {
+            let Some(ch) = ch.filter(|value| !value.is_empty()) else {
+                return SearchEdit::Ignore;
+            };
+            if ch.chars().any(|item| item.is_control()) {
+                return SearchEdit::Ignore;
+            }
+            let mut next = text.to_string();
+            if next.chars().count() < 240 {
+                next.push_str(ch);
+            }
+            SearchEdit::Text(next)
+        }
+    }
+}
+
+pub fn search_page_name(term: &str) -> String {
+    format!("Search: {term}")
+}
+
+/// Page keys move the subject. Escape is not one of them.
+pub fn page_after_key(index: usize, count: usize, key: &str) -> Option<usize> {
+    match desk_key(key, false, false) {
+        DeskKey::Page(delta) => Some(super::turn_page(index, count, delta)),
+        _ => None,
     }
 }
 
@@ -784,6 +839,26 @@ mod tests {
         assert_eq!(desk_key("k", true, false), DeskKey::Palette);
         assert_eq!(desk_key("page_up", false, false), DeskKey::Page(-1));
         assert_eq!(desk_key("right", false, false), DeskKey::Page(1));
+        let mut index = 1usize;
+        for key in ["right", "pagedown", "down"] {
+            assert_ne!(key, "escape");
+            index = page_after_key(index, 4, key).unwrap();
+        }
+        assert_eq!(index, 3);
+        assert_eq!(page_after_key(3, 4, "left"), Some(2));
+        assert_eq!(page_after_key(2, 4, "pageup"), Some(1));
+        assert_eq!(page_after_key(1, 4, "up"), Some(0));
+        assert!(page_after_key(1, 4, "escape").is_none());
+        assert_eq!(search_label(true, ""), "|");
+        assert!(!search_label(true, "rates").contains("click to edit"));
+        match search_edit("rat", "e", Some("e")) {
+            SearchEdit::Text(text) => assert_eq!(text, "rate"),
+            other => panic!("{other:?}"),
+        }
+        match search_edit("rates", "enter", None) {
+            SearchEdit::Submit(term) => assert_eq!(search_page_name(&term), "Search: rates"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             next_refresh_text(Some(0), 10, false, 15, 0),
             "auto-refresh off"

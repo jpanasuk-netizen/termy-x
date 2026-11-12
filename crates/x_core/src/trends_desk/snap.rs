@@ -164,6 +164,63 @@ pub fn area_gate(area: XlArea, image_quote: bool) -> WriteGate {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct SeenWindow {
+    pub title: String,
+    pub image: String,
+    pub rect: WindowRect,
+    pub minimized: bool,
+}
+
+/// Termy X is the process image first, the window title only as a fallback.
+/// `trends_desk.exe` is never the host.
+pub fn pick_termy_host(windows: &[SeenWindow]) -> Option<SeenWindow> {
+    windows
+        .iter()
+        .find(|window| {
+            let image = window.image.to_ascii_lowercase();
+            !image.contains("trends_desk")
+                && (super::is_termy_x_image(&window.image) || is_termy_x_title(&window.title))
+        })
+        .cloned()
+}
+
+/// Attach whenever Termy X is visible. `docked_setting` is the slim-tab flag,
+/// not a permission bit. A host that runs past the monitor is clamped onto
+/// the monitor, overlapping Termy X's right edge when that is what fits.
+pub fn attach_plan(
+    host: Option<&SeenWindow>,
+    monitor: WindowRect,
+    expanded: bool,
+    docked_setting: bool,
+) -> (Snap, String) {
+    let snap = snap_tracked(
+        host.filter(|item| !item.minimized).map(|item| item.rect),
+        host.is_some_and(|item| item.minimized),
+        monitor,
+        expanded,
+        LOCKED_OPEN_WIDTH,
+    );
+    let decision = match snap.source {
+        SnapSource::HostEdge => "attach",
+        SnapSource::MonitorHalf => "standalone",
+    };
+    let line = format!(
+        "INFO dock: detected={} image={} title={} minimized={} docked_setting={} decision={} x={} y={} w={} h={}",
+        host.is_some(),
+        host.map_or("-", |item| item.image.as_str()),
+        host.map_or("-", |item| item.title.as_str()),
+        host.is_some_and(|item| item.minimized),
+        docked_setting,
+        decision,
+        snap.x,
+        snap.y,
+        snap.width,
+        snap.height
+    );
+    (snap, line)
+}
+
 pub fn termy_areas() -> &'static [XlArea] {
     &[
         XlArea::Timeline,
@@ -280,6 +337,51 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn ultrawide_termy_still_attaches_when_docked_is_false() {
+        let host = SeenWindow {
+            title: r"C:\Windows\System32\cmd.exe - Termy".into(),
+            image: r"C:\Users\j\AppData\Local\termyx-app\termy-0e0aff49.exe".into(),
+            rect: WindowRect {
+                x: 223.0,
+                y: 389.0,
+                width: 2689.0,
+                height: 1434.0,
+            },
+            minimized: false,
+        };
+        let seen = [
+            SeenWindow {
+                title: "Termy XL".into(),
+                image: r"C:\Users\j\AppData\Local\Termy XL\trends_desk.exe".into(),
+                rect: WindowRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 687.0,
+                    height: 800.0,
+                },
+                minimized: false,
+            },
+            host.clone(),
+        ];
+        let picked = pick_termy_host(&seen).unwrap();
+        assert_eq!(picked.image, host.image);
+        let monitor = WindowRect {
+            x: 0.0,
+            y: 0.0,
+            width: 3440.0,
+            height: 1440.0,
+        };
+        let (snap, log) = attach_plan(Some(&picked), monitor, true, false);
+        assert_eq!(snap.source, SnapSource::HostEdge);
+        assert!(snap.x + snap.width <= monitor.x + monitor.width + 0.5);
+        assert!(snap.x < host.rect.x + host.rect.width);
+        assert!(log.starts_with("INFO dock:"));
+        assert!(log.contains("docked_setting=false"));
+        assert!(log.contains("decision=attach"));
+        assert!(log.contains("termy-0e0aff49.exe"));
+    }
+
     fn title_match_skips_termy_xl() {
         assert!(is_termy_x_title("Termy"));
         assert!(is_termy_x_title("Termy "));
