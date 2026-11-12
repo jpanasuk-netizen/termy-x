@@ -3,7 +3,7 @@
 use gpui_kit::{App, Window, px, size};
 
 use crate::trends_desk::TrendsDesk;
-use termy_x::trends_desk::{DeskFrame, WindowRect, snap_beside};
+use termy_x::trends_desk::{DeskFrame, WindowRect, snap_tracked};
 
 #[cfg(test)]
 mod tests {
@@ -135,7 +135,16 @@ unsafe fn attach_foreground_thread(
     unsafe { AttachThreadInput(current, foreground_thread, attach) }.as_bool()
 }
 
+pub(crate) struct TermyHost {
+    pub rect: WindowRect,
+    pub minimized: bool,
+}
+
 pub(crate) fn find_termy_x() -> Option<WindowRect> {
+    termy_host().map(|host| host.rect)
+}
+
+pub(crate) fn termy_host() -> Option<TermyHost> {
     #[cfg(target_os = "windows")]
     {
         find_termy_x_windows()
@@ -178,23 +187,30 @@ impl TrendsDesk {
     pub(crate) fn follow_host(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
         if self
             .last_follow
-            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(200))
         {
             return;
         }
         self.last_follow = Some(std::time::Instant::now());
-        let host = find_termy_x();
-        if host == self.last_host {
+        let host = termy_host();
+        if host.as_ref().map(|item| (item.rect, item.minimized)) == self.last_host_key {
             return;
         }
-        self.last_host = host;
-        self.retarget(window, cx);
+        self.last_host_key = host.as_ref().map(|item| (item.rect, item.minimized));
+        self.last_host = host.as_ref().map(|item| item.rect);
+        self.apply_snap(window, cx, false);
     }
 
     pub(crate) fn retarget(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>) {
+        self.apply_snap(window, cx, true);
+    }
+
+    fn apply_snap(&mut self, window: &mut Window, cx: &mut gpui_kit::Context<Self>, save: bool) {
         let monitor = monitor_rect(window, cx);
-        let snap = snap_beside(
-            find_termy_x(),
+        let host = termy_host();
+        let snap = snap_tracked(
+            host.as_ref().map(|item| item.rect),
+            host.as_ref().is_some_and(|item| item.minimized),
             monitor,
             self.frame.expanded,
             self.frame.expanded_width,
@@ -204,30 +220,38 @@ impl TrendsDesk {
         self.frame.width = snap.width;
         self.frame.height = snap.height;
         place_frame(window, &self.frame);
-        self.write_frame();
+        if save {
+            self.write_frame();
+        }
         cx.notify();
     }
 }
 
 #[cfg(target_os = "windows")]
-fn find_termy_x_windows() -> Option<WindowRect> {
+fn find_termy_x_windows() -> Option<TermyHost> {
     use windows::Win32::Foundation::RECT;
-    use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect, IsWindowVisible};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, GetWindowRect, IsIconic, IsWindowVisible,
+    };
     use windows::core::PCWSTR;
 
     // Exact title. "Termy XL" does not match.
     let title: Vec<u16> = "Termy".encode_utf16().chain(std::iter::once(0)).collect();
     let hwnd = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) }.ok()?;
-    if !unsafe { IsWindowVisible(hwnd) }.as_bool() {
+    let minimized = unsafe { IsIconic(hwnd) }.as_bool();
+    if !unsafe { IsWindowVisible(hwnd) }.as_bool() && !minimized {
         return None;
     }
     let mut rect = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut rect) }.ok()?;
-    Some(WindowRect {
-        x: rect.left as f32,
-        y: rect.top as f32,
-        width: (rect.right - rect.left) as f32,
-        height: (rect.bottom - rect.top) as f32,
+    Some(TermyHost {
+        minimized,
+        rect: WindowRect {
+            x: rect.left as f32,
+            y: rect.top as f32,
+            width: (rect.right - rect.left) as f32,
+            height: (rect.bottom - rect.top) as f32,
+        },
     })
 }
 

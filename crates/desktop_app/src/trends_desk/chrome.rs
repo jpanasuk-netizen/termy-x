@@ -279,6 +279,25 @@ impl TrendsDesk {
         list.into_any_element()
     }
 
+    fn queued_drafts(&self) -> gpui_kit::AnyElement {
+        let rows =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root));
+        let mut list = div().flex().flex_col().gap(px(6.0)).child(format!(
+            "{} queued draft(s) from this app or termy-xcli",
+            rows.len()
+        ));
+        for draft in rows.iter().rev().take(12) {
+            let target = draft.reply_to.clone().unwrap_or_else(|| "no tweet".into());
+            list = list.child(
+                div()
+                    .text_size(px(12.0))
+                    .whitespace_normal()
+                    .child(format!("{} · reply to {target} · {}", draft.id, draft.text)),
+            );
+        }
+        list.into_any_element()
+    }
+
     pub(crate) fn draft_view(&self, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
         div()
             .flex()
@@ -300,10 +319,11 @@ impl TrendsDesk {
                 ),
             )
             .child(
-                div().text_size(px(12.0)).child(
-                    "Sending stays in the existing X compose confirm. This desk does not post.",
-                ),
+                div()
+                    .text_size(px(12.0))
+                    .child("Sending stays on the card Send button. This page does not post."),
             )
+            .child(self.queued_drafts())
             .into_any_element()
     }
 

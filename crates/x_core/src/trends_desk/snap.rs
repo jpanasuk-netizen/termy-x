@@ -70,28 +70,57 @@ pub fn snap_beside(
     host: Option<WindowRect>,
     monitor: WindowRect,
     expanded: bool,
+    saved_width: f32,
+) -> Snap {
+    snap_tracked(host, false, monitor, expanded, saved_width)
+}
+
+/// Place XL on Termy X's right edge, flush with that window.
+/// A minimized or missing Termy X uses the standalone right half.
+/// The open width stays the locked 687.
+pub fn snap_tracked(
+    host: Option<WindowRect>,
+    minimized: bool,
+    monitor: WindowRect,
+    expanded: bool,
     _saved_width: f32,
 ) -> Snap {
-    let x = if let Some(host) = host {
-        host.x + host.width
-    } else {
-        monitor.x + monitor.width / 2.0
-    };
-    let source = if host.is_some() {
-        SnapSource::HostEdge
-    } else {
-        SnapSource::MonitorHalf
-    };
     let width = if expanded {
         LOCKED_OPEN_WIDTH
     } else {
         DOCK_WIDTH
     };
+    let attached = host.filter(|rect| !minimized && rect.width > 40.0 && rect.height > 40.0);
+    let (x, y, height, source) = if let Some(host) = attached {
+        (
+            host.x + host.width,
+            host.y,
+            host.height,
+            SnapSource::HostEdge,
+        )
+    } else {
+        (
+            monitor.x + monitor.width / 2.0,
+            monitor.y,
+            monitor.height.max(240.0),
+            SnapSource::MonitorHalf,
+        )
+    };
+    let (x, y, width, height) = clamp_outer(
+        x.round() as i32,
+        y.round() as i32,
+        width.round() as i32,
+        height.round() as i32,
+        monitor.x.round() as i32,
+        monitor.y.round() as i32,
+        (monitor.x + monitor.width).round() as i32,
+        (monitor.y + monitor.height).round() as i32,
+    );
     Snap {
-        x,
-        y: monitor.y,
-        width,
-        height: monitor.height.max(240.0),
+        x: x as f32,
+        y: y as f32,
+        width: width as f32,
+        height: height as f32,
         source,
     }
 }
@@ -175,14 +204,14 @@ mod tests {
         let dock = snap_beside(Some(host()), monitor(), false, 2560.0);
         assert_eq!(dock.source, SnapSource::HostEdge);
         assert_eq!(dock.x, 1320.0);
-        assert_eq!(dock.y, monitor().y);
+        assert_eq!(dock.y, host().y);
         assert_eq!(dock.width, DOCK_WIDTH);
-        assert_eq!(dock.height, monitor().height);
+        assert_eq!(dock.height, host().height);
         let open = snap_beside(Some(host()), monitor(), true, 2560.0);
         assert_eq!(open.x, dock.x);
-        assert_eq!(open.y, monitor().y);
+        assert_eq!(open.y, host().y);
         assert_eq!(open.width, LOCKED_OPEN_WIDTH);
-        assert_eq!(open.height, monitor().height);
+        assert_eq!(open.height, host().height);
         let stale = snap_beside(Some(host()), monitor(), true, 1800.0);
         assert_eq!(stale.width, LOCKED_OPEN_WIDTH);
     }
@@ -203,11 +232,39 @@ mod tests {
         let mut host = host();
         let before = snap_beside(Some(host), monitor(), false, 2560.0);
         host.x += 80.0;
+        host.width += 40.0;
+        host.y += 15.0;
         host.height = 900.0;
         let after = snap_beside(Some(host), monitor(), false, 2560.0);
-        assert_eq!(after.x, before.x + 80.0);
-        assert_eq!(after.height, monitor().height);
-        assert_eq!(after.y, monitor().y);
+        assert_eq!(after.x, before.x + 80.0 + 40.0);
+        assert_eq!(after.y, before.y + 15.0);
+        assert_eq!(after.height, 900.0);
+        assert_eq!(after.source, SnapSource::HostEdge);
+        let parked = snap_tracked(Some(host), true, monitor(), false, 2560.0);
+        assert_eq!(parked.source, SnapSource::MonitorHalf);
+        let back = snap_tracked(Some(host), false, monitor(), true, 2560.0);
+        assert_eq!(back.source, SnapSource::HostEdge);
+        assert_eq!(back.x, host.x + host.width);
+        assert_eq!(back.width, LOCKED_OPEN_WIDTH);
+        for (width, height) in [(1920.0, 1080.0), (1536.0, 864.0), (1280.0, 720.0)] {
+            let work = WindowRect {
+                x: 0.0,
+                y: 0.0,
+                width,
+                height,
+            };
+            let edge = WindowRect {
+                x: width - 400.0,
+                y: 10.0,
+                width: 360.0,
+                height: height - 20.0,
+            };
+            let fitted = snap_beside(Some(edge), work, true, 2560.0);
+            assert!(fitted.x >= work.x);
+            assert!(fitted.x + fitted.width <= work.x + work.width + 0.5);
+            assert!(fitted.y + fitted.height <= work.y + work.height + 0.5);
+            assert_eq!(fitted.width, LOCKED_OPEN_WIDTH.min(width));
+        }
     }
 
     #[test]

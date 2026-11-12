@@ -230,6 +230,16 @@ mod tests {
     }
 
     #[test]
+    fn install_script_refuses_termy_x_and_checks_hashes() {
+        let script = include_str!("../../../../scripts/windows/install-termy-xl.ps1");
+        assert!(script.contains("Refusing to rewrite"));
+        assert!(script.contains("termy-7154b8a5.exe"));
+        assert!(script.contains("Get-FileHash"));
+        assert!(script.contains(".bak"));
+        assert!(script.contains("trends_desk.exe"));
+    }
+
+    #[test]
     fn subject_match_is_by_name_or_id() {
         let topics = vec![Topic::law(), Topic::finance()];
         assert_eq!(topic_by_subject(&topics, "Law").unwrap().id, "law");

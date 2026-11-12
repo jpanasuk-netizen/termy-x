@@ -22,6 +22,9 @@ pub const TAKE_CARD_WIDTH: f32 = 480.0;
 pub const TAKE_CARD_MAX: f32 = 520.0;
 /// Inset between the window edge and a take card's outer border.
 pub const WINDOW_PAD: f32 = 16.0;
+/// Pink selected-card border. Cyan is the selected text.
+pub const SELECT_PINK: u32 = 0xff4fa3;
+pub const SELECT_CYAN: u32 = 0x7af6ff;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeskFrame {
@@ -397,6 +400,27 @@ pub struct EditPopout {
 
 pub fn select_take(card_id: &str) -> String {
     format!("take:{card_id}")
+}
+
+pub fn selection_colors(selected: bool) -> (u32, u32) {
+    if selected {
+        (SELECT_PINK, SELECT_CYAN)
+    } else {
+        (0xffd60a, 0xffe56a)
+    }
+}
+
+/// A card click replaces any previous selection. Empty space and Esc clear it.
+pub fn selection_after_card(card_id: &str) -> Option<String> {
+    Some(select_take(card_id))
+}
+
+pub fn selection_after_empty() -> Option<String> {
+    None
+}
+
+pub fn send_is_busy(phase: &ReplyPhase) -> bool {
+    matches!(phase, ReplyPhase::Pending { .. })
 }
 
 pub fn open_editor(card_id: &str, draft: &str, provider: TakeProvider) -> EditPopout {
@@ -1043,6 +1067,34 @@ mod tests {
         assert_eq!(scroll_of(&offsets, "take:1"), 80.0);
         assert_eq!(scroll_of(&offsets, "take:2"), 12.0);
         assert_eq!(scroll_of(&offsets, "take:3"), 0.0);
+    }
+
+    #[test]
+    fn click_selects_one_card_and_reply_stays_a_draft_until_send() {
+        let first = selection_after_card("55");
+        let second = selection_after_card("56");
+        assert_eq!(first.as_deref(), Some("take:55"));
+        assert_eq!(second.as_deref(), Some("take:56"));
+        assert_ne!(first, second);
+        assert!(selection_after_empty().is_none());
+        assert_eq!(selection_colors(true), (SELECT_PINK, SELECT_CYAN));
+        let open = open_editor("55", "Courts are testing models", TakeProvider::Hermes);
+        assert!(open.open);
+        assert_eq!(open.card_id, "55");
+        assert_eq!(open.variants.len(), 3);
+        assert_ne!(open.variants[0], open.variants[1]);
+        assert_ne!(open.variants[1], open.variants[2]);
+        assert_ne!(open.variants[0], open.variants[2]);
+        let closed = close_editor(&open);
+        assert!(!closed.open);
+        assert_eq!(closed.draft, "Courts are testing models");
+        assert!(editor_send(&closed, true).is_err());
+        assert!(send_is_busy(&ReplyPhase::Pending {
+            text: "queued".into()
+        }));
+        assert!(!send_is_busy(&ReplyPhase::Editing {
+            text: "queued".into()
+        }));
     }
 
     #[test]

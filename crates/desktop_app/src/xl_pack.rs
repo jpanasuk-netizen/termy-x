@@ -512,13 +512,9 @@ impl TrendsDesk {
                     .p(px(12.0))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener({
-                            let subject_key = subject_key.clone();
-                            move |this, _, _, cx| {
-                                this.selected = Some(subject_key.clone());
-                                cx.stop_propagation();
-                                cx.notify();
-                            }
+                        cx.listener(|this, _, _, cx| {
+                            this.selected = None;
+                            cx.notify();
                         }),
                     )
                     .child(

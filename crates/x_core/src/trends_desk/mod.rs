@@ -25,13 +25,14 @@ pub use agents::{
 };
 pub use cards::{
     COMPANION_HEIGHT, COMPANION_WIDTH, DOCK_WIDTH, DeskFrame, EditPopout, LOCKED_OPEN_WIDTH,
-    ReplyPhase, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame, TakeProvider, TweetCard,
-    WINDOW_PAD, apply_send_result, card_columns, card_from_post, char_count, close_editor,
-    collapse_dock, commit_send, draft_take, edit_reply, editor_send, expand_locked, expand_right,
-    expand_to_full, frame_from_parts, layout_takes, move_selection, offline_take, open_editor,
-    open_width, page_index, page_label, remember_width, request_send, scroll_by, scroll_of,
-    select_take, short_take_note, subject_pages, take_column_count, takes_for_posts, toggle_dock,
-    tone_variants, turn_page, wrap_token,
+    ReplyPhase, SELECT_CYAN, SELECT_PINK, SubjectPage, TAKE_CARD_WIDTH, TakeDraft, TakeFrame,
+    TakeProvider, TweetCard, WINDOW_PAD, apply_send_result, card_columns, card_from_post,
+    char_count, close_editor, collapse_dock, commit_send, draft_take, edit_reply, editor_send,
+    expand_locked, expand_right, expand_to_full, frame_from_parts, layout_takes, move_selection,
+    offline_take, open_editor, open_width, page_index, page_label, remember_width, request_send,
+    scroll_by, scroll_of, select_take, selection_after_card, selection_after_empty,
+    selection_colors, send_is_busy, short_take_note, subject_pages, take_column_count,
+    takes_for_posts, toggle_dock, tone_variants, turn_page, wrap_token,
 };
 pub use desk_cmd::{
     find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
@@ -63,7 +64,7 @@ pub use parse::{
 };
 pub use snap::{
     Snap, SnapSource, WindowRect, WriteGate, XlArea, area_gate, clamp_outer, is_termy_x_title,
-    snap_beside, termy_areas,
+    snap_beside, snap_tracked, termy_areas,
 };
 pub use store::{
     DATA_DIR_ENV, DATA_FOLDER, DIR_NAME, DeskStore, drafts_file, termy_xl_data_root,

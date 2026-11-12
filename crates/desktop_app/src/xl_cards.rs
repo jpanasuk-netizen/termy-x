@@ -99,13 +99,13 @@ impl TrendsDesk {
             .rounded(px(10.0))
             .track_scroll(&handle)
             .bg(if selected {
-                rgb(0x2a2410)
+                rgb(0x2a1020)
             } else {
                 rgb(0x10141c)
             })
-            .border_1()
+            .border_2()
             .border_color(if selected {
-                rgb(0xffe56a)
+                rgb(termy_x::trends_desk::SELECT_PINK)
             } else {
                 rgb(0xffd60a)
             })
@@ -152,7 +152,11 @@ impl TrendsDesk {
                 div()
                     .text_size(px(14.0))
                     .whitespace_normal()
-                    .text_color(rgb(0xffe56a))
+                    .text_color(if selected {
+                        rgb(termy_x::trends_desk::SELECT_CYAN)
+                    } else {
+                        rgb(0xffe56a)
+                    })
                     .child(take_line),
             )
             .children(take_tag.map(|tag| {

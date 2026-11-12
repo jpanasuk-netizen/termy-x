@@ -104,6 +104,7 @@ pub struct TrendsDesk {
     pub(crate) board: String,
     pub(crate) x_panel: Option<gpui_kit::Entity<crate::x_panel::XPanel>>,
     pub(crate) last_host: Option<termy_x::trends_desk::WindowRect>,
+    pub(crate) last_host_key: Option<(termy_x::trends_desk::WindowRect, bool)>,
     pub(crate) last_follow: Option<Instant>,
     pub(crate) session: SessionStatus,
     generation: u64,
@@ -235,6 +236,7 @@ impl TrendsDesk {
             board: "subject".into(),
             x_panel: None,
             last_host: None,
+            last_host_key: None,
             last_follow: None,
             session: SessionStatus {
                 state: SessionState::ProbeFailed,
@@ -267,6 +269,7 @@ impl TrendsDesk {
         self.spawn_probe(cx);
         self.spawn_daily(cx);
         self.spawn_refresh(cx);
+        self.spawn_follow(cx);
         self.probe_hermes_models(cx);
         self.seed_agent_file();
     }
@@ -537,6 +540,20 @@ impl TrendsDesk {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn spawn_follow(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let _ = this.update(cx, |_desk, cx| {
+                    cx.notify();
+                });
+            }
         })
         .detach();
     }
@@ -874,6 +891,15 @@ impl TrendsDesk {
         let Some(pop) = self.popout.clone() else {
             return;
         };
+        if self
+            .card_replies
+            .get(&pop.card_id)
+            .is_some_and(termy_x::trends_desk::send_is_busy)
+        {
+            self.draft_note = "Send is already in progress.".into();
+            cx.notify();
+            return;
+        }
         match editor_send(&pop, true) {
             Err(error) => self.draft_note = error,
             Ok(text) => {
