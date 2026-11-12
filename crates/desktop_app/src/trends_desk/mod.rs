@@ -933,11 +933,14 @@ impl TrendsDesk {
                 cx.notify();
             }
             Ok(pending) => {
-                let text = pending.text().to_string();
+                let text = termy_x::trends_desk::text_to_post(&pending.text());
+                let pending = termy_x::trends_desk::ReplyPhase::Pending { text: text.clone() };
                 self.card_replies.insert(id.clone(), pending.clone());
                 cx.notify();
                 let bin = self.config.opencli_bin.clone();
                 let url = post.url.clone();
+                let parent_id = post.id.clone();
+                let provider = self.settings.take_provider.clone();
                 let receipt_url = url.clone();
                 cx.spawn(async move |this, cx| {
                     let result = cx
@@ -949,17 +952,27 @@ impl TrendsDesk {
                         .await;
                     let _ = this.update(cx, |desk, cx| {
                         let pending = desk.card_replies.get(&id).cloned().unwrap_or(pending);
-                        desk.pack.receipts.push(termy_x::trends_desk::ReplyMark {
-                            card_id: id.clone(),
-                            url: receipt_url.clone(),
-                            at_unix: TrendsDesk::now_unix(),
-                            status: if result.is_ok() {
-                                "confirmed".into()
-                            } else {
-                                "failed".into()
-                            },
-                            text: pending.text().to_string(),
-                        });
+                        let posted = termy_x::trends_desk::text_to_post(pending.text());
+                        let outcome = if result.is_ok() { "ok" } else { "failed" };
+                        termy_x::trends_desk::append_desk_log(
+                            &desk.data_root,
+                            &termy_x::trends_desk::post_log_line(
+                                &provider, &parent_id, outcome, &posted,
+                            ),
+                        );
+                        let mut mark = termy_x::trends_desk::reply_receipt(
+                            &parent_id,
+                            &receipt_url,
+                            result.as_deref().unwrap_or(""),
+                        );
+                        mark.at_unix = TrendsDesk::now_unix();
+                        mark.status = if result.is_ok() {
+                            "confirmed".into()
+                        } else {
+                            "failed".into()
+                        };
+                        mark.text = posted;
+                        desk.pack.receipts.push(mark);
                         desk.save_pack_file();
                         desk.action_note = match &result {
                             Ok(receipt) => {
@@ -972,7 +985,15 @@ impl TrendsDesk {
                             Err(error) => error.clone(),
                         };
                         desk.card_replies
-                            .insert(id, apply_send_result(&pending, result));
+                            .insert(id.clone(), apply_send_result(&pending, result));
+                        if desk.card_replies.get(&id).is_some_and(|phase| {
+                            matches!(phase, termy_x::trends_desk::ReplyPhase::Confirmed { .. })
+                        }) {
+                            if desk.popout.as_ref().is_some_and(|pop| pop.card_id == id) {
+                                desk.popout = None;
+                                desk.reply_edit = None;
+                            }
+                        }
                         cx.notify();
                     });
                 })

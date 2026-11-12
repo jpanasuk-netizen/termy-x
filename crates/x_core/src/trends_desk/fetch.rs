@@ -357,7 +357,10 @@ pub fn post_reply_opencli(
     {
         return Err(shorten(&redact_secrets(&error.to_string())));
     }
-    if let Some(url) = super::pack::reply_link(output.stdout.trim()) {
+    if let Some(url) = super::pack::status_urls(output.stdout.trim())
+        .into_iter()
+        .find(|url| url != target_url)
+    {
         return Ok(format!("reply receipt · {url}"));
     }
     Ok(format!("reply receipt · {target_url}"))

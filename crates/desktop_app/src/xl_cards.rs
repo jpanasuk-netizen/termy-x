@@ -1,8 +1,8 @@
 //! Gold take cards for a Termy XL subject page.
 
 use gpui_kit::{
-    AppContext, Context, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px, rgb,
+    AppContext, BoxShadow, Context, InteractiveElement, IntoElement, MouseButton, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, hsla, px, rgb,
 };
 
 use crate::trends_desk::{ColumnUi, TrendsDesk, button};
@@ -86,6 +86,7 @@ impl TrendsDesk {
                 ReplyPhase::Editing { .. } | ReplyPhase::Idle => String::new(),
             }
         };
+        let posted = termy_x::trends_desk::card_is_posted(&self.pack.receipts, &card.id, &card.url);
         let mut shell = div()
             .id(SharedString::from(format!("desk-card-{id}")))
             .w_full()
@@ -97,13 +98,21 @@ impl TrendsDesk {
                 rgb(0x2a1020)
             } else {
                 rgb(0x10141c)
-            })
-            .border_2()
-            .border_color(if selected {
-                rgb(termy_x::trends_desk::SELECT_PINK)
-            } else {
-                rgb(0xffd60a)
-            })
+            });
+        shell = if posted {
+            shell.border_8().border_color(rgb(0xffe14a)).shadow(vec![
+                BoxShadow::new(px(0.), px(0.), hsla(0.13, 0.95, 0.62, 0.55))
+                    .blur_radius(px(18.))
+                    .spread_radius(px(1.)),
+            ])
+        } else if selected {
+            shell
+                .border_2()
+                .border_color(rgb(termy_x::trends_desk::SELECT_PINK))
+        } else {
+            shell.border_2().border_color(rgb(0xffd60a))
+        };
+        let mut shell = shell
             .flex()
             .flex_col()
             .gap(px(4.0))
@@ -274,6 +283,12 @@ impl TrendsDesk {
                     .text_color(rgb(0x30d158))
                     .child(self.badge_for(&card.id).unwrap_or_default()),
             )
+            .children(posted.then(|| {
+                div()
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xffe14a))
+                    .child("Posted ✓")
+            }))
             .children(self.saved_urls.contains(&card.url).then(|| {
                 div()
                     .text_size(px(12.0))

@@ -4,9 +4,9 @@
 //! Copy copies it. Send is the only control that posts. Esc and Close keep the text.
 
 use gpui_kit::{
-    AppContext, Context, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement, Styled, canvas, div,
-    px, rgb,
+    Animation, AnimationExt, AppContext, Context, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, MouseMoveEvent, ParentElement, SharedString, StatefulInteractiveElement,
+    Styled, canvas, div, px, rgb,
 };
 
 use crate::trends_desk::TrendsDesk;
@@ -24,13 +24,16 @@ impl TrendsDesk {
             return None;
         }
         let drafting = pop.draft == termy_x::trends_desk::DRAFTING_PLACEHOLDER;
-        let caret = self.pop_caret.caret.min(pop.draft.len());
-        let (head, tail) = pop.draft.split_at(caret);
-        let field = if drafting {
-            termy_x::trends_desk::DRAFTING_PLACEHOLDER.to_string()
-        } else {
-            format!("{head}|{tail}")
-        };
+        let shown = self
+            .reply_edit
+            .as_ref()
+            .map(|editor| editor.text.clone())
+            .unwrap_or_else(|| pop.draft.clone());
+        let caret = self
+            .reply_edit
+            .as_ref()
+            .map(|editor| editor.caret)
+            .unwrap_or(self.pop_caret);
         let phase = self.card_replies.get(&pop.card_id).cloned().unwrap_or(
             termy_x::trends_desk::ReplyPhase::Editing {
                 text: pop.draft.clone(),
@@ -64,12 +67,7 @@ impl TrendsDesk {
         } else {
             self.action_note.clone()
         };
-        let count = termy_x::trends_desk::char_count(&pop.draft);
-        let selected = self
-            .reply_edit
-            .as_ref()
-            .map(|editor| editor.selected())
-            .unwrap_or_default();
+        let count = termy_x::trends_desk::char_count(&shown);
         let mut box_el = div()
             .id("desk-inline-editor")
             .w_full()
@@ -125,18 +123,16 @@ impl TrendsDesk {
                         .size_full(),
                     )
                     .child(if drafting {
-                        termy_x::trends_desk::DRAFTING_PLACEHOLDER.to_string()
-                    } else if selected.is_empty() {
-                        field
+                        drafting_mark()
                     } else {
-                        format!("[{selected}]")
+                        reply_surface(&shown, &caret)
                     })
-                    .child(
+                    .children((!drafting).then(|| {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(0xc7c7cc))
-                            .child(format!("{count} characters")),
-                    )
+                            .child(format!("{count} characters"))
+                    }))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -654,6 +650,61 @@ fn box_button(
             }),
         )
         .into_any_element()
+}
+
+fn breath_animation() -> Animation {
+    Animation::new(std::time::Duration::from_millis(1600))
+        .repeat()
+        .with_easing(|t| 0.5 - 0.5 * (t * std::f32::consts::TAU).cos())
+}
+
+fn drafting_mark() -> gpui_kit::AnyElement {
+    div()
+        .text_size(px(28.0))
+        .text_color(rgb(0xffe56a))
+        .child("…")
+        .with_animation("desk-drafting-breath", breath_animation(), |el, value| {
+            el.opacity(0.2 + 0.8 * value)
+        })
+        .into_any_element()
+}
+
+fn reply_surface(text: &str, caret: &termy_x::draft_edit::DraftCaret) -> gpui_kit::AnyElement {
+    let len = text.len();
+    let (start, end) = caret
+        .selection()
+        .unwrap_or((caret.caret.min(len), caret.caret.min(len)));
+    let start = start.min(len);
+    let end = end.min(len).max(start);
+    let before = text.get(..start).unwrap_or("");
+    let middle = text.get(start..end).unwrap_or("");
+    let after = text.get(end..).unwrap_or("");
+    let mut row = div().flex().flex_wrap();
+    if !before.is_empty() {
+        row = row.child(before.to_string());
+    }
+    if middle.is_empty() {
+        row = row.child(
+            div()
+                .w(px(2.0))
+                .h(px(18.0))
+                .bg(rgb(0xffe56a))
+                .with_animation("desk-caret", breath_animation(), |el, value| {
+                    el.opacity(0.15 + 0.85 * value)
+                }),
+        );
+    } else {
+        row = row.child(
+            div()
+                .bg(rgb(0xff4fa3))
+                .text_color(rgb(0x070b14))
+                .child(middle.to_string()),
+        );
+    }
+    if !after.is_empty() {
+        row = row.child(after.to_string());
+    }
+    row.into_any_element()
 }
 
 fn remember_editor_box(x: f32, y: f32, width: f32) {

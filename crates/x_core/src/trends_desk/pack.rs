@@ -245,12 +245,109 @@ pub struct HitItem {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyMark {
+    /// Parent tweet id. Never a URL.
     pub card_id: String,
     pub url: String,
     pub at_unix: i64,
     pub status: String,
     #[serde(default)]
     pub text: String,
+    #[serde(default)]
+    pub parent_id: String,
+    #[serde(default)]
+    pub parent_url: String,
+    #[serde(default)]
+    pub reply_id: String,
+    #[serde(default)]
+    pub reply_url: String,
+}
+
+pub const POSTED_BORDER_PX: f32 = 8.0;
+
+pub fn status_id(url: &str) -> Option<String> {
+    let rest = url.split("/status/").nth(1)?;
+    let id: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if id.is_empty() { None } else { Some(id) }
+}
+
+pub fn status_urls(body: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("http://").or_else(|| rest.find("https://")) {
+        rest = &rest[start..];
+        let end = rest
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | '}' | ')' | ']'))
+            .unwrap_or(rest.len());
+        let url = &rest[..end];
+        if let Some(id) = status_id(url) {
+            let host = url.split("/status/").next().unwrap_or("https://x.com");
+            let clean = format!("{host}/status/{id}");
+            if !found.contains(&clean) {
+                found.push(clean);
+            }
+        }
+        rest = &rest[end..];
+    }
+    found
+}
+
+/// Parent id and URL stay separate from the reply OpenCLI actually created.
+pub fn reply_receipt(parent_id: &str, parent_url: &str, body: &str) -> ReplyMark {
+    let parent_id = status_id(parent_url)
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| {
+            if parent_id.chars().all(|ch| ch.is_ascii_digit()) && !parent_id.is_empty() {
+                parent_id.to_string()
+            } else {
+                status_id(parent_id).unwrap_or_else(|| parent_id.to_string())
+            }
+        });
+    let reply_url = status_urls(body)
+        .into_iter()
+        .find(|url| url != parent_url)
+        .unwrap_or_default();
+    let reply_id = status_id(&reply_url).unwrap_or_default();
+    ReplyMark {
+        card_id: parent_id.clone(),
+        url: if reply_url.is_empty() {
+            String::new()
+        } else {
+            reply_url.clone()
+        },
+        at_unix: 0,
+        status: "confirmed".into(),
+        text: String::new(),
+        parent_id,
+        parent_url: parent_url.to_string(),
+        reply_id,
+        reply_url,
+    }
+}
+
+pub fn card_is_posted(marks: &[ReplyMark], post_id: &str, post_url: &str) -> bool {
+    marks.iter().rev().any(|mark| {
+        mark.status == "confirmed"
+            && (mark.card_id == post_id
+                || mark.parent_id == post_id
+                || mark.parent_url == post_url
+                || mark.card_id == post_url)
+    })
+}
+
+pub fn text_hash(text: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+pub fn post_log_line(provider: &str, parent_id: &str, outcome: &str, text: &str) -> String {
+    format!(
+        "INFO post: provider={provider} parent={parent_id} outcome={outcome} hash={}",
+        text_hash(text)
+    )
 }
 
 pub fn replied_badge(marks: &[ReplyMark], card_id: &str) -> Option<String> {
@@ -746,7 +843,7 @@ pub fn remember_take(
 ) -> Result<usize, String> {
     let draft = crate::model::Draft {
         id: format!("take-{card_id}"),
-        text: text.trim().to_string(),
+        text: super::cards::text_to_post(text),
         tone: Some(tweet.trim().to_string()),
         source: "termy-xl".into(),
         created_at: "saved".into(),
@@ -761,7 +858,7 @@ pub fn rewrite_draft(path: &std::path::Path, id: &str, text: &str) -> Result<(),
     let Some(row) = rows.iter_mut().find(|row| row.id == id) else {
         return Err("That draft is not in the list.".into());
     };
-    row.text = text.trim().to_string();
+    row.text = super::cards::text_to_post(text);
     crate::drafts::save_drafts(path, &rows)
 }
 
@@ -936,13 +1033,21 @@ mod tests {
             at_unix: 1_700_000_000,
             status: "confirmed".into(),
             text: "reply".into(),
+            parent_id: "9".into(),
+            parent_url: "https://x.com/ada/status/9".into(),
+            reply_id: "10".into(),
+            reply_url: "https://x.com/me/status/10".into(),
         });
         pack.receipts.push(ReplyMark {
             card_id: "8".into(),
-            url: "https://x.com/me/status/11".into(),
+            url: String::new(),
             at_unix: 1,
             status: "failed".into(),
             text: "nope".into(),
+            parent_id: "8".into(),
+            parent_url: "https://x.com/ada/status/8".into(),
+            reply_id: String::new(),
+            reply_url: String::new(),
         });
         save_pack(dir.path(), &pack).unwrap();
         let loaded = load_pack(dir.path());
@@ -1137,6 +1242,30 @@ mod tests {
             2
         );
         assert!(quote_seed("the filing").starts_with("Quote:"));
+        assert_eq!(super::super::cards::text_to_post("hello|"), "hello");
+        assert_eq!(
+            super::super::cards::text_to_post("keep | this"),
+            "keep | this"
+        );
+        assert_eq!(POSTED_BORDER_PX, 8.0);
+        let mark = reply_receipt(
+            "https://x.com/ada/status/9",
+            "https://x.com/ada/status/9",
+            r#"{"url":"https://x.com/me/status/44"}"#,
+        );
+        assert_eq!(mark.card_id, "9");
+        assert_eq!(mark.parent_id, "9");
+        assert_eq!(mark.parent_url, "https://x.com/ada/status/9");
+        assert_eq!(mark.reply_id, "44");
+        assert_eq!(mark.reply_url, "https://x.com/me/status/44");
+        assert_ne!(mark.card_id, mark.parent_url);
+        let line = post_log_line("hermes", "9", "ok", "the secret reply");
+        assert!(line.contains("provider=hermes"));
+        assert!(line.contains("parent=9"));
+        assert!(line.contains("outcome=ok"));
+        assert!(line.contains("hash="));
+        assert!(!line.contains("the secret reply"));
+        assert!(card_is_posted(&[mark], "9", "https://x.com/ada/status/9"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("drafts.json");
         let first = remember_take(

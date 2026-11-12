@@ -695,6 +695,7 @@ pub fn uniform_stops(
 #[derive(Clone, Debug)]
 pub struct ReplyEditor {
     pub text: String,
+    pub original: String,
     pub caret: DraftCaret,
     undo: Vec<(String, usize, Option<usize>)>,
     redo: Vec<(String, usize, Option<usize>)>,
@@ -704,6 +705,7 @@ impl ReplyEditor {
     pub fn new(text: &str) -> Self {
         Self {
             text: text.to_string(),
+            original: text.to_string(),
             caret: DraftCaret::at_end(text.len()),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -797,6 +799,11 @@ impl ReplyEditor {
 
     pub fn undo(&mut self) -> bool {
         let Some((text, caret, anchor)) = self.undo.pop() else {
+            if self.text != self.original {
+                self.text = self.original.clone();
+                self.caret = DraftCaret::at_end(self.text.len());
+                return true;
+            }
             return false;
         };
         self.redo
@@ -1108,6 +1115,14 @@ mod tests {
         editor.move_key(Motion::End, false);
         editor.move_key(Motion::Left, true);
         assert!(!editor.selected().is_empty());
+        let mut taken = ReplyEditor::new("original take");
+        taken.select_all();
+        assert_eq!(taken.selected(), "original take");
+        taken.insert("n");
+        assert_eq!(taken.text, "n");
+        assert!(!taken.text.contains('|'));
+        assert!(taken.undo());
+        assert_eq!(taken.text, "original take");
         assert!(editor.undo());
         editor.click_at(0.0, 0.0, 0.0, 0.0, 320.0);
         assert!(editor.selected().is_empty());

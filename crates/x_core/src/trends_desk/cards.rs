@@ -523,14 +523,24 @@ pub fn editor_send(pop: &EditPopout, explicit: bool) -> Result<String, String> {
     if !pop.open {
         return Err("The editor is closed. Nothing was posted.".into());
     }
-    let text = pop.draft.trim();
+    let text = text_to_post(pop.draft.trim());
     if text.is_empty()
         || text == DRAFTING_PLACEHOLDER
         || text.starts_with(super::takes::HONEST_PREFIX)
     {
         return Err("Write a reply first.".into());
     }
-    Ok(text.to_string())
+    Ok(text)
+}
+
+/// The string that is saved and posted. A display caret at the end is removed.
+/// A `|` the user typed between words stays.
+pub fn text_to_post(text: &str) -> String {
+    let trimmed = text.trim();
+    let Some(rest) = trimmed.strip_suffix('|') else {
+        return trimmed.to_string();
+    };
+    rest.trim_end().to_string()
 }
 
 pub fn tone_variants(idea: &str, tone: crate::model::Tone) -> Vec<String> {
@@ -1254,6 +1264,28 @@ mod tests {
         assert_eq!(*poster.calls.lock().unwrap(), 0);
         assert_eq!(after.text(), "hello take");
         assert_eq!(editor_send(&open, true).unwrap(), "hello take");
+        let leaked = EditPopout {
+            draft: "hello take|".into(),
+            ..open.clone()
+        };
+        assert_eq!(editor_send(&leaked, true).unwrap(), "hello take");
+        let kept = EditPopout {
+            draft: "score | 3".into(),
+            ..open.clone()
+        };
+        assert_eq!(editor_send(&kept, true).unwrap(), "score | 3");
+        let poster = MockPoster {
+            result: Ok("unused".into()),
+            calls: std::sync::Mutex::new(0),
+        };
+        let sitting = ReplyPhase::Editing {
+            text: "a finished take".into(),
+        };
+        let untouched = commit_send(&sitting, false, "https://x.com/ada/status/9", &poster);
+        assert_eq!(*poster.calls.lock().unwrap(), 0);
+        assert_eq!(untouched.text(), "a finished take");
+        assert!(crate::trends_desk::posts_on_ctrl_enter("enter", true));
+        assert!(!crate::trends_desk::posts_on_ctrl_enter("enter", false));
         assert_eq!(*poster.calls.lock().unwrap(), 0);
     }
 

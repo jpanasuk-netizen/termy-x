@@ -39,7 +39,7 @@ pub use cards::{
     pink_box_controls, remember_width, reply_needs_a_take, request_send, scroll_by, scroll_of,
     select_take, selection_after_card, selection_after_empty, selection_colors, send_is_busy,
     short_take_note, subject_pages, take_column_count, takes_for_posts, text_after_take,
-    toggle_dock, tone_variants, turn_page, wrap_token,
+    text_to_post, toggle_dock, tone_variants, turn_page, wrap_token,
 };
 pub use desk_cmd::{
     find_cached_post, list_drafts, queue_reply, save_draft, search_subject, takes_for_tweet,
@@ -74,15 +74,16 @@ pub use media::{
     read_cached, tile_grid, write_cached,
 };
 pub use pack::{
-    CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, PackFile, PostFace,
-    ReplyMark, SearchEdit, TakeTone, apply_filters, copied_mark, copy_all, copy_entry,
-    delete_draft, desk_key, distinct_variants, flip_variant, format_clock, format_post_time,
-    heat_badge, heat_line, heat_score, hud_line, load_pack, local_offset_secs, new_ids,
-    next_click_reaches, next_refresh_text, next_tone, page_after_key, panel_tone_name, panel_tones,
-    post_button_text, post_reply_label, posts_on_ctrl_enter, provider_drafts, quote_seed,
-    read_composer, refresh_due, refresh_is_search_only, remember_take, replied_badge, reply_link,
-    rewrite_draft, save_pack, saved_drafts_label, search_edit, search_label, search_page_name,
-    sends_on_key, should_auto_refresh, sort_by_heat,
+    CardFilter, ComposerRead, DeskKey, HitItem, PAGE_BAR_H, PAGE_BAR_HIT, POSTED_BORDER_PX,
+    PackFile, PostFace, ReplyMark, SearchEdit, TakeTone, apply_filters, card_is_posted,
+    copied_mark, copy_all, copy_entry, delete_draft, desk_key, distinct_variants, flip_variant,
+    format_clock, format_post_time, heat_badge, heat_line, heat_score, hud_line, load_pack,
+    local_offset_secs, new_ids, next_click_reaches, next_refresh_text, next_tone, page_after_key,
+    panel_tone_name, panel_tones, post_button_text, post_log_line, post_reply_label,
+    posts_on_ctrl_enter, provider_drafts, quote_seed, read_composer, refresh_due,
+    refresh_is_search_only, remember_take, replied_badge, reply_link, reply_receipt, rewrite_draft,
+    save_pack, saved_drafts_label, search_edit, search_label, search_page_name, sends_on_key,
+    should_auto_refresh, sort_by_heat,
 };
 pub use parse::{
     ParseError, as_post_list, parse_json_blob, posts_from_stdout, unwrap_opencli_data,
