@@ -942,36 +942,7 @@ pub(crate) fn grok_cli(post: &super::SourcePost, tone: &str) -> Result<String, S
         return Err("takes stopped".into());
     }
     let _permit = GrokPermit::acquire()?;
-    let prompt = super::agents::reply_prompt(&post.author, &post.text, tone);
-    let plan = background_grok_spawn();
-    let mut command = std::process::Command::new(plan.program);
-    command.args(grok_print_args(&prompt));
-    apply_hidden_command(&mut command);
-    let _ = command.stdin(std::process::Stdio::null());
-    let child = command.spawn().map_err(|error| error.to_string())?;
-    let pid = child.id();
-    register_job(&post.id, pid);
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let result = if let Ok(Ok(output)) = rx.recv_timeout(HERMES_TAKE_TIMEOUT) {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if takes_halted() {
-            Err("takes stopped".into())
-        } else if text.is_empty() {
-            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
-        } else if is_provider_failure(&text) {
-            Err(text)
-        } else {
-            Ok(text)
-        }
-    } else {
-        kill_pid(pid);
-        Err("grok timed out after 90s".into())
-    };
-    unregister_job(&post.id);
-    result
+    super::grok_take::run(post, tone)
 }
 
 struct GrokPermit;
@@ -1037,13 +1008,13 @@ pub fn retain_grok_jobs(keep: &[String]) {
     kill_grok_jobs(keep);
 }
 
-fn register_job(id: &str, pid: u32) {
+pub(crate) fn register_job(id: &str, pid: u32) {
     let mut jobs = grok_jobs().lock().unwrap_or_else(|err| err.into_inner());
     jobs.retain(|(have, _)| have != id);
     jobs.push((id.to_string(), pid));
 }
 
-fn unregister_job(id: &str) {
+pub(crate) fn unregister_job(id: &str) {
     let mut jobs = grok_jobs().lock().unwrap_or_else(|err| err.into_inner());
     jobs.retain(|(have, _)| have != id);
 }
@@ -1061,7 +1032,7 @@ fn kill_grok_jobs(keep: &[String]) {
     *jobs = left;
 }
 
-fn kill_pid(pid: u32) {
+pub(crate) fn kill_pid(pid: u32) {
     if pid == 0 {
         return;
     }
