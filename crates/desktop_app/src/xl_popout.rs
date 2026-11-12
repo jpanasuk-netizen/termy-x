@@ -131,6 +131,7 @@ impl TrendsDesk {
                 match pop.provider {
                     TakeProvider::Treg => "Treg",
                     TakeProvider::Hermes => "Hermes",
+                    TakeProvider::Grok => "Grok",
                     TakeProvider::Free => "Free",
                 }
             )))
@@ -138,18 +139,21 @@ impl TrendsDesk {
                 div()
                     .flex()
                     .gap(px(8.0))
+                    .child(pop_button("desk-pop-grok", "Grok", cx, |this, cx| {
+                        this.set_take_provider("grok", cx);
+                        this.regenerate_open_variants(cx);
+                    }))
                     .child(pop_button("desk-pop-free", "Free", cx, |this, cx| {
-                        this.remember_provider("free");
-                        cx.notify();
+                        this.set_take_provider("free", cx);
+                        this.regenerate_open_variants(cx);
                     }))
                     .child(pop_button("desk-pop-treg", "Treg", cx, |this, cx| {
-                        this.remember_provider("treg");
-                        cx.notify();
+                        this.set_take_provider("treg", cx);
+                        this.regenerate_open_variants(cx);
                     }))
                     .child(pop_button("desk-pop-hermes", "Hermes", cx, |this, cx| {
-                        this.remember_provider("hermes");
-                        this.probe_hermes_models(cx);
-                        cx.notify();
+                        this.set_take_provider("hermes", cx);
+                        this.regenerate_open_variants(cx);
                     }))
                     .child(pop_button(
                         "desk-variant-next",
@@ -202,6 +206,7 @@ fn tone_button(
             return;
         }
         this.set_pop_tone(&name);
+        this.regenerate_open_variants(cx);
         cx.notify();
     })
 }

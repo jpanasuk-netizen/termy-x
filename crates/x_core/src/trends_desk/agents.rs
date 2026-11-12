@@ -247,10 +247,59 @@ pub fn remove_agents_key(text: &str, key: &str) -> String {
     out
 }
 
+pub fn tone_instruction(tone: &str) -> &'static str {
+    match tone.trim().to_ascii_lowercase().as_str() {
+        "funny" => {
+            "Funny means it lands as a joke. The first reply should make a person laugh, not just sound clever."
+        }
+        "spicy" | "savage" => {
+            "Savage means the contrarian reply has a real bite. Be bold, not cruel, and stay specific to this post."
+        }
+        "data" | "smart" => {
+            "Smart means the add-on carries a concrete fact or angle that is actually in the post."
+        }
+        "supportive" => "Supportive means warm and specific. No generic praise and no 'so true'.",
+        "hype" => "Hype means energetic, still tied to a detail in the post, not empty excitement.",
+        "contrarian" => "Lead with the disagreement. Make the objection specific to this post.",
+        _ => "Match the named tone in word choice and attitude, using details from the post.",
+    }
+}
+
 pub fn reply_prompt(author: &str, tweet: &str, tone: &str) -> String {
     format!(
-        "Tone: {tone}\nAuthor: @{author}\nPost:\n{tweet}\n\nWrite 3 different replies. One agrees and adds a point. One asks a question. One is contrarian or witty. Use different length and angle. Separate them with a line containing only ---. Each under 240 characters. No hashtags. Output only the 3 replies."
+        "Tone: {tone}\n{}\nAuthor: @{author}\nPost:\n{tweet}\n\nWrite exactly 3 replies a person would post on X. They must differ in approach and voice:\n(a) a sharp witty or funny one-liner that is actually funny\n(b) a smart add-on with a concrete fact or angle drawn from the tweet itself\n(c) a bold contrarian or spicy take\nEach one under 280 characters. Casual human voice. Do not start with Agree, Question:, or Contrarian:. Use specifics from the post. No generic filler, no hashtags, no emoji spam. Separate them with a line containing only ---. Output only the 3 replies.",
+        tone_instruction(tone)
     )
+}
+
+/// Word overlap. Above this, two replies are the same joke in different clothes.
+pub fn similarity(left: &str, right: &str) -> f64 {
+    let a = words(left);
+    let b = words(right);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let shared = a.intersection(&b).count() as f64;
+    let union = a.union(&b).count() as f64;
+    if union == 0.0 { 0.0 } else { shared / union }
+}
+
+fn words(text: &str) -> std::collections::BTreeSet<String> {
+    text.split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|word| word.len() > 2)
+        .map(|word| word.to_ascii_lowercase())
+        .collect()
+}
+
+pub fn too_similar(lines: &[String]) -> bool {
+    for i in 0..lines.len() {
+        for j in (i + 1)..lines.len() {
+            if similarity(&lines[i], &lines[j]) > 0.55 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn api_server_key_from_env_file(text: &str) -> Option<String> {
@@ -429,7 +478,7 @@ pub fn hermes_pill(result: Result<(), String>) -> String {
 /// because the gateway ignores that model name on its own.
 pub fn hermes_body(model: &str, prompt: &str) -> String {
     let mut body = serde_json::json!({
-        "temperature": 0.9,
+        "temperature": 1.0,
         "messages": [
             {"role": "system", "content": "You draft X replies. You never post."},
             {"role": "user", "content": prompt}
@@ -534,11 +583,32 @@ pub fn draft_hermes_variants(
         }
         Err(error) => Err(error),
     };
-    let (mut lines, note) = variants_from_draft(tweet, result);
-    lines.truncate(n);
-    while lines.len() < n {
-        lines.push(format!("Take {}: {tweet}", lines.len() + 1));
+    let (mut lines, mut note) = variants_from_draft(tweet, result);
+    if lines.len() < n && !note.contains("401") && !note.contains("402") {
+        let second = match plan_hermes_draft(auth, &prompt) {
+            Ok(request) => match http.request(request) {
+                Ok(body) => {
+                    parse_chat_text(&body).map_err(|error| redact_secret(&error, &auth.key))
+                }
+                Err(error) => Err(redact_secret(&error, &auth.key)),
+            },
+            Err(error) => Err(error),
+        };
+        let (more, note2) = variants_from_draft(tweet, second);
+        for line in more {
+            if lines.iter().all(|have| similarity(have, &line) <= 0.55) {
+                lines.push(line);
+            }
+        }
+        if lines.len() < n && note.is_empty() {
+            note = if note2.is_empty() {
+                "model returned fewer than 3 distinct replies".into()
+            } else {
+                note2
+            };
+        }
     }
+    lines.truncate(n);
     (lines, note)
 }
 
@@ -609,14 +679,20 @@ pub fn split_agent_output(text: &str) -> Vec<String> {
     crate::handoff::parse_options(text)
 }
 
-/// Model text is deduped. A failure still yields three different fallback replies.
+/// Model text is deduped. A failure is an empty list plus the reason, not a template.
 pub fn variants_from_draft(tweet: &str, result: Result<String, String>) -> (Vec<String>, String) {
+    let _ = tweet;
     match result {
-        Ok(text) => (
-            super::distinct_variants(tweet, &split_agent_output(&text)),
-            String::new(),
-        ),
-        Err(error) => (super::fallback_angles(tweet), one_line(&error)),
+        Ok(text) if super::takes::is_provider_failure(&text) => (Vec::new(), one_line(&text)),
+        Ok(text) => {
+            let lines = super::distinct_variants("", &split_agent_output(&text));
+            if too_similar(&lines) {
+                (Vec::new(), "variants were too similar; regenerate".into())
+            } else {
+                (lines, String::new())
+            }
+        }
+        Err(error) => (Vec::new(), one_line(&error)),
     }
 }
 
@@ -638,7 +714,7 @@ impl AgentPane {
         Self {
             agent: agent.label().into(),
             command: command.to_string(),
-            scrollback: format!("$ {command}\n"),
+            scrollback: String::new(),
             input: String::new(),
             notice: String::new(),
         }
@@ -837,7 +913,7 @@ mod tests {
             serde_json::from_str(&hermes_body(HERMES_MODEL, "hi")).unwrap();
         assert_eq!(plain["model"], "hermes-agent");
         assert!(plain.get("provider").is_none());
-        assert_eq!(plain["temperature"], 0.9);
+        assert_eq!(plain["temperature"], 1.0);
         let vyce: serde_json::Value = serde_json::from_str(&hermes_body(VYCE_MODEL, "hi")).unwrap();
         assert_eq!(vyce["provider"], "vyce");
         assert_eq!(vyce["model"], VYCE_MODEL);
@@ -893,7 +969,7 @@ mod tests {
         assert!(cli.seen.lock().unwrap()[0].starts_with("fake-grok --draft ::"));
         let (model_lines, note) = variants_from_draft(tweet, Ok(text));
         assert!(note.is_empty());
-        assert_distinct(&model_lines);
+        assert_eq!(model_lines, vec!["same line".to_string()]);
         let distinct = execute_draft(
             plan_agent_draft(Agent::Muse, Ok(&launch), None, "prompt"),
             &ScriptCli {
@@ -910,12 +986,47 @@ mod tests {
         let (fallback, notice) =
             variants_from_draft(tweet, Err("http 402: payment required".into()));
         assert!(notice.contains("402"));
-        assert_distinct(&fallback);
-        assert!(
-            fallback
-                .iter()
-                .all(|line| line.contains("Courts") || line.contains("models"))
+        assert!(fallback.is_empty());
+        assert!(!super::super::takes::is_template_angle(&notice));
+    }
+
+    #[test]
+    fn grok_stub_is_three_different_voices_and_the_pane_is_not_a_dollar_prompt() {
+        let tweet =
+            "The appeals court spent the morning asking whether a model can sign a legal opinion.";
+        let funny = reply_prompt("ada", tweet, "Funny");
+        assert!(funny.contains("lands as a joke"));
+        assert!(reply_prompt("ada", tweet, "Spicy").contains("bite"));
+        assert!(reply_prompt("ada", tweet, "Smart").contains("concrete fact"));
+        let stub = "The model asked for a pen and the clerk asked for a bar number.\n---\nThe transcript shows the panel kept returning to who is responsible when the cited case does not exist.\n---\nA model signing an opinion is not efficiency. It is a clerk with no malpractice insurance.";
+        let (lines, note) = variants_from_draft(tweet, Ok(stub.into()));
+        assert!(note.is_empty(), "{note}");
+        assert_eq!(
+            lines,
+            vec![
+                "The model asked for a pen and the clerk asked for a bar number.".to_string(),
+                "The transcript shows the panel kept returning to who is responsible when the cited case does not exist.".to_string(),
+                "A model signing an opinion is not efficiency. It is a clerk with no malpractice insurance.".to_string(),
+            ]
         );
+        assert!(!too_similar(&lines));
+        for line in &lines {
+            assert!(line.chars().count() <= 280);
+            let lower = line.to_lowercase();
+            assert!(!lower.starts_with("agree"));
+            assert!(!lower.starts_with("question:"));
+            assert!(!lower.starts_with("contrarian:"));
+        }
+        let (rejected, why) = variants_from_draft(
+            tweet,
+            Ok("The court asked the model.\n---\nThe court asked the model today.\n---\nThe court asked the model again.".into()),
+        );
+        assert!(rejected.is_empty());
+        assert!(why.contains("similar"));
+        let pane = AgentPane::open(Agent::Grok, "grok");
+        assert!(pane.scrollback.is_empty());
+        assert!(!pane.scrollback.contains("$ grok"));
+        assert_eq!(pane.command, "grok");
     }
 
     #[test]

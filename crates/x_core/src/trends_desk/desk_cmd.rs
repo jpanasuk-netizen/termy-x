@@ -330,10 +330,10 @@ mod tests {
         assert_eq!(body["posted"], false);
         assert_eq!(body["provider"], "hermes");
         let lines: Vec<String> = serde_json::from_value(body["variants"].clone()).unwrap();
-        assert_eq!(lines.len(), 3);
-        assert_ne!(lines[0], lines[1]);
-        assert_ne!(lines[1], lines[2]);
-        assert_ne!(lines[0], lines[2]);
+        assert_eq!(lines, vec!["same".to_string()]);
+        assert!(body["note"].as_str().unwrap_or("").contains("fewer"));
+        assert!(!body.to_string().contains("Agree, and one thing to add"));
+        assert!(!body.to_string().contains("Take 2:"));
         assert!(http.urls.lock().unwrap()[0].starts_with("http://127.0.0.1:9/v1/chat/completions"));
         let blocked = ScriptHttp {
             body: Err("unused".into()),
@@ -350,12 +350,41 @@ mod tests {
         assert!(failed["note"].as_str().unwrap().contains("402"));
         assert!(!failed["note"].as_str().unwrap().contains("secret-key"));
         let lines: Vec<String> = serde_json::from_value(failed["variants"].clone()).unwrap();
-        assert_eq!(lines.len(), 3);
-        assert_ne!(lines[0], lines[1]);
-        assert_ne!(lines[1], lines[2]);
+        assert!(lines.is_empty());
+        assert!(!failed.to_string().contains("Agree, and one thing to add"));
         let missing = takes_for_tweet(&dir, "999", "hermes", 3, &blocked);
         assert_eq!(missing["ok"], false);
         assert_eq!(missing["posted"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grok_takes_json_is_three_real_stub_replies() {
+        let dir = std::env::temp_dir().join(format!("xl-desk-grok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = DeskStore::open_isolated(&dir).unwrap();
+        let post = sample(
+            "88",
+            "The appeals court spent the morning asking whether a model can sign a legal opinion.",
+        );
+        store
+            .write_fresh(&outcome_from_posts(&Topic::law(), "", vec![post]), 1)
+            .unwrap();
+        let stub = "The model asked for a pen and the clerk asked for a bar number.\n---\nThe transcript shows the panel kept returning to who is responsible when the cited case does not exist.\n---\nA model signing an opinion is not efficiency. It is a clerk with no malpractice insurance.";
+        let http = ScriptHttp {
+            body: Err("unused".into()),
+            urls: std::sync::Mutex::new(Vec::new()),
+        };
+        let body = super::super::with_grok_stub(stub, || {
+            takes_for_tweet(&dir, "https://x.com/ada/status/88", "grok", 3, &http)
+        });
+        assert_eq!(body["posted"], false);
+        assert_eq!(body["provider"], "grok");
+        let lines: Vec<String> = serde_json::from_value(body["variants"].clone()).unwrap();
+        assert_eq!(lines.len(), 3);
+        assert!(!body.to_string().contains("Agree, and one thing to add"));
+        assert!(!body.to_string().contains("fallback"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

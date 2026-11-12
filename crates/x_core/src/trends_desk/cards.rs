@@ -567,6 +567,7 @@ pub enum TakeProvider {
     Treg,
     Free,
     Hermes,
+    Grok,
 }
 
 impl TakeProvider {
@@ -574,6 +575,7 @@ impl TakeProvider {
         match value.trim().to_ascii_lowercase().as_str() {
             "treg" => Self::Treg,
             "hermes" => Self::Hermes,
+            "grok" => Self::Grok,
             _ => Self::Free,
         }
     }
@@ -583,6 +585,7 @@ impl TakeProvider {
             Self::Treg => "treg",
             Self::Free => "free",
             Self::Hermes => "hermes",
+            Self::Grok => "grok",
         }
     }
 }
@@ -662,10 +665,13 @@ pub fn free_take(config: &crate::config::XConfig, http: &dyn Http, post: &Source
     }
 }
 
-fn offline_with(post: &SourcePost, reason: &str) -> TakeDraft {
-    let mut draft = offline_take(post);
-    draft.note = reason.to_string();
-    draft
+fn offline_with(_post: &SourcePost, reason: &str) -> TakeDraft {
+    TakeDraft {
+        text: String::new(),
+        source: "offline",
+        note: super::takes::honest_failure(&[reason.to_string()]),
+        variants: Vec::new(),
+    }
 }
 
 fn is_canned(text: &str) -> bool {
@@ -741,6 +747,15 @@ pub fn hermes_take(
     http: &dyn Http,
     post: &SourcePost,
 ) -> TakeDraft {
+    hermes_take_toned(config, http, post, "Reply")
+}
+
+pub fn hermes_take_toned(
+    config: &crate::config::XConfig,
+    http: &dyn Http,
+    post: &SourcePost,
+    tone: &str,
+) -> TakeDraft {
     let env_text = hermes_env_file_text();
     let auth = super::hermes_auth(
         &config.hermes_base_url,
@@ -749,12 +764,9 @@ pub fn hermes_take(
         &env_text,
     );
     let (lines, note) =
-        super::draft_hermes_variants(&auth, http, &post.author, &post.text, "Reply", 3);
-    let text = lines
-        .first()
-        .cloned()
-        .unwrap_or_else(|| super::domain::idea_from(post));
-    if note.is_empty() {
+        super::draft_hermes_variants(&auth, http, &post.author, &post.text, tone, 3);
+    let text = lines.first().cloned().unwrap_or_default();
+    if note.is_empty() && !text.is_empty() {
         TakeDraft {
             text,
             source: "hermes",
@@ -823,6 +835,20 @@ pub fn draft_take(
         TakeProvider::Free => Ok(free_take(config, http, post)),
         TakeProvider::Treg => treg_take(config, http, post),
         TakeProvider::Hermes => Ok(hermes_take(config, http, post)),
+        TakeProvider::Grok => {
+            if let Some(stub) = super::takes::grok_stub_output() {
+                return Ok(super::takes::grok_draft_from_output(post, &stub));
+            }
+            match super::takes::grok_cli(post, "Reply") {
+                Ok(text) => Ok(super::takes::grok_draft_from_output(post, &text)),
+                Err(error) => Ok(TakeDraft {
+                    text: String::new(),
+                    source: "offline",
+                    note: super::honest_failure(&[error]),
+                    variants: Vec::new(),
+                }),
+            }
+        }
     }
 }
 
@@ -1082,10 +1108,7 @@ mod tests {
         let open = open_editor("55", "Courts are testing models", TakeProvider::Hermes);
         assert!(open.open);
         assert_eq!(open.card_id, "55");
-        assert_eq!(open.variants.len(), 3);
-        assert_ne!(open.variants[0], open.variants[1]);
-        assert_ne!(open.variants[1], open.variants[2]);
-        assert_ne!(open.variants[0], open.variants[2]);
+        assert!(open.variants.is_empty());
         let closed = close_editor(&open);
         assert!(!closed.open);
         assert_eq!(closed.draft, "Courts are testing models");
@@ -1102,10 +1125,7 @@ mod tests {
     fn closing_the_editor_keeps_the_draft_and_does_not_send() {
         let open = open_editor("55", "hello take", TakeProvider::Free);
         assert!(open.open);
-        assert_eq!(open.variants.len(), 3);
-        assert_ne!(open.variants[0], open.variants[1]);
-        assert_ne!(open.variants[1], open.variants[2]);
-        assert_ne!(open.variants[0], open.variants[2]);
+        assert!(open.variants.is_empty());
         assert_eq!(char_count("hi"), 2);
         let closed = close_editor(&open);
         assert!(!closed.open);
@@ -1202,10 +1222,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(free.source, "offline");
-        assert!(free.note.starts_with("free model unreachable"));
-        assert!(free.note.contains("127.0.0.1:11434"));
-        assert!(free.text.contains("Courts") || free.text.contains("Ada"));
-        assert!(!free.text.starts_with("Ada Lovelace:"));
+        assert!(free.note.starts_with("No model available"));
+        assert!(free.note.contains("127.0.0.1:11434") || free.note.contains("unreachable"));
+        assert!(free.text.is_empty());
+        assert!(!super::super::takes::is_template_angle(&free.note));
         assert_eq!(
             short_take_note("http 402: payment required"),
             "Free model needs credits (402) · fallback angle"
@@ -1224,8 +1244,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_ne!(free.text, other_take.text);
-        assert!(other_take.text.contains("earnings") || other_take.text.contains("FinanceDesk"));
+        assert!(other_take.text.is_empty());
+        assert!(other_take.note.starts_with("No model available"));
         let configured = crate::config::XConfig {
             ai_base_url: "https://vyce.example/v1".into(),
             ai_model: "glm-5.3-flash".into(),

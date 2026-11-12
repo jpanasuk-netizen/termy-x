@@ -33,10 +33,13 @@ pub struct Snap {
 pub fn is_termy_x_title(title: &str) -> bool {
     let title = title.trim();
     let lower = title.to_ascii_lowercase();
-    if lower.contains("termy xl") {
+    if lower.contains("termy xl") || lower.contains("trends_desk") {
         return false;
     }
-    lower == "termy" || lower.starts_with("termy ")
+    lower == "termy"
+        || lower.starts_with("termy ")
+        || lower.ends_with(" - termy")
+        || lower.contains(" - termy")
 }
 
 /// Pull an outer window rectangle fully inside the work area. Width stays
@@ -177,7 +180,6 @@ pub fn termy_areas() -> &'static [XlArea] {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::*;
     use crate::trends_desk::LOCKED_OPEN_WIDTH;
 

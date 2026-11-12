@@ -109,6 +109,7 @@ pub fn sort_by_heat(posts: &[&SourcePost], now_unix: i64) -> Vec<String> {
     rows.into_iter().map(|(id, _)| id).collect()
 }
 
+#[cfg(test)]
 pub fn three_variants(text: &str, tone: TakeTone) -> Vec<String> {
     let name = tone.label();
     fallback_angles(text)
@@ -117,7 +118,8 @@ pub fn three_variants(text: &str, tone: TakeTone) -> Vec<String> {
         .collect()
 }
 
-/// Three fallback replies that are never the same sentence.
+/// Three fallback replies. Test-only. Cards and the compose box never call this.
+#[cfg(test)]
 pub fn fallback_angles(text: &str) -> Vec<String> {
     let claim = text
         .split_whitespace()
@@ -134,29 +136,9 @@ pub fn fallback_angles(text: &str) -> Vec<String> {
     ]
 }
 
-/// Keep model lines that differ, then fill from the fallback angles.
-pub fn distinct_variants(seed: &str, generated: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in generated {
-        let line = line.trim();
-        if line.is_empty() || out.iter().any(|have: &String| have == line) {
-            continue;
-        }
-        out.push(line.to_string());
-        if out.len() == 3 {
-            return out;
-        }
-    }
-    for line in fallback_angles(seed) {
-        if out.iter().any(|have| have == &line) {
-            continue;
-        }
-        out.push(line);
-        if out.len() == 3 {
-            break;
-        }
-    }
-    out
+/// Keep model lines that differ. Templates are not added to fill a short list.
+pub fn distinct_variants(_seed: &str, generated: &[String]) -> Vec<String> {
+    super::takes::accept_lines(generated)
 }
 
 pub fn flip_variant(index: usize, delta: i32, len: usize) -> usize {
@@ -173,16 +155,19 @@ pub fn flip_variant(index: usize, delta: i32, len: usize) -> usize {
     }
 }
 
-/// Free returns three labeled templates. Treg must already have a result.
-/// A Treg error is returned as-is and is not replaced with the free templates.
+/// Treg must already have a result. Free, Hermes, and Grok do not invent
+/// template replies; the take chain asks a model instead.
 pub fn provider_drafts(
     text: &str,
     tone: TakeTone,
     provider: TakeProvider,
     treg: Result<String, String>,
 ) -> Result<Vec<String>, String> {
+    let _ = (text, tone);
     match provider {
-        TakeProvider::Free | TakeProvider::Hermes => Ok(three_variants(text, tone)),
+        TakeProvider::Free | TakeProvider::Hermes | TakeProvider::Grok => {
+            Err("model reply required".into())
+        }
         TakeProvider::Treg => {
             let draft = treg?;
             if draft.trim().is_empty() {
@@ -683,18 +668,16 @@ mod tests {
             "Courts are testing whether models can write opinions",
             &["same line".into(), "same line".into(), "same line".into()],
         );
-        assert_eq!(repeated.len(), 3);
-        assert_ne!(repeated[0], repeated[1]);
-        assert_ne!(repeated[1], repeated[2]);
-        assert_ne!(repeated[0], repeated[2]);
+        assert_eq!(repeated, vec!["same line".to_string()]);
         let funny = provider_drafts(
             "rates",
             TakeTone::Funny,
             TakeProvider::Free,
             Err("no".into()),
         )
-        .unwrap();
-        assert!(funny[0].contains("Funny"));
+        .unwrap_err();
+        assert!(funny.contains("model reply required"));
+        assert!(!funny.contains("Agree, and one thing to add"));
         let err = provider_drafts(
             "rates",
             TakeTone::Data,

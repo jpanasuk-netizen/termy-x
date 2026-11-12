@@ -49,6 +49,29 @@ impl TrendsDesk {
         rows
     }
 
+    pub(crate) fn posts_for_takes(&self) -> Vec<termy_x::trends_desk::SourcePost> {
+        let index = self
+            .columns
+            .iter()
+            .position(|column| column.topic.id == self.settings.subject_id)
+            .unwrap_or(0);
+        let Some(column) = self.columns.get(index) else {
+            return Vec::new();
+        };
+        self.visible_posts(column)
+            .into_iter()
+            .take(self.card_window)
+            .filter(|post| {
+                !self.takes.get(&post.id).is_some_and(|take| {
+                    !take.text.trim().is_empty()
+                        && take.source != "offline"
+                        && take.source != "none"
+                })
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn hud(&self) -> String {
         let sent = self
             .pack
@@ -56,11 +79,8 @@ impl TrendsDesk {
             .iter()
             .filter(|mark| mark.status == "confirmed")
             .count();
-        let drafts = self
-            .card_replies
-            .values()
-            .filter(|phase| !phase.text().trim().is_empty())
-            .count();
+        let drafts =
+            termy_x::drafts::load_drafts(&termy_x::trends_desk::drafts_file(&self.data_root)).len();
         let line = hud_line(
             sent,
             drafts,
@@ -288,6 +308,7 @@ impl TrendsDesk {
                 "free" => self.remember_provider("free"),
                 "treg" => self.remember_provider("treg"),
                 "hermes" => self.remember_provider("hermes"),
+                "grok" => self.remember_provider("grok"),
                 _ => {}
             }
         }

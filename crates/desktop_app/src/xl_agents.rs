@@ -112,13 +112,16 @@ impl AgentProc {
     }
 }
 
-struct SystemCli;
+struct SystemCli {
+    cwd: std::path::PathBuf,
+}
 
 impl PromptCli for SystemCli {
     fn run(&self, program: &str, args: &[String], stdin_text: &str) -> Result<String, String> {
         let mut command = Command::new(program);
         command
             .args(args)
+            .current_dir(&self.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -202,6 +205,125 @@ impl TrendsDesk {
         }
     }
 
+    pub(crate) fn regenerate_open_variants(&mut self, cx: &mut Context<Self>) {
+        let Some(pop) = self.popout.clone() else {
+            return;
+        };
+        let Some(post) = self
+            .columns
+            .iter()
+            .flat_map(|column| column.view.posts.iter())
+            .find(|post| post.id == pop.card_id)
+            .cloned()
+        else {
+            return;
+        };
+        let config = self.config.clone();
+        let tone = pop.tone.clone();
+        let provider = pop.provider;
+        let id = pop.card_id.clone();
+        self.model_notice = format!("Drafting with {}…", provider.as_str());
+        cx.spawn(async move |this, cx| {
+            let draft = cx
+                .background_executor()
+                .spawn(async move {
+                    let http = termy_x::io::UreqHttp::default();
+                    termy_x::trends_desk::run_take_chain(provider, &config, &post, &http, &tone)
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                if let Some(open) = desk.popout.as_mut().filter(|item| item.card_id == id) {
+                    open.variants = draft.variants.clone();
+                    if open.draft.trim().is_empty() && !draft.text.trim().is_empty() {
+                        open.draft = draft.text.clone();
+                    }
+                }
+                desk.model_notice = if draft.variants.is_empty() {
+                    draft.note.clone()
+                } else {
+                    format!("{} ready. Not posted.", provider.as_str())
+                };
+                if draft.note.to_lowercase().contains("402")
+                    || termy_x::trends_desk::agy_credit_error(&draft.note).is_some()
+                {
+                    desk.model_notice = draft.note.clone();
+                    if let Some(open) = desk.popout.as_mut() {
+                        open.draft.clear();
+                        open.variants.clear();
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn retry_takes(&mut self, cx: &mut Context<Self>) {
+        self.takes.clear();
+        self.free_halted = false;
+        self.model_notice.clear();
+        self.begin_take_stream(cx);
+    }
+
+    pub(crate) fn focus_root_after_click(
+        &mut self,
+        window: &mut gpui_kit::Window,
+        cx: &mut Context<Self>,
+    ) {
+        let handle = self.focus_handle.clone();
+        window.defer(cx, move |window, cx| {
+            handle.focus(window, cx);
+        });
+    }
+
+    pub(crate) fn run_live_search(&mut self, cx: &mut Context<Self>) {
+        let term = self.filter_text.trim().to_string();
+        if term.is_empty() {
+            return;
+        }
+        self.model_notice = format!("Search: {term}");
+        self.columns.retain(|column| column.topic.id != "search");
+        let topic = termy_x::trends_desk::Topic {
+            id: "search".into(),
+            name: format!("Search: {term}"),
+            desc: term.clone(),
+        };
+        self.columns.insert(
+            0,
+            crate::trends_desk::ColumnUi {
+                topic: topic.clone(),
+                view: termy_x::trends_desk::column_loading(&term),
+                cached: None,
+                tags: Vec::new(),
+            },
+        );
+        self.settings.subject_id = "search".into();
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let runner = std::sync::Arc::new(termy_x::io::SystemRunner);
+                    let desk = termy_x::trends_desk::OpenCliDesk::new(&config, runner)
+                        .with_hermes_dir(None);
+                    desk.run_topic(&topic, "", &std::sync::atomic::AtomicBool::new(false))
+                })
+                .await;
+            let _ = this.update(cx, |desk, cx| {
+                if let Some(column) = desk
+                    .columns
+                    .iter_mut()
+                    .find(|column| column.topic.id == "search")
+                {
+                    column.view = termy_x::trends_desk::column_from_outcome(&outcome, None);
+                }
+                desk.model_notice = format!("Search: {term} · {}", outcome.message);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn set_take_provider(&mut self, name: &str, cx: &mut Context<Self>) {
         self.remember_provider(name);
         self.free_halted = false;
@@ -237,6 +359,8 @@ impl TrendsDesk {
     }
 
     pub(crate) fn open_agent(&mut self, agent: Agent, cx: &mut Context<Self>) {
+        let work = termy_x::trends_desk::agent_work_dir(&self.data_root);
+        let _ = std::fs::create_dir_all(&work);
         let configured = self.config.agent_command(agent);
         let exe_text = local_hermes_exe().unwrap_or_default();
         match resolve_launch(
@@ -246,14 +370,16 @@ impl TrendsDesk {
             Some(exe_text.as_str()).filter(|value| !value.is_empty()),
         ) {
             Ok(launch) => {
-                let mut pane = AgentPane::open(agent, &launch.display);
-                match AgentProc::spawn(&launch) {
-                    Ok(proc) => {
-                        self.agent_proc = Some(proc);
-                        pane.notice = format!(
-                            "Agent pane · {}. Nothing is posted from here.",
-                            agent.label()
-                        );
+                let shown = termy_x::trends_desk::interactive_command(&launch.program).join(" ");
+                let mut pane = AgentPane::open(agent, &shown);
+                match spawn_visible(&launch, &work) {
+                    Ok(note) => {
+                        self.agent_proc = None;
+                        pane.notice = if agent == Agent::Muse {
+                            termy_x::trends_desk::muse_trust_line(&work)
+                        } else {
+                            note
+                        };
                     }
                     Err(error) => {
                         self.agent_proc = None;
@@ -262,7 +388,7 @@ impl TrendsDesk {
                 }
                 self.agent_seen = 0;
                 self.agent_pane = Some(pane);
-                self.agent_input = true;
+                self.agent_input = false;
                 self.watch_agent(cx);
             }
             Err(error) => {
@@ -376,6 +502,8 @@ impl TrendsDesk {
         let base = self.hermes_base_text.clone();
         let model = self.hermes_model_text.clone();
         let card = pop.card_id.clone();
+        let work = termy_x::trends_desk::agent_work_dir(&self.data_root);
+        let _ = std::fs::create_dir_all(&work);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
@@ -396,13 +524,31 @@ impl TrendsDesk {
                     );
                     execute_draft(
                         route,
-                        &SystemCli,
+                        &SystemCli { cwd: work.clone() },
                         &termy_x::io::UreqHttp::with_timeout(std::time::Duration::from_secs(45)),
                     )
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
-                let (lines, notice) = variants_from_draft(&post.text, result);
+                let (mut lines, mut notice) = variants_from_draft(&post.text, result);
+                if agent == termy_x::agents::Agent::Agy
+                    && let Some(error) =
+                        termy_x::trends_desk::agy_credit_error(&notice).or_else(|| {
+                            lines
+                                .iter()
+                                .find_map(|line| termy_x::trends_desk::agy_credit_error(line))
+                        })
+                {
+                    lines.clear();
+                    notice = error;
+                }
+                if agent == termy_x::agents::Agent::Muse
+                    && termy_x::trends_desk::muse_needs_trust(&notice)
+                {
+                    notice = termy_x::trends_desk::muse_trust_line(
+                        &termy_x::trends_desk::agent_work_dir(&desk.data_root),
+                    );
+                }
                 if let Some(pop) = desk.popout.as_mut().filter(|pop| pop.card_id == card) {
                     pop.variants = lines;
                     if let Some(first) = pop.variants.first().cloned() {
@@ -478,7 +624,7 @@ impl TrendsDesk {
                         div()
                             .text_size(px(11.0))
                             .text_color(rgb(0xffd60a))
-                            .child(notice),
+                            .child(notice.clone()),
                     )
                     .child(
                         div()
@@ -497,7 +643,9 @@ impl TrendsDesk {
                             .bg(rgb(0x0c1422))
                             .text_size(px(12.0))
                             .cursor_pointer()
-                            .child(if input.is_empty() {
+                            .child(if notice.contains("terminal window") {
+                                "Type in the terminal window that opened.".to_string()
+                            } else if input.is_empty() {
                                 "Click to type in the agent pane".to_string()
                             } else {
                                 format!("{input}|")
@@ -521,6 +669,51 @@ impl TrendsDesk {
             );
         }
         column.into_any_element()
+    }
+}
+
+fn spawn_visible(launch: &Launch, cwd: &std::path::Path) -> Result<String, String> {
+    let program = launch.program.clone();
+    let args = launch.args.clone();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut attempts: Vec<std::process::Command> = Vec::new();
+        let mut wt = Command::new("wt.exe");
+        wt.args(["-w", "0", "-d"])
+            .arg(cwd)
+            .arg(&program)
+            .args(&args);
+        attempts.push(wt);
+        let mut conhost = Command::new("conhost.exe");
+        conhost.arg(&program).args(&args).current_dir(cwd);
+        attempts.push(conhost);
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/k", &program]).args(&args).current_dir(cwd);
+        cmd.creation_flags(0x0000_0010);
+        attempts.push(cmd);
+        let mut last = format!("{program} is missing");
+        for mut command in attempts {
+            match command.spawn() {
+                Ok(_) => {
+                    return Ok(format!(
+                        "Opened {program} in a terminal window. cwd {}",
+                        cwd.display()
+                    ));
+                }
+                Err(error) => last = error.to_string(),
+            }
+        }
+        return Err(last);
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new(&program);
+        command.args(&args).current_dir(cwd);
+        command
+            .spawn()
+            .map_err(|error| format!("{program} is missing: {error}"))?;
+        Ok(format!("Started {program}. cwd {}", cwd.display()))
     }
 }
 

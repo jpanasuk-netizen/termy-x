@@ -60,14 +60,13 @@ impl TrendsDesk {
             .map(|take| take.note.clone());
         let (take_line, take_tag) = match shown {
             Some(take) if take.source == "pending" => ("Drafting take…".to_string(), None),
-            Some(take) if take.source == "offline" => (
-                take.text.clone(),
-                Some(termy_x::trends_desk::short_take_note(&take.note)),
-            ),
+            Some(take) if take.text.trim().is_empty() => {
+                (take.note.clone(), Some("Retry".to_string()))
+            }
             Some(take) => (take.text.clone(), None),
             None => (
-                termy_x::trends_desk::idea_from(post),
-                Some("offline take".to_string()),
+                "Take not drafted yet".to_string(),
+                Some("Retry".to_string()),
             ),
         };
         let editing = self
@@ -116,8 +115,9 @@ impl TrendsDesk {
                 MouseButton::Left,
                 cx.listener({
                     let take_key = take_key.clone();
-                    move |this, _, _, cx| {
+                    move |this, _, window, cx| {
                         this.selected = Some(take_key.clone());
+                        this.focus_root_after_click(window, cx);
                         cx.stop_propagation();
                         cx.notify();
                     }
@@ -242,8 +242,19 @@ impl TrendsDesk {
                         SharedString::from(format!("desk-take-{id}")),
                         "Draft take",
                         false,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_root_after_click(window, cx);
                             this.draft_take_for(take_id.clone(), cx);
+                            cx.stop_propagation();
+                        }),
+                    ))
+                    .child(button(
+                        SharedString::from(format!("desk-retry-{id}")),
+                        "Retry",
+                        false,
+                        cx.listener(move |this, _, window, cx| {
+                            this.focus_root_after_click(window, cx);
+                            this.retry_takes(cx);
                             cx.stop_propagation();
                         }),
                     ))

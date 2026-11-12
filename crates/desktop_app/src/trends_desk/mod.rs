@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use gpui_kit::{
     App, AppContext, Bounds, Context, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, ParentElement, Render, Rgba, SharedString, StatefulInteractiveElement, Styled,
-    Window, WindowBounds, WindowKind, WindowOptions, div, point, px, rgb, size,
+    ParentElement, Render, StatefulInteractiveElement, Styled, Window, WindowBounds, WindowKind,
+    WindowOptions, div, point, px, rgb, size,
 };
 use termy_x::XConfig;
 use termy_x::io::SystemRunner;
@@ -277,22 +277,8 @@ impl TrendsDesk {
     fn begin_take_stream(&mut self, cx: &mut Context<Self>) {
         self.take_wave = self.take_wave.saturating_add(1);
         let wave = self.take_wave;
-        let mut posts = Vec::new();
-        for column in &self.columns {
-            for post in &column.view.posts {
-                if posts
-                    .iter()
-                    .any(|seen: &termy_x::trends_desk::SourcePost| seen.id == post.id)
-                {
-                    continue;
-                }
-                posts.push(post.clone());
-            }
-        }
+        let posts = self.posts_for_takes();
         if self.options.fixture {
-            for post in &posts {
-                self.takes.insert(post.id.clone(), offline_take(post));
-            }
             return;
         }
         if self.free_halted
@@ -393,15 +379,9 @@ impl TrendsDesk {
                             let http = termy_x::io::UreqHttp::with_timeout(
                                 std::time::Duration::from_secs(30),
                             );
-                            match draft_take(provider, &config, &post, &http) {
-                                Ok(draft) => draft,
-                                Err(error) => TakeDraft {
-                                    text: error.clone(),
-                                    source: "error",
-                                    note: error,
-                                    variants: Vec::new(),
-                                },
-                            }
+                            termy_x::trends_desk::run_take_chain(
+                                provider, &config, &post, &http, "Reply",
+                            )
                         })
                         .await
                 };
@@ -545,17 +525,7 @@ impl TrendsDesk {
     }
 
     fn spawn_follow(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(250))
-                    .await;
-                let _ = this.update(cx, |_desk, cx| {
-                    cx.notify();
-                });
-            }
-        })
-        .detach();
+        chrome::follow_loop(cx);
     }
 
     fn spawn_refresh(&mut self, cx: &mut Context<Self>) {
@@ -916,7 +886,7 @@ impl TrendsDesk {
         };
         let parsed = termy_x::trends_desk::TakeTone::parse(tone);
         pop.tone = parsed.label().to_string();
-        pop.variants = termy_x::trends_desk::three_variants(&pop.draft, parsed);
+        pop.variants.clear();
         self.pack.tone = parsed.label().to_ascii_lowercase();
         self.save_pack_file();
     }
@@ -980,7 +950,17 @@ impl TrendsDesk {
                 .background_executor()
                 .spawn(async move {
                     let http = termy_x::io::UreqHttp::default();
-                    draft_take(provider, &config, &post, &http)
+                    let drafted = termy_x::trends_desk::run_take_chain(
+                        provider, &config, &post, &http, "Reply",
+                    );
+                    if !drafted.text.trim().is_empty() {
+                        let _ = termy_x::trends_desk::queue_reply(
+                            &config.config_dir,
+                            &post.id,
+                            &drafted.text,
+                        );
+                    }
+                    Ok(drafted)
                 })
                 .await;
             let _ = this.update(cx, |desk, cx| {
@@ -1249,6 +1229,11 @@ impl TrendsDesk {
                 self.toggle_frame(window, cx);
             }
             cx.notify();
+            return;
+        }
+        if key == "enter" && self.field == Some(Field::Filter) {
+            self.run_live_search(cx);
+            self.field = None;
             return;
         }
         if key == "enter" && self.field == Some(Field::Focus) {

@@ -134,6 +134,15 @@ impl TrendsDesk {
                         }),
                     ))
                     .child(button(
+                        "desk-take-grok",
+                        "Grok takes",
+                        TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Grok,
+                        cx.listener(|this, _, window, cx| {
+                            this.focus_root_after_click(window, cx);
+                            this.set_take_provider("grok", cx);
+                        }),
+                    ))
+                    .child(button(
                         "desk-take-hermes",
                         "Hermes takes",
                         TakeProvider::parse(&self.settings.take_provider) == TakeProvider::Hermes,
@@ -574,4 +583,16 @@ impl Render for HintView {
             .text_color(rgb(0xe5e5ea))
             .child(self.text.clone())
     }
+}
+
+pub(crate) fn follow_loop(cx: &mut Context<super::TrendsDesk>) {
+    cx.spawn(async move |this, cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let _ = this.update(cx, |_desk, cx| cx.notify());
+        }
+    })
+    .detach();
 }
